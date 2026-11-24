@@ -104,8 +104,6 @@ async def test_an_uploaded_md_is_a_document_with_no_parse(writer) -> None:
     assert content.status_code == 200, content.text
     assert content.json()["markdown"] == "# Plan\n\nShip it.\n"
     assert content.json()["notes"] == ""
-    # No pages to render: the original is text, not a source.
-    assert content.json()["has_source"] is False
 
     directory = writer.root / "files" / "Drafts" / "notes.md"
     meta = json.loads((directory / ".meta.json").read_text())
@@ -183,7 +181,7 @@ async def test_a_new_document_starts_empty_and_takes_a_free_name(writer) -> None
     assert original_of(writer.root, document["id"]) is None
 
     content = (await writer.get(f"/api/library/documents/{document['id']}/content")).json()
-    assert content["markdown"] == "" and content["has_source"] is False
+    assert content["markdown"] == ""
     saved = await writer.put(
         f"/api/library/documents/{document['id']}/content",
         json={"markdown": "# Written here\n", "base_revision": content["revision"]},
@@ -251,16 +249,6 @@ async def test_me_lists_markdown_with_its_own_cap(writer) -> None:
     assert limits["markdown_media_types"] == ["text/markdown"]
     assert limits["markdown_extensions"] == [".md", ".markdown"]
     assert limits["markdown_max_bytes"] == writer.app.state.settings.content_max_bytes
-
-
-async def test_the_agent_page_renders_a_markdown_documents_facts(writer) -> None:
-    document = (await _new(writer, "Draft")).json()
-    context = await writer.get("/api/agents/chat/context", params={"document_id": document["id"]})
-    assert context.status_code == 200, context.text
-    facts = context.json()["facts"]
-    assert facts["page_count"] == "none" and facts["bbox_format"] == "none"
-    assert facts["parse_model"] == "not parsed (a markdown document)"
-    assert facts["document_path"] == "/workspace/files/Draft.md"
 
 
 @respx.mock

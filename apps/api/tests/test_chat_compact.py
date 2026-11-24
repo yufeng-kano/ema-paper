@@ -133,9 +133,8 @@ async def test_a_compaction_replaces_the_history_with_its_summary(chat_client) -
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello there")
     await _run_queued_turn(client)
-    before = (await detail(client, conversation_id))["conversation"]
-    assert before["compactable"]
-    assert before["compacted_message_id"] is None
+    assert (await detail(client, conversation_id))["conversation"]["compactable"]
+    assert (await conversation_row(client, conversation_id)).compacted_message_id is None
 
     sent = await send(client, conversation_id, text="keep the table", command="compact")
     assert sent.status_code == 202, sent.text
@@ -166,8 +165,8 @@ async def test_a_compaction_replaces_the_history_with_its_summary(chat_client) -
     assert row.memory_ids is None
     assert row.context_tokens is None
     assert row.cache_warm_until is None
+    assert row.compacted_message_id is not None
     after = await detail(client, conversation_id)
-    assert after["conversation"]["compacted_message_id"] == row.compacted_message_id
     assert not after["conversation"]["compactable"]
     assert after["turns"][1]["status"] == "succeeded"
     assert after["messages"][-1]["content"] == [
@@ -730,7 +729,7 @@ async def test_the_idle_pass_compacts_a_long_conversation_before_its_cache_expir
         "status": "succeeded",
         "error": None,
     }
-    assert after["conversation"]["compacted_message_id"] is not None
+    assert (await conversation_row(client, conversation_id)).compacted_message_id is not None
     assert after["conversation"]["updated_at"] == listed_before
     assert after["messages"][-1]["content"][0]["context"] == chat_compact.SUMMARY_CONTEXT
 
@@ -913,7 +912,6 @@ async def test_the_memory_file_is_read_and_written_on_the_agent_page(make_client
     assert empty.status_code == 200, empty.text
     assert empty.json() == {"text": "", "max_chars": 40}
     limits = (await client.get("/api/me")).json()["limits"]
-    assert limits["memory_file_max_chars"] == 40
     # The panel reads the open conversation again as the worker's window opens (docs/web.md).
     assert limits["idle_compact_lead_seconds"] == 123
 

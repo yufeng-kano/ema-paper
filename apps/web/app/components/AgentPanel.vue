@@ -17,16 +17,14 @@
  */
 import {
   AGENT_EFFORTS,
+  CHAT_AGENT,
   listAgentModels,
   putAgentSettings,
   type AgentEffort,
   type AgentEntry,
-  type ConnectionModel,
+  type AgentModel,
   type SavedAgentSettings,
 } from '~/lib/api'
-
-const CHAT_AGENT = 'chat'
-const DEFAULT_EFFORT: AgentEffort = 'medium'
 
 const props = defineProps<{
   agent: AgentEntry
@@ -57,7 +55,7 @@ const isChat = computed(() => props.agent.name === CHAT_AGENT)
 
 /** The chat agent's offered models (docs/billing.md § Models); the parse agent's model is
  *  a fact of the deployment and loads nothing. */
-const models = ref<ConnectionModel[] | null>(null)
+const models = ref<AgentModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 const modelPending = ref(false)
 
@@ -102,7 +100,7 @@ const convention = computed(() =>
 
 const effortPending = ref(false)
 const effortError = ref<string | null>(null)
-const effortChoice = computed(() => settings.value.effort ?? DEFAULT_EFFORT)
+const effortChoice = computed(() => settings.value.effort)
 
 async function applyEffort(value: string) {
   effortPending.value = true
@@ -120,7 +118,7 @@ async function applyEffort(value: string) {
 
 /** Whether the worker compacts the reader's long conversations before their cache expires
  *  (docs/chat.md § Compaction, *Idle compaction*): on unless turned off. */
-const idleOn = computed(() => settings.value.idle_compact ?? true)
+const idleOn = computed(() => settings.value.idle_compact)
 const idlePending = ref(false)
 const idleError = ref<string | null>(null)
 

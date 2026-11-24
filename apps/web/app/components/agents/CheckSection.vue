@@ -15,8 +15,6 @@ import {
   type SavedAgentSettings,
 } from '~/lib/api'
 
-const DEFAULT_EFFORT: AgentEffort = 'medium'
-
 const props = defineProps<{
   /** The `check` agent's registry entry. */
   agent: AgentEntry
@@ -46,7 +44,7 @@ const error = ref<string | null>(null)
 
 /** The click being saved; the stored value otherwise. Put back when the save fails. */
 const autoChoice = ref<boolean | null>(null)
-const autoOn = computed(() => autoChoice.value ?? settings.value.auto_check ?? true)
+const autoOn = computed(() => autoChoice.value ?? settings.value.auto_check)
 
 async function toggleAuto() {
   if (autoChoice.value !== null) {
@@ -68,7 +66,7 @@ async function toggleAuto() {
 // --- effort ---------------------------------------------------------------------------
 
 const effortPending = ref(false)
-const effortChoice = computed(() => settings.value.effort ?? DEFAULT_EFFORT)
+const effortChoice = computed(() => settings.value.effort)
 
 async function applyEffort(value: string) {
   const name = props.agent.name

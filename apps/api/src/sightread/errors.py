@@ -16,10 +16,13 @@ from .body_limit import BodyTooLarge
 # one 409 a client answers by reloading, apart from every other 409 (docs/api.md).
 ErrorType = Literal[
     "invalid_request",
+    # A conversation with no message turn to name, or nothing since its last summary to
+    # compact (docs/chat.md § Conversations, turns, events, § Compaction).
+    "nothing_to_rename",
+    "nothing_to_compact",
     "revision_conflict",
     "auth",
     "rate_limit",
-    "payment",
     "insufficient_credits",
     "storage_full",
     "not_convertible",
@@ -53,7 +56,6 @@ _STATUS_TO_TYPE: dict[int, ErrorType] = {
     413: "invalid_request",
     422: "invalid_request",
     429: "rate_limit",
-    402: "payment",
     501: "internal",
     502: "upstream",
     503: "upstream",

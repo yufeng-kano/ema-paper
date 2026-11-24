@@ -81,7 +81,7 @@ async function save() {
     </template>
 
     <form :id="`prompt-form-${agent.name}`" class="form" @submit.prevent="save">
-      <div v-if="agent.prompt_tokens?.length" class="tokens">
+      <div v-if="agent.prompt_tokens.length" class="tokens">
         <button
           v-for="token in agent.prompt_tokens"
           :key="token"

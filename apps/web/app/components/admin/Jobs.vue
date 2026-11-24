@@ -8,15 +8,8 @@
  * The filter and the page live in the route query (`?status=&page=`), so Back and a reload
  * return to them; nothing of the list is kept in browser storage.
  */
-import { listAdminJobs, requeueAdminJob, type AdminJob } from '~/lib/api'
-import {
-  JOB_STATUSES,
-  JOB_TONES,
-  formatElapsed,
-  jobStatusOf,
-  pageOf,
-  type JobStatus,
-} from '~/lib/admin'
+import { listAdminJobs, requeueAdminJob, type AdminJob, type JobStatus } from '~/lib/api'
+import { JOB_STATUSES, JOB_TONES, formatElapsed, jobStatusOf, pageOf } from '~/lib/admin'
 import { formatCount, formatShortDateTime } from '~/lib/format'
 import type { TableColumn } from '~/lib/table'
 

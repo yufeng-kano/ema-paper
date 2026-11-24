@@ -15,7 +15,15 @@ import {
 const TURN = 'turn-1'
 
 function turn(finished: boolean, status = finished ? 'succeeded' : 'running'): ChatTurn {
-  return { id: TURN, status, error: null, finished_at: finished ? '2026-10-17T00:00:00Z' : null }
+  return {
+    id: TURN,
+    kind: 'message',
+    status,
+    error: null,
+    credits: null,
+    finished_at: finished ? '2026-10-17T00:00:00Z' : null,
+    versions: null,
+  }
 }
 
 let nextId = 1
@@ -501,10 +509,10 @@ describe('a compaction turn', () => {
     expect(dimBefore).toBe(-1)
   })
 
-  it('is known from its turn_start when the record has no kind yet', () => {
+  it('is known from its turn_start when the record does not list the turn yet', () => {
     const messages = [message('user', [{ type: 'text', text: '/compact' }])]
     const groups = events({ event: 'turn_start', model: 'm', kind: 'idle_compact' })
-    const { items } = buildThread({ turns: [{ ...turn(false), kind: undefined }], messages, groups })
+    const { items } = buildThread({ turns: [], messages, groups })
     expect(kinds(items)).toEqual(['compacting'])
     expect(turnKind(undefined, groups.get(TURN))).toBe('idle_compact')
     expect(turnKind({ ...turn(true), kind: 'compact' }, undefined)).toBe('compact')
@@ -512,7 +520,7 @@ describe('a compaction turn', () => {
   })
 
   it('becomes a divider with the focus, the summary and its cost, and dims everything above it', () => {
-    const earlier: ChatTurn = { id: 'turn-0', status: 'succeeded', error: null, finished_at: '2026-10-17T00:00:00Z', credits: 3 }
+    const earlier: ChatTurn = { ...turn(true), id: 'turn-0', credits: 3 }
     const before = [
       { ...message('user', [{ type: 'text', text: 'Hello' }]), turn_id: 'turn-0' },
       { ...message('assistant', [{ type: 'text', text: 'Hi.' }]), turn_id: 'turn-0' },

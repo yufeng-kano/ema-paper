@@ -129,8 +129,8 @@ function meta(memory: Memory): string {
 
 /** The click being saved; the stored value otherwise. Put back when the save fails. */
 const autoChoice = ref<boolean | null>(null)
-const autoOn = computed(() => autoChoice.value ?? props.agent.settings.memory_auto ?? true)
-const paused = computed(() => props.agent.settings.memory_paused ?? false)
+const autoOn = computed(() => autoChoice.value ?? props.agent.settings.memory_auto)
+const paused = computed(() => props.agent.settings.memory_paused)
 const pausePending = ref(false)
 
 async function toggleAuto() {

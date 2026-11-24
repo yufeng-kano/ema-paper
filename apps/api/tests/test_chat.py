@@ -685,11 +685,6 @@ async def test_a_finished_library_parse_keeps_its_source(chatting, tmp_path) -> 
     assert kept.read_bytes() == b"%PDF-1.4 test"
     assert not upload.exists()
     async with sessionmaker() as db:
-        content = await workspace_documents.read_content(
-            db, settings, await db.get(Document, chatting.document_id)
-        )
-    assert content.has_source
-    async with sessionmaker() as db:
         assert (await db.execute(select(Message))).scalars().all() == []
 
 

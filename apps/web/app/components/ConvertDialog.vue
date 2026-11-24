@@ -15,16 +15,13 @@ import {
 } from '~/lib/api'
 import { formatBytes } from '~/lib/format'
 
-const props = withDefaults(
-  defineProps<{
-    document: LibraryDocument
-    /** The view the document opens on when the parse succeeds, remembered as if the reader
-     *  had switched to it — Markdown when the dialog opened from the viewer's menu; null,
-     *  from the row's menu, leaves the reader's default to decide (docs/web.md § Files). */
-    view?: DocumentView | null
-  }>(),
-  { view: null },
-)
+const props = defineProps<{
+  document: LibraryDocument
+  /** The view the document opens on when the parse succeeds, remembered as if the reader
+   *  had switched to it — Markdown when the dialog opened from the viewer's menu; null,
+   *  from the row's menu, leaves the reader's default to decide (docs/web.md § Files). */
+  view: DocumentView | null
+}>()
 
 const emit = defineEmits<{ close: []; converted: [id: number]; refused: [refusal: CreditsRefusal] }>()
 
@@ -44,7 +41,7 @@ async function start() {
   busy.value = true
   error.value = null
   try {
-    const converted = await convertDocument(props.document.id, null, props.view)
+    const converted = await convertDocument(props.document.id, props.view)
     emit('converted', converted.id)
   } catch (failure) {
     const refusal = creditsRefusalOf(failure)

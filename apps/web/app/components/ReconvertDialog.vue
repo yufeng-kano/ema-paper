@@ -6,7 +6,7 @@
  * made meanwhile are replaced too and stay in its revisions, and the notes stay
  * (docs/jobs.md § Re-converting a document).
  */
-import { reconvertDocument, type ConnectionModel, type LibraryDocument } from '~/lib/api'
+import { reconvertDocument, type AgentModel, type LibraryDocument } from '~/lib/api'
 import { loadParseModels, PARSE_AGENT } from '~/lib/models'
 
 const props = defineProps<{ document: LibraryDocument }>()
@@ -16,7 +16,7 @@ const emit = defineEmits<{ close: []; started: [] }>()
 const { t } = useI18n()
 const { resolve } = useApiError()
 
-const models = ref<ConnectionModel[] | null>(null)
+const models = ref<AgentModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 /** The parse agent's own model, the first choice. */
 const own = ref<string | null>(null)

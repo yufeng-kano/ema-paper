@@ -9,12 +9,11 @@
  * what a cold next message re-reads; no cache on this model — the **Compact idle
  * conversations** switch, and **Compact now**, which the panel sends as `/compact`.
  */
-import { putAgentSettings, type AgentSettings, type Conversation, type SavedAgentSettings } from '~/lib/api'
+import { CHAT_AGENT, putAgentSettings, type AgentSettings, type Conversation, type SavedAgentSettings } from '~/lib/api'
 import { cacheState, contextFill, contextLine, formatTokens, ringLevel } from '~/lib/context'
 import { formatCount } from '~/lib/format'
 import { modalPanelKey, placeCard } from '~/lib/menu'
 
-const CHAT_AGENT = 'chat'
 /** The ring's circumference: a 20-unit box, a radius of 8. */
 const RADIUS = 8
 const CIRCUMFERENCE = 2 * Math.PI * RADIUS

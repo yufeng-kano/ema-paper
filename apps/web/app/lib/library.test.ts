@@ -52,8 +52,40 @@ function document(
     created_at: '2026-08-01T00:00:00Z',
     finished_at: '2026-08-01T00:01:00Z',
     failed_pages: null,
+    media_type: null,
+    storage_bytes: null,
+    checking: false,
+    reconvert: null,
+    credits: null,
+    view: null,
+    original: null,
     ...overrides,
   }
+}
+
+/** The server's limits as `GET /api/me` sends them, every key present. */
+const LIMITS: UploadLimits = {
+  upload_max_bytes: 1000,
+  file_max_bytes: 5000,
+  accepted_media_types: ['application/pdf', 'image/jpeg', 'image/heic', 'text/markdown'],
+  accepted_extensions: ['.pdf', '.jpg', '.heic', '.md', '.markdown'],
+  markdown_media_types: ['text/markdown'],
+  markdown_extensions: ['.md', '.markdown'],
+  markdown_max_bytes: 100,
+  image_media_types: ['image/png', 'image/jpeg'],
+  image_max_bytes: 2000,
+  prompt_max_chars: 8000,
+  attachment_max_bytes: 3000,
+  attachments_per_message: 5,
+  attachment_extensions: ['.txt', '.png'],
+  instructions_max_chars: 4000,
+  memory_max_chars: 500,
+  sections_per_message: 3,
+  selection_max_chars: 2000,
+  section_heading_max_chars: 200,
+  conversation_title_max_chars: 120,
+  idle_compact_lead_seconds: 60,
+  trash_retention_days: 30,
 }
 
 // Home ├─ Invoices ─ 2026 ─ Q1
@@ -144,37 +176,27 @@ describe('re-convert state', () => {
     }
     expect(isReconverting(document(1, 'a.pdf', null, { reconvert: reconvert({ status: 'failed' }) }))).toBe(false)
     expect(isReconverting(document(1, 'a.pdf', null, { reconvert: null }))).toBe(false)
-    // An older API sends no field at all.
-    expect(isReconverting(document(1, 'a.pdf'))).toBe(false)
   })
 })
 
 describe('acceptsUpload', () => {
-  const limits: UploadLimits = {
-    upload_max_bytes: 1000,
-    page_cap: 500,
-    accepted_media_types: ['application/pdf', 'image/jpeg', 'image/heic'],
-    accepted_extensions: ['.pdf', '.jpg', '.heic'],
-    prompt_max_chars: 8000,
-  }
-
   it('takes a file the browser typed for us', () => {
-    expect(acceptsUpload({ name: 'report.pdf', type: 'application/pdf' }, limits)).toBe(true)
+    expect(acceptsUpload({ name: 'report.pdf', type: 'application/pdf' }, LIMITS)).toBe(true)
   })
 
   it('falls back to the extension when the browser had no type to give', () => {
     // What a drag out of a file manager with no `.heic` association looks like.
-    expect(acceptsUpload({ name: 'scan.heic', type: '' }, limits)).toBe(true)
-    expect(acceptsUpload({ name: 'scan.HEIC', type: 'application/octet-stream' }, limits)).toBe(true)
+    expect(acceptsUpload({ name: 'scan.heic', type: '' }, LIMITS)).toBe(true)
+    expect(acceptsUpload({ name: 'scan.HEIC', type: 'application/octet-stream' }, LIMITS)).toBe(true)
   })
 
   it('leaves what the server would keep as a file', () => {
-    expect(acceptsUpload({ name: 'notes.txt', type: 'text/plain' }, limits)).toBe(false)
-    expect(acceptsUpload({ name: 'notes', type: '' }, limits)).toBe(false)
+    expect(acceptsUpload({ name: 'notes.txt', type: 'text/plain' }, LIMITS)).toBe(false)
+    expect(acceptsUpload({ name: 'notes', type: '' }, LIMITS)).toBe(false)
   })
 
   it('reads a leading dot as part of the name, as the server does', () => {
-    expect(acceptsUpload({ name: '.pdf', type: '' }, limits)).toBe(false)
+    expect(acceptsUpload({ name: '.pdf', type: '' }, LIMITS)).toBe(false)
   })
 
   it('defers to the server while the limits are still loading', () => {
@@ -183,30 +205,19 @@ describe('acceptsUpload', () => {
 })
 
 describe('isMarkdownUpload', () => {
-  const limits: UploadLimits = {
-    upload_max_bytes: 1000,
-    page_cap: 500,
-    accepted_media_types: ['application/pdf', 'text/markdown'],
-    accepted_extensions: ['.pdf', '.md', '.markdown'],
-    markdown_media_types: ['text/markdown'],
-    markdown_extensions: ['.md', '.markdown'],
-    markdown_max_bytes: 100,
-    prompt_max_chars: 8000,
-  }
-
   it('knows a markdown file by its type or its extension, as the server does', () => {
-    expect(isMarkdownUpload({ name: 'readme', type: 'text/markdown' }, limits)).toBe(true)
-    expect(isMarkdownUpload({ name: 'Notes.MD', type: '' }, limits)).toBe(true)
-    expect(isMarkdownUpload({ name: 'plan.markdown', type: 'application/octet-stream' }, limits)).toBe(true)
+    expect(isMarkdownUpload({ name: 'readme', type: 'text/markdown' }, LIMITS)).toBe(true)
+    expect(isMarkdownUpload({ name: 'Notes.MD', type: '' }, LIMITS)).toBe(true)
+    expect(isMarkdownUpload({ name: 'plan.markdown', type: 'application/octet-stream' }, LIMITS)).toBe(true)
   })
 
   it('takes anything else for a parse', () => {
-    expect(isMarkdownUpload({ name: 'report.pdf', type: 'application/pdf' }, limits)).toBe(false)
+    expect(isMarkdownUpload({ name: 'report.pdf', type: 'application/pdf' }, LIMITS)).toBe(false)
     expect(isMarkdownUpload({ name: 'notes.md', type: '' }, null)).toBe(false)
   })
 
   it('reads a leading dot as part of the name, as the server does', () => {
-    expect(isMarkdownUpload({ name: '.md', type: '' }, limits)).toBe(false)
+    expect(isMarkdownUpload({ name: '.md', type: '' }, LIMITS)).toBe(false)
   })
 })
 
@@ -278,36 +289,23 @@ describe('checkFailureReason', () => {
 })
 
 describe('uploadCap', () => {
-  const limits: UploadLimits = {
-    upload_max_bytes: 1000,
-    page_cap: 500,
-    accepted_media_types: ['application/pdf', 'image/jpeg', 'text/markdown'],
-    accepted_extensions: ['.pdf', '.jpg', '.md'],
-    markdown_media_types: ['text/markdown'],
-    markdown_extensions: ['.md'],
-    markdown_max_bytes: 100,
-    file_max_bytes: 5000,
-    prompt_max_chars: 8000,
-  }
-
   it('applies the cap intake applies: markdown, a parse, or a file kept as it is', () => {
-    expect(uploadCap({ name: 'notes.md', type: '' }, limits, true)).toEqual({ bytes: 100, as: 'markdown' })
-    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, true)).toEqual({ bytes: 1000, as: 'parse' })
-    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, limits, true)).toEqual({ bytes: 5000, as: 'file' })
-    expect(uploadCap({ name: 'mystery', type: '' }, limits, true)).toEqual({ bytes: 5000, as: 'file' })
+    expect(uploadCap({ name: 'notes.md', type: '' }, LIMITS, true)).toEqual({ bytes: 100, as: 'markdown' })
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, LIMITS, true)).toEqual({ bytes: 1000, as: 'parse' })
+    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, LIMITS, true)).toEqual({ bytes: 5000, as: 'file' })
+    expect(uploadCap({ name: 'mystery', type: '' }, LIMITS, true)).toEqual({ bytes: 5000, as: 'file' })
   })
 
   it('caps a PDF or an image as a file while the parse agent keeps them, which it does unless asked', () => {
-    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, false)).toEqual({ bytes: 5000, as: 'file' })
-    expect(uploadCap({ name: 'scan.jpg', type: 'image/jpeg' }, limits, false)).toEqual({ bytes: 5000, as: 'file' })
-    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits)).toEqual({ bytes: 5000, as: 'file' })
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, LIMITS, false)).toEqual({ bytes: 5000, as: 'file' })
+    expect(uploadCap({ name: 'scan.jpg', type: 'image/jpeg' }, LIMITS, false)).toEqual({ bytes: 5000, as: 'file' })
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, LIMITS)).toEqual({ bytes: 5000, as: 'file' })
     // Markdown is never parsed: the switch changes nothing for it.
-    expect(uploadCap({ name: 'notes.md', type: '' }, limits, false)).toEqual({ bytes: 100, as: 'markdown' })
+    expect(uploadCap({ name: 'notes.md', type: '' }, LIMITS, false)).toEqual({ bytes: 100, as: 'markdown' })
   })
 
-  it('names no cap while the limits are loading, or where an older API has none', () => {
+  it('names no cap while the limits are loading', () => {
     expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, null)).toBeNull()
-    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, { ...limits, file_max_bytes: undefined })).toBeNull()
   })
 })
 

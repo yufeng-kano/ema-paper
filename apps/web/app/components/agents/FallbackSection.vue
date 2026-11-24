@@ -21,12 +21,12 @@ const { resolve } = useApiError()
 
 const labelId = useId()
 
-const fallback = computed(() => props.agent.settings.fallback_model ?? null)
+const fallback = computed(() => props.agent.settings.fallback_model)
 /** The click being saved; the stored value otherwise. Put back when the save fails. */
 const autoChoice = ref<boolean | null>(null)
 /** Drawn off with no fallback, whatever is stored: there is nowhere to send a page. */
 const autoOn = computed(
-  () => fallback.value !== null && (autoChoice.value ?? props.agent.settings.auto_fallback ?? false),
+  () => fallback.value !== null && (autoChoice.value ?? props.agent.settings.auto_fallback),
 )
 const error = ref<string | null>(null)
 

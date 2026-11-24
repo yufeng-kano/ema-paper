@@ -42,8 +42,6 @@ class ExecResult:
 class SandboxStatus:
     state: str  # stopped | starting | running | unavailable
     last_used_at: str | None
-    shells: int
-    uptime_seconds: int
 
 
 class SandboxClient:
@@ -121,8 +119,6 @@ class SandboxClient:
             last_used_at=payload.get("last_used_at")
             if isinstance(payload.get("last_used_at"), str)
             else None,
-            shells=int(payload.get("shells") or 0),
-            uptime_seconds=int(payload.get("uptime_seconds") or 0),
         )
 
     async def stop(self, user_id: int) -> None:

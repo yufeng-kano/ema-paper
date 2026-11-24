@@ -96,9 +96,7 @@ def conversation_payload(row: Conversation, settings: AppSettings, *, compactabl
     return {
         "id": row.id,
         "title": row.title,
-        "document_id": row.document_id,
         "model": row.model,
-        "compacted_message_id": row.compacted_message_id,
         "compactable": compactable,
         "context_tokens": row.context_tokens,
         "context_window": (
@@ -1431,14 +1429,9 @@ async def sandbox_status(user: SessionUser, db: DbSession, settings: AppSettings
     client = SandboxClient(settings)
     try:
         runner = await client.status(user.id)
-        state = {
-            "state": runner.state,
-            "last_used_at": runner.last_used_at,
-            "shells": runner.shells,
-            "uptime_seconds": runner.uptime_seconds,
-        }
+        state = {"state": runner.state, "last_used_at": runner.last_used_at}
     except SandboxUnavailable:
-        state = {"state": "unavailable", "last_used_at": None, "shells": 0, "uptime_seconds": 0}
+        state = {"state": "unavailable", "last_used_at": None}
     root = user_root(settings.workspaces_dir, user.id)
     plan = await ledger.plan_of(db, settings, user.id)
     workspace = workspace_payload(

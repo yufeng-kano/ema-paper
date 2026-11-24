@@ -344,7 +344,7 @@ async def test_an_edit_joins_its_branch_with_that_branchs_summary(chat_client) -
     # compaction, then the revised message — with its summary row again.
     switched = await switch(client, conversation_id, first)
     assert switched.status_code == 200, switched.text
-    assert switched.json()["compacted_message_id"] == boundary
+    assert (await conversation_row(client, conversation_id)).compacted_message_id == boundary
     assert [turn["id"] for turn in (await detail(client, conversation_id))["turns"]] == [
         first,
         compaction,

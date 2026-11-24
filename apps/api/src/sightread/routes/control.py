@@ -70,14 +70,13 @@ from ..workspace.documents import (
     IMAGE_MEDIA_TYPES,
     MARKDOWN_EXTENSIONS,
     MARKDOWN_MEDIA_TYPE,
-    document_paths,
 )
 from ..workspace.layout import FILES_DIR, user_root
 from ..workspace.locks import workspace_lock
 from ..workspace.memory_file import memory_file_text, write_memory_file
 from ..workspace.trash import lock_user
 from .billing import me_fields
-from .chat import TITLE_MAX_CHARS, owned_document, turn_note
+from .chat import TITLE_MAX_CHARS, turn_note
 from .library import parse_auto_convert
 
 logger = logging.getLogger(__name__)
@@ -234,7 +233,6 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
         # a limit written twice is a limit that drifts (docs/api.md § Limits).
         "limits": {
             "upload_max_bytes": settings.upload_max_bytes,
-            "page_cap": settings.page_cap,
             "accepted_media_types": [PDF_MEDIA_TYPE, *ACCEPTED_IMAGE_TYPES, MARKDOWN_MEDIA_TYPE],
             # The extensions intake falls back to when a browser reports a generic type
             # for a file it has no association for (docs/api.md § Limits).
@@ -266,8 +264,6 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "selection_max_chars": settings.chat_selection_max_chars,
             # A conversation's rename field (docs/chat.md § Conversations, turns, events).
             "conversation_title_max_chars": TITLE_MAX_CHARS,
-            # The Agent page's memory file editor (docs/chat.md § Memory, *The memory file*).
-            "memory_file_max_chars": settings.chat_memory_file_max_chars,
             # When the idle pass may queue a compaction of an open conversation, for the
             # panel to read it again then (docs/web.md § The agent panel).
             "idle_compact_lead_seconds": settings.chat_idle_compact_lead_seconds,
@@ -562,7 +558,6 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
         "agents": [
             {
                 "name": agent.name,
-                "capabilities": list(agent.capabilities),
                 "input": agent.input,
                 "output": agent.output,
                 # What the prompt dialog opens on when the user saved no prompt, and the
@@ -763,24 +758,12 @@ async def chat_agent_context(
     db: DbSession,
     settings: AppSettings,
     locale: str = Query(default="en", max_length=16, pattern=LANGUAGE_TAG.pattern),
-    document_id: int | None = None,
 ):
     """What the chat agent receives, rendered by the code the runner uses, for the Agent
-    page's drawer (docs/api.md): the system blocks in the order a turn sends them, the turn
-    block a message sent now in `locale` would carry, and the document's facts when one is
-    named. Reads only: nothing is materialized and no snapshot is taken."""
-    facts: dict[str, str] | None = None
-    # The AGENTS.md files a new conversation would read: the document's path, or the root
-    # file alone without a document (docs/chat.md § AGENTS.md).
-    folder_dir = Path(FILES_DIR)
-    if document_id is not None:
-        document = await owned_document(db, user.id, document_id)
-        paths = await document_paths(db, settings, document)
-        folder_dir = paths.relative.parent
-        # A markdown document has no job and still has facts: it has no pages to name.
-        job = await db.get(Job, document.job_id) if document.job_id is not None else None
-        if document.job_id is None or job is not None:
-            facts = chat_runner.document_facts(settings, job, paths)
+    page's drawer (docs/api.md): the system blocks in the order a turn sends them and the
+    turn block a message sent now in `locale` would carry. No document is open on the Agent
+    page, so the prompt keeps its tokens. Reads only: nothing is materialized and no
+    snapshot is taken."""
     setting = (
         await db.execute(
             select(AgentSetting).where(
@@ -795,15 +778,15 @@ async def chat_agent_context(
     subagents = subagent_defs.resolve_subagents(
         (await db.execute(select(Subagent).where(Subagent.user_id == user.id))).scalars()
     )
-    # What a new conversation would load: the first turn's selection, over every
-    # document's memories and, with a document, this one's (docs/chat.md § Memory).
+    # What a new conversation would load: the first turn's selection over every
+    # document's memories (docs/chat.md § Memory).
     auto = setting.memory_auto if setting else True
     paused = setting.memory_paused if setting else False
     loaded = (
         []
         if paused
         else chat_memory.first_turn_selection(
-            await chat_memory.applicable_memories(db, user.id, document_id if facts else None),
+            await chat_memory.applicable_memories(db, user.id, None),
             settings,
         )
     )
@@ -813,7 +796,7 @@ async def chat_agent_context(
         # Without a document the template keeps its tokens, its tool lines filtered as a
         # turn's would be.
         chat_agent.render_system_prompt(
-            own_prompt or CHAT.default_prompt_template, facts, tools=tools
+            own_prompt or CHAT.default_prompt_template, None, tools=tools
         ),
         instructions=setting.instructions if setting else None,
         catalogue=chat_runner.turn_catalogue(skills, subagents),
@@ -822,8 +805,10 @@ async def chat_agent_context(
         memory_file=chat_agent.render_memory_file(
             await memory_file_text(settings, user.id), settings.chat_memory_file_max_chars
         ),
+        # The AGENTS.md a new conversation reads with no document named: the root file
+        # alone (docs/chat.md § AGENTS.md).
         agents_file=chat_agent.render_agents_file(
-            await agents_file_text(settings, user.id, folder_dir),
+            await agents_file_text(settings, user.id, Path(FILES_DIR)),
             settings.chat_agents_file_max_chars,
         ),
     )
@@ -852,7 +837,6 @@ async def chat_agent_context(
             for part in parts
         ],
         "turn": {"text": turn, "chars": len(turn)},
-        "facts": facts,
     }
 
 

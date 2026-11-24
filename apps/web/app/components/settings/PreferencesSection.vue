@@ -45,7 +45,7 @@ async function toggleConvert(next: boolean) {
     parseAgent.value = { ...agent, settings, bbox }
     // The Files page reads the switch from the session (`GET /api/me`), so it follows at once.
     if (auth.me.value) {
-      auth.me.value = { ...auth.me.value, auto_convert: settings.auto_convert ?? next }
+      auth.me.value = { ...auth.me.value, auto_convert: settings.auto_convert }
     }
   } catch (failure) {
     convertError.value = await resolve(failure)

@@ -36,8 +36,8 @@ const countId = useId()
 const drawerId = useId()
 const advancedId = useId()
 
-/** `limits.instructions_max_chars`; null until the session has loaded, or from an API that
- *  predates it — the count then shows without a cap. */
+/** `limits.instructions_max_chars`; null until the session has loaded — the count then
+ *  shows without a cap. */
 const maxChars = computed(() => auth.me.value?.limits.instructions_max_chars ?? null)
 
 /** What is stored, in the form the controls hold it: `''` for none. */

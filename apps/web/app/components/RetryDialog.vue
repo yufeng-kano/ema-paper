@@ -17,7 +17,7 @@ import {
   creditsRefusalOf,
   getDocumentPages,
   retryDocument,
-  type ConnectionModel,
+  type AgentModel,
   type CreditsRefusal,
   type DocumentPage,
   type LibraryDocument,
@@ -36,7 +36,7 @@ const { resolve } = useApiError()
 
 const pages = ref<DocumentPage[] | null>(null)
 const pagesError = ref<string | null>(null)
-const models = ref<ConnectionModel[] | null>(null)
+const models = ref<AgentModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 /** The parse agent's fallback, the first choice when there is one. */
 const fallback = ref<string | null>(null)

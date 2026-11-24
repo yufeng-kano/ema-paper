@@ -4,19 +4,14 @@
  * blocks in the order a turn sends them, then the context block every message carries,
  * then the document's facts — each with its size in characters.
  */
-import type { AgentContext, AgentContextFacts, AgentContextPart } from './api'
+import type { AgentContext, AgentContextPart } from './api'
 
-/** The facts the prompt is rendered with, in the order the API lists them. */
-export const FACT_NAMES: readonly (keyof AgentContextFacts)[] = [
-  'document_path',
-  'page_count',
-  'bbox_format',
-  'parse_model',
-  'network',
-]
+/** The facts the prompt is rendered with per document (docs/chat.md § System prompt). */
+export const FACT_NAMES = ['document_path', 'page_count', 'bbox_format', 'parse_model', 'network'] as const
 
 interface ReceivesFact {
-  name: keyof AgentContextFacts
+  name: (typeof FACT_NAMES)[number]
+  /** Its token: no document is open where the drawer is. */
   value: string
 }
 
@@ -41,13 +36,12 @@ export function receivesRows(context: AgentContext): ReceivesRow[] {
     seen.set(part.kind, nth + 1)
     return { key: `${part.kind}-${nth}`, kind: 'part', part, text: part.text, chars: part.chars }
   })
-  // A fact's value, or — on the Agent page, where no document is open — its token.
-  const facts = FACT_NAMES.map((name) => ({ name, value: context.facts?.[name] ?? `{${name}}` }))
+  const facts = FACT_NAMES.map((name) => ({ name, value: `{${name}}` }))
   return [
     ...parts,
     { key: 'turn', kind: 'turn', text: context.turn.text, chars: context.turn.chars },
     // The facts are substituted into the prompt rather than sent as a block of their own;
-    // their size is that of the values the row lists.
+    // their size is that of the tokens the row lists.
     { key: 'facts', kind: 'facts', facts, chars: facts.reduce((sum, fact) => sum + [...fact.value].length, 0) },
   ]
 }

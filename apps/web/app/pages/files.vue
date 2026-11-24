@@ -649,7 +649,7 @@ const autoConvert = computed(() => auth.me.value?.auto_convert ?? false)
 /** The view a converted PDF or image opens on until it was switched once (Settings ›
  *  Preferences, docs/web.md § Result viewer, *Original and Markdown*). */
 const defaultView = computed<DocumentView>(() => auth.me.value?.default_view ?? 'markdown')
-/** How long the Trash keeps an item; 0 (or an older API's silence) keeps it until emptied. */
+/** How long the Trash keeps an item; 0 keeps it until emptied. */
 const trashRetentionDays = computed(() => limits.value?.trash_retention_days ?? 0)
 /** The 409 of an upload past the plan's storage: a banner with the way to more of it
  *  (docs/web.md § Files). */

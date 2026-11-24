@@ -202,7 +202,6 @@ class Content:
     revision: str
     notes: str
     notes_revision: str
-    has_source: bool
 
 
 def revision_of(text: str) -> str:
@@ -1176,7 +1175,7 @@ async def discard_adopted(
 # --- content ------------------------------------------------------------------------------
 
 
-def _read(paths: DocumentPaths, max_bytes: int, *, document_id: int, parsed: bool) -> Content:
+def _read(paths: DocumentPaths, max_bytes: int) -> Content:
     paths.check()
     markdown = _read_text(paths.root, paths.doc, max_bytes)
     notes = _read_text(paths.root, paths.notes, max_bytes)
@@ -1185,9 +1184,6 @@ def _read(paths: DocumentPaths, max_bytes: int, *, document_id: int, parsed: boo
         revision=revision_of(markdown),
         notes=notes,
         notes_revision=revision_of(notes),
-        # A markdown document's original is its first text, not pages to render.
-        has_source=parsed
-        and (original_of(paths.root, document_id) is not None or paths.source() is not None),
     )
 
 
@@ -1200,13 +1196,7 @@ async def read_content(
     root = user_root(settings.workspaces_dir, document.user_id)
     async with contextlib.nullcontext() if locked else workspace_lock(root):
         paths = await materialize_document(db, settings, document, locked=True)
-        return await asyncio.to_thread(
-            _read,
-            paths,
-            settings.content_max_bytes,
-            document_id=document.id,
-            parsed=document.job_id is not None,
-        )
+        return await asyncio.to_thread(_read, paths, settings.content_max_bytes)
 
 
 def _write_file(

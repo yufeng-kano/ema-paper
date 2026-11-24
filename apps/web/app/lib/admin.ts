@@ -8,7 +8,7 @@
  * what a page offers, so an operator is not handed a control the API would refuse. Code
  * compares permission strings and the `builtin` flag — never a group's name.
  */
-import { ApiRequestError, type AdminCodesCreated, type AdminSettingImpact } from './api'
+import { ApiRequestError, type AdminCodesCreated, type AdminSettingImpact, type JobStatus } from './api'
 import type { CostDay } from './chart'
 import type { IconName } from './icons'
 
@@ -349,9 +349,7 @@ export function conflictKey(reason: string | null): string | null {
 // --- jobs and usage -------------------------------------------------------------------
 
 /** A job's statuses, in the order the Jobs filter offers them (docs/admin.md § Routes). */
-export const JOB_STATUSES = ['queued', 'running', 'failed', 'succeeded'] as const
-
-export type JobStatus = (typeof JOB_STATUSES)[number]
+export const JOB_STATUSES = ['queued', 'running', 'failed', 'succeeded'] as const satisfies readonly JobStatus[]
 
 /** A job status's dot, wherever the console lists jobs. */
 export const JOB_TONES: Record<JobStatus, 'ok' | 'danger' | 'info' | 'neutral'> = {

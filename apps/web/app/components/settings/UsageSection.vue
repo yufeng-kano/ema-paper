@@ -43,9 +43,7 @@ const free = computed(() => billing.value?.plan.id === 'free')
 /** Whether a Pay subscription pays for the current period: the period says, not the row —
  *  a lapsed subscriber's row stands while their period is Free's or redeemed days'
  *  (docs/billing.md § Periods). */
-const subscribed = computed(
-  () => (billing.value?.period.source ?? (billing.value?.subscription ? 'subscription' : 'free')) === 'subscription',
-)
+const subscribed = computed(() => billing.value?.period.source === 'subscription')
 
 const planName = computed(() => {
   const plan = billing.value?.plan
@@ -233,7 +231,7 @@ async function manage() {
 
 /** The VM's controls: a runner this deployment has, on a plan that gives one. */
 const sandboxAvailable = computed(
-  () => sandbox.value !== null && sandbox.value.state !== 'unavailable' && sandbox.value.granted !== false,
+  () => sandbox.value !== null && sandbox.value.state !== 'unavailable' && sandbox.value.granted,
 )
 
 function stateTone(state: SandboxState): 'ok' | 'info' | 'neutral' {
@@ -435,7 +433,7 @@ async function runSandboxAction(action: () => Promise<void>) {
         </div>
         <!-- The workspace above is the reader's either way (docs/billing.md § Plans). -->
         <p v-else-if="sandbox" class="sandbox-note">
-          {{ sandbox.granted === false ? t('usage.notInPlan') : t('usage.unavailable') }}
+          {{ sandbox.granted ? t('usage.unavailable') : t('usage.notInPlan') }}
         </p>
         <template v-if="sandboxError || (sandboxActionError && !confirmingReset)" #foot>
           <UiBanner v-if="sandboxError" tone="error">{{ sandboxError }}</UiBanner>

@@ -7,7 +7,7 @@
  * screen opens the dialogs.
  */
 import type { AdminUserDetail } from '~/lib/api'
-import { JOB_TONES, nameOrEmail, planLabel, type JobStatus } from '~/lib/admin'
+import { JOB_TONES, nameOrEmail, planLabel } from '~/lib/admin'
 import { formatBytes, formatCount, formatDate, formatShortDateTime } from '~/lib/format'
 
 const props = defineProps<{
@@ -133,7 +133,7 @@ function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
       </h3>
       <ul v-if="detail.jobs.recent.length" class="jobs">
         <li v-for="job in detail.jobs.recent" :key="job.id" class="job">
-          <UiStatusDot :tone="JOB_TONES[job.status as JobStatus]" :label="t(`admin.jobs.statuses.${job.status}`)" />
+          <UiStatusDot :tone="JOB_TONES[job.status]" :label="t(`admin.jobs.statuses.${job.status}`)" />
           <span class="file" :title="job.filename">{{ job.filename }}</span>
           <span class="muted tabular">{{ jobLine(job) }}</span>
         </li>

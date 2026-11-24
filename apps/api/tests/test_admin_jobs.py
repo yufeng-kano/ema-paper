@@ -201,12 +201,17 @@ async def test_a_stuck_job_goes_back_with_its_finished_pages_and_one_audit_row(
     assert response.status_code == 200, response.text
     body = response.json()
     assert (body["id"], body["status"], body["pages_done"]) == (str(job.id), "queued", 1)
-    assert (body["worker_generation"], body["started_at"], body["stuck"]) == (None, None, False)
+    assert (body["worker_generation"], body["stuck"]) == (None, False)
     assert body["email"] == "reader@example.test"
 
     async with owner.app.state.sessionmaker() as db:
         stored = await db.get(Job, job.id)
-        assert (stored.status, stored.pages_done, stored.worker_generation) == ("queued", 1, None)
+        assert (stored.status, stored.pages_done, stored.worker_generation, stored.started_at) == (
+            "queued",
+            1,
+            None,
+            None,
+        )
         assert list(await db.scalars(select(JobPage.page_no).where(JobPage.job_id == job.id))) == [
             1
         ]

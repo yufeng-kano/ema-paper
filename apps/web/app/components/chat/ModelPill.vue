@@ -12,19 +12,19 @@
  */
 import {
   AGENT_EFFORTS,
+  CHAT_AGENT,
+  DEFAULT_EFFORT,
   listAgentModels,
   putAgentSettings,
   updateConversation,
   type AgentEffort,
   type AgentSettings,
-  type ConnectionModel,
+  type AgentModel,
   type Conversation,
   type SavedAgentSettings,
 } from '~/lib/api'
 import type { MenuItem } from '~/lib/menu'
 
-const CHAT_AGENT = 'chat'
-const DEFAULT_EFFORT: AgentEffort = 'medium'
 const MODEL_KEY = 'model:'
 const EFFORT_KEY = 'effort:'
 
@@ -51,7 +51,7 @@ const button = ref<HTMLButtonElement | null>(null)
 
 // --- the offered models --------------------------------------------------------------------
 
-const models = ref<ConnectionModel[] | null>(null)
+const models = ref<AgentModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 let modelsSeq = 0
 

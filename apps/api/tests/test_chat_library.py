@@ -22,7 +22,14 @@ from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, DATABASE_URL
 from tests.test_chat import _run_queued_turn
 from tests.test_chat_agents_file import _agents_part, _write
-from tests.test_chat_compact import DONE, SUMMARY, detail, set_clock, turns_of
+from tests.test_chat_compact import (
+    DONE,
+    SUMMARY,
+    conversation_row,
+    detail,
+    set_clock,
+    turns_of,
+)
 from tests.test_chat_extensions import (
     chatting_client,
     new_conversation,
@@ -44,8 +51,9 @@ async def chat_client(make_client, tmp_path) -> AsyncClient:
 async def new_library_conversation(client: AsyncClient) -> int:
     created = await client.post("/api/library/conversations", headers=CSRF_HEADERS)
     assert created.status_code == 201, created.text
-    assert created.json()["document_id"] is None
-    return created.json()["id"]
+    conversation_id = created.json()["id"]
+    assert (await conversation_row(client, conversation_id)).document_id is None
+    return conversation_id
 
 
 async def _papers(client: AsyncClient) -> int:
@@ -110,7 +118,8 @@ async def test_the_files_page_lists_its_own_threads_and_no_one_elses(chat_client
 
     listed = (await client.get("/api/library/conversations")).json()["conversations"]
     assert [row["id"] for row in listed] == [second, first]
-    assert all(row["document_id"] is None for row in listed)
+    for row in listed:
+        assert (await conversation_row(client, row["id"])).document_id is None
     assert empty not in [row["id"] for row in listed]
     # A document's list never holds one either way.
     on_document = await client.get(f"/api/library/documents/{client.document_id}/conversations")
@@ -176,8 +185,8 @@ async def test_a_message_carries_the_files_page_and_no_passage(chat_client) -> N
     # The turn's note has no document revision to name.
     note = content[-1]["text"]
     assert note.startswith("Context for this message:") and "revision" not in note
+    assert (await conversation_row(client, conversation_id)).document_id is None
     thread = await detail(client, conversation_id)
-    assert thread["conversation"]["document_id"] is None
     assert thread["messages"][0]["content"][:2] == [
         {"type": "text", "text": "Tidy this up"},
         {
@@ -814,7 +823,7 @@ async def test_the_idle_pass_compacts_a_library_conversation(chat_client) -> Non
     instruction = main[1]["messages"][-1]["content"]
     assert instruction[0]["text"] == chat_agent.compact_instruction("")
     assert "revision" not in instruction[-1]["text"]
-    assert (await detail(client, conversation_id))["conversation"]["compacted_message_id"]
+    assert (await conversation_row(client, conversation_id)).compacted_message_id is not None
 
 
 @pytest.mark.skipif(

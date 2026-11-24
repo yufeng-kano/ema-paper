@@ -330,7 +330,6 @@ async def test_the_builtin_group_holds_every_permission_whatever_its_stored_list
     builtin = listed["groups"][0]
     assert builtin["builtin"] is True
     assert builtin["permissions"] == list(ALL_PERMISSIONS)
-    assert builtin["stored_permissions"] == ["audit.read"]
 
 
 # --- the re-login window --------------------------------------------------------------
@@ -513,7 +512,6 @@ async def test_creating_renaming_editing_and_deleting_a_group_each_record_once(
         "name": "support",
         "builtin": False,
         "permissions": ["users.read", "users.write", "audit.read"],
-        "stored_permissions": ["users.read", "users.write", "audit.read"],
         "member_count": 0,
         "updated_at": created["updated_at"],
         "updated_by": {"id": owner.user_id, "name": "Local Developer"},
@@ -736,8 +734,10 @@ async def test_the_builtin_group_is_never_renamed_edited_or_deleted(make_client)
         assert _error(response)["reason"] == "builtin"
     assert await _audit(owner, start) == []
     group = (await owner.get(path)).json()["group"]
-    assert (group["name"], group["builtin"], group["stored_permissions"]) == ("owner", True, [])
+    assert (group["name"], group["builtin"]) == ("owner", True)
     assert group["updated_by"] is None
+    async with owner.app.state.sessionmaker() as db:
+        assert (await db.get(Group, builtin)).permissions == []
 
 
 async def test_groups_list_the_builtin_first_with_the_matrix_and_members_in_join_order(

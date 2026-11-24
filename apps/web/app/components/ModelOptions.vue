@@ -4,12 +4,12 @@
  * catalog does not list it, then the catalog in the order given. The caller keeps its own
  * leading option (*None*, *Follows the conversation*).
  */
-import type { ConnectionModel } from '~/lib/api'
+import type { AgentModel } from '~/lib/api'
 import { injectedModel, modelLabel } from '~/lib/models'
 
 const props = defineProps<{
   /** The catalog; null while it loads or when it failed. */
-  models: ConnectionModel[] | null
+  models: AgentModel[] | null
   current: string | null | undefined
 }>()
 

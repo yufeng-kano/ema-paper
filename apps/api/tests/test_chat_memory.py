@@ -35,7 +35,6 @@ from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, DATABASE_URL
 from tests.test_chat import _run_queued_turn
 from tests.test_chat_extensions import (
-    DOC_PATH,
     chatting_client,
     new_conversation,
     one_call,
@@ -538,10 +537,8 @@ async def test_the_readers_memory_writes_wait_for_a_call_in_flight(chat_client) 
 
 async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> None:
     client = chat_client
-    other = await another_document(client, client.user_id, "other.pdf")
     everywhere = await save_memory(client, kind="term", text="query → 查詢")
     await save_memory(client, kind="document", text="d is 512", document_id=client.document_id)
-    await save_memory(client, kind="document", text="elsewhere", document_id=other)
 
     bare = await client.get("/api/agents/chat/context")
     assert bare.status_code == 200, bare.text
@@ -555,7 +552,7 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
     assert (catalogue["skills"], catalogue["subagents"]) == (1, 1)  # fix-math, translator
     assert (memory["count"], memory["paused"]) == (1, False)
     assert f"[m{everywhere['id']}]" in memory["text"] and "d is 512" not in memory["text"]
-    assert context["facts"] is None
+    assert "facts" not in context
     assert context["turn"] == {
         "text": "Context for this message:\n- document revision: <revision>\n- reader locale: en",
         "chars": len(
@@ -563,32 +560,17 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
         ),
     }
 
-    # Instructions and languages, with a document.
+    # Instructions and languages.
     await put_chat(client, instructions="Be brief.", answer_language="ja", translate_language="en")
-    with_document = (
-        await client.get(
-            "/api/agents/chat/context",
-            params={"locale": "zh-TW", "document_id": client.document_id},
-        )
-    ).json()
-    kinds = [part["kind"] for part in with_document["parts"]]
+    configured = (await client.get("/api/agents/chat/context", params={"locale": "zh-TW"})).json()
+    kinds = [part["kind"] for part in configured["parts"]]
     assert kinds == ["prompt", "instructions", "catalogue", "memory"]
-    parts = {part["kind"]: part for part in with_document["parts"]}
+    parts = {part["kind"]: part for part in configured["parts"]}
     assert parts["instructions"]["text"] == chat_agent.INSTRUCTIONS_INTRO + "Be brief."
-    assert parts["memory"]["count"] == 2 and "d is 512 (this document)" in parts["memory"]["text"]
-    assert "elsewhere" not in parts["memory"]["text"]
-    assert with_document["facts"] == {
-        "document_path": DOC_PATH,
-        "page_count": "1",
-        "bbox_format": "yxyx_norm1000",
-        "parse_model": "claude-x",
-        "network": chat_agent.network_note("none", ()),
-    }
-    assert f"Current document: {DOC_PATH}" in parts["prompt"]["text"]
-    assert with_document["turn"]["text"].endswith(
+    assert configured["turn"]["text"].endswith(
         f"- reader locale: zh-TW\n{ANSWER_JA}\n{translation_line('en')}"
     )
-    # Reads only: the document was never materialized for it.
+    # Reads only: nothing was materialized for it.
     assert not (user_root(client.app.state.settings.workspaces_dir, client.user_id)).exists()
 
     await put_chat(client, prompt="Mine for {document_path}.")
@@ -610,11 +592,6 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
     assert (paused["count"], paused["paused"]) == (0, True)
     assert paused["text"] == memory_defs.PAUSED
 
-    theirs = await stranger_rows(client)
-    missing = await client.get(
-        "/api/agents/chat/context", params={"document_id": theirs.document_id}
-    )
-    assert missing.status_code == 404
     assert (
         await client.get("/api/agents/chat/context", params={"locale": "not a tag"})
     ).status_code == 422

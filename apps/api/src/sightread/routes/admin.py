@@ -683,7 +683,6 @@ def _job_payload(job: Job, email: str | None, worker: queue.WorkerStatus) -> dic
     return {
         "id": job.id,
         "created_at": job.created_at,
-        "started_at": job.started_at,
         "finished_at": job.finished_at,
         "user_id": job.user_id,
         "email": email,
@@ -926,7 +925,6 @@ async def _group_payloads(db: AsyncSession, rows: list[Group]) -> list[dict]:
             "name": group.name,
             "builtin": group.builtin,
             "permissions": groups.effective_permissions(group),
-            "stored_permissions": list(group.permissions),
             "member_count": counts.get(group.id, 0),
             "updated_at": group.updated_at,
             "updated_by": editors.get(group.id),

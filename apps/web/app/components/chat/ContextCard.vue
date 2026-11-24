@@ -13,7 +13,7 @@
  * the thread's view, or on Escape, a press outside or focus leaving it — focus then goes
  * back to that control.
  */
-import { listAgents, type Memory, type MemoryKind } from '~/lib/api'
+import { CHAT_AGENT, listAgents, type Memory, type MemoryKind } from '~/lib/api'
 import { formatShortDateTime } from '~/lib/format'
 import { parseResultMarkdown, type ResultBlock } from '~/lib/markdown'
 import { modalPanelKey, placeCard } from '~/lib/menu'
@@ -133,7 +133,7 @@ async function loadInstructions() {
   instructionsError.value = null
   try {
     const { agents } = await listAgents()
-    const text = agents.find((agent) => agent.name === 'chat')?.settings.instructions?.trim() ?? ''
+    const text = agents.find((agent) => agent.name === CHAT_AGENT)?.settings.instructions?.trim() ?? ''
     instructions.value = text ? parseResultMarkdown(text).flatMap((page) => page.blocks) : []
   } catch (error) {
     instructionsError.value = await resolve(error)

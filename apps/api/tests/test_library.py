@@ -530,7 +530,6 @@ async def test_the_library_is_signed_in_only(client: AsyncClient) -> None:
 async def test_me_carries_the_upload_limits(library) -> None:
     limits = (await library.get("/api/me")).json()["limits"]
     assert limits["upload_max_bytes"] > 0
-    assert limits["page_cap"] > 0
     assert "application/pdf" in limits["accepted_media_types"]
     assert "image/png" in limits["accepted_media_types"]
     assert limits["trash_retention_days"] == 30

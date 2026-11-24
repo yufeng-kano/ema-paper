@@ -1981,7 +1981,6 @@ async def document_content(
         "revision": content.revision,
         "notes": content.notes,
         "notes_revision": content.notes_revision,
-        "has_source": content.has_source,
     }
 
 

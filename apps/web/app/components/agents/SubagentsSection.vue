@@ -5,12 +5,12 @@
  * conversation*) and how many read-only tools it holds, an edit control on every row. No
  * row has a delete: deleting is the edit dialog's.
  */
-import { listSubagents, type ConnectionModel, type Subagent } from '~/lib/api'
+import { listSubagents, type AgentModel, type Subagent } from '~/lib/api'
 import type { TableColumn } from '~/lib/table'
 
 defineProps<{
   /** The chat agent's catalog, for the dialog's model picker. */
-  models: ConnectionModel[] | null
+  models: AgentModel[] | null
   maxChars: number | null
 }>()
 

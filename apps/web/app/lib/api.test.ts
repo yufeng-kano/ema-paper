@@ -9,7 +9,6 @@ import {
   deleteAccount,
   deleteAdminGroup,
   disableAdminCode,
-  getAdminMe,
   getLibrary,
   getMe,
   isDevLoginAvailable,
@@ -18,11 +17,10 @@ import {
   putAgentSettings,
   putDocumentContent,
   removeAdminGroupMember,
-  renameConversation,
   revertRevision,
-  revokeKey,
   sendMessage,
   updateAdminGroup,
+  updateConversation,
   conversationEventsUrl,
 } from './api'
 
@@ -70,12 +68,6 @@ describe('request', () => {
     expect(lastInit(fetchMock).body).toBe(JSON.stringify({ name: 'ci' }))
   })
 
-  it('accepts an empty 204 body', async () => {
-    stubFetch(new Response(null, { status: 204 }))
-
-    await expect(revokeKey(7)).resolves.toBeUndefined()
-  })
-
   it('deletes the account as a mutation, with the CSRF header and no body', async () => {
     const fetchMock = stubFetch(new Response(null, { status: 204 }))
 
@@ -117,6 +109,7 @@ describe('request', () => {
       caught = error
     }
     expect(caught).toBeInstanceOf(ApiRequestError)
+    expect((caught as ApiRequestError).details).toEqual({ need: 21, remaining: 4, period_end: '2026-11-01T00:00:00+00:00' })
     expect(creditsRefusalOf(caught)).toEqual({ need: 21, remaining: 4, period_end: '2026-11-01T00:00:00+00:00' })
     // Any other failure, or a 402 whose fields are not the refusal's, is not one.
     expect(creditsRefusalOf(new ApiRequestError(500, 'internal', 'boom'))).toBeNull()
@@ -165,16 +158,6 @@ describe('workspace and chat routes', () => {
     expect(lastInit(fetchMock).body).toBe(JSON.stringify({ markdown: '# x', base_revision: 'a' }))
   })
 
-  it('surfaces a stale save as a 409', async () => {
-    stubFetch(Response.json({ error: { type: 'invalid_request', message: 'Stale' } }, { status: 409 }))
-
-    const error = (await putDocumentContent(7, { markdown: '', base_revision: 'old' }).catch(
-      (thrown: unknown) => thrown,
-    )) as ApiRequestError
-
-    expect(error.status).toBe(409)
-  })
-
   it('posts a message with its selection and reads the queued turn', async () => {
     const fetchMock = stubFetch(
       Response.json({ turn_id: 'a3f1c2d4-0000-4000-8000-000000000012', message_id: 5 }, { status: 202 }),
@@ -204,7 +187,7 @@ describe('workspace and chat routes', () => {
     const saved = { id: 3, title: 'Table 2', created_at: 'a', updated_at: 'b' }
     const fetchMock = stubFetch(Response.json(saved))
 
-    await expect(renameConversation(3, 'Table 2')).resolves.toEqual(saved)
+    await expect(updateConversation(3, { title: 'Table 2' })).resolves.toEqual(saved)
     expect(fetchMock).toHaveBeenCalledWith('/api/conversations/3', expect.anything())
     expect(lastInit(fetchMock).method).toBe('PUT')
     expect(lastInit(fetchMock).body).toBe(JSON.stringify({ title: 'Table 2' }))
@@ -240,29 +223,13 @@ describe('isDevLoginAvailable', () => {
   })
 })
 
-
 describe('the operator console', () => {
-  it('reads its own view of the account as a plain GET', async () => {
-    const me = {
-      user: { id: 1, email: 'a@example.com', name: null, picture: null },
-      permissions: [],
-      reauth_required: false,
-      reauth_hours: 12,
-    }
-    const fetchMock = stubFetch(Response.json(me))
-
-    await expect(getAdminMe()).resolves.toEqual(me)
-    expect(fetchMock).toHaveBeenCalledWith('/api/admin/me', expect.anything())
-    expect(headersOf(fetchMock)['X-Requested-With']).toBeUndefined()
-  })
-
   it('sends every group change as a mutation, with the CSRF header', async () => {
     const group = {
       id: 4,
       name: 'support',
       builtin: false,
       permissions: [],
-      stored_permissions: [],
       member_count: 0,
       updated_at: '',
       updated_by: null,
@@ -303,26 +270,21 @@ describe('the operator console', () => {
     }
   })
 
-  it('pages the audit log, sending only the filters that are set, encoded', async () => {
-    const page = { items: [], total: 0, page: 2, page_size: 50 }
-    const fetchMock = stubFetch(Response.json(page), Response.json(page))
+  it('pages a console list, page first, sending only the filters that are set, encoded', async () => {
+    const page = { items: [], total: 0, page: 1, page_size: 50 }
+    const fetchMock = stubFetch(Response.json(page), Response.json(page), Response.json(page), Response.json(page))
 
-    await listAdminAudit({ page: 2 })
+    await listAdminAudit({ page: 2, area: undefined, q: undefined })
     expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/audit?page=2', expect.anything())
+
+    await listAdminAudit({ q: '', area: 'groups', page: 4 })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/audit?page=4&area=groups', expect.anything())
 
     await listAdminAudit({ page: 1, area: 'groups', q: 'a+b@example.com' })
     expect(fetchMock).toHaveBeenLastCalledWith(
       '/api/admin/audit?page=1&area=groups&q=a%2Bb%40example.com',
       expect.anything(),
     )
-  })
-
-  it('pages the redeem codes, sending only the filters that are set, encoded', async () => {
-    const page = { items: [], total: 0, page: 1, page_size: 50 }
-    const fetchMock = stubFetch(Response.json(page), Response.json(page))
-
-    await listAdminCodes({ page: 1 })
-    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes?page=1', expect.anything())
 
     await listAdminCodes({ page: 3, status: 'all', q: 'launch & vip' })
     expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes?page=3&status=all&q=launch+%26+vip', expect.anything())
@@ -345,20 +307,5 @@ describe('the operator console', () => {
     for (const [, init] of fetchMock.mock.calls) {
       expect((init?.headers as Record<string, string>)['X-Requested-With']).toBe('fetch')
     }
-  })
-
-  it('keeps the reason of a console conflict beside its message', async () => {
-    stubFetch(
-      Response.json(
-        { error: { type: 'admin_conflict', message: 'The last member stays', reason: 'last_owner' } },
-        { status: 409 },
-      ),
-    )
-
-    const error = await removeAdminGroupMember(1, 2).catch((thrown: unknown) => thrown)
-
-    expect(error).toBeInstanceOf(ApiRequestError)
-    expect((error as ApiRequestError).type).toBe('admin_conflict')
-    expect((error as ApiRequestError).details).toEqual({ reason: 'last_owner' })
   })
 })

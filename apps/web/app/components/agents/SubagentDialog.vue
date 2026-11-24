@@ -12,7 +12,7 @@ import {
   SUBAGENT_TOOLS,
   updateSubagent,
   WRITING_TOOLS,
-  type ConnectionModel,
+  type AgentModel,
   type Subagent,
   type SubagentFields,
 } from '~/lib/api'
@@ -22,7 +22,7 @@ const props = defineProps<{
   /** Null for a new subagent. */
   subagent: Subagent | null
   /** The chat agent's catalog; null while it loads or when it failed. */
-  models: ConnectionModel[] | null
+  models: AgentModel[] | null
   maxChars: number | null
 }>()
 

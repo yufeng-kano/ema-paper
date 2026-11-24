@@ -188,7 +188,7 @@ onBeforeUnmount(() => {
                   <dd class="mono">{{ fact.value }}</dd>
                 </div>
               </dl>
-              <p v-if="!context?.facts" class="facts-note">{{ t('agents.receives.factsNote') }}</p>
+              <p class="facts-note">{{ t('agents.receives.factsNote') }}</p>
             </template>
             <pre v-else class="text mono">{{ row.text }}</pre>
           </div>

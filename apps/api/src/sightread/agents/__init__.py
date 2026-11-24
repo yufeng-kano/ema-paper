@@ -1,10 +1,9 @@
 """The agent registry (docs/agents.md).
 
-An agent is defined here, in code, and nowhere else: what it is called, what it needs from
-a model, what it takes and returns, and the prompt it runs by default. A definition says
-nothing about how the agent calls a model — `parse` makes one vision call per page, a later
-agent may run a tool loop — so the run loop belongs to the agent's runner, not to this
-registry.
+An agent is defined here, in code, and nowhere else: what it is called, what it takes and
+returns, and the prompt it runs by default. A definition says nothing about how the agent
+calls a model — `parse` makes one vision call per page, a later agent may run a tool loop —
+so the run loop belongs to the agent's runner, not to this registry.
 """
 
 from __future__ import annotations
@@ -17,9 +16,6 @@ from . import chat, check, parse
 @dataclass(frozen=True)
 class AgentDefinition:
     name: str
-    # Model capabilities the agent needs. Declared, not enforced: nothing filters a catalog
-    # or refuses a model by them yet (docs/agents.md).
-    capabilities: tuple[str, ...]
     input: str
     output: str
     default_prompt_template: str
@@ -32,7 +28,6 @@ class AgentDefinition:
 
 PARSE = AgentDefinition(
     name="parse",
-    capabilities=("vision",),
     input="document",
     output="markdown",
     default_prompt_template=parse.DEFAULT_PROMPT_TEMPLATE,
@@ -43,7 +38,6 @@ PARSE = AgentDefinition(
 
 CHAT = AgentDefinition(
     name="chat",
-    capabilities=("vision", "tools", "anthropic"),
     input="document",
     output="edits",
     default_prompt_template=chat.DEFAULT_SYSTEM_PROMPT,
@@ -54,7 +48,6 @@ CHAT = AgentDefinition(
 
 CHECK = AgentDefinition(
     name="check",
-    capabilities=("tools", "anthropic"),
     input="markdown",
     output="edits",
     default_prompt_template=check.DEFAULT_PROMPT,

@@ -14,10 +14,11 @@ import type { LibraryStep } from './steps'
 export type ApiErrorType =
   | 'revision_conflict'
   | 'invalid_request'
+  | 'nothing_to_rename'
+  | 'nothing_to_compact'
   | 'storage_full'
   | 'auth'
   | 'rate_limit'
-  | 'payment'
   | 'insufficient_credits'
   | 'not_convertible'
   | 'checkout_unavailable'
@@ -66,7 +67,7 @@ export class ApiRequestError extends Error {
 
 // --- response shapes (mirror apps/api/src/sightread/routes) -----------------
 
-export interface User {
+interface User {
   id: number
   email: string
   name: string | null
@@ -80,7 +81,14 @@ export type AgentEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
 export const AGENT_EFFORTS: readonly AgentEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
-/** One agent's settings (docs/agents.md); every null is that field's default. */
+/** The effort an agent runs at when the reader picked none (docs/agents.md § Per-agent settings). */
+export const DEFAULT_EFFORT: AgentEffort = 'medium'
+
+/** The registry's chat agent, the one the panel talks to (docs/agents.md). */
+export const CHAT_AGENT = 'chat'
+
+/** One agent's settings (docs/agents.md); every null is that field's default; `effort` is
+ *  never null. */
 export interface AgentSettings {
   /** The model the agent runs (docs/api.md § GET /api/agents): the deployment's for `parse`
    *  and `check` — a fact — and for `chat` the reader's pick among the offered models, or
@@ -88,38 +96,38 @@ export interface AgentSettings {
   model: string | null
   /** The user's own template; null means the agent's `default_prompt` (docs/agents.md). */
   prompt: string | null
-  /** Reasoning effort; meaningful for the `chat` and `check` agents, `medium` when unset. */
-  effort: AgentEffort | null
+  /** Reasoning effort; meaningful for the `chat` and `check` agents; the server sends
+   *  `medium` when unset. */
+  effort: AgentEffort
   /** `chat` and `check` only: the reader's instructions, appended after the prompt; null for
-   *  none (docs/chat.md § Instructions). Optional fields so a page served by an older API
-   *  still renders. */
-  instructions?: string | null
+   *  none (docs/chat.md § Instructions). */
+  instructions: string | null
   /** `chat` only: language tags; null follows the reader's locale of each message. */
-  answer_language?: string | null
-  translate_language?: string | null
+  answer_language: string | null
+  translate_language: string | null
   /** `chat` only: the memory switches (docs/chat.md § Memory). */
-  memory_auto?: boolean
-  memory_paused?: boolean
+  memory_auto: boolean
+  memory_paused: boolean
   /** `chat` only: whether the worker compacts a long conversation before its prompt cache
    *  expires (docs/chat.md § Compaction, *Idle compaction*); on by default. */
-  idle_compact?: boolean
+  idle_compact: boolean
   /** `parse` only: the deployment's fallback model, a fact (null: none), and whether a
    *  blocked page goes there on its own (docs/parsing.md § Fallback model). */
-  fallback_model?: string | null
-  auto_fallback?: boolean
+  fallback_model: string | null
+  auto_fallback: boolean
   /** `check` only: whether a Files upload is checked before it opens (docs/parsing.md
    *  § Format check). */
-  auto_check?: boolean
+  auto_check: boolean
   /** `parse` only: whether an uploaded PDF or image is converted on arrival; off, it is
    *  kept as a file and converted from its menu (docs/workspace.md § Files). */
-  auto_convert?: boolean
+  auto_convert: boolean
 }
 
 /**
  * The coordinate convention the pipeline asks the saved model for — a fact about the model's
  * family, never a setting (docs/parsing.md § Coordinate conventions).
  */
-export interface BboxConvention {
+interface BboxConvention {
   family: 'gemini' | 'claude' | 'gpt' | 'default'
   format: string
 }
@@ -127,13 +135,12 @@ export interface BboxConvention {
 /** An entry of the code-defined agent registry, with the caller's settings for it. */
 export interface AgentEntry {
   name: string
-  capabilities: string[]
   input: string
   output: string
   /** What the prompt dialog opens on when the user saved no prompt of their own. */
   default_prompt: string
   /** The tokens the template substitutes — the prompt dialog's chips. */
-  prompt_tokens?: string[]
+  prompt_tokens: string[]
   /** The tools this deployment really gives the agent (empty for agents without any). */
   tools: string[]
   settings: AgentSettings
@@ -144,7 +151,7 @@ export interface AgentEntry {
 export type SavedAgentSettings = AgentSettings & { bbox: BboxConvention }
 
 /** One model an agent may run (docs/api.md § GET /api/agents/{agent}/models). */
-export interface ConnectionModel {
+export interface AgentModel {
   id: string
   name: string | null
 }
@@ -153,51 +160,42 @@ export interface ConnectionModel {
  *  one set of numbers. */
 export interface UploadLimits {
   upload_max_bytes: number
-  /** The cap of a file kept as it is (docs/api.md § Limits); optional so a page served
-   *  by an older API still renders. */
-  file_max_bytes?: number
-  page_cap: number
+  /** The cap of a file kept as it is (docs/api.md § Limits). */
+  file_max_bytes: number
   accepted_media_types: string[]
   /** What intake accepts by extension when the browser reports a generic media type. */
   accepted_extensions: string[]
   /** Which uploads are markdown, and their own cap: they are not parsed, they become
-   *  `doc.md` (docs/workspace.md § Markdown documents). Optional only so a page served by an
-   *  older API still renders. */
-  markdown_media_types?: string[]
-  markdown_extensions?: string[]
-  markdown_max_bytes?: number
-  /** What an image inserted into a document may be (docs/web.md § Editing, *Images*).
-   *  Optional, as above. */
-  image_media_types?: string[]
-  image_max_bytes?: number
+   *  `doc.md` (docs/workspace.md § Markdown documents). */
+  markdown_media_types: string[]
+  markdown_extensions: string[]
+  markdown_max_bytes: number
+  /** What an image inserted into a document may be (docs/web.md § Editing, *Images*). */
+  image_media_types: string[]
+  image_max_bytes: number
   /** The cap on an agent's prompt, a skill's body and a subagent's prompt. */
   prompt_max_chars: number
-  /** The chat composer's attachments (docs/chat.md § What a user message carries). Optional
-   *  only so a page served by an older API still renders. */
-  attachment_max_bytes?: number
-  attachments_per_message?: number
-  attachment_extensions?: string[]
+  /** The chat composer's attachments (docs/chat.md § What a user message carries). */
+  attachment_max_bytes: number
+  attachments_per_message: number
+  attachment_extensions: string[]
   /** The chat agent's instructions and one memory (docs/chat.md § Instructions, § Memory). */
-  instructions_max_chars?: number
-  memory_max_chars?: number
+  instructions_max_chars: number
+  memory_max_chars: number
   /** Whole sections one message may carry, the cap on one section's text and on the
    *  selection, and on a section's heading (docs/chat.md § What a user message carries). */
-  sections_per_message?: number
-  selection_max_chars?: number
-  section_heading_max_chars?: number
+  sections_per_message: number
+  selection_max_chars: number
+  section_heading_max_chars: number
   /** A conversation's title, as a rename stores it (docs/chat.md § Conversations, turns,
-   *  events). Optional, as above. */
-  conversation_title_max_chars?: number
-  /** The chat agent's memory file, as the Agent page's editor caps it (docs/chat.md
-   *  § Memory, *The memory file*). Optional, as above. */
-  memory_file_max_chars?: number
+   *  events). */
+  conversation_title_max_chars: number
   /** How long before a conversation's cache expires the worker may compact it
    *  (docs/chat.md § Compaction, *Idle compaction*). */
-  idle_compact_lead_seconds?: number
+  idle_compact_lead_seconds: number
   /** How many days the Trash keeps an item before the worker deletes it for good; 0 never
-   *  does (docs/workspace.md § The Trash). Optional only so a page served by an older API
-   *  still renders. */
-  trash_retention_days?: number
+   *  does (docs/workspace.md § The Trash). */
+  trash_retention_days: number
 }
 
 // --- memory (docs/chat.md § Memory) ----------------------------------------------------
@@ -244,7 +242,7 @@ export interface MemoryFields {
 
 // --- what the chat agent receives (docs/api.md, GET /api/agents/chat/context) -------------
 
-export type AgentContextPartKind = 'prompt' | 'instructions' | 'catalogue' | 'agents_file' | 'memory_file' | 'memory'
+type AgentContextPartKind = 'prompt' | 'instructions' | 'catalogue' | 'agents_file' | 'memory_file' | 'memory'
 
 export interface AgentContextPart {
   kind: AgentContextPartKind
@@ -261,21 +259,11 @@ export interface AgentContextPart {
   paused?: boolean
 }
 
-export interface AgentContextFacts {
-  document_path: string
-  page_count: string
-  bbox_format: string
-  parse_model: string
-  network: string
-}
-
 export interface AgentContext {
   /** The system blocks in the order a turn sends them; a block not sent is not listed. */
   parts: AgentContextPart[]
   /** The context block a message sent now would carry. */
   turn: { text: string; chars: number }
-  /** The document's facts, when one was named; null on the Agent page. */
-  facts: AgentContextFacts | null
 }
 
 // --- skills and subagents (docs/chat.md § Skills, § Subagents) -----------------------
@@ -301,9 +289,9 @@ export interface Skill extends SkillFields {
   modified: boolean
   /** A built-in's shipped fields; null for a skill of the reader's own. */
   default: SkillFields | null
-  /** It works on a document: a library conversation neither offers nor runs it. Optional
-   *  only so a page served by an older API still renders (docs/chat.md § Skills). */
-  document_only?: boolean
+  /** It works on a document: a library conversation neither offers nor runs it
+   *  (docs/chat.md § Skills). */
+  document_only: boolean
 }
 
 /** The tools a subagent may hold: the editor answers `view` only to one that cannot change
@@ -329,13 +317,13 @@ export interface Subagent extends SubagentFields {
   modified: boolean
   default: SubagentFields | null
   /** It works on a document: a library conversation does not offer it. */
-  document_only?: boolean
+  document_only: boolean
 }
 
 // --- attachments (docs/chat.md § What a user message carries) -------------------------
 
 /** One prepared upload waiting for its message. */
-export interface Attachment {
+interface Attachment {
   id: string
   name: string
   /** An image goes to the model as an image; a PDF or a text file as its text. */
@@ -354,31 +342,26 @@ export interface MeResponse {
   credits_remaining: number
   /** The balance a chat send needs (`CHAT_MIN_CREDITS`). */
   chat_min_credits: number
-  /** When the period resets, which the composer's notice says (docs/billing.md § Periods).
-   *  Optional so a page served by an older API still renders. */
-  period_end?: string
+  /** When the period resets, which the composer's notice says (docs/billing.md § Periods). */
+  period_end: string
   /** Whether a top-up pack can be offered: Pay configured, a pack configured and a paid
-   *  plan's period (docs/billing.md § Top-up packs); the catalog says whether one is on sale.
-   *  Optional so a page served by an older API still renders. */
-  pack_checkout_available?: boolean
+   *  plan's period (docs/billing.md § Top-up packs); the catalog says whether one is on sale. */
+  pack_checkout_available: boolean
   /** The parse agent's switch (docs/agents.md): whether a PDF or an image uploaded on Files
    *  is converted on arrival — which decides the cap the page applies to it (docs/web.md
-   *  § Files). Off where it is unset; optional so a page served by an older API still
-   *  renders. */
-  auto_convert?: boolean
+   *  § Files). Off where it is unset. */
+  auto_convert: boolean
   /** The view a converted PDF or image opens on the first time it is read (docs/web.md
-   *  § Result viewer, *Original and Markdown*); Markdown where unset. Optional so a page
-   *  served by an older API still renders. */
-  default_view?: DocumentView
+   *  § Result viewer, *Original and Markdown*). */
+  default_view: DocumentView
   /** Whether to offer the operator console: it is on and the account holds one of its
-   *  permissions (docs/admin.md § Signing in). Optional so a page served by an older API
-   *  still renders — without it the account menu has no *Admin console*. */
-  console?: boolean
+   *  permissions (docs/admin.md § Signing in). */
+  console: boolean
 }
 
 // --- billing (docs/billing.md § Routes) --------------------------------------------
 
-export interface BillingPlan {
+interface BillingPlan {
   id: string
   name: string
   credits: number
@@ -387,7 +370,7 @@ export interface BillingPlan {
   max_jobs: number
 }
 
-export interface BillingSubscription {
+interface BillingSubscription {
   status: string
   plan_id: string
   period_start: string
@@ -423,10 +406,9 @@ export interface BillingPack {
   active: boolean
   purchased_at: string
   expires_at: string
-  /** Bought from Pay, granted by a redeem code, or granted by an operator in the console.
-   *  Optional so a page served by an older API still renders: bought where unset. */
-  source?: 'pay' | 'code' | 'grant'
-  redemption_id?: number | null
+  /** Bought from Pay, granted by a redeem code, or granted by an operator in the console. */
+  source: 'pay' | 'code' | 'grant'
+  redemption_id: number | null
 }
 
 export interface BillingPacks {
@@ -444,7 +426,7 @@ export type PeriodSource = 'subscription' | 'grant' | 'free'
 
 /** The bank of redeemed days and, while one runs, its open period (docs/billing.md
  *  § Periods, *Granted days*). */
-export interface BillingPlanGrant {
+interface BillingPlanGrant {
   plan_id: string
   days_banked: number
   period_start: string | null
@@ -452,7 +434,7 @@ export interface BillingPlanGrant {
 }
 
 /** One code the reader redeemed (docs/billing.md § Redeem codes). */
-export interface BillingRedemption {
+interface BillingRedemption {
   id: number
   kind: 'credits' | 'plan'
   credits: number | null
@@ -461,7 +443,7 @@ export interface BillingRedemption {
   redeemed_at: string
 }
 
-export interface BillingResponse {
+interface BillingResponse {
   plan: BillingPlan
   subscription: BillingSubscription | null
   period: {
@@ -470,14 +452,12 @@ export interface BillingResponse {
     granted: number
     spent: number
     remaining: number
-    /** Optional so a page served by an older API still renders. */
-    source?: PeriodSource
+    source: PeriodSource
   }
   packs: BillingPacks
-  /** Null for a reader who never redeemed days; optional so a page served by an older API
-   *  still renders. */
-  plan_grant?: BillingPlanGrant | null
-  redemptions?: BillingRedemption[]
+  /** Null for a reader who never redeemed days. */
+  plan_grant: BillingPlanGrant | null
+  redemptions: BillingRedemption[]
   /** The balance a charge is measured against: the period's, 0 when overdrawn, plus the
    *  active packs' (docs/billing.md § Top-up packs). */
   credits_available: number
@@ -571,21 +551,11 @@ export interface CreatedApiKey {
 // --- workspace: content, notes, revisions (docs/workspace.md) ------------------
 
 /** The document's editable copy. `revision` is a content hash, not a commit id. */
-export interface DocumentContent {
+interface DocumentContent {
   markdown: string
   revision: string
   notes: string
   notes_revision: string
-  /** Whether the original upload is kept beside it — what `view_page` needs. */
-  has_source: boolean
-}
-
-export interface Revision {
-  commit: string
-  author: string
-  message: string
-  created_at: string
-  files: string[]
 }
 
 // --- chat (docs/chat.md) -------------------------------------------------------
@@ -595,36 +565,30 @@ export interface Conversation {
   title: string | null
   created_at: string
   updated_at: string
-  /** The model its later turns run on; null until the first turn chose one. Optional only
-   *  so a page served by an older API still renders (docs/chat.md § Conversations). */
-  model?: string | null
+  /** The model its later turns run on; null until the first turn chose one (docs/chat.md
+   *  § Conversations). */
+  model: string | null
   /** What the panel's context ring reads (docs/chat.md § Compaction, *The cache clock and
-   *  the context*): the summary row the replay starts from, whether there is an answer to
-   *  compact since it, the tokens the last call replayed (null after a compaction, until
-   *  the next call), the model's window, when the prompt cache expires (null when the last
-   *  call wrote none) and what a cold re-read would cost. */
-  compacted_message_id?: number | null
-  compactable?: boolean
-  context_tokens?: number | null
-  context_window?: number
-  cache_warm_until?: string | null
-  recache_credits?: number | null
-}
-
-export interface ConversationDetail extends Conversation {
-  /** Null for a library conversation, the Files page's (docs/chat.md § Library conversations). */
-  document_id: number | null
+   *  the context*): whether there is an answer to compact since the last summary, the tokens
+   *  the last call replayed (null after a compaction, until the next call), the model's
+   *  window, when the prompt cache expires (null when the last call wrote none) and what a
+   *  cold re-read would cost. */
+  compactable: boolean
+  context_tokens: number | null
+  context_window: number
+  cache_warm_until: string | null
+  recache_credits: number | null
 }
 
 /** What the thread knows of an attached file: its name, never its text or bytes. */
-export interface AttachmentMeta {
+interface AttachmentMeta {
   name: string
   kind?: 'image' | 'text'
   chars?: number | null
 }
 
 /** One thing a subagent did, as its run's record keeps it (docs/chat.md § Subagents). */
-export type SubagentStep =
+type SubagentStep =
   /** `id` joins the step to its `edit` event; a record from before it lacks one. */
   | { type: 'tool'; id?: string; name: string; input: Record<string, unknown>; is_error: boolean }
   | { type: 'note'; text: string }
@@ -690,7 +654,7 @@ export interface ChatMessage {
   created_at: string
 }
 
-export type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
+type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
 
 /** A user message's turn, or a compaction the reader asked for or the worker ran on its
  *  own (docs/chat.md § Compaction). */
@@ -698,24 +662,22 @@ export type TurnKind = 'message' | 'compact' | 'idle_compact' | string
 
 export interface ChatTurn {
   id: string
-  /** Absent from a record served by an older API: a message turn. */
-  kind?: TurnKind
+  kind: TurnKind
   status: TurnStatus
   error: string | null
-  /** What the turn cost, once settled; null while unsettled, absent from a record served by
-   *  an older API (docs/billing.md § Routes). */
-  credits?: number | null
+  /** What the turn cost, once settled; null while unsettled (docs/billing.md § Routes). */
+  credits: number | null
   /** Null while the turn is unfinished, whatever its status: a cancel marks the status
    *  first and the writer winds down after (docs/chat.md § Conversations). */
   finished_at: string | null
   /** The turns that are versions of one message, this one among them, oldest first; null
-   *  for a message with one version, absent from a record served by an older API
-   *  (docs/chat.md § History is append-only, *An edited message starts a version*). */
-  versions?: string[] | null
+   *  for a message with one version (docs/chat.md § History is append-only, *An edited
+   *  message starts a version*). */
+  versions: string[] | null
 }
 
-export interface ConversationResponse {
-  conversation: ConversationDetail
+interface ConversationResponse {
+  conversation: Conversation
   messages: ChatMessage[]
   turns: ChatTurn[]
 }
@@ -798,14 +760,12 @@ export const CHAT_EVENT_NAMES: readonly ChatEvent['event'][] = [
 
 export type SandboxState = 'stopped' | 'starting' | 'running' | 'unavailable'
 
-export interface SandboxStatus {
+interface SandboxStatus {
   state: SandboxState
   /** Whether the plan gives the chat agent a sandbox at all; `state` says whether the
    *  deployment has one to give (docs/billing.md § Plans). */
-  granted?: boolean
+  granted: boolean
   last_used_at: string | null
-  shells: number
-  uptime_seconds: number
   /** `bytes` is what counts against `quota_bytes`: the files, the Trash and the history,
    *  each original once and never the service's copies (docs/workspace.md § Quota). */
   workspace: {
@@ -819,7 +779,7 @@ export interface SandboxStatus {
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
 
-export interface ResultPage {
+interface ResultPage {
   page: number
   /** Absent on a partial result's pages — only the final outcome knows the dimensions. */
   width_pt?: number
@@ -831,7 +791,7 @@ export interface ResultPage {
   error: string | null
 }
 
-export interface ResultFigure {
+interface ResultFigure {
   id: string
   page: number
   bbox: [number, number, number, number]
@@ -841,22 +801,15 @@ export interface ResultFigure {
   check?: 'verified' | 'adjusted' | 'unverified'
 }
 
-export interface ResultPageError {
+interface ResultPageError {
   page: number
   reason: string
 }
 
-export interface ResultMeta {
-  /** Absent on results stored before the pipeline started writing it. */
-  job_id?: string
-  /** Absent on results stored before agents existed; those carry `profile` instead. */
-  agent?: string
-  profile?: string | null
+/** The result's `meta`, as far as the viewer reads it (docs/api.md). */
+interface ResultMeta {
   model: string
   bbox_format: string
-  pipeline_version: number
-  sha256: string
-  cached: boolean
   /** The figure check's statuses, counted. Absent on results parsed before it. */
   figure_check?: { verified: number; adjusted: number; unverified: number }
   /** True on a running job's snapshot — never cache one (docs/api.md § Partial results). */
@@ -904,13 +857,12 @@ export interface LibraryDocument {
   /** The upload; null for a markdown document. */
   size_bytes: number | null
   /** A file kept as it is: its media type, as intake decided it (docs/workspace.md
-   *  § Files); null for a document. Optional so a page served by an older API still
-   *  renders. */
-  media_type?: string | null
+   *  § Files); null for a document. */
+  media_type: string | null
   /** What the document takes of the storage: its directory, its original and its images,
    *  never the service's copies (docs/workspace.md § Quota). Null where the library read did
-   *  not measure it; optional so a page served by an older API still renders. */
-  storage_bytes?: number | null
+   *  not measure it. */
+  storage_bytes: number | null
   error: string | null
   created_at: string
   finished_at: string | null
@@ -918,22 +870,20 @@ export interface LibraryDocument {
    *  (docs/api.md). */
   failed_pages: number | null
   /** A running parse past its last page, being checked before it opens (docs/parsing.md
-   *  § Format check). Optional so a page served by an older API still renders. */
-  checking?: boolean
-  /** The re-convert queued, running or failed — null when there is none. Optional so a page
-   *  served by an older API still renders. */
-  reconvert?: DocumentReconvert | null
+   *  § Format check). */
+  checking: boolean
+  /** The re-convert queued, running or failed — null when there is none. */
+  reconvert: DocumentReconvert | null
   /** What the parse cost once settled; null while its reservation is pending, which is
    *  the whole of a queued or running parse (docs/billing.md § Routes). */
-  credits?: number | null
+  credits: number | null
   /** The view the document was last read in (`PUT …/view`); null until it was switched
    *  once, when the reader's `default_view` decides (docs/web.md § Result viewer, *Original
-   *  and Markdown*). Optional so a page served by an older API still renders. */
-  view?: DocumentView | null
+   *  and Markdown*). */
+  view: DocumentView | null
   /** A parsed document: whether its original is kept, for the Original view (`…/original`);
-   *  null for a file or a markdown document, and where the library read did not look.
-   *  Optional so a page served by an older API still renders. */
-  original?: boolean | null
+   *  null for a file or a markdown document, and where the library read did not look. */
+  original: boolean | null
 }
 
 /**
@@ -980,7 +930,7 @@ export interface TrashedDocument extends LibraryDocument {
 }
 
 /** `folders` and `documents` are the live library; `trash` is what was moved to the Trash. */
-export interface LibraryResponse {
+interface LibraryResponse {
   folders: LibraryFolder[]
   documents: LibraryDocument[]
   trash: { folders: TrashedFolder[]; documents: TrashedDocument[] }
@@ -1109,16 +1059,14 @@ export function putAgentSettings(
 }
 
 /** The models the agent may run — what a model picker lists (docs/billing.md § Models). */
-export function listAgentModels(agent: string): Promise<{ data: ConnectionModel[] }> {
+export function listAgentModels(agent: string): Promise<{ data: AgentModel[] }> {
   return request('GET', `/api/agents/${encodeURIComponent(agent)}/models`)
 }
 
 /** What the chat agent receives, rendered by the runner's own code, for a message sent in
- *  `locale`; with a document, its facts filled in. */
-export function getAgentContext(locale: string, documentId?: number): Promise<AgentContext> {
-  const query = new URLSearchParams({ locale })
-  if (documentId !== undefined) query.set('document_id', String(documentId))
-  return request('GET', `/api/agents/chat/context?${query}`)
+ *  `locale` with no document named. */
+export function getAgentContext(locale: string): Promise<AgentContext> {
+  return request('GET', `/api/agents/chat/context?${new URLSearchParams({ locale })}`)
 }
 
 // --- memory (docs/chat.md § Memory) ----------------------------------------------------
@@ -1194,7 +1142,7 @@ export function deleteSubagent(name: string): Promise<void> {
   return request<undefined>('DELETE', `/api/subagents/${encodeURIComponent(name)}`)
 }
 
-// --- sandbox (docs/sandbox.md) --------------------------------------------------
+// --- billing (docs/billing.md § Routes) --------------------------------------------
 
 export function getBilling(): Promise<BillingResponse> {
   return request('GET', '/api/billing')
@@ -1238,6 +1186,8 @@ export type RedeemResult =
 export function redeemCode(code: string): Promise<RedeemResult> {
   return request('POST', '/api/billing/redeem', { code })
 }
+
+// --- sandbox (docs/sandbox.md) --------------------------------------------------
 
 export function getSandbox(): Promise<SandboxStatus> {
   return request('GET', '/api/sandbox')
@@ -1382,17 +1332,13 @@ export function dismissReconvert(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/library/documents/${id}/reconvert`)
 }
 
-/** A file kept as it is becomes a document: a parse of it on `model` — null runs it on the
- *  parse agent's own — in its place and under its name (docs/jobs.md § Converting a file).
- *  `view` is the view the document opens on when the parse succeeds, remembered as if the
- *  reader had switched to it; null leaves the reader's default to decide. Answers the
- *  document as the library now lists it, queued. */
-export function convertDocument(
-  id: number,
-  model: string | null,
-  view: DocumentView | null = null,
-): Promise<LibraryDocument> {
-  return request('POST', `/api/library/documents/${id}/convert`, { model, view })
+/** A file kept as it is becomes a document: a parse of it on the parse agent's model, in
+ *  its place and under its name (docs/jobs.md § Converting a file). `view` is the view the
+ *  document opens on when the parse succeeds, remembered as if the reader had switched to
+ *  it; null leaves the reader's default to decide. Answers the document as the library now
+ *  lists it, queued. */
+export function convertDocument(id: number, view: DocumentView | null): Promise<LibraryDocument> {
+  return request('POST', `/api/library/documents/${id}/convert`, { view })
 }
 
 /** Where a file's bytes are read from — inline for what a browser shows safely, as a save
@@ -1442,10 +1388,6 @@ export function putDocumentNotes(
   return request('PUT', `/api/library/documents/${id}/notes`, body)
 }
 
-export function listRevisions(id: number): Promise<{ revisions: Revision[] }> {
-  return request('GET', `/api/library/documents/${id}/revisions`)
-}
-
 /** Writes the files as they were before `commit`, as a new revision — undo is itself a
  *  revision, nothing is rewritten (docs/workspace.md § Revisions). */
 export function revertRevision(id: number, commit: string): Promise<{ revision: string; commit: string }> {
@@ -1477,7 +1419,7 @@ export function getConversation(id: number): Promise<ConversationResponse> {
 }
 
 /** What one message carries besides its text (docs/chat.md § What a user message carries). */
-export interface MessageBody {
+interface MessageBody {
   /** The reader's words; a command's arguments when `command` is set. */
   text: string
   selection?: string
@@ -1597,12 +1539,6 @@ export function cancelTurn(id: number): Promise<void> {
   return request<undefined>('POST', `/api/conversations/${id}/cancel`)
 }
 
-/** The reader's title for a thread; the answer is the title as the server cleaned it, and
- *  the thread keeps its place in the list (docs/chat.md § Conversations, turns, events). */
-export function renameConversation(id: number, title: string): Promise<Conversation> {
-  return updateConversation(id, { title })
-}
-
 /** `/rename` with no name: the summary model writes the thread's title, in the reader's
  *  answer language or else `locale`, billed by its tokens — 400 `nothing_to_rename` before
  *  the first exchange, 402 under the minimum balance, 502 when the model answers no title.
@@ -1611,11 +1547,13 @@ export function generateTitle(id: number, locale: string): Promise<Conversation>
   return request('POST', `/api/conversations/${id}/title`, { locale })
 }
 
-/** A rename, a move to another model for the conversation's later turns, a switch to
- *  another version of a message (`version`, a turn's id — the conversation then shows that
- *  branch), or any of them together: 400 for a model the chat agent does not offer or a
- *  version that is no message turn, 409 for a move or a switch while a turn of it is
- *  unfinished (docs/api.md). The answer is the conversation as the list gives it. */
+/** A rename (the reader's title, which the answer carries as the server cleaned it; the
+ *  thread keeps its place in the list), a move to another model for the conversation's later
+ *  turns, a switch to another version of a message (`version`, a turn's id — the
+ *  conversation then shows that branch), or any of them together: 400 for a model the chat
+ *  agent does not offer or a version that is no message turn, 409 for a move or a switch
+ *  while a turn of it is unfinished (docs/api.md, docs/chat.md § Conversations, turns,
+ *  events). The answer is the conversation as the list gives it. */
 export function updateConversation(
   id: number,
   body: { title?: string; model?: string; version?: string },
@@ -1640,6 +1578,21 @@ export function deleteConversation(id: number): Promise<void> {
 }
 
 // --- operator console (docs/admin.md § Routes) ---------------------------------------
+
+/** A console list's GET: `page` first, then each filter that is set (not empty), in the order
+ *  given. */
+function listQuery<T>(
+  path: string,
+  { page, ...filters }: { page: number } & Record<string, string | number | undefined>,
+): Promise<T> {
+  const params = new URLSearchParams({ page: String(page) })
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== '') {
+      params.set(key, String(value))
+    }
+  }
+  return request('GET', `${path}?${params}`)
+}
 
 /** Who did something, as the console names them: the account's id and name. */
 export interface AdminPerson {
@@ -1670,8 +1623,6 @@ export interface AdminGroup {
   builtin: boolean
   /** What the group gives: every permission for the built-in group, whatever it stores. */
   permissions: string[]
-  /** The row's own list — `[]` on the built-in group. */
-  stored_permissions: string[]
   member_count: number
   /** When it was created or its name or permissions last changed, and who did it — null for
    *  the built-in group, which no one edits, and once that account is deleted. */
@@ -1737,7 +1688,7 @@ export interface AdminUser {
   email: string
   name: string | null
   /** `free` or a configured plan's id, and what pays for the current period. */
-  plan: { id: string; source: 'subscription' | 'grant' | 'free' }
+  plan: { id: string; source: PeriodSource }
   /** The period's and the active packs' together: what a charge is measured against. */
   credits_available: number
   /** Null when the workspace cannot be measured. */
@@ -1766,7 +1717,7 @@ export interface AdminUsersResponse extends AdminList<AdminUser> {
 /** One account's page: what it has, never what it wrote. */
 export interface AdminUserDetail {
   user: { id: number; email: string; name: string | null; created_at: string }
-  plan: { id: string; source: 'subscription' | 'grant' | 'free'; start: string; end: string }
+  plan: { id: string; source: PeriodSource; start: string; end: string }
   subscription: { status: string; plan_id: string; period_end: string; cancel_at_period_end: boolean } | null
   /** `sources` always the four, by source — not the order a charge takes them, which is the
    *  period first, then every pack by expiry; `expires_at` null for one that holds nothing. */
@@ -1782,7 +1733,7 @@ export interface AdminUserDetail {
     recent: {
       id: string
       filename: string
-      status: string
+      status: JobStatus
       page_count: number | null
       pages_done: number
       created_at: string
@@ -1794,7 +1745,7 @@ export interface AdminUserDetail {
 }
 
 /** A grant: credits as a pack, or days of a paid plan, each with the dialog's `request_id`. */
-export type AdminGrant =
+type AdminGrant =
   | { kind: 'credits'; credits: number; valid_days: number; request_id: string; reason?: string }
   | { kind: 'days'; plan: string; days: number; request_id: string; reason?: string }
 
@@ -1804,14 +1755,7 @@ export function getAdminMe(): Promise<AdminMe> {
 
 /** Newest sign-up first. `plan` keeps the accounts on one plan; `q` an address or a name. */
 export function listAdminUsers(query: { page: number; plan?: string; q?: string }): Promise<AdminUsersResponse> {
-  const params = new URLSearchParams({ page: String(query.page) })
-  if (query.plan) {
-    params.set('plan', query.plan)
-  }
-  if (query.q) {
-    params.set('q', query.q)
-  }
-  return request('GET', `/api/admin/users?${params}`)
+  return listQuery('/api/admin/users', query)
 }
 
 export function getAdminUser(id: number): Promise<AdminUserDetail> {
@@ -1867,21 +1811,14 @@ export function removeAdminGroupMember(id: number, userId: number): Promise<void
 /** Newest first. `area` keeps the actions of one area; `q` an actor's address or name, a
  *  user target's address, or a target id. */
 export function listAdminAudit(query: { page: number; area?: string; q?: string }): Promise<AdminList<AuditEntry>> {
-  const params = new URLSearchParams({ page: String(query.page) })
-  if (query.area) {
-    params.set('area', query.area)
-  }
-  if (query.q) {
-    params.set('q', query.q)
-  }
-  return request('GET', `/api/admin/audit?${params}`)
+  return listQuery('/api/admin/audit', query)
 }
 
 // --- operator console: redeem codes (docs/admin.md § Redeem codes) -----------------------
 
 /** What a code is now: disabled, else expired (past `redeem_by`), else used up, else plan
  *  missing (a plan code whose plan is no longer configured), else active. */
-export type AdminCodeStatus = 'active' | 'disabled' | 'expired' | 'used_up' | 'plan_missing'
+type AdminCodeStatus = 'active' | 'disabled' | 'expired' | 'used_up' | 'plan_missing'
 
 /** One redeem code as the console lists it: masked — the prefix and the first group, or
  *  none of a short code — and never whole. The fields of the other kind are null. */
@@ -1916,7 +1853,7 @@ export interface AdminCodesList extends AdminList<AdminCode> {
 
 /** `python -m sightread.codes create`'s fields: `kind` for `--credits` or `--plan`,
  *  `max_uses` for `--uses`, `redeem_by` a date, `YYYY-MM-DD`. */
-export interface AdminCodesCreate {
+interface AdminCodesCreate {
   kind: 'credits' | 'plan'
   credits?: number
   valid_days?: number
@@ -1945,14 +1882,7 @@ export interface AdminCodesCreated {
 /** Newest first. `status` `all` lists every code, else only those redeemable now; `q` a
  *  label containing it, in any letter case. */
 export function listAdminCodes(query: { page: number; status?: 'all'; q?: string }): Promise<AdminCodesList> {
-  const params = new URLSearchParams({ page: String(query.page) })
-  if (query.status) {
-    params.set('status', query.status)
-  }
-  if (query.q) {
-    params.set('q', query.q)
-  }
-  return request('GET', `/api/admin/codes?${params}`)
+  return listQuery('/api/admin/codes', query)
 }
 
 /** 201 with the codes in plaintext; 422 for a batch outside the rules the CLI shares. */
@@ -1967,9 +1897,9 @@ export function disableAdminCode(id: number): Promise<AdminCode> {
 
 // --- operator console: overview, jobs and usage (docs/admin.md § Overview, jobs and usage) ---
 
-/** `usage_log` summed (docs/api.md § Usage aggregates): billed `cost`, `estimated_cost` and
+/** `usage_log` summed (docs/admin.md § Overview, jobs and usage): billed `cost`, `estimated_cost` and
  *  the calls nobody priced kept apart, never added together. */
-export interface AdminUsageFigures {
+interface AdminUsageFigures {
   calls: number
   prompt_tokens: number
   completion_tokens: number
@@ -1983,24 +1913,21 @@ export interface AdminUsageFigures {
 
 /** Whether a worker runs, as the worker lock says: `since` and `generation` only while
  *  `running` (`generation` null also before any worker took one); `unknown` off PostgreSQL. */
-export interface AdminWorker {
+interface AdminWorker {
   state: 'running' | 'stopped' | 'unknown'
   since: string | null
   generation: number | null
 }
 
-export type AdminJobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
-
 /** A job as the console shows it: never its file name, prompt or pages' text. */
 export interface AdminJob {
   id: string
   created_at: string
-  started_at: string | null
   finished_at: string | null
   user_id: number
   /** The account's address, only for a caller who also holds `users.read`. */
   email: string | null
-  status: AdminJobStatus
+  status: JobStatus
   /** The pages it selected; null while the document's page count is unknown. */
   pages: number | null
   pages_done: number
@@ -2015,13 +1942,13 @@ export interface AdminJob {
 
 export interface AdminJobsResponse extends AdminList<AdminJob> {
   /** Every job on record by status, whatever the filter. */
-  counts: Record<AdminJobStatus, number>
+  counts: Record<JobStatus, number>
   worker: AdminWorker
 }
 
 /** A connection the overview checked: `message` only when `failed`, the figures only when
  *  `ok`. */
-export interface AdminKanoProxyStatus {
+interface AdminKanoProxyStatus {
   state: 'ok' | 'unconfigured' | 'failed'
   message: string | null
   models: number | null
@@ -2029,7 +1956,7 @@ export interface AdminKanoProxyStatus {
   parse_model: string | null
 }
 
-export interface AdminKanoPayStatus {
+interface AdminKanoPayStatus {
   state: 'ok' | 'unconfigured' | 'failed'
   message: string | null
   checkout_enabled: boolean | null
@@ -2076,12 +2003,8 @@ export function getAdminOverview(): Promise<AdminOverviewResponse> {
 }
 
 /** Newest first; `status` keeps one status. */
-export function listAdminJobs(query: { page: number; status?: AdminJobStatus }): Promise<AdminJobsResponse> {
-  const params = new URLSearchParams({ page: String(query.page) })
-  if (query.status) {
-    params.set('status', query.status)
-  }
-  return request('GET', `/api/admin/jobs?${params}`)
+export function listAdminJobs(query: { page: number; status?: JobStatus }): Promise<AdminJobsResponse> {
+  return listQuery('/api/admin/jobs', query)
 }
 
 /** A stuck job back in the queue; 409 `admin_conflict` (`not_running`, `not_stuck`,

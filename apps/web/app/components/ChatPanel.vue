@@ -31,6 +31,7 @@
 import {
   attachmentUrl,
   cancelTurn,
+  CHAT_AGENT,
   createConversation,
   createLibraryConversation,
   deleteConversation,
@@ -43,7 +44,6 @@ import {
   listConversations,
   listLibraryConversations,
   listMemories,
-  renameConversation,
   generateTitle,
   revertRevision,
   sendMessage,
@@ -367,7 +367,7 @@ async function renameRow(id: number, name: string) {
   countRename(id)
   patchRow(id, () => ({ title: name }))
   try {
-    const saved = await renameConversation(id, name)
+    const saved = await updateConversation(id, { title: name })
     listChanged()
     countRename(id)
     patchRow(id, () => ({ title: saved.title }))
@@ -646,7 +646,7 @@ async function loadAgentSettings() {
   const request = ++agentSettingsRequest
   try {
     const { agents } = await listAgents()
-    const chat = agents.find((agent) => agent.name === 'chat')
+    const chat = agents.find((agent) => agent.name === CHAT_AGENT)
     if (request === agentSettingsRequest && chat) {
       agentSettings.value = chat.settings
     }
@@ -683,7 +683,7 @@ function onExtrasError(message: string) {
 
 /** **Compact now**: the conversation open, no turn in flight, an answer since the last
  *  summary (docs/chat.md § Compaction). */
-const canCompact = computed(() => current.value !== null && !running.value && current.value.compactable === true)
+const canCompact = computed(() => current.value !== null && !running.value && current.value.compactable)
 
 function compactNow() {
   if (!canCompact.value) {
@@ -1011,7 +1011,7 @@ watch(
 const offersPack = computed(() => canTopUp.value && topUp.pack !== null)
 const creditsNotice = computed(() => {
   const me = auth.me.value
-  return offersPack.value && me?.period_end
+  return offersPack.value && me
     ? t('chat.blockedCreditsPack', { date: formatDate(me.period_end, locale.value) })
     : t('chat.blockedCredits')
 })
@@ -1527,7 +1527,7 @@ async function renameFromComposer(text: string): Promise<boolean> {
   listChanged()
   countRename(id)
   try {
-    const saved = text ? await renameConversation(id, text) : await generateTitle(id, locale.value)
+    const saved = text ? await updateConversation(id, { title: text }) : await generateTitle(id, locale.value)
     listChanged()
     countRename(id)
     patchRow(id, () => ({ title: saved.title }))
@@ -1627,7 +1627,9 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
         kind: payload.command === COMPACT_COMMAND ? 'compact' : 'message',
         status: 'queued',
         error: null,
+        credits: null,
         finished_at: null,
+        versions: null,
       },
     ]
     stream.expectTurn(turn_id)

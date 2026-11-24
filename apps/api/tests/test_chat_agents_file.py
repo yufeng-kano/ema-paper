@@ -158,8 +158,8 @@ async def test_a_conversation_without_agents_files_sends_no_block(chat_client) -
 
 
 async def test_the_drawer_shows_the_files_a_new_conversation_would_read(chat_client) -> None:
-    """`GET /api/agents/chat/context`: the document's path with `document_id`, the root file
-    alone without one, no part when there is none (docs/api.md)."""
+    """`GET /api/agents/chat/context`: the root file alone, never a folder's below it, and
+    no part when there is none (docs/api.md)."""
     client = chat_client
     bare = (await client.get("/api/agents/chat/context")).json()
     assert "agents_file" not in [part["kind"] for part in bare["parts"]]
@@ -171,11 +171,6 @@ async def test_the_drawer_shows_the_files_a_new_conversation_would_read(chat_cli
     assert kinds.index("catalogue") < kinds.index("agents_file") < kinds.index("memory")
     text = without["parts"][kinds.index("agents_file")]["text"]
     assert "Notes in English" in text and "Cite with the DOI" not in text
-    with_document = (
-        await client.get("/api/agents/chat/context", params={"document_id": client.document_id})
-    ).json()
-    text = next(part["text"] for part in with_document["parts"] if part["kind"] == "agents_file")
-    assert text.endswith("## /workspace/files/Papers/AGENTS.md\n\n- Cite with the DOI")
 
 
 # --- /init ---------------------------------------------------------------------------------
