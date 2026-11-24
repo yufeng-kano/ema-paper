@@ -69,8 +69,6 @@ function partLabel(part: AgentContextPart): string {
   switch (part.kind) {
     case 'prompt':
       return part.own ? t('agents.receives.ownPrompt') : t('agents.receives.defaultPrompt')
-    case 'preset':
-      return t('agents.receives.preset')
     case 'instructions':
       return t('agents.receives.instructions')
     case 'catalogue':

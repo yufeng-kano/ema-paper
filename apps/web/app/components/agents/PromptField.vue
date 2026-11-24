@@ -1,10 +1,10 @@
 <script setup lang="ts">
 /**
  * The **Prompt** control (docs/web.md § Pages): a field label over a button saying the
- * prompt's state — *Default* or *Edited*, which a legacy preset still in force also reads
- * as — that opens the prompt dialog. The parse agent has it in its row of controls; the
- * chat agent only inside the advanced disclosure under its instructions, since replacing
- * the whole prompt is what the instructions spare a reader from doing.
+ * prompt's state — *Default* or *Edited* — that opens the prompt dialog. The parse agent
+ * has it in its row of controls; the chat agent only inside the advanced disclosure under
+ * its instructions, since replacing the whole prompt is what the instructions spare a
+ * reader from doing.
  */
 import type { AgentEntry, SavedAgentSettings } from '~/lib/api'
 
@@ -21,7 +21,7 @@ const emit = defineEmits<{ saved: [settings: SavedAgentSettings] }>()
 const { t } = useI18n()
 
 const open = ref(false)
-const edited = computed(() => props.agent.settings.prompt !== null || props.agent.settings.prompt_preset_id !== null)
+const edited = computed(() => props.agent.settings.prompt !== null)
 
 function onSaved(saved: SavedAgentSettings) {
   open.value = false

@@ -131,7 +131,7 @@ async function closeDrawer() {
 
 /** Closed unless the prompt is not the default: a reader who replaced it should see that
  *  they did, and where to undo it. */
-const advancedOpen = ref(props.agent.settings.prompt !== null || props.agent.settings.prompt_preset_id !== null)
+const advancedOpen = ref(props.agent.settings.prompt !== null)
 </script>
 
 <template>

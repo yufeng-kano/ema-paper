@@ -134,7 +134,7 @@ function cancelInstructions() {
 // --- advanced: the whole prompt -------------------------------------------------------
 
 /** Closed unless the prompt is not the default. */
-const advancedOpen = ref(settings.value.prompt !== null || settings.value.prompt_preset_id !== null)
+const advancedOpen = ref(settings.value.prompt !== null)
 </script>
 
 <template>

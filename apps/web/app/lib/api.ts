@@ -88,8 +88,6 @@ export interface AgentSettings {
   model: string | null
   /** The user's own template; null means the agent's `default_prompt` (docs/agents.md). */
   prompt: string | null
-  /** The legacy preset selection, which only an API call still makes; the page shows none. */
-  prompt_preset_id: number | null
   /** Reasoning effort; meaningful for the `chat` and `check` agents, `medium` when unset. */
   effort: AgentEffort | null
   /** `chat` and `check` only: the reader's instructions, appended after the prompt; null for
@@ -246,7 +244,7 @@ export interface MemoryFields {
 
 // --- what the chat agent receives (docs/api.md, GET /api/agents/chat/context) -------------
 
-export type AgentContextPartKind = 'prompt' | 'preset' | 'instructions' | 'catalogue' | 'agents_file' | 'memory_file' | 'memory'
+export type AgentContextPartKind = 'prompt' | 'instructions' | 'catalogue' | 'agents_file' | 'memory_file' | 'memory'
 
 export interface AgentContextPart {
   kind: AgentContextPartKind
