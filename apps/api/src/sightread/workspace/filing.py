@@ -108,7 +108,7 @@ def free_name(taken: set[str], name: str, limit: int) -> str:
         room = limit - len(suffix)
         # `room <= 0` needs an extension longer than the whole column, which `clean_name`
         # already makes impossible; should it happen, the extension gives way and the
-        # counter stays, so every try is a new candidate (as the name migration does).
+        # counter stays, so every try is a new candidate.
         candidate = f"{stem[:room]}{suffix}" if room > 0 else suffix[:limit]
         if candidate not in taken:
             return candidate

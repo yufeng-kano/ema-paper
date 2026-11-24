@@ -169,6 +169,7 @@ The *Redeem codes* page creates, lists and disables codes by the same rules as `
 ## Keep it running
 
 - **Update:** `git pull`, then the same `docker compose -f … up -d --build` you started with. A changed Caddyfile also needs `docker compose -f … restart caddy` ([deployment.md](./deployment.md) § Release flow).
+- **An install, or a restored backup, from before the migration baseline** — its database on any revision other than `4449f68533c0` or a later one (`docker compose -f … exec api alembic current`) — first updates once to commit `945b2e9`, the last release that carries the earlier migrations (`git checkout 945b2e9`, then the same `up -d --build`), and then back to the current release (`git checkout main && git pull`, then the same `up -d --build`). Started directly on the current release, the api stops at *Can't locate revision* and does not come up; nothing in the database is changed ([database.md](./database.md) § Migrations).
 - **Back up:** the `backup` service writes the database dump, the figure crops and every workspace into `./backups/<stamp>/` once a day and keeps the newest seven. Copy them off the server, and test a restore before you rely on it ([deployment.md](./deployment.md) § Compose files).
 - **Logs:** `docker logs -f ema-paper-api`, and likewise `ema-paper-worker`, `ema-paper-web` and `ema-paper-caddy`.
 

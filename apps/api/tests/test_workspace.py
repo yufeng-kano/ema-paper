@@ -1277,49 +1277,6 @@ async def test_a_removal_whose_rows_stay_is_put_back(sessionmaker, tmp_path) -> 
     assert newest.message == f"restore {paths.relative}"
 
 
-def test_the_name_migration_brings_legacy_names_into_one_namespace() -> None:
-    import importlib.util
-
-    from alembic.migration import MigrationContext
-    from alembic.operations import Operations
-    from sqlalchemy import create_engine, insert, text
-
-    from sightread.db.models import Base
-
-    spec = importlib.util.spec_from_file_location(
-        "normalize_library_names",
-        Path(__file__).resolve().parents[1]
-        / "migrations"
-        / "versions"
-        / "c8f28f7cd45e_normalize_library_names.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-
-    engine = create_engine("sqlite://")
-    # The two tables the migration reads; SQLite enforces no foreign key here, and the
-    # core inserts fill the timestamps the models default.
-    Base.metadata.create_all(engine, tables=[Folder.__table__, Document.__table__])
-    with engine.begin() as connection:
-        connection.execute(
-            insert(Folder.__table__).values(id=1, user_id=1, parent_id=None, name="Report")
-        )
-        for row_id, name in ((1, "Report"), (2, "e\u0301.pdf"), (3, "\u00e9.pdf"), (4, "a/b")):
-            connection.execute(
-                insert(Document.__table__).values(
-                    id=row_id, user_id=1, folder_id=None, job_id=uuid.uuid4(), name=name
-                )
-            )
-        with Operations.context(MigrationContext.configure(connection)):
-            module.upgrade()
-        names = connection.execute(text("SELECT id, name FROM documents ORDER BY id")).all()
-    # The folder keeps `Report`; the document that shared it is suffixed; the decomposed
-    # spelling becomes the composed one, and the second of the two is suffixed; a
-    # separator is cleaned as a fresh name would be.
-    assert names == [(1, "Report (2)"), (2, "\u00e9.pdf"), (3, "\u00e9 (2).pdf"), (4, "a b")]
-
-
 async def test_a_reverted_rename_takes_the_untracked_assets_along(sessionmaker, tmp_path) -> None:
     settings = _settings(tmp_path)
     async with sessionmaker() as db:

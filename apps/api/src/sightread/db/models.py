@@ -194,8 +194,8 @@ class AgentSetting(Base):
     # § Format check).
     auto_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     # The parse agent's switch: a PDF or an image uploaded on the Files page is converted on
-    # arrival; off — the default since 2026-10-26 — it is kept as a file until the reader
-    # asks for Markdown (docs/workspace.md § Files).
+    # arrival; off — the default — it is kept as a file until the reader asks for Markdown
+    # (docs/workspace.md § Files).
     auto_convert: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
     prompt_preset: Mapped[PromptPreset | None] = relationship(
@@ -499,7 +499,8 @@ class UsageLog(Base):
     )
     # The chat turn that made the call; NULL on parse rows (docs/chat.md).
     turn_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("chat_turns.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("chat_turns.id", name="fk_usage_log_turn_id", ondelete="SET NULL"),
+        nullable=True,
     )
     # Which agent billed the call, written with the row (docs/database.md § Rules).
     agent: Mapped[str] = mapped_column(String(32), default="parse", server_default="parse")
@@ -607,8 +608,8 @@ class ChatTurn(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
-    # The user message this turn answers. No FK the other way: messages.turn_id names the
-    # turn that produced an assistant message.
+    # The user message this turn answers, a messages.id without a foreign key; the key is
+    # the other way: messages.turn_id names the turn that produced an assistant message.
     message_id: Mapped[int] = mapped_column(Integer)
     # message | compact | idle_compact (docs/chat.md § Compaction).
     kind: Mapped[str] = mapped_column(
@@ -631,9 +632,10 @@ class ChatTurn(Base):
 
 class ChatToolCall(Base):
     """One web tool call of a turn that was answered or kept a file — `web_search`,
-    `search_papers`, `download_file` — what the per-day caps count and what a turn's web
-    searches are charged from (docs/chat.md § Tools, docs/billing.md § A chat turn). A
-    deleted turn keeps its rows for the day's count, as a purged parse keeps its entry."""
+    `search_papers`, `download_file` — or one `convert_file` call that made a document or
+    queued a retry: what the per-day caps count and what a turn's web searches are charged
+    from (docs/chat.md § Tools, docs/billing.md § A chat turn). A deleted turn keeps its
+    rows for the day's count, as a purged parse keeps its entry."""
 
     __tablename__ = "chat_tool_calls"
     __table_args__ = (
@@ -906,7 +908,8 @@ class Subscription(Base):
     __table_args__ = (CheckConstraint("period_end > period_start", name="ck_subscriptions_period"),)
 
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("users.id", name="fk_subscriptions_user_id_users", ondelete="CASCADE"),
+        primary_key=True,
     )
     subscription_id: Mapped[str] = mapped_column(String(255), unique=True)
     status: Mapped[str] = mapped_column(String(32))
@@ -928,7 +931,8 @@ class Checkout(Base):
     __tablename__ = "checkouts"
 
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("users.id", name="fk_checkouts_user_id_users", ondelete="CASCADE"),
+        primary_key=True,
     )
     plan_id: Mapped[str] = mapped_column(String(64))
     idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
@@ -947,7 +951,8 @@ class PayEvent(Base):
     type: Mapped[str] = mapped_column(String(64))
     # The record of the event outlives the user it was about.
     user_id: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("users.id", name="fk_pay_events_user_id_users", ondelete="SET NULL"),
+        nullable=True,
     )
     received_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
@@ -963,7 +968,8 @@ class CreditPeriod(Base):
     )
 
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("users.id", name="fk_credit_periods_user_id_users", ondelete="CASCADE"),
+        primary_key=True,
     )
     period_start: Mapped[datetime] = mapped_column(TIMESTAMPTZ, primary_key=True)
     period_end: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
@@ -999,17 +1005,25 @@ class CreditEntry(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", name="fk_credit_entries_user_id_users", ondelete="CASCADE")
+    )
     # The period the entry was made in, where it is settled whenever that happens.
     period_start: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
     kind: Mapped[str] = mapped_column(String(8))  # parse | chat
     state: Mapped[str] = mapped_column(String(8))  # reserved | consumed | released
     amount: Mapped[int] = mapped_column(Integer)
     job_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("jobs.id", ondelete="SET NULL"), unique=True, nullable=True
+        ForeignKey("jobs.id", name="fk_credit_entries_job_id_jobs", ondelete="SET NULL"),
+        unique=True,
+        nullable=True,
     )
     turn_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("chat_turns.id", ondelete="SET NULL"), unique=True, nullable=True
+        ForeignKey(
+            "chat_turns.id", name="fk_credit_entries_turn_id_chat_turns", ondelete="SET NULL"
+        ),
+        unique=True,
+        nullable=True,
     )
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
@@ -1030,6 +1044,7 @@ class CreditPack(Base):
         CheckConstraint("expires_at > purchased_at", name="ck_credit_packs_validity"),
         CheckConstraint("status IN ('paid', 'refunded')", name="ck_credit_packs_status"),
         CheckConstraint("source IN ('pay', 'code', 'grant')", name="ck_credit_packs_source"),
+        UniqueConstraint("redemption_id", name="uq_credit_packs_redemption_id"),
     )
 
     # Pay's purchaseId, `redeem-<redemption id>` for a code's credits, or
@@ -1049,7 +1064,8 @@ class CreditPack(Base):
     # (docs/billing.md § Redeem codes, § Operator grants).
     source: Mapped[str] = mapped_column(String(8), default="pay", server_default=text("'pay'"))
     redemption_id: Mapped[int | None] = mapped_column(
-        ForeignKey("redemptions.id", ondelete="SET NULL"), unique=True, nullable=True
+        ForeignKey("redemptions.id", name="fk_credit_packs_redemption_id", ondelete="SET NULL"),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
@@ -1222,7 +1238,7 @@ class AuditLog(Base):
     # What the route required; NULL for a sign-in's owner join.
     permission: Mapped[str | None] = mapped_column(String(32), nullable=True)
     action: Mapped[str] = mapped_column(String(64))  # <area>.<verb>
-    target_type: Mapped[str] = mapped_column(String(32))  # group | user | setting
+    target_type: Mapped[str] = mapped_column(String(32))  # group | user | code | job | setting
     # No foreign key: a record outlives what it names.
     target_id: Mapped[str] = mapped_column(String(64))
     # A side with nothing is SQL NULL (docs/admin.md § The audit log): `none_as_null`, or a
