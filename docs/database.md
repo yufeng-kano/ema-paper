@@ -15,7 +15,7 @@ users            id PK, google_sub UNIQUE, email, name,
                                                   -- refused redeem-code attempts in the
                                                   -- window (billing.md § Redeem codes)
                  created_at
-                 -- deleting the row is deleting the account (see Rules): every table
+                 -- deleting the row is deleting the account (§ Deleting an account): every table
                  -- below with a user_id cascades from it; pay_events and audit_log keep
                  -- theirs as NULL
 sessions         id PK, user_id FK, token_hash UNIQUE, created_at, expires_at
@@ -66,8 +66,8 @@ jobs             id UUID PK, user_id FK, agent, kind pdf|image, filename, media_
                                                   -- KANO_PROXY_BASE_URL. NULL on a job of
                                                   -- an upstream the deployment no longer
                                                   -- has (OpenRouter, a provider
-                                                  -- connection), which never runs (see
-                                                  -- Rules); part of the dedup key (jobs.md
+                                                  -- connection), which never runs (§ Jobs
+                                                  -- and usage); part of the dedup key (jobs.md
                                                   -- § Dedup)
                  prompt TEXT,                     -- effective prompt template, verbatim
                  prompt_sha256,                   -- its hash; part of the dedup key
@@ -156,7 +156,7 @@ documents        id PK, user_id FK, folder_id FK folders NULL, job_id FK jobs NU
                                                   -- last switched a PDF or image to; NULL
                                                   -- never (web.md § Result viewer)
                  reconvert_job_id FK jobs NULL,   -- the re-convert queued, running or
-                                                  -- failed (docs/jobs.md § Re-converting
+                                                  -- failed (jobs.md § Re-converting
                                                   -- a document); ON DELETE SET NULL
                  created_at, updated_at
                  UNIQUE (user_id, folder_id, name) WHERE trashed_at IS NULL
@@ -174,7 +174,7 @@ documents        id PK, user_id FK, folder_id FK folders NULL, job_id FK jobs NU
                  -- job_id NULL), or a file of any other kind kept once in the tree
                  -- (file, job_id NULL; workspace.md § Files). folder_id NULL = root
 usage_log        id PK, user_id FK, job_id FK NULL, turn_id FK chat_turns NULL,
-                 agent,                           -- parse | check | chat (see Rules)
+                 agent,                           -- parse | check | chat (§ Jobs and usage)
                  model, prompt_tokens, completion_tokens,
                  cache_read_tokens, cache_write_tokens,
                                                   -- prompt caching, 0 on parse rows
@@ -482,27 +482,127 @@ runtime_settings key VARCHAR(64) PK,              -- one of the thirteen keys th
 
 ## Migrations
 
-- **The chain starts at one baseline.** `4449f68533c0` (`baseline`, no `down_revision`) creates the schema production carries at that revision — every table, column, default, constraint and index under the name production gives it — plus what autogenerate cannot see: the `worker_generation_seq` sequence (PostgreSQL only) and one row, the built-in group `owner` (`builtin` true, an empty permission list, no members; [admin.md](./admin.md) § Groups). Its downgrade drops all of it. The revisions after it form one line, each revising the one before it, and bring that schema to the tables above; the last is the chain's one head. `alembic upgrade head` runs, on a database at `4449f68533c0` or a later revision of the chain, the revisions it lacks, and on an empty one the whole chain.
-- **A database on a revision outside the chain is not on it.** `alembic upgrade head` stops on it with *Can't locate revision*, and the api, which runs it before it serves, does not start. Such a database — an install last updated before the baseline, or a backup taken from one — is first brought to `4449f68533c0` by the last release that carries the earlier revisions, commit `945b2e9`, once ([self-hosting.md](./self-hosting.md) § Keep it running).
-- **A new migration** starts from `alembic revision` (`--autogenerate` against a database at head), never a hand-built file; the post-write hook in `alembic.ini` runs `ruff format` over it, and `migrations/env.py` renders the models' `UtcDateTime` as `sa.DateTime(timezone=True)`, so a revision imports nothing from the app. It revises the head and leaves the database equal to the models — columns, defaults, constraints, indexes and sequences, names included: `tests/test_migrations.py` compares an upgraded database with one built from the models ([testing.md](./testing.md) § Backend). A revision that has shipped is never edited; a correction is a new revision.
-- **Constraint names are the models'.** A constraint the models name is created under that name; one they leave unnamed gets PostgreSQL's default (`<table>_<column>_fkey`, `<table>_<column>_key`), which `create_all` and a migration give alike. A migration that gives a constraint a name gives it the same name in the models — autogenerate matches an unnamed constraint by its columns and would never see the two disagree.
-- **A migration that rewrites existing rows** ships with a test in `tests/test_migrations.py` that upgrades a scratch database from the previous head with such rows in place and checks what it left. A downgrade that could undo its change only by deleting or relabelling rows a user made refuses while such rows exist, naming the count.
-- **A squash** replaces the chain with a new baseline that keeps the head's revision id, so a database at head runs nothing: generated with `alembic revision --autogenerate --rev-id <head>` against an empty database, given the sequence and the seed rows by hand and its generated column lines moved into the chain's column order (ADD COLUMN appends, so pg_dump lists the chain's columns in the order they were added), and proven equal to the chain by a `pg_dump` of a database each builds — schema and seed rows — before the old revisions are deleted, with the tests that only they needed.
+- **The chain starts at one baseline.** `4449f68533c0` (`baseline`, no `down_revision`) creates the schema production carries at that revision: every table, column, default, constraint and index, under the name production gives it.
+  - It also creates what autogenerate cannot see: the `worker_generation_seq` sequence (PostgreSQL only) and one row, the built-in group `owner` (`builtin` true, an empty permission list, no members; [admin.md](./admin.md) § Groups).
+  - Its downgrade drops all of it.
+  - The revisions after it form one line, each revising the one before it, and bring that schema to the tables above. The last is the chain's one head.
+  - `alembic upgrade head` runs the revisions a database lacks when it is at `4449f68533c0` or a later revision of the chain, and the whole chain on an empty one.
+- **A database on a revision outside the chain is not on it.** `alembic upgrade head` stops on it with *Can't locate revision*, and the api, which runs it before it serves, does not start.
+  - Such a database — an install last updated before the baseline, or a backup taken from one — is first brought to `4449f68533c0`, once, by the last release that carries the earlier revisions, commit `945b2e9` ([self-hosting.md](./self-hosting.md) § Keep it running).
+- **A new migration** starts from `alembic revision` (`--autogenerate` against a database at head), never a hand-built file.
+  - The post-write hook in `alembic.ini` runs `ruff format` over it.
+  - `migrations/env.py` renders the models' `UtcDateTime` as `sa.DateTime(timezone=True)`, so a revision imports nothing from the app.
+  - It revises the head and leaves the database equal to the models — columns, defaults, constraints, indexes and sequences, names included. `tests/test_migrations.py` compares an upgraded database with one built from the models ([testing.md](./testing.md) § Backend).
+  - A revision that has shipped is never edited; a correction is a new revision.
+- **Constraint names are the models'.** A constraint the models name is created under that name.
+  - One they leave unnamed gets PostgreSQL's default (`<table>_<column>_fkey`, `<table>_<column>_key`), which `create_all` and a migration give alike.
+  - A migration that gives a constraint a name gives it the same name in the models, because autogenerate matches an unnamed constraint by its columns and would never see the two disagree.
+- **A migration that rewrites existing rows** ships with a test in `tests/test_migrations.py` that upgrades a scratch database from the previous head with such rows in place and checks what it left.
+  - A downgrade that could undo its change only by deleting or relabelling rows a user made refuses while such rows exist, naming the count.
+- **A squash** replaces the chain with a new baseline that keeps the head's revision id, so a database at head runs nothing. The new baseline:
+  1. is generated with `alembic revision --autogenerate --rev-id <head>` against an empty database;
+  2. is given the sequence and the seed rows by hand;
+  3. has its generated column lines moved into the chain's column order (ADD COLUMN appends, so pg_dump lists the chain's columns in the order they were added);
+  4. is proven equal to the chain by a `pg_dump` of a database each builds — schema and seed rows — before the old revisions are deleted, with the tests that only they needed.
 
 ## Rules
 
-- Credentials we only verify are stored as their SHA-256 hash ([auth.md](./auth.md)): sessions, API keys, upload and document tickets, OAuth codes and tokens. No column holds an upstream key or any secret we would have to replay, encrypted or not. The one credential stored as written is a redeem code (`redeem_codes.code`, [billing.md](./billing.md) § Redeem codes): it is never logged, and the console shows it whole only in the answer that created it ([admin.md](./admin.md) § Redeem codes).
-- **A stored setting is the text, not the value it reads as.** `runtime_settings.value` is a JSON string holding exactly what `.env` would — `"0.002"`, `"[{\"planId\": \"pro\", …}]"` — never the number or the JSON it parses to: `jsonb` keeps no object key order, and `MODEL_PRICES_JSON`'s order is the chat agent's model order. The settings are parsed and checked from that text as from `.env` ([admin.md](./admin.md) § Settings).
-- **The console's tables say who may do what, and what was done; the permissions themselves are code.** `groups.permissions` is a JSON list rather than an array type (the SQLite fallback the tests run on has none), normalized before it is written and read whole — no query looks inside it — and the strings it may hold are `ALL_PERMISSIONS` ([admin.md](./admin.md) § Permissions), so a new permission needs no migration. One group carries `builtin`, which the code checks instead of a name. `audit_log` is append-only: a row is written in the transaction of the change it records and never updated or deleted, its `before` and `after` hold ids, amounts, flags, permission strings, group names, plan ids and dates as ISO 8601 strings — never an address, a person's name, content or a secret; who a row is about is joined from `users` when it is read — and `target_id` is text with no foreign key — a group's, an account's or a code's id, a job's UUID, a setting's key — so a record outlives what it names. The one free text a row holds is a grant's optional `reason` in `after`, the operator's own note, written under the same rule ([admin.md](./admin.md) § Users and grants); it stays when the account it is about is deleted, as the row does. A day grant's `after` also keeps the request's `request_id`, and that is the one query that looks inside `after`: a day grant sent again is found by `after ->> 'request_id'` among that account's `users.grant_days` rows — narrowed by the `(target_type, target_id)` index, under the account's row lock — since days have no row of their own to carry the id.
-- **The upstream key is read at run time**, never snapshotted onto a job: the worker presents `KANO_PROXY_API_KEY` as configured when the job runs, so a rotated key applies to queued work. The model is snapshotted onto `jobs.model` at enqueue, like every other parse parameter. The dedup cache is protected separately by the `connection_base_url` snapshot ([jobs.md](./jobs.md) § Dedup).
-- **A job with no endpoint snapshot never runs.** `jobs.connection_base_url` is NULL only on a job of an upstream the deployment no longer has — OpenRouter, or a user's provider connection — and never on a new job, which snapshots `KANO_PROXY_BASE_URL`. Such a result never answers a dedup lookup, and the worker fails such a job when it takes it, a retry's included, rather than run it on the operator's key: Kano Proxy would transcribe only the pages the other upstream failed, and the mixed result would then be keyed as a Kano Proxy one ([jobs.md](./jobs.md) § Dedup, § Retrying failed pages).
-- **A usage row's cost is only as good as its source.** `cost_source` is written with the row and never revised: `openrouter` is billing, `estimated` is what the endpoint said the call cost, `unknown` has `cost` NULL. A row whose job the retention deletes ([jobs.md](./jobs.md) § Retention) keeps the `cost_source` and the `agent` it was written with. No new row is `openrouter`; the historical ones stay readable and keep counting as billed.
-- **A document is a library entry, not a second copy of the result.** `documents` names a parse and places it in a folder; the markdown lives in `results` exactly once, keyed by the job that produced it. A markdown document has no parse: `job_id` is NULL, and its baseline is the `.md` it was uploaded as, kept as its original, or nothing for one written new ([workspace.md](./workspace.md) § Markdown documents). `kind` says which it is (`parse` or `markdown`), and `job_id` agrees: a parse has one, a markdown document none. **A file** (`kind` `file`, [workspace.md](./workspace.md) § Files) is the third kind of row: no parse, no baseline, the one copy of its bytes in the tree at `files/<folder>/<name>`, its `media_type` and `size_bytes` on the row because the file itself is the only other place they could be read from; reconciliation removes the row when the file is gone from the tree — the one row it removes ([workspace.md](./workspace.md) § The tree is the truth). Deleting a document deletes the entry only; its parse then falls under the retention ([jobs.md](./jobs.md) § Retention) — kept while any document of the user names a parse of the same original or an upload ticket that has not expired names it, else deleted `PARSE_RETENTION_DAYS` after it finished — and its `usage_log` rows and its ledger entry outlive it with `job_id` NULL, because they are the billing record of something that really ran. Deleting a folder cascades to its subfolders and their documents, the way removing a directory does.
-- **The Trash is a column, not a table.** Putting a folder or a document in the Trash sets its `trashed_at` and nothing else: the row keeps its place (`parent_id`, `folder_id`) and its name, which is where *Put Back* returns it, and everything under a trashed folder is in the Trash with it without a write of its own. So *live* is computed, not stored — a folder is live when neither it nor any folder above it has `trashed_at`, a document when it has none and its folder (if any) is live — and every route of the library, the reader and the agent answers 404 for what is not live ([workspace.md](./workspace.md) § The Trash). Names are unique among the live rows only: the unique indexes carry `WHERE trashed_at IS NULL`, so a trashed `report.pdf` does not keep its folder from taking a new one, and Put Back resolves the collision the way a move does, with ` (2)`. A row inside a trashed folder still holds its name there, which nothing can contest: a trashed folder takes no new entries. That is decided again under the user's row lock, which a move to the Trash takes too: a folder or a file created while its destination goes to the Trash either lands first and goes with it, or is refused (404) — an upload whose parse is already under way lands at the top level instead, since the parse is not undone. An item trashed on its own stays its own entry in the Trash when a folder above it is trashed later. Deleting a row for good — from the Trash, or a live one deleted immediately — takes its own subtree only: an item inside it that was trashed separately is moved up to the deleted folder's parent first, so the cascade cannot take it, and it stays in the Trash. The Trash is emptied by the reader — *Delete Immediately*, *Empty Trash* — and by the worker's sweep, which deletes for good, the way *Delete Immediately* does, every item whose own `trashed_at` is older than `TRASH_RETENTION_DAYS` (30; 0 = never), reading the partial `trashed_at` indexes ([workspace.md](./workspace.md) § The Trash). An expired folder takes its whole subtree, and nothing in it outlives it: an item trashed on its own inside it was trashed earlier, nothing inside a trashed folder being trashable, so it has expired too.
-- **The root level needs its own unique index.** `folders.parent_id` and `documents.folder_id` are NULL at the root, and PostgreSQL treats NULLs as distinct in a unique constraint, so `UNIQUE (user_id, parent_id, name)` would not stop two root folders called "Invoices". The partial indexes above close that. The application checks the same thing before writing, which is what turns a collision into `report (2).pdf` instead of a 409 — and it checks across both tables: a folder and a document in one parent cannot share a name, because the workspace gives each name one directory ([workspace.md](./workspace.md) § Layout). The indexes cannot express that, so the name is chosen under a lock on the user's row.
-- **Deleting a user is deleting the account** ([auth.md](./auth.md) § Deleting the account): one `DELETE` of the `users` row, under its row lock, and every table with a `user_id` cascades from it — sessions, API keys, OAuth grants, upload tickets, document tickets, agent settings, skills, subagents, memories, chat attachments, folders, documents, conversations with their messages, turns and events, jobs with their pages and results, `usage_log`, subscriptions, checkouts, credit periods and credit entries, and the account's memberships of the operator console's groups (`group_members`, by `user_id`). `pay_events` keep their rows with `user_id` NULL — the record of an event outlives the user it was about — and so do the console's `audit_log` rows, with `actor_id` NULL: a row the account made keeps what was changed and loses who, and a row about the account keeps its `target_id`, a number no address resolves from any more ([admin.md](./admin.md) § The audit log); a membership the account added keeps its row with `added_by` NULL. `oauth_clients`, which belong to no user, stay. Nothing refuses for the console: deleting the last owner's account leaves the owner group empty. PostgreSQL never reuses an id, so the same Google account signing in later is a new row: a new, empty account, on Free from zero.
-- `results` holds parsed **output**, kept as long as its job (`PARSE_RETENTION_DAYS` after the parse finishes, or while a document names a parse of that original or an upload ticket that has not expired names the job, [jobs.md](./jobs.md) § Retention); the DB never stores document bytes. `jobs.source_path` points at a temp file that is deleted at terminal state unless the job belongs to a library document, in which case the worker moves it into the document's workspace directory ([workspace.md](./workspace.md)).
-- **A document's editable content is a file, not a column.** `doc.md` and `notes.md` live in the user's workspace and their history is that workspace's git log; `documents` keeps the entry, the parse behind it and its place in the tree, and the workspace is reconciled to it after every chat turn ([workspace.md](./workspace.md) § The tree is the truth).
-- `usage_log.agent` is written with the row — `parse`, `check` or `chat` — and every row carries one, whatever its job or turn became. A row with no job and no turn is a parse or a check whose job is gone, a chat call whose conversation was deleted, or a title's call (`/rename`, [chat.md](./chat.md) § Conversations, turns, events), the last two written with `agent` `chat`. Chat rows carry `turn_id` while their turn exists, and the cache token columns; parse and check rows carry `job_id` and zeros.
+### Credentials
+
+- Credentials we only verify are stored as their SHA-256 hash ([auth.md](./auth.md)): sessions, API keys, upload and document tickets, OAuth codes and tokens.
+- No column holds an upstream key or any secret we would have to replay, encrypted or not.
+- The one credential stored as written is a redeem code (`redeem_codes.code`, [billing.md](./billing.md) § Redeem codes). It is never logged, and the console shows it whole only in the answer that created it ([admin.md](./admin.md) § Redeem codes).
+
+### Settings
+
+- **A stored setting is the text, not the value it reads as.** `runtime_settings.value` is a JSON string holding exactly what `.env` would — `"0.002"`, `"[{\"planId\": \"pro\", …}]"` — never the number or the JSON it parses to.
+  - The reason: `jsonb` keeps no object key order, and `MODEL_PRICES_JSON`'s order is the chat agent's model order.
+  - The settings are parsed and checked from that text as from `.env` ([admin.md](./admin.md) § Settings).
+
+### The console's tables
+
+**The console's tables say who may do what, and what was done; the permissions themselves are code.**
+
+- `groups.permissions` is a JSON list rather than an array type, because the SQLite fallback the tests run on has none.
+  - It is normalized before it is written and read whole; no query looks inside it.
+  - The strings it may hold are `ALL_PERMISSIONS` ([admin.md](./admin.md) § Permissions), so a new permission needs no migration.
+- One group carries `builtin`, which the code checks instead of a name.
+- `audit_log` is append-only: a row is written in the transaction of the change it records and never updated or deleted.
+  - Its `before` and `after` hold ids, amounts, flags, permission strings, group names, plan ids and dates as ISO 8601 strings — never an address, a person's name, content or a secret. Who a row is about is joined from `users` when it is read.
+  - `target_id` is text with no foreign key — a group's, an account's or a code's id, a job's UUID, a setting's key — so a record outlives what it names.
+  - The one free text a row holds is a grant's optional `reason` in `after`, the operator's own note, written under the same rule ([admin.md](./admin.md) § Users and grants). It stays when the account it is about is deleted, as the row does.
+  - A day grant's `after` also keeps the request's `request_id`, since days have no row of their own to carry the id. That is the one query that looks inside `after`: a day grant sent again is found by `after ->> 'request_id'` among that account's `users.grant_days` rows, narrowed by the `(target_type, target_id)` index, under the account's row lock.
+
+### Jobs and usage
+
+- **The upstream key is read at run time**, never snapshotted onto a job: the worker presents `KANO_PROXY_API_KEY` as configured when the job runs, so a rotated key applies to queued work.
+  - The model is snapshotted onto `jobs.model` at enqueue, like every other parse parameter.
+  - The dedup cache is protected separately by the `connection_base_url` snapshot ([jobs.md](./jobs.md) § Dedup).
+- **A job with no endpoint snapshot never runs.**
+  - `jobs.connection_base_url` is NULL only on a job of an upstream the deployment no longer has — OpenRouter, or a user's provider connection.
+  - It is never NULL on a new job, which snapshots `KANO_PROXY_BASE_URL`.
+  - The result of such a job never answers a dedup lookup.
+  - The worker fails such a job when it takes it, a retry's included, rather than run it on the operator's key: Kano Proxy would transcribe only the pages the other upstream failed, and the mixed result would then be keyed as a Kano Proxy one ([jobs.md](./jobs.md) § Dedup; [jobs.md](./jobs.md) § Retrying failed pages).
+- **A usage row's cost is only as good as its source.** `cost_source` is written with the row and never revised.
+  - `openrouter` is billing. No new row is `openrouter`; the historical ones stay readable and keep counting as billed.
+  - `estimated` is what the endpoint said the call cost.
+  - `unknown` has `cost` NULL.
+  - A row whose job the retention deletes ([jobs.md](./jobs.md) § Retention) keeps the `cost_source` and the `agent` it was written with.
+- `usage_log.agent` is written with the row — `parse`, `check` or `chat` — and every row carries one, whatever its job or turn became.
+  - A row with no job and no turn is a parse or a check whose job is gone, a chat call whose conversation was deleted, or a title's call (`/rename`, [chat.md](./chat.md) § Conversations, turns, events). The last two are written with `agent` `chat`.
+  - Chat rows carry `turn_id` while their turn exists, and the cache token columns.
+  - Parse and check rows carry `job_id` and zeros.
 - Job claiming and per-user caps: exact queries in [jobs.md](./jobs.md).
+
+### The library
+
+- **A document is a library entry, not a second copy of the result.** `documents` names a parse and places it in a folder; the markdown lives in `results` exactly once, keyed by the job that produced it.
+  - `kind` says which of the three a row is. For `parse` and `markdown`, `job_id` agrees: a parse has one, a markdown document none.
+    - `parse`: a parse, named by `job_id`.
+    - `markdown`: a markdown document has no parse. `job_id` is NULL, and its baseline is the `.md` it was uploaded as, kept as its original, or nothing for one written new ([workspace.md](./workspace.md) § Markdown documents).
+    - `file` ([workspace.md](./workspace.md) § Files): no parse, no baseline, the one copy of its bytes in the tree at `files/<folder>/<name>`. Its `media_type` and `size_bytes` are on the row because the file itself is the only other place they could be read from. Reconciliation removes the row when the file is gone from the tree — the one row it removes ([workspace.md](./workspace.md) § The tree is the truth).
+  - Deleting a document deletes the entry only. Its parse then falls under the retention ([jobs.md](./jobs.md) § Retention): kept while any document of the user names a parse of the same original or an upload ticket that has not expired names it, else deleted `PARSE_RETENTION_DAYS` after it finished.
+  - The parse's `usage_log` rows and its ledger entry outlive it with `job_id` NULL, because they are the billing record of something that really ran.
+  - Deleting a folder cascades to its subfolders and their documents, the way removing a directory does.
+- `results` holds parsed **output**, kept as long as its job ([jobs.md](./jobs.md) § Retention). The DB never stores document bytes.
+- `jobs.source_path` points at a temp file that is deleted at terminal state, unless the job is the parse behind a library document: then the worker files it as that document's original, outside the VM's mount, and puts a copy of it in the document's workspace directory ([jobs.md](./jobs.md) § Retention, [workspace.md](./workspace.md)).
+- **A document's editable content is a file, not a column.** `doc.md` and `notes.md` live in the user's workspace, and their history is that workspace's git log.
+  - `documents` keeps the entry, the parse behind it and its place in the tree.
+  - The workspace is reconciled to it after every chat turn ([workspace.md](./workspace.md) § The tree is the truth).
+- **The root level needs its own unique index.** `folders.parent_id` and `documents.folder_id` are NULL at the root, and PostgreSQL treats NULLs as distinct in a unique constraint, so `UNIQUE (user_id, parent_id, name)` would not stop two root folders called "Invoices". The partial indexes above close that.
+  - The application checks the same thing before writing, which is what turns a collision into `report (2).pdf` instead of a 409.
+  - It checks across both tables: a folder and a document in one parent cannot share a name, because the workspace gives each name one directory ([workspace.md](./workspace.md) § Layout).
+  - The indexes cannot express that, so the name is chosen under a lock on the user's row.
+
+### The Trash
+
+- **The Trash is a column, not a table.** Putting a folder or a document in the Trash sets its `trashed_at` and nothing else.
+  - The row keeps its place (`parent_id`, `folder_id`) and its name, which is where *Put Back* returns it.
+  - Everything under a trashed folder is in the Trash with it without a write of its own.
+- ***Live* is computed, not stored.** A folder is live when neither it nor any folder above it has `trashed_at`. A document is live when it has none and its folder (if any) is live.
+  - Every route of the library, the reader and the agent answers 404 for what is not live ([workspace.md](./workspace.md) § The Trash).
+- **Names are unique among the live rows only.** The unique indexes carry `WHERE trashed_at IS NULL`, so a trashed `report.pdf` does not keep its folder from taking a new one.
+  - Put Back resolves the collision the way a move does, with ` (2)`.
+  - A row inside a trashed folder still holds its name there, which nothing can contest: a trashed folder takes no new entries.
+  - That is decided again under the user's row lock, which a move to the Trash takes too. A folder or a file created while its destination goes to the Trash either lands first and goes with it, or is refused (404); an upload whose parse is already under way lands at the top level instead, since the parse is not undone.
+- An item trashed on its own stays its own entry in the Trash when a folder above it is trashed later.
+- Deleting a row for good — from the Trash, or a live one deleted immediately — takes its own subtree only. An item inside it that was trashed separately is moved up to the deleted folder's parent first, so the cascade cannot take it, and it stays in the Trash.
+- The Trash is emptied by the reader — *Delete Immediately*, *Empty Trash* — and by the worker's sweep.
+  - The sweep deletes for good, the way *Delete Immediately* does, every item whose own `trashed_at` is older than `TRASH_RETENTION_DAYS` (30; 0 = never), reading the partial `trashed_at` indexes ([workspace.md](./workspace.md) § The Trash).
+  - An expired folder takes its whole subtree, and nothing in it outlives it: an item trashed on its own inside it was trashed earlier, nothing inside a trashed folder being trashable, so it has expired too.
+
+### Deleting an account
+
+- **Deleting a user is deleting the account** ([auth.md](./auth.md) § Deleting the account): one `DELETE` of the `users` row, under its row lock.
+- Every table with a `user_id` cascades from it: sessions, API keys, OAuth grants, upload tickets, document tickets, agent settings, skills, subagents, memories, chat attachments, chat tool calls, folders, documents, conversations with their messages, turns and events, jobs with their pages and results, `usage_log`, subscriptions, checkouts, pack checkouts, credit periods, credit entries, credit packs, redemptions, plan grants, and the account's memberships of the operator console's groups (`group_members`, by `user_id`).
+- Some rows outlive the account:
+  - `pay_events` keep their rows with `user_id` NULL: the record of an event outlives the user it was about.
+  - The console's `audit_log` rows keep their rows too, with `actor_id` NULL. A row the account made keeps what was changed and loses who; a row about the account keeps its `target_id`, a number no address resolves from any more ([admin.md](./admin.md) § The audit log).
+  - A membership the account added keeps its row with `added_by` NULL.
+  - `oauth_clients`, which belong to no user, stay.
+- Nothing refuses for the console: deleting the last owner's account leaves the owner group empty.
+- PostgreSQL never reuses an id, so the same Google account signing in later is a new row: a new, empty account, on Free from zero.
+
+### Timestamps
+
 - Timestamps are `timestamptz`, UTC.
