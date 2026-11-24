@@ -9,9 +9,7 @@ import asyncio
 import json
 
 import httpx
-import pytest
 import respx
-from httpx import AsyncClient
 from sqlalchemy import select
 
 from sightread.agents import chat as chat_agent
@@ -21,130 +19,20 @@ from sightread.db.models import Message, Skill, UsageLog
 from sightread.jobs import chat_runner, chat_subagent, chat_tools
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
-from tests.test_chat import MESSAGES_URL, _run_queued_turn, _seed_document, sse
-from tests.test_jobs_queue import postgres_only
-
-DOC_PATH = "/workspace/files/Papers/paper.pdf"
-SUBAGENT_PREAMBLE_START = "You are a subagent"
-
-
-def streamed(
-    blocks: list[dict],
-    stop_reason: str,
-    *,
-    model: str = "claude-opus-5-5",
-    transformations: list[dict] | None = None,
-) -> bytes:
-    """A Messages stream of text, thinking and tool_use blocks; `transformations` is the
-    `input_transformations` its `message_start` reports."""
-    message: dict = {"model": model, "usage": {"input_tokens": 100}}
-    if transformations is not None:
-        message["input_transformations"] = transformations
-    events: list[dict] = [{"type": "message_start", "message": message}]
-    for index, block in enumerate(blocks):
-        if block["type"] == "thinking":
-            start = {"type": "thinking", "thinking": ""}
-            deltas = [
-                {"type": "thinking_delta", "thinking": block["thinking"]},
-                {"type": "signature_delta", "signature": "sig"},
-            ]
-        elif block["type"] == "text":
-            start = {"type": "text", "text": ""}
-            deltas = [{"type": "text_delta", "text": block["text"]}]
-        else:
-            start = {"type": "tool_use", "id": block["id"], "name": block["name"], "input": {}}
-            deltas = [{"type": "input_json_delta", "partial_json": json.dumps(block["input"])}]
-        events.append({"type": "content_block_start", "index": index, "content_block": start})
-        events += [{"type": "content_block_delta", "index": index, "delta": d} for d in deltas]
-        events.append({"type": "content_block_stop", "index": index})
-    events += [
-        {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason},
-            "usage": {"output_tokens": 5},
-        },
-        {"type": "message_stop"},
-    ]
-    return sse(*events)
-
-
-def stub_messages(main: list, sub: list | None = None) -> tuple[list[dict], list[dict]]:
-    """Answer the turn's calls from `main` and a subagent's from `sub`, each `(blocks,
-    stop_reason)` in order, on the model each request asked for; the requests are kept."""
-    main_answers, sub_answers = iter(main), iter(sub or [])
-    main_requests: list[dict] = []
-    sub_requests: list[dict] = []
-
-    def answer(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        if body["system"][0]["text"].startswith(SUBAGENT_PREAMBLE_START):
-            sub_requests.append(body)
-            blocks, stop = next(sub_answers)
-        else:
-            main_requests.append(body)
-            blocks, stop = next(main_answers)
-        return httpx.Response(200, content=streamed(blocks, stop, model=body["model"]))
-
-    respx.post(MESSAGES_URL).mock(side_effect=answer)
-    return main_requests, sub_requests
-
-
-def one_call(call_id: str, name: str, tool_input: dict) -> tuple[list[dict], str]:
-    """A round of one tool call. The tests make one call a round: SQLite takes the events'
-    sequence numbers without the row lock PostgreSQL holds (chat_events.append), so calls
-    finishing together would collide on the fallback database only."""
-    return [{"type": "tool_use", "id": call_id, "name": name, "input": tool_input}], "tool_use"
-
-
-async def chatting_client(client: AsyncClient) -> AsyncClient:
-    """Signed in, Kano Proxy connected, a model chosen for the chat agent, one document."""
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    chosen = await client.put(
-        "/api/agents/chat/settings",
-        json={"model": "claude-code/claude-opus-5-5"},
-        headers=CSRF_HEADERS,
-    )
-    assert chosen.status_code == 200, chosen.text
-    client.document_id = await _seed_document(client, user_id)
-    client.user_id = user_id
-    return client
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
-
-
-async def new_conversation(client: AsyncClient) -> int:
-    created = await client.post(
-        f"/api/library/documents/{client.document_id}/conversations", headers=CSRF_HEADERS
-    )
-    assert created.status_code == 201, created.text
-    return created.json()["id"]
-
-
-async def send(client: AsyncClient, conversation_id: int, **body) -> httpx.Response:
-    return await client.post(
-        f"/api/conversations/{conversation_id}/messages", json=body, headers=CSRF_HEADERS
-    )
-
-
-async def replayed_events(client: AsyncClient, conversation_id: int) -> list[tuple[str, dict]]:
-    async with client.stream(
-        "GET", f"/api/conversations/{conversation_id}/events?after=0"
-    ) as stream:
-        body = (await stream.aread()).decode()
-    events: list[tuple[str, dict]] = []
-    name = None
-    for line in body.splitlines():
-        if line.startswith("event: "):
-            name = line[len("event: ") :]
-        elif line.startswith("data: ") and name is not None:
-            events.append((name, json.loads(line[len("data: ") :])))
-            name = None
-    return events
+from tests.chat_helpers import (
+    DOC_PATH,
+    MESSAGES_URL,
+    SUBAGENT_PREAMBLE_START,
+    chatting_client,
+    new_conversation,
+    one_call,
+    replayed_events,
+    run_queued_turn,
+    send,
+    streamed,
+    stub_messages,
+)
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, postgres_only
 
 
 def fake_pages(monkeypatch) -> list[int]:
@@ -536,7 +424,7 @@ async def test_a_turn_runs_on_the_readers_prompt_with_the_catalogue_before_memor
     main, _ = stub_messages([([{"type": "text", "text": "Hi."}], "end_turn")])
     conversation_id = await new_conversation(client)
     assert (await send(client, conversation_id, text="hello")).status_code == 202
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     system = main[0]["system"]
     assert len(system) == 3
@@ -568,7 +456,7 @@ async def test_the_agent_loads_the_skills_it_may_and_no_other(chat_client) -> No
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Fix the math")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     loaded, user_only, missing = (
         main[index]["messages"][2 * index]["content"][0] for index in (1, 2, 3)
@@ -595,7 +483,7 @@ async def test_a_command_runs_a_skill_the_reader_can_run(chat_client) -> None:
         assert refused.status_code == 400, command
     sent = await send(client, conversation_id, command="check-figures", text=" 1-3 ")
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     content = main[0]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "/check-figures 1-3"}
@@ -632,7 +520,7 @@ async def test_a_command_keeps_to_the_selection_and_sections_it_is_sent_with(cha
     ):
         sent = await send(client, conversation_id, command="translate", **extra)
         assert sent.status_code == 202, sent.text
-        await _run_queued_turn(client)
+        await run_queued_turn(client)
 
     lines = []
     for index in range(3):
@@ -661,7 +549,7 @@ async def test_a_reply_carries_the_passage_it_answers(chat_client) -> None:
     assert nothing.status_code == 400
     sent = await send(client, conversation_id, text="Why this value?", quote=" Greedy is 3.45. ")
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     content = main[0]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "Why this value?"}
@@ -720,7 +608,7 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Check page 1")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][0]["status"] == "succeeded", thread["turns"]
@@ -830,7 +718,7 @@ async def test_a_subagent_that_writes_edits_the_document_itself(chat_client) -> 
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Translate page 1")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][0]["status"] == "succeeded", thread["turns"]
@@ -862,11 +750,9 @@ async def test_a_subagent_that_writes_edits_the_document_itself(chat_client) -> 
 
 @respx.mock
 async def test_a_subagent_runs_on_its_own_model_and_stops_at_its_call_cap(
-    make_client, tmp_path, monkeypatch
+    make_client, monkeypatch
 ) -> None:
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_subagent_max_tool_calls=1)
-    )
+    client = await chatting_client(make_client(chat_subagent_max_tool_calls=1))
     pages = fake_pages(monkeypatch)
     created = await client.post(
         "/api/subagents",
@@ -908,7 +794,7 @@ async def test_a_subagent_runs_on_its_own_model_and_stops_at_its_call_cap(
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Read")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     assert sub[0]["model"] == "claude-code/claude-haiku-5-5"
     assert [tool["name"] for tool in sub[0]["tools"]] == ["view_page"]
@@ -960,7 +846,7 @@ async def test_a_subagent_on_an_unpriced_model_never_calls_it(chat_client) -> No
     )
     conversation_id = await new_conversation(chat_client)
     await send(chat_client, conversation_id, text="Read")
-    await _run_queued_turn(chat_client)
+    await run_queued_turn(chat_client)
 
     assert (len(main), len(sub)) == (2, 0)
     result = main[1]["messages"][2]["content"][0]
@@ -977,7 +863,7 @@ async def test_a_subagent_on_an_unpriced_model_never_calls_it(chat_client) -> No
 
 @respx.mock
 async def test_a_subagent_that_spends_the_balance_stops_and_the_turn_answers(
-    make_client, tmp_path, monkeypatch
+    make_client, monkeypatch
 ) -> None:
     """docs/billing.md § A chat turn: once a subagent's call spends the balance, its tool
     calls past the allowance are not run, it reports what it has, and the turn's last call
@@ -987,7 +873,6 @@ async def test_a_subagent_that_spends_the_balance_stops_and_the_turn_answers(
     # leaves one, the subagent's call overdraws.
     client = await chatting_client(
         make_client(
-            workspaces_dir=str(tmp_path / "workspaces"),
             free_credits_per_period=4,
             credit_usd="0.00005",
             chat_overdraft_max_tool_calls=0,
@@ -1018,7 +903,7 @@ async def test_a_subagent_that_spends_the_balance_stops_and_the_turn_answers(
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Read")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     # The subagent made one call and ran none of its tools; the turn's second call is its
     # last, with no tool left to it.
@@ -1039,14 +924,13 @@ async def test_a_subagent_that_spends_the_balance_stops_and_the_turn_answers(
 @postgres_only
 @respx.mock
 async def test_a_write_waiting_when_a_subagent_spends_the_balance_is_not_started(
-    make_client, tmp_path, monkeypatch
+    make_client, monkeypatch
 ) -> None:
     """docs/billing.md § A chat turn: a tool of the round not yet started once the balance
     is spent and the allowance used answers an error result; the write already running
     finishes."""
     client = await chatting_client(
         make_client(
-            workspaces_dir=str(tmp_path / "workspaces"),
             free_credits_per_period=4,
             credit_usd="0.00005",
             chat_overdraft_max_tool_calls=0,
@@ -1108,7 +992,7 @@ async def test_a_write_waiting_when_a_subagent_spends_the_balance_is_not_started
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Write")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     assert (len(main), len(sub), writes) == (2, 1, ["a.md"])
     assert main[1]["tool_choice"] == {"type": "none"}
@@ -1164,7 +1048,7 @@ async def test_a_stop_reaches_a_subagent_inside_its_run(chat_client, monkeypatch
     respx.post(MESSAGES_URL).mock(side_effect=answer)
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Read it")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][0]["status"] == "cancelled"
@@ -1231,7 +1115,7 @@ async def test_thinking_is_replayed_only_under_the_prompt_it_was_made_under(chat
 
     async def turn(text: str) -> None:
         assert (await send(chat_client, conversation_id, text=text)).status_code == 202
-        await _run_queued_turn(chat_client)
+        await run_queued_turn(chat_client)
 
     def thinking(request: dict) -> list[str]:
         return [
@@ -1329,7 +1213,7 @@ async def test_a_drop_the_upstream_reports_cuts_the_thinking_before_it(chat_clie
     conversation_id = await new_conversation(chat_client)
     for text in ("one", "two", "three"):
         assert (await send(chat_client, conversation_id, text=text)).status_code == 202
-        await _run_queued_turn(chat_client)
+        await run_queued_turn(chat_client)
 
     def thinking(request: dict) -> list[str]:
         return [

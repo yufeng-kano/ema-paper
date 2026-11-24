@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
 from httpx import AsyncClient
 from sqlalchemy import func, select
@@ -20,20 +19,8 @@ from sightread.db.models import Document, Job
 from sightread.routes.library import DOCUMENT_NAME_MAX
 from sightread.workspace import git
 from sightread.workspace.documents import original_of
-from sightread.workspace.layout import user_root
+from tests.chat_helpers import MESSAGES_URL, assistant_turn, run_queued_turn
 from tests.conftest import CSRF_HEADERS
-from tests.test_chat import MESSAGES_URL, _run_queued_turn, assistant_turn
-
-
-@pytest.fixture
-async def writer(make_client, tmp_path) -> AsyncClient:
-    """Signed in, with a workspace of its own and no upstream connected: nothing here
-    needs one."""
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
 
 
 async def _upload_markdown(
@@ -133,10 +120,8 @@ async def test_a_markdown_type_alone_is_enough(writer) -> None:
     assert uploaded.json()["name"] == "readme.md"
 
 
-async def test_a_markdown_upload_must_be_utf8_text_under_the_content_cap(
-    make_client, tmp_path
-) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), content_max_bytes=64)
+async def test_a_markdown_upload_must_be_utf8_text_under_the_content_cap(make_client) -> None:
+    client = make_client(content_max_bytes=64)
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     uploads = Path(client.app.state.settings.upload_dir)
 
@@ -302,7 +287,7 @@ async def test_a_turn_on_a_markdown_document_edits_it_and_has_no_pages(writer) -
         headers=CSRF_HEADERS,
     )
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(writer)
+    await run_queued_turn(writer)
 
     system = requests[0]["system"][0]["text"]
     assert "Pages: none   Bbox format: none   Parsed with: not parsed (a markdown document)" in (

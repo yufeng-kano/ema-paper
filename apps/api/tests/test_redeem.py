@@ -37,7 +37,8 @@ from sightread.db.models import (
     User,
 )
 from sightread.errors import ApiError
-from tests.conftest import CSRF_HEADERS, PAY_SETTINGS, PRO_PLANS_JSON, grant_plan
+from tests.conftest import CSRF_HEADERS, PAY_SETTINGS, PRO_PLANS_JSON, grant_plan, sign_in
+from tests.factories import job_row, user_row
 from tests.test_billing import _subscription
 from tests.test_ledger import _user, settings_with
 from tests.test_library import MODEL
@@ -66,11 +67,6 @@ REDEEM = "/api/billing/redeem"
 PRINTED = re.compile(r"^EMA-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
 
 
-async def _signed_in(client: AsyncClient) -> int:
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    return (await client.get("/api/me")).json()["user"]["id"]
-
-
 async def _code(sessionmaker, settings, **grant) -> str:
     """One code as the operator would make it, printed as a user types it."""
     kind = codes.PLAN if "plan_id" in grant else codes.CREDITS
@@ -95,7 +91,7 @@ async def _redeem(client: AsyncClient, code: str):
 
 async def _another_user(sessionmaker, sub: str) -> int:
     async with sessionmaker() as db:
-        user = User(google_sub=sub, email=f"{sub}@example.test")
+        user = user_row(f"{sub}@example.test")
         db.add(user)
         await db.commit()
         return user.id
@@ -194,7 +190,7 @@ def test_a_paid_period_cuts_an_open_granted_one_and_banks_its_whole_days() -> No
 
 async def test_a_credits_code_becomes_a_pack_that_is_not_pays(make_client, sessionmaker) -> None:
     client = make_client(free_credits_per_period=100)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     settings = client.app.state.settings
     code = await _code(sessionmaker, settings, credits=500, valid_days=365, max_uses=2)
     before = datetime.now(UTC)
@@ -251,7 +247,7 @@ async def test_a_code_that_is_unknown_disabled_or_past_its_date_is_refused(
     make_client, sessionmaker
 ) -> None:
     client = make_client()
-    await _signed_in(client)
+    await sign_in(client)
     settings = client.app.state.settings
     for typed in ("", "EMA-NOPE", "EMA-AAAA-AAAA-AAAA", "x" * 64):
         answer = await _redeem(client, typed)
@@ -326,7 +322,7 @@ async def _redeem_state(sessionmaker, user_id: int) -> tuple[int, datetime | Non
 
 async def test_a_plan_code_starts_at_once_when_nothing_else_pays(make_client, sessionmaker) -> None:
     client = make_client(**PLANS, grant_period_days=30)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     settings = client.app.state.settings
     assert (await client.get("/api/me")).json()["plan"] == "free"
     code = await _code(sessionmaker, settings, plan_id="pro", days=30)
@@ -383,7 +379,7 @@ async def test_days_wait_under_a_paid_subscription_and_a_paid_period_cuts_an_ope
     make_client, sessionmaker
 ) -> None:
     client = make_client(**PLANS, grant_period_days=30)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     settings = client.app.state.settings
     await grant_plan(sessionmaker, user_id)
     code = await _code(sessionmaker, settings, plan_id="pro", days=30)
@@ -446,7 +442,7 @@ async def test_pays_subscription_banks_the_granted_days_it_starts_inside(
     the open granted period and banks its whole days then — no charge needed, so a reader
     who never parses again still has the days when the subscription lapses."""
     client = make_client(**PAY_SETTINGS, grant_period_days=30)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     settings = client.app.state.settings
     code = await _code(sessionmaker, settings, plan_id="pro", days=30)
     assert (await _redeem(client, code)).json()["period_end"] is not None
@@ -469,7 +465,7 @@ async def test_pays_subscription_banks_the_granted_days_it_starts_inside(
 
 async def test_a_code_of_another_plan_than_the_banks_is_refused(make_client, sessionmaker) -> None:
     client = make_client(kano_pay_plans_json=TWO_PLANS_JSON)
-    await _signed_in(client)
+    await sign_in(client)
     settings = client.app.state.settings
     assert (
         await _redeem(client, await _code(sessionmaker, settings, plan_id="pro", days=30))
@@ -504,26 +500,20 @@ async def test_the_claim_counts_an_open_granted_period_as_the_plan(
     from sightread.jobs.queue import claim_next_job
 
     client = make_client(**PLANS, grant_period_days=30)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     settings = client.app.state.settings
     async with sessionmaker() as db:
         for index in range(3):
             db.add(
-                Job(
-                    user_id=user_id,
-                    kind="pdf",
+                job_row(
+                    user_id,
                     filename=f"queued-{index}.pdf",
-                    media_type="application/pdf",
                     size_bytes=10,
                     sha256=str(index) * 64,
                     pages_spec="",
                     model=MODEL,
-                    agent="parse",
                     pipeline_version=1,
-                    bbox_format="yxyx_norm1000",
-                    prompt="Transcribe page {page}.",
                     status="queued",
-                    page_count=1,
                 )
             )
         await db.commit()
@@ -559,7 +549,7 @@ async def test_the_claim_counts_an_open_granted_period_as_the_plan(
 
 async def test_the_cli_creates_lists_and_disables_codes(make_client, sessionmaker, capsys) -> None:
     client = make_client(**PLANS)
-    await _signed_in(client)
+    await sign_in(client)
     settings = client.app.state.settings
 
     async def run(*argv: str) -> tuple[int, str, str]:

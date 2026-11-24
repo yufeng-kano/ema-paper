@@ -11,7 +11,6 @@ from datetime import timedelta
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
 from httpx import AsyncClient
 from sqlalchemy import delete, select, update
@@ -19,9 +18,9 @@ from sqlalchemy import delete, select, update
 from sightread.auth import upload_tickets
 from sightread.db.models import Document, Job, UploadTicket, User, utcnow
 from sightread.jobs.sweeper import purge_parses
-from tests.conftest import KANO_CHAT_URL, mcp_running
-from tests.test_parse_end_to_end import MODEL, _authorize, _drain_queue, _vision_stub
-from tests.test_retention import postgres_only
+from tests.conftest import KANO_CHAT_URL, mcp_running, postgres_only
+from tests.helpers import bearer
+from tests.test_parse_end_to_end import MODEL, _drain_queue, _vision_stub
 
 # The copy is part of the contract: it is the agent's only recovery hint (docs/auth.md § 5).
 EXPECTED_REJECTION = (
@@ -29,11 +28,6 @@ EXPECTED_REJECTION = (
     "ticket. Re-uploading the same file joins its parse while it runs and returns it once "
     "it has succeeded; a failed parse is resumed with the retry command."
 )
-
-
-@pytest.fixture
-async def api_client(make_client, sessionmaker) -> AsyncClient:
-    return await _authorize(make_client(), sessionmaker)
 
 
 async def _mint(client: AsyncClient, sessionmaker, ttl_seconds: int | None = None) -> str:
@@ -54,10 +48,6 @@ async def _upload(client: AsyncClient, token: str, path: Path, **fields) -> http
         data={"model": MODEL, **fields},
         headers={"Authorization": f"Bearer {token}"},
     )
-
-
-def _bearer(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
 
 
 async def _stored_ticket(sessionmaker) -> UploadTicket:
@@ -88,15 +78,15 @@ async def test_last_resolves_a_spent_ticket_to_its_own_job(
     job_id = (await _upload(api_client, token, documents["text_pdf"])).json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
 
-    status = await api_client.get("/v1/jobs/last", headers=_bearer(token))
+    status = await api_client.get("/v1/jobs/last", headers=bearer(token))
     assert status.status_code == 200
     assert status.json() == {**status.json(), "job_id": job_id, "status": "succeeded"}
 
-    result = await api_client.get("/v1/jobs/last/result", headers=_bearer(token))
+    result = await api_client.get("/v1/jobs/last/result", headers=bearer(token))
     assert result.status_code == 200
     assert result.json()["meta"]["job_id"] == job_id
 
-    markdown = await api_client.get("/v1/jobs/last/result.md", headers=_bearer(token))
+    markdown = await api_client.get("/v1/jobs/last/result.md", headers=bearer(token))
     assert markdown.status_code == 200
     assert markdown.headers["content-type"].startswith("text/markdown")
     assert markdown.text.startswith("<!-- page: 1 -->\n")
@@ -113,7 +103,7 @@ async def test_last_with_an_unspent_ticket_says_it_has_started_no_parse(
     # refused, or never sent, while this ticket can still upload (docs/auth.md § 5).
     token = await _mint(api_client, sessionmaker)
     for path in ("/v1/jobs/last", "/v1/jobs/last/result.md", "/v1/jobs/last/figures/1/0,0,9,9"):
-        response = await api_client.get(path, headers=_bearer(token))
+        response = await api_client.get(path, headers=bearer(token))
         assert response.status_code == 409, path
         assert "has not started a parse" in response.json()["error"]["message"]
 
@@ -139,8 +129,8 @@ async def test_a_spent_ticket_reads_its_own_job_and_nothing_else(
     job_id = (await _upload(api_client, token, documents["text_pdf"])).json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
 
-    status = await api_client.get(f"/v1/jobs/{job_id}", headers=_bearer(token))
-    result = await api_client.get(f"/v1/jobs/{job_id}/result", headers=_bearer(token))
+    status = await api_client.get(f"/v1/jobs/{job_id}", headers=bearer(token))
+    result = await api_client.get(f"/v1/jobs/{job_id}/result", headers=bearer(token))
 
     assert status.status_code == 200
     assert status.json()["status"] == "succeeded"
@@ -149,7 +139,7 @@ async def test_a_spent_ticket_reads_its_own_job_and_nothing_else(
 
     frames = []
     async with api_client.stream(
-        "GET", f"/v1/jobs/{job_id}/events", headers=_bearer(token)
+        "GET", f"/v1/jobs/{job_id}/events", headers=bearer(token)
     ) as response:
         assert response.status_code == 200
         async for line in response.aiter_lines():
@@ -164,7 +154,7 @@ async def test_a_spent_ticket_reads_its_own_job_and_nothing_else(
             data={"model": MODEL},
         )
     ).json()["job_id"]
-    stranger_read = await api_client.get(f"/v1/jobs/{other}", headers=_bearer(token))
+    stranger_read = await api_client.get(f"/v1/jobs/{other}", headers=bearer(token))
     assert stranger_read.status_code == 401
     assert stranger_read.json()["error"]["message"] == EXPECTED_REJECTION
 
@@ -177,7 +167,7 @@ async def test_an_unspent_ticket_cannot_read_a_job(api_client, sessionmaker, doc
     )
     token = await _mint(api_client, sessionmaker)
 
-    response = await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}", headers=_bearer(token))
+    response = await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}", headers=bearer(token))
 
     assert response.status_code == 401
     assert response.json()["error"]["message"] == EXPECTED_REJECTION
@@ -192,7 +182,7 @@ async def test_an_expired_ticket_is_refused_everywhere(api_client, sessionmaker,
     )
 
     upload = await _upload(api_client, expired, documents["mixed_pdf"])
-    read = await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}", headers=_bearer(expired))
+    read = await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}", headers=bearer(expired))
 
     assert upload.status_code == 401
     assert upload.json()["error"]["message"] == EXPECTED_REJECTION
@@ -209,11 +199,11 @@ async def test_an_unknown_ticket_is_refused(api_client, documents) -> None:
 async def test_a_ticket_is_not_a_credential_anywhere_else(api_client, sessionmaker) -> None:
     token = await _mint(api_client, sessionmaker)
 
-    models = await api_client.get("/v1/models", headers=_bearer(token))
+    models = await api_client.get("/v1/models", headers=bearer(token))
     async with mcp_running(api_client):
         mcp = await api_client.post(
             "/mcp",
-            headers={**_bearer(token), "Accept": "application/json, text/event-stream"},
+            headers={**bearer(token), "Accept": "application/json, text/event-stream"},
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         )
 
@@ -231,7 +221,7 @@ async def test_an_upload_that_fails_before_a_job_exists_keeps_the_ticket(
     refused = await api_client.post(
         "/v1/parse",
         files={"nope": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        headers=_bearer(token),
+        headers=bearer(token),
     )
     assert refused.status_code == 400
     assert (await _stored_ticket(sessionmaker)).spent_at is None
@@ -266,8 +256,8 @@ async def test_a_dedup_hit_binds_the_ticket_to_the_cached_job(
     assert str(ticket.job_id) == job_id
     assert ticket.spent_at is not None
     # The reads the ticket now allows are the cached job's.
-    assert (await api_client.get(f"/v1/jobs/{job_id}", headers=_bearer(token))).status_code == 200
-    result = await api_client.get(f"/v1/jobs/{job_id}/result", headers=_bearer(token))
+    assert (await api_client.get(f"/v1/jobs/{job_id}", headers=bearer(token))).status_code == 200
+    result = await api_client.get(f"/v1/jobs/{job_id}/result", headers=bearer(token))
     assert result.status_code == 200
     assert result.json()["markdown"]
 
@@ -307,7 +297,7 @@ async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads
         await db.execute(delete(Document).where(Document.job_id == job_id))
         await db.commit()
     assert await purge_parses(sessionmaker, settings) == 0
-    fetched = await api_client.get("/v1/jobs/last/result", headers=_bearer(token))
+    fetched = await api_client.get("/v1/jobs/last/result", headers=bearer(token))
     assert fetched.status_code == 200, fetched.text
 
     async with sessionmaker() as db:

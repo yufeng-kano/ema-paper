@@ -31,12 +31,18 @@ from sightread.db.models import (
 from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_turn, fail_turn
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, PRO_PLANS_JSON, TEST_MODEL_PRICES, grant_plan
-from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn, sse
-from tests.test_jobs_queue import postgres_only
-from tests.test_library import _read, _ready_to_parse, _upload
-
-pytestmark = pytest.mark.usefixtures("documents")
+from tests.chat_helpers import MESSAGES_URL, assistant_turn, seed_document, sse
+from tests.conftest import (
+    CSRF_HEADERS,
+    PRO_PLANS_JSON,
+    TEST_MODEL_PRICES,
+    grant_plan,
+    postgres_only,
+    sign_in,
+)
+from tests.factories import job_row, user_row
+from tests.helpers import read_library
+from tests.test_library import _ready_to_parse, _upload
 
 
 def settings_with(**overrides) -> Settings:
@@ -52,7 +58,7 @@ def settings_with(**overrides) -> Settings:
 
 async def _user(sessionmaker) -> int:
     async with sessionmaker() as db:
-        user = User(google_sub="ledger-user", email="ledger@example.test")
+        user = user_row("ledger@example.test")
         db.add(user)
         await db.commit()
         return user.id
@@ -78,19 +84,14 @@ async def test_two_parses_racing_for_the_last_credits(sessionmaker) -> None:
         async with sessionmaker() as db:
             await started.wait()
             await db.execute(select(User.id).where(User.id == user_id).with_for_update())
-            job = Job(
-                user_id=user_id,
-                agent="parse",
+            job = job_row(
+                user_id,
                 kind="image",
                 filename="a.png",
                 media_type="image/png",
-                size_bytes=1,
                 sha256="x",
                 status="queued",
                 model="m",
-                bbox_format="yxyx_norm1000",
-                prompt="Transcribe page {page}.",
-                page_count=1,
                 pages_done=0,
             )
             db.add(job)
@@ -116,33 +117,25 @@ async def test_settlement_is_idempotent_and_a_release_restores_the_balance(sessi
     settings = settings_with(free_credits_per_period=10)
     user_id = await _user(sessionmaker)
     async with sessionmaker() as db:
-        kept = Job(
-            user_id=user_id,
-            agent="parse",
+        kept = job_row(
+            user_id,
             kind="image",
             filename="a.png",
             media_type="image/png",
-            size_bytes=1,
             sha256="x",
             status="running",
             model="m",
-            bbox_format="yxyx_norm1000",
-            prompt="Transcribe page {page}.",
             page_count=3,
             pages_done=0,
         )
-        lost = Job(
-            user_id=user_id,
-            agent="parse",
+        lost = job_row(
+            user_id,
             kind="image",
             filename="b.png",
             media_type="image/png",
-            size_bytes=1,
             sha256="y",
             status="running",
             model="m",
-            bbox_format="yxyx_norm1000",
-            prompt="Transcribe page {page}.",
             page_count=4,
             pages_done=0,
         )
@@ -272,7 +265,7 @@ async def test_the_balances_of_many_accounts_read_as_each_account_alone(sessionm
     settings = settings_with(kano_pay_plans_json=PRO_PLANS_JSON)
     now = utcnow()
     async with sessionmaker() as db:
-        users = [User(google_sub=f"many-{n}", email=f"many-{n}@example.test") for n in range(4)]
+        users = [user_row(f"many-{n}@example.test") for n in range(4)]
         db.add_all(users)
         await db.commit()
     fresh, used, paid, banked = ids = [user.id for user in users]
@@ -375,7 +368,7 @@ async def test_an_upload_the_balance_cannot_cover_is_refused_and_not_stored(
     assert error["type"] == "insufficient_credits"
     assert (error["need"], error["remaining"]) == (1, 0)
     assert error["period_end"]
-    assert (await _read(client))["documents"] == []
+    assert (await read_library(client))["documents"] == []
     assert not list((tmp_path / "uploads").glob("*.png"))
     async with client.app.state.sessionmaker() as db:
         assert (await db.execute(select(Job))).scalars().all() == []
@@ -402,17 +395,16 @@ async def test_an_upload_reserves_its_pages_and_its_entry_shows_the_settled_cost
         assert await ledger.credits_by_job(db, [job_id]) == {job_id: 1}
 
 
-async def test_a_send_without_the_minimum_balance_is_refused(make_client, tmp_path) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "workspaces"), free_credits_per_period=0)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
+async def test_a_send_without_the_minimum_balance_is_refused(make_client) -> None:
+    client = make_client(free_credits_per_period=0)
+    user_id = (await sign_in(client)).user_id
     chosen = await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},
         headers=CSRF_HEADERS,
     )
     assert chosen.status_code == 200, chosen.text
-    document_id = await _seed_document(client, user_id)
+    document_id = await seed_document(client, user_id)
     created = await client.post(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )
@@ -426,12 +418,11 @@ async def test_a_send_without_the_minimum_balance_is_refused(make_client, tmp_pa
     assert (await client.get(f"/api/conversations/{conversation_id}")).json()["messages"] == []
 
 
-async def test_a_send_into_a_full_workspace_is_refused(make_client, tmp_path) -> None:
+async def test_a_send_into_a_full_workspace_is_refused(make_client) -> None:
     # One byte of storage: the seeded document alone fills it.
-    client = make_client(workspaces_dir=str(tmp_path / "workspaces"), free_storage_bytes=1)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    document_id = await _seed_document(client, user_id)
+    client = make_client(free_storage_bytes=1)
+    user_id = (await sign_in(client)).user_id
+    document_id = await seed_document(client, user_id)
     created = await client.post(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )
@@ -451,7 +442,7 @@ async def test_a_send_into_a_full_workspace_is_refused(make_client, tmp_path) ->
 @pytest.mark.parametrize("granted", [1, 6])
 @pytest.mark.parametrize("last_stop", ["end_turn", "tool_use"])
 async def test_a_turn_that_runs_out_of_credits_finishes_within_the_allowance(
-    make_client, tmp_path, monkeypatch, granted: int, last_stop: str
+    make_client, monkeypatch, granted: int, last_stop: str
 ) -> None:
     """docs/billing.md § A chat turn: once the balance is spent the turn runs at most
     `CHAT_OVERDRAFT_MAX_TOOL_CALLS` more tool calls, then its last call goes with no tool
@@ -460,19 +451,17 @@ async def test_a_turn_that_runs_out_of_credits_finishes_within_the_allowance(
     # credit is 6 credits: the first call overdraws a period of one credit, and spends a
     # period of six to exactly zero. Two calls are 11, rounded once for the turn.
     client = make_client(
-        workspaces_dir=str(tmp_path / "workspaces"),
         free_credits_per_period=granted,
         credit_usd="0.0001",
         chat_overdraft_max_tool_calls=2,
     )
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    user_id = (await sign_in(client)).user_id
     await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},
         headers=CSRF_HEADERS,
     )
-    document_id = await _seed_document(client, user_id)
+    document_id = await seed_document(client, user_id)
     created = await client.post(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )
@@ -551,21 +540,20 @@ async def test_a_turn_that_runs_out_of_credits_finishes_within_the_allowance(
 
 @respx.mock
 async def test_a_call_stopped_mid_stream_is_charged_for_what_it_streamed(
-    make_client, tmp_path, monkeypatch
+    make_client, monkeypatch
 ) -> None:
     """docs/billing.md § A chat turn: a Stop pressed with the answer on screen, before its
     stream ends, cuts the call short; the call is still charged — the input its
     message_start reported and the output that streamed — though none of it is kept."""
     monkeypatch.setattr(chat_runner, "CANCEL_POLL_SECONDS", 0.05)
-    client = make_client(workspaces_dir=str(tmp_path / "workspaces"), credit_usd="0.0001")
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    client = make_client(credit_usd="0.0001")
+    user_id = (await sign_in(client)).user_id
     await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},
         headers=CSRF_HEADERS,
     )
-    document_id = await _seed_document(client, user_id)
+    document_id = await seed_document(client, user_id)
     created = await client.post(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )
@@ -629,13 +617,10 @@ async def test_a_call_stopped_mid_stream_is_charged_for_what_it_streamed(
     assert (await client.get("/api/billing")).json()["period"]["spent"] == 15
 
 
-async def test_a_turn_queued_before_the_workspace_filled_fails_storage_full(
-    make_client, tmp_path
-) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "workspaces"), free_storage_bytes=1 << 20)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    document_id = await _seed_document(client, user_id)
+async def test_a_turn_queued_before_the_workspace_filled_fails_storage_full(make_client) -> None:
+    client = make_client(free_storage_bytes=1 << 20)
+    user_id = (await sign_in(client)).user_id
+    document_id = await seed_document(client, user_id)
     created = await client.post(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )

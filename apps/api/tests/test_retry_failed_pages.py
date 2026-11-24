@@ -22,10 +22,11 @@ from sqlalchemy import select, update
 
 from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.billing import ledger
-from sightread.db.models import CreditPeriod, Document, Job, JobPage, UsageLog, User
+from sightread.db.models import CreditPeriod, Document, Job, JobPage, UsageLog
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload
+from tests.factories import user_row
 from tests.test_library import MODEL, _ready_to_parse
 from tests.test_library_trash import _fail_next_commit
 from tests.test_parse_end_to_end import VISION_MARKDOWN, _drain_queue
@@ -61,10 +62,10 @@ class Upstream:
 
 
 @pytest.fixture
-async def library(make_client, tmp_path) -> AsyncClient:
+async def library(make_client) -> AsyncClient:
     """A signed-in client that can parse, whose library keeps originals under tmp_path."""
     # The deployment names a fallback, the model a retry may send failed pages to.
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), parse_fallback_model=FALLBACK)
+    client = make_client(parse_fallback_model=FALLBACK)
     await _ready_to_parse(client)
     return client
 
@@ -91,9 +92,9 @@ async def _retry(client: AsyncClient, document_id: int, **body) -> httpx.Respons
     )
 
 
-async def _with_fallback(make_client, tmp_path, fallback: str | None, auto_fallback: bool):
+async def _with_fallback(make_client, fallback: str | None, auto_fallback: bool):
     """A library on a deployment that names `fallback`, the reader's switch set."""
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), parse_fallback_model=fallback or "")
+    client = make_client(parse_fallback_model=fallback or "")
     await _ready_to_parse(client)
     switched = await client.put(
         "/api/agents/parse/settings", json={"auto_fallback": auto_fallback}, headers=CSRF_HEADERS
@@ -171,14 +172,13 @@ async def test_a_retry_sends_only_the_failed_pages_and_keeps_the_rest(
 
 @respx.mock
 async def test_a_retry_takes_the_credits_back_and_the_document_is_charged_once(
-    make_client, tmp_path, sessionmaker, documents
+    make_client, sessionmaker, documents
 ) -> None:
     """docs/billing.md § A parse: a failure releases the parse's credits, and a retry
     reserves them again — refused 402, with nothing requeued, when the balance cannot
     cover them — so a job that keeps failing costs nothing and the run that succeeds is
     the one charge."""
     client = make_client(
-        workspaces_dir=str(tmp_path / "ws"),
         parse_fallback_model=FALLBACK,
         free_credits_per_period=3,
     )
@@ -240,13 +240,13 @@ async def test_only_a_failed_parse_with_its_original_can_be_retried(
         job = await db.get(Job, uuid.UUID(uploaded["job_id"]))
         job.status = "failed"
         root = user_root(library.app.state.settings.workspaces_dir, job.user_id)
-        other = User(google_sub="stranger", email="stranger@example.com")
+        other = user_row("stranger@example.com")
         db.add(other)
         await db.flush()
         token = await create_session(db, other)
         await db.commit()
     # Another account's document is not there at all.
-    stranger = make_client(workspaces_dir=library.app.state.settings.workspaces_dir)
+    stranger = make_client()
     stranger.cookies.set(SESSION_COOKIE, token)
     assert (await _retry(stranger, uploaded["id"])).status_code == 404
     assert (await stranger.get(f"/api/library/documents/{uploaded['id']}/pages")).status_code == 404
@@ -370,11 +370,11 @@ async def test_a_page_already_transcribed_is_not_sent_again(
 
 @respx.mock
 async def test_a_blocked_page_goes_to_the_fallback_when_it_is_switched_on(
-    make_client, tmp_path, sessionmaker, documents
+    make_client, sessionmaker, documents
 ) -> None:
     upstream = Upstream({(MODEL, 1): lambda: _answer("", "content_filter")})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    library = await _with_fallback(make_client, tmp_path, FALLBACK, True)
+    library = await _with_fallback(make_client, FALLBACK, True)
     uploaded = await _upload(library, documents["png"], "image/png")
     await _drain_queue(library, sessionmaker)
 
@@ -404,11 +404,11 @@ async def test_a_blocked_page_goes_to_the_fallback_when_it_is_switched_on(
     ],
 )
 async def test_a_page_the_model_stopped_fails_the_job_after_one_call(
-    make_client, tmp_path, sessionmaker, documents, finish_reason, reason, settings
+    make_client, sessionmaker, documents, finish_reason, reason, settings
 ) -> None:
     upstream = Upstream({(MODEL, 1): lambda: _answer("half a page", finish_reason)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    library = await _with_fallback(make_client, tmp_path, *settings)
+    library = await _with_fallback(make_client, *settings)
     uploaded = await _upload(library, documents["png"], "image/png")
     await _drain_queue(library, sessionmaker)
 
@@ -426,7 +426,7 @@ async def test_a_page_the_model_stopped_fails_the_job_after_one_call(
 
 @respx.mock
 async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
-    make_client, tmp_path, sessionmaker, documents
+    make_client, sessionmaker, documents
 ) -> None:
     upstream = Upstream(
         {
@@ -435,7 +435,7 @@ async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
         }
     )
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    library = await _with_fallback(make_client, tmp_path, FALLBACK, True)
+    library = await _with_fallback(make_client, FALLBACK, True)
     uploaded = await _upload(library, documents["png"], "image/png")
     await _drain_queue(library, sessionmaker)
 
@@ -455,9 +455,7 @@ async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
 # --- settings --------------------------------------------------------------------------------
 
 
-async def test_the_fallback_switch_is_the_parse_agents_alone(
-    library, make_client, tmp_path
-) -> None:
+async def test_the_fallback_switch_is_the_parse_agents_alone(library, make_client) -> None:
     """The switch is the reader's; the fallback model is the deployment's, a fact
     (docs/api.md § GET /api/agents)."""
     saved = await library.put(
@@ -475,7 +473,7 @@ async def test_the_fallback_switch_is_the_parse_agents_alone(
     assert switch.status_code == 400
 
     # A deployment naming no fallback: the switch is kept, with nowhere to send a page.
-    unnamed = await _with_fallback(make_client, tmp_path, None, True)
+    unnamed = await _with_fallback(make_client, None, True)
     parse = next(
         a for a in (await unnamed.get("/api/agents")).json()["agents"] if a["name"] == "parse"
     )

@@ -23,8 +23,9 @@ from sightread.agents.bbox import (
     prepare_image,
 )
 from sightread.parsing.images import JPEG_QUALITY, image_size
-from sightread.upstream.client import Connection, transcribe_page
-from tests.conftest import CSRF_HEADERS, KANO_BASE, KANO_CHAT_URL
+from sightread.upstream.client import transcribe_page
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
+from tests.helpers import stub_connection
 
 SECRET = "test-secret-key-not-a-real-one"
 
@@ -117,13 +118,6 @@ def test_only_claude_gets_a_pre_resized_image(documents) -> None:
     wide_jpg.unlink()
 
 
-def _key() -> Connection:
-    return Connection(
-        api_key="sk-kano-proxy-test",
-        base_url=f"{KANO_BASE}/openai/v1",
-    )
-
-
 @respx.mock
 async def test_a_pixel_model_is_asked_in_pixels_and_answers_in_the_contract(documents) -> None:
     width, height = image_size(documents["png"])
@@ -144,7 +138,7 @@ async def test_a_pixel_model_is_asked_in_pixels_and_answers_in_the_contract(docu
     )
 
     result = await transcribe_page(
-        _key(),
+        stub_connection(),
         "openai/gpt-6",
         "Page {page}. {bbox_instructions} Id: {bbox_format}.",
         documents["png"],
@@ -175,7 +169,7 @@ async def test_a_normalized_model_keeps_the_original_contract_wording(documents)
         )
     )
     result = await transcribe_page(
-        _key(),
+        stub_connection(),
         "google/gemini-2.5-flash",
         "{bbox_instructions} Id: {bbox_format}.",
         documents["png"],

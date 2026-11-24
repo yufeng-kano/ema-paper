@@ -26,13 +26,8 @@ from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.config import Settings
 from sightread.db.models import AuditLog, Group, GroupMember, User, UserSession, utcnow
 from sightread.routes import admin as admin_routes
-from tests.conftest import CSRF_HEADERS, DATABASE_URL
+from tests.conftest import CSRF_HEADERS, postgres_only, sign_in
 from tests.test_oauth_as import _connected
-
-postgres_only = pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="foreign-key actions and row locks need PostgreSQL",
-)
 
 # The dev login signs in as dev@localhost, counted as verified (docs/auth.md § 1).
 OWNERS = "dev@localhost"
@@ -41,9 +36,7 @@ OWNERS = "dev@localhost"
 async def _owner(make_client, **settings) -> AsyncClient:
     """The dev login on a console whose OWNER_EMAILS lists it: an owner."""
     client = make_client(**{"owner_emails": OWNERS, **settings})
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    return client
+    return await sign_in(client)
 
 
 async def _account(make_client, email: str, name: str | None = None, **settings) -> AsyncClient:
@@ -1357,11 +1350,9 @@ async def test_console_mutations_require_the_custom_header(
 
 
 @postgres_only
-async def test_deleting_an_account_takes_its_memberships_and_keeps_its_records(
-    make_client, tmp_path
-) -> None:
-    owner = await _owner(make_client, workspaces_dir=str(tmp_path / "ws"))
-    member = await _account(make_client, "member@example.test", workspaces_dir=str(tmp_path / "ws"))
+async def test_deleting_an_account_takes_its_memberships_and_keeps_its_records(make_client) -> None:
+    owner = await _owner(make_client)
+    member = await _account(make_client, "member@example.test")
     group = await _group(owner, "ops", ["audit.read"])
     await _add(owner, group["id"], user_id=member.user_id)
     await _add(owner, group["id"], user_id=owner.user_id)

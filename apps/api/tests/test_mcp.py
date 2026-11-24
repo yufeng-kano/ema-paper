@@ -13,7 +13,6 @@ from contextlib import asynccontextmanager
 from datetime import timedelta
 
 import httpx2
-import pytest
 from httpx import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -22,16 +21,9 @@ from sqlalchemy import select
 from sightread.auth.crypto import hash_token
 from sightread.auth.upload_tickets import TICKET_PREFIX
 from sightread.db.models import UploadTicket, User, utcnow
-from tests.conftest import mcp_running
-from tests.test_parse_end_to_end import _authorize
+from tests.conftest import api_key_client, mcp_running
 
 BASE_URL = "https://testserver"
-
-
-@pytest.fixture
-async def api_client(make_client, sessionmaker) -> AsyncClient:
-    """A client holding an API key, exactly like REST tests."""
-    return await _authorize(make_client(), sessionmaker)
 
 
 @asynccontextmanager
@@ -190,8 +182,8 @@ async def test_every_call_mints_a_fresh_ticket(api_client: AsyncClient) -> None:
         assert (await _mint(session))["token"] != (await _mint(session))["token"]
 
 
-async def test_the_mint_rate_limit_trips_at_the_configured_count(make_client, sessionmaker) -> None:
-    client = await _authorize(make_client(upload_ticket_rate_per_hour=2), sessionmaker)
+async def test_the_mint_rate_limit_trips_at_the_configured_count(make_client) -> None:
+    client = await api_key_client(make_client(upload_ticket_rate_per_hour=2))
 
     async with mcp_running(client), _mcp_session(client) as session:
         await _mint(session)
@@ -239,14 +231,10 @@ async def test_an_invalid_token_never_reaches_a_tool(api_client: AsyncClient) ->
     assert 'error="invalid_token"' in response.headers["WWW-Authenticate"]
 
 
-async def test_the_models_listed_are_the_parse_agents_with_the_fallback_second(
-    make_client, sessionmaker
-) -> None:
+async def test_the_models_listed_are_the_parse_agents_with_the_fallback_second(make_client) -> None:
     # The connector cannot read `GET /v1/models` with its ticket, so the tool hands over
     # the ids `-F model=` takes — the fallback a retry sends a blocked page to among them.
-    client = await _authorize(
-        make_client(parse_fallback_model="vendor/fallback-model"), sessionmaker
-    )
+    client = await api_key_client(make_client(parse_fallback_model="vendor/fallback-model"))
     async with mcp_running(client), _mcp_session(client) as session:
         payload = await _mint(session)
     assert payload["models"] == [client.app.state.settings.parse_model, "vendor/fallback-model"]

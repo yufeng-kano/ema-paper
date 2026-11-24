@@ -13,41 +13,24 @@ import uuid
 from pathlib import Path
 
 import httpx
-import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
 from sightread.auth.sessions import SESSION_COOKIE, create_session
-from sightread.db.models import Document, Folder, Job, User
+from sightread.db.models import Document, Folder, Job
 from sightread.jobs import chat_tools, sweeper
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git, safe_io
 from sightread.workspace.documents import original_of
-from sightread.workspace.layout import sources_dir, trash_root, user_root
+from sightread.workspace.layout import sources_dir, trash_root
 from sightread.workspace.reconcile import reconcile_user
-from tests.conftest import CSRF_HEADERS, image_view
+from tests.conftest import CSRF_HEADERS, image_view, sign_in
+from tests.factories import user_row
+from tests.helpers import post_folder, read_library
 from tests.test_library import _upload_markdown
 
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 OCTET = "application/octet-stream"
-
-
-@pytest.fixture
-async def writer(make_client, tmp_path) -> AsyncClient:
-    """Signed in, with a workspace of its own; the parse agent can enqueue."""
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
-
-
-async def _folder(client: AsyncClient, name: str, parent_id: int | None = None) -> dict:
-    response = await client.post(
-        "/api/library/folders", json={"name": name, "parent_id": parent_id}, headers=CSRF_HEADERS
-    )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 async def _upload(
@@ -69,12 +52,6 @@ async def _kept(client: AsyncClient, name: str, data: bytes, media_type: str) ->
     response = await _upload(client, name, data, media_type)
     assert response.status_code == 201, response.text
     assert response.json()["kind"] == "file"
-    return response.json()
-
-
-async def _read(client: AsyncClient) -> dict:
-    response = await client.get("/api/library")
-    assert response.status_code == 200, response.text
     return response.json()
 
 
@@ -113,7 +90,7 @@ def _multipart(name: str, media_type: str, chunks: list[bytes]) -> tuple[dict, o
 
 
 async def test_a_file_of_any_kind_is_kept_once_in_the_tree(writer) -> None:
-    work = await _folder(writer, "Work")
+    work = await post_folder(writer, "Work")
     data = b"PK\x03\x04" + b"\0" * 64 + b"report"
     created = await _upload(writer, "report.docx", data, DOCX, work["id"])
     assert created.status_code == 201, created.text
@@ -132,7 +109,7 @@ async def test_a_file_of_any_kind_is_kept_once_in_the_tree(writer) -> None:
     assert [entry.name for entry in (writer.root / "files" / "Work").iterdir()] == ["report.docx"]
     assert [entry.name for entry in (writer.root / "files").iterdir()] == ["Work"]
     assert original_of(writer.root, body["id"]) is None
-    listed = (await _read(writer))["documents"]
+    listed = (await read_library(writer))["documents"]
     assert [(row["id"], row["kind"], row["media_type"], row["size_bytes"]) for row in listed] == [
         (body["id"], "file", DOCX, len(data))
     ]
@@ -230,16 +207,16 @@ async def test_the_file_route_is_the_owners_and_a_documents_is_not_a_file(
     created = await _kept(writer, "notes.txt", b"mine", "text/plain")
     markdown = (await _upload_markdown(writer)).json()
     assert (await writer.get(f"/api/library/documents/{markdown['id']}/file")).status_code == 404
-    stranger = make_client(workspaces_dir=writer.app.state.settings.workspaces_dir)
+    stranger = make_client()
     async with writer.app.state.sessionmaker() as db:
-        other = User(google_sub="stranger", email="stranger@example.com")
+        other = user_row("stranger@example.com")
         db.add(other)
         await db.flush()
         token = await create_session(db, other)
         await db.commit()
     stranger.cookies.set(SESSION_COOKIE, token)
     assert (await stranger.get(f"/api/library/documents/{created['id']}/file")).status_code == 404
-    signed_out = make_client(workspaces_dir=writer.app.state.settings.workspaces_dir)
+    signed_out = make_client()
     assert (await signed_out.get(f"/api/library/documents/{created['id']}/file")).status_code == 401
 
 
@@ -249,7 +226,7 @@ async def test_the_file_route_is_the_owners_and_a_documents_is_not_a_file(
 async def test_the_switch_keeps_a_pdf_as_a_file_and_this_origin_may_frame_it(
     writer, documents
 ) -> None:
-    # Off until the reader turns it on (since 2026-10-26), and `GET /api/me` says which,
+    # Off until the reader turns it on, and `GET /api/me` says which,
     # so the Files page applies the cap the server will (docs/web.md § Files).
     assert (await writer.get("/api/me")).json()["auto_convert"] is False
     pdf = documents["text_pdf"].read_bytes()
@@ -325,7 +302,7 @@ async def test_a_kept_image_is_converted_into_a_document_on_request(writer, docu
     assert job.check_model is not None  # a Files upload's check comes with the conversion
     assert (await writer.get(f"/api/library/documents/{kept['id']}/file")).status_code == 404
     assert (await _convert(writer, kept["id"])).status_code == 404
-    listed = (await _read(writer))["documents"]
+    listed = (await read_library(writer))["documents"]
     assert [(row["id"], row["kind"], row["status"]) for row in listed] == [
         (kept["id"], "image", "queued")
     ]
@@ -370,12 +347,10 @@ async def test_a_conversion_names_only_the_parse_agents_models(writer, documents
 
 
 async def test_a_file_the_plan_cannot_hold_is_refused_before_or_after_its_bytes(
-    make_client, tmp_path
+    make_client,
 ) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), free_storage_bytes=64)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    root = user_root(client.app.state.settings.workspaces_dir, user_id)
+    client = make_client(free_storage_bytes=64)
+    root = (await sign_in(client)).root
     # Declared up front: refused before a byte is written.
     refused = await _upload(client, "big.bin", b"x" * 100, OCTET)
     assert refused.status_code == 409, refused.text
@@ -391,13 +366,9 @@ async def test_a_file_the_plan_cannot_hold_is_refused_before_or_after_its_bytes(
         assert (await db.execute(select(Document))).scalars().all() == []
 
 
-async def test_a_file_past_the_cap_is_refused_while_it_streams(
-    make_client, tmp_path, documents
-) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), file_max_bytes=1024)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    root = user_root(client.app.state.settings.workspaces_dir, user_id)
+async def test_a_file_past_the_cap_is_refused_while_it_streams(make_client, documents) -> None:
+    client = make_client(file_max_bytes=1024)
+    root = (await sign_in(client)).root
     limits = (await client.get("/api/me")).json()["limits"]
     assert limits["file_max_bytes"] == 1024
 
@@ -490,8 +461,8 @@ async def test_an_upload_without_a_file_part_or_with_two_is_refused(writer) -> N
 
 
 async def test_a_file_is_renamed_moved_copied_trashed_and_put_back(writer) -> None:
-    drafts = await _folder(writer, "Drafts")
-    archive = await _folder(writer, "Archive")
+    drafts = await post_folder(writer, "Drafts")
+    archive = await post_folder(writer, "Archive")
     data = b"alpha\nbeta\n"
     created = (await _upload(writer, "notes.txt", data, "text/plain", drafts["id"])).json()
     base = f"/api/library/documents/{created['id']}"
@@ -529,7 +500,7 @@ async def test_a_file_is_renamed_moved_copied_trashed_and_put_back(writer) -> No
     assert entry.is_file() and entry.read_bytes() == data
     assert not (writer.root / "files" / "Archive" / "todo.txt").exists()
     assert (await writer.get(f"{base}/file")).status_code == 404
-    library = await _read(writer)
+    library = await read_library(writer)
     assert [row["id"] for row in library["trash"]["documents"]] == [created["id"]]
     assert [row["id"] for row in library["documents"]] == [made["id"]]
 
@@ -544,7 +515,7 @@ async def test_a_file_is_renamed_moved_copied_trashed_and_put_back(writer) -> No
     deleted = await writer.delete(base, headers=CSRF_HEADERS)
     assert deleted.status_code == 204, deleted.text
     assert not entry.exists()
-    assert [row["id"] for row in (await _read(writer))["documents"]] == [made["id"]]
+    assert [row["id"] for row in (await read_library(writer))["documents"]] == [made["id"]]
 
 
 async def test_reconciliation_follows_a_file_the_shell_made_moved_and_removed(writer) -> None:
@@ -587,7 +558,7 @@ async def test_reconciliation_follows_a_file_the_shell_made_moved_and_removed(wr
     assert (writer.root / "files" / "_.env").is_file()
     assert not (writer.root / "files" / ".env").exists()
     assert (writer.root / "files" / f"{safe_io.TEMP_PREFIX}deadbeef").is_file()
-    listed = {row["name"]: row for row in (await _read(writer))["documents"]}
+    listed = {row["name"]: row for row in (await read_library(writer))["documents"]}
     assert (listed["data.csv"]["kind"], listed["data.csv"]["size_bytes"]) == ("file", 8)
     served = await writer.get(f"/api/library/documents/{csv.id}/file")
     assert served.status_code == 200 and served.content == b"a,b\n1,2\n"
@@ -621,7 +592,7 @@ async def test_reconciliation_puts_back_a_file_a_crashed_delete_left_aside(write
     # Back where its row says, and the row kept: the tree is read again after a restore.
     assert (writer.root / "files" / "notes.txt").read_bytes() == b"keep me\n"
     assert [name for name in os.listdir(writer.root) if name.startswith(safe_io.TEMP_PREFIX)] == []
-    rows = (await _read(writer))["documents"]
+    rows = (await read_library(writer))["documents"]
     assert [(row["id"], row["kind"], row["size_bytes"]) for row in rows] == [
         (kept["id"], "file", 8)
     ]
@@ -647,7 +618,7 @@ async def test_reconciliation_sweeps_the_file_a_committed_conversion_left_aside(
     # Swept, not put back over the document's place.
     assert not (writer.root / "files" / "tiny.png").exists()
     assert [name for name in os.listdir(writer.root) if name.startswith(safe_io.TEMP_PREFIX)] == []
-    rows = (await _read(writer))["documents"]
+    rows = (await read_library(writer))["documents"]
     assert [(row["id"], row["kind"]) for row in rows] == [(kept["id"], "image")]
 
 
@@ -669,7 +640,7 @@ async def test_a_file_the_trash_holds_keeps_its_row(writer) -> None:
     bytes wait in the Trash, and the repair rule cannot return them. The rows are not
     deleted as missing — the rule would then remove the bytes as nobody's."""
     settings = writer.app.state.settings
-    shell = await _folder(writer, "Shell")
+    shell = await post_folder(writer, "Shell")
     kept = await _kept(writer, "notes.txt", b"kept", "text/plain")
     inside = await _upload(writer, "data.csv", b"a,b\n", "text/csv", shell["id"])
     assert inside.status_code == 201, inside.text
@@ -683,7 +654,7 @@ async def test_a_file_the_trash_holds_keeps_its_row(writer) -> None:
     async def reconciled() -> list[tuple[int, str, int]]:
         async with writer.app.state.sessionmaker() as db:
             await reconcile_user(db, settings, writer.user_id)
-        rows = (await _read(writer))["documents"]
+        rows = (await read_library(writer))["documents"]
         return sorted((row["id"], row["name"], row["size_bytes"]) for row in rows)
 
     expected = sorted([(kept["id"], "notes.txt", 4), (inside.json()["id"], "data.csv", 4)])
@@ -699,14 +670,10 @@ async def test_a_file_the_trash_holds_keeps_its_row(writer) -> None:
     assert list(trash.iterdir()) == []
 
 
-async def test_the_staging_file_of_an_upload_the_process_died_in_is_swept(
-    make_client, tmp_path
-) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), free_storage_bytes=1_000_000)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
+async def test_the_staging_file_of_an_upload_the_process_died_in_is_swept(make_client) -> None:
+    client = make_client(free_storage_bytes=1_000_000)
+    root = (await sign_in(client)).root
     settings = client.app.state.settings
-    root = user_root(settings.workspaces_dir, user_id)
     (root / "files").mkdir(parents=True)
     prefix = workspace_documents.UPLOAD_STAGING_PREFIX
     # What a process that died mid-stream leaves: a staging file nobody holds, counted
@@ -724,7 +691,7 @@ async def test_the_staging_file_of_an_upload_the_process_died_in_is_swept(
         assert not dead.exists() and live.is_file()
         dead.write_bytes(b"x" * 16)
         async with client.app.state.sessionmaker() as db:
-            await reconcile_user(db, settings, user_id)
+            await reconcile_user(db, settings, client.user_id)
         assert not dead.exists() and live.is_file()
         dead.write_bytes(b"x" * 16)
         assert await sweeper.sweep_staged_uploads(Path(settings.workspaces_dir)) == 1
@@ -830,7 +797,7 @@ async def test_a_file_remembers_the_view_it_was_read_in_and_the_conversion_names
     assert (await _view(writer, kept["id"], "markdown")).status_code == 400
     assert (await _view(writer, kept["id"], "json")).status_code == 400
     assert (await _view(writer, kept["id"], "original")).status_code == 204
-    listed = (await _read(writer))["documents"]
+    listed = (await read_library(writer))["documents"]
     assert [(row["id"], row["view"]) for row in listed] == [(kept["id"], "original")]
     # A view the conversion cannot take is refused whole: the file stays a file.
     refused = await _convert(writer, kept["id"], view="json")
@@ -869,7 +836,7 @@ async def test_a_parsed_documents_original_is_served_for_the_original_view(
     directory = sources_dir(writer.root)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{kept['id']}.png").write_bytes(png)
-    listed = (await _read(writer))["documents"]
+    listed = (await read_library(writer))["documents"]
     assert [(row["id"], row["original"]) for row in listed] == [(kept["id"], True)]
     shown = await writer.get(url)
     assert shown.status_code == 200, shown.text
@@ -921,7 +888,7 @@ async def test_a_finished_parses_upload_answers_as_its_original_until_it_is_file
         source = Path(job.source_path)
     assert source.is_file() and original_of(writer.root, kept["id"]) is None
     url = f"/api/library/documents/{kept['id']}/original"
-    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
+    listed = {row["id"]: row for row in (await read_library(writer))["documents"]}
     assert listed[kept["id"]]["original"] is True
     shown = await writer.get(url)
     assert shown.status_code == 200 and shown.content == png
@@ -945,12 +912,12 @@ async def test_a_finished_parses_upload_answers_as_its_original_until_it_is_file
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{kept['id']}.png").write_bytes(png)
     source.unlink()
-    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
+    listed = {row["id"]: row for row in (await read_library(writer))["documents"]}
     assert listed[kept["id"]]["original"] is True
     assert (await writer.get(url)).content == png
     # Neither there: not kept.
     (directory / f"{kept['id']}.png").unlink()
-    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
+    listed = {row["id"]: row for row in (await read_library(writer))["documents"]}
     assert listed[kept["id"]]["original"] is False
     assert (await writer.get(url)).status_code == 404
 
@@ -977,7 +944,7 @@ async def test_an_unfiled_upload_answers_only_for_the_row_it_is_filed_for(
         job.error = "1 of 1 pages failed"
         await db.commit()
     heir, other = max(kept["id"], twin["id"]), min(kept["id"], twin["id"])
-    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
+    listed = {row["id"]: row for row in (await read_library(writer))["documents"]}
     assert (listed[heir]["original"], listed[other]["original"]) == (True, False)
     shown = await writer.get(f"/api/library/documents/{heir}/original")
     assert shown.status_code == 200 and shown.content == png

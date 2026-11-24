@@ -24,15 +24,15 @@ from PIL import Image, ImageFile
 from sightread.jobs import chat_runner, chat_tools
 from sightread.workspace.layout import user_root
 from sightread.workspace.locks import workspace_lock
-from tests.conftest import CSRF_HEADERS, image_view
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_extensions import (
+from tests.chat_helpers import (
     chatting_client,
     new_conversation,
     one_call,
+    run_queued_turn,
     send,
     stub_messages,
 )
+from tests.conftest import CSRF_HEADERS, image_view
 
 # The crop the reader's screenshot showed failing as "not a text file".
 CROP = "files/DL/DIO/DINO Paper Presentation.pdf/figures/p11_330_115_785_880.png"
@@ -557,10 +557,8 @@ async def test_an_editor_image_counts_against_the_image_budgets(tmp_path, monkey
 
 
 @respx.mock
-async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(
-    make_client, tmp_path
-) -> None:
-    client = await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
+async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(make_client) -> None:
+    client = await chatting_client(make_client())
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     _place(root, ".cache/chart.png", _encoded(Image.new("RGB", (300, 200), "navy"), "PNG"))
     view = {"command": "view", "path": "/workspace/.cache/chart.png"}
@@ -584,7 +582,7 @@ async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(
     conversation_id = await new_conversation(client)
     sent = await send(client, conversation_id, text="What is in the chart?")
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     for requests in (main, sub):
         result = requests[1]["messages"][2]["content"][0]

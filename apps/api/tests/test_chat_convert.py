@@ -27,9 +27,8 @@ from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
+from tests.chat_helpers import new_conversation, one_call, run_queued_turn, send, stub_messages
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_extensions import new_conversation, one_call, send, stub_messages
 from tests.test_chat_web import tool_results, turn_credits, web_client
 
 VISION_MARKDOWN = "## Page one\n\nBody text."
@@ -46,10 +45,10 @@ def _completion(content: str) -> httpx.Response:
     )
 
 
-async def _ready(make_client, tmp_path, **overrides) -> httpx.AsyncClient:
+async def _ready(make_client, **overrides) -> httpx.AsyncClient:
     """A chatting client whose format check is off: the check speaks the Messages route the
     turn is stubbed on, and a reader may switch it off (docs/parsing.md § Format check)."""
-    client = await web_client(make_client, tmp_path, **overrides)
+    client = await web_client(make_client, **overrides)
     off = await client.put(
         "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
     )
@@ -85,7 +84,7 @@ async def _run(client: httpx.AsyncClient, *calls: dict) -> tuple[int, list[dict]
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Read the other paper")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     return conversation_id, await tool_results(client, conversation_id)
 
 
@@ -116,13 +115,13 @@ def test_the_tool_is_declared_only_with_a_parse_model() -> None:
 
 @respx.mock
 async def test_convert_file_turns_a_kept_file_into_a_document_inside_the_turn(
-    make_client, tmp_path, documents
+    make_client, documents
 ) -> None:
     """docs/chat.md § Tools, *A conversion runs inside the turn*: the file becomes the
     parse's document where it was, the parse runs to its end within the call, the credits
     are the job's, and the document is there to read before the next model call."""
     vision = respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     settings = client.app.state.settings
     png = documents["png"].read_bytes()
     kept = await _keep(client, "tiny.png", png, "image/png", await _papers(client))
@@ -165,13 +164,11 @@ async def test_convert_file_turns_a_kept_file_into_a_document_inside_the_turn(
 
 
 @respx.mock
-async def test_a_file_converted_before_costs_nothing_again(
-    make_client, tmp_path, documents
-) -> None:
+async def test_a_file_converted_before_costs_nothing_again(make_client, documents) -> None:
     """docs/billing.md: the dedup cache answers a file whose bytes were converted on this
     model — no parse runs, no credits move — and the document is written all the same."""
     vision = respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     settings = client.app.state.settings
     png = documents["png"].read_bytes()
     papers = await _papers(client)
@@ -196,11 +193,11 @@ async def test_a_file_converted_before_costs_nothing_again(
 
 
 @respx.mock
-async def test_a_trashed_twin_does_not_hide_the_live_file(make_client, tmp_path, documents) -> None:
+async def test_a_trashed_twin_does_not_hide_the_live_file(make_client, documents) -> None:
     """docs/workspace.md § Files: what is in the Trash takes no name, so a trashed row of
     the same name and place is not the file the agent names, and the live one converts."""
     respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     png = documents["png"].read_bytes()
     first = await _keep(client, "tiny.png", png, "image/png", None)
     trashed = await client.post(f"/api/library/documents/{first['id']}/trash", headers=CSRF_HEADERS)
@@ -217,14 +214,12 @@ async def test_a_trashed_twin_does_not_hide_the_live_file(make_client, tmp_path,
 
 
 @respx.mock
-async def test_a_document_whose_parse_still_waits_is_driven_too(
-    make_client, tmp_path, documents
-) -> None:
+async def test_a_document_whose_parse_still_waits_is_driven_too(make_client, documents) -> None:
     """docs/chat.md § Tools: an upload converting on arrival sits queued behind the turn;
     named to `convert_file`, its parse is driven inside the turn the same way and read —
     not charged again, since the upload's conversion is the one that runs."""
     vision = respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     await convert_on_upload(client)
     uploaded = await client.post(
         "/api/library/documents",
@@ -246,11 +241,11 @@ async def test_a_document_whose_parse_still_waits_is_driven_too(
 
 
 @respx.mock
-async def test_convert_file_refuses_what_is_not_a_file_to_convert(make_client, tmp_path) -> None:
+async def test_convert_file_refuses_what_is_not_a_file_to_convert(make_client) -> None:
     """docs/chat.md § Tools: a path that names nothing, a file that is not there, a kind
     the parse agent does not take and a document already are each refused with nothing
     changed."""
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     zipped = await _keep(client, "archive.zip", b"PK\x05\x06" + b"\0" * 18, "application/zip", None)
     _, results = await _run(
         client,
@@ -282,15 +277,13 @@ async def test_convert_file_refuses_what_is_not_a_file_to_convert(make_client, t
 
 @respx.mock
 async def test_convert_file_stops_at_the_balance_and_at_the_turn_cap(
-    make_client, tmp_path, documents
+    make_client, documents
 ) -> None:
     """docs/billing.md: a conversion the balance cannot cover is refused as the Files page
     refuses it, the file left a file; docs/chat.md § Tools: `CONVERT_FILE_MAX_PER_TURN`
     counts the calls, a refused one among them."""
     vision = respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
-    client = await _ready(
-        make_client, tmp_path, convert_file_max_per_turn=1, parse_credits_per_page=10**9
-    )
+    client = await _ready(make_client, convert_file_max_per_turn=1, parse_credits_per_page=10**9)
     kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     _, (first, second) = await _run(client, {"path": "tiny.png"}, {"path": "tiny.png"})
     assert first["is_error"] is True and first["output"].startswith("tiny.png was not converted: ")
@@ -308,7 +301,7 @@ async def test_convert_file_stops_at_the_balance_and_at_the_turn_cap(
 
 @respx.mock
 async def test_a_conversion_past_its_time_goes_back_on_the_queue(
-    make_client, tmp_path, documents, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/chat.md § Tools, *A conversion runs inside the turn*: a parse not done within
     `CONVERT_FILE_TIMEOUT_SECONDS` is put back on the queue keeping its pages, the tool
@@ -324,7 +317,7 @@ async def test_a_conversion_past_its_time_goes_back_on_the_queue(
         return _completion(VISION_MARKDOWN)
 
     respx.post(KANO_CHAT_URL).mock(side_effect=slow_once)
-    client = await _ready(make_client, tmp_path, convert_file_timeout_seconds=1.0)
+    client = await _ready(make_client, convert_file_timeout_seconds=1.0)
     settings = client.app.state.settings
     kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     started = asyncio.get_running_loop().time()
@@ -391,7 +384,7 @@ async def _worker_runs_next(client: httpx.AsyncClient) -> Job:
 
 @respx.mock
 async def test_a_failed_conversion_keeps_the_file_to_retry(
-    make_client, tmp_path, documents, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/jobs.md § Converting a file: a parse the upstream fails inside the turn fails
     whole, and the file is never lost to the error — kept as the failed document's original
@@ -405,7 +398,7 @@ async def test_a_failed_conversion_keeps_the_file_to_retry(
         return httpx.Response(503, json={"error": "down"}) if down else _completion(VISION_MARKDOWN)
 
     respx.post(KANO_CHAT_URL).mock(side_effect=vision)
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     kept = await _keep(
         client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
@@ -439,7 +432,7 @@ async def test_a_failed_conversion_keeps_the_file_to_retry(
 
 @respx.mock
 async def test_the_agent_retries_a_failed_conversion_once_told_to(
-    make_client, tmp_path, documents, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/chat.md § Tools: a failed conversion answers that the original is kept and that
     a retry needs the user's yes; `retry` — a literal true only — puts the parse back
@@ -453,7 +446,7 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
         return httpx.Response(503, json={"error": "down"}) if down else _completion(VISION_MARKDOWN)
 
     respx.post(KANO_CHAT_URL).mock(side_effect=vision)
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     settings = client.app.state.settings
     root = user_root(settings.workspaces_dir, client.user_id)
     kept = await _keep(
@@ -496,14 +489,14 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
 
 @respx.mock
 async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
-    make_client, tmp_path, documents, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/billing.md § A chat turn: the agent's retry is refused as the Files page's is
     when the balance cannot cover it, the job left failed; a document
     whose original is gone answers that it cannot be retried."""
     monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
     vision = respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503, json={}))
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     kept = await _keep(
         client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
@@ -542,7 +535,7 @@ async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
 
 @respx.mock
 async def test_a_stop_during_a_failed_finish_still_keeps_the_original(
-    make_client, tmp_path, documents, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/jobs.md § Retention: the finalization of a failed parse runs to its end like a
     result's. The reader's Stop lands while the failure files the original — a wait on the
@@ -563,7 +556,7 @@ async def test_a_stop_during_a_failed_finish_still_keeps_the_original(
 
     monkeypatch.setattr(runner, "_retain_source", slow)
     monkeypatch.setattr(chat_runner, "_cancelled", stopped)
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     kept = await _keep(
         client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
@@ -581,14 +574,14 @@ async def test_a_stop_during_a_failed_finish_still_keeps_the_original(
 
 @respx.mock
 async def test_a_full_workspace_still_keeps_a_converted_files_original(
-    make_client, tmp_path, documents, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/workspace.md § Layout: the upload moved into place as the row's original is
     kept whatever the quota says — a converted file was counted in the tree, and the
     upload is the only copy there is."""
     monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503))
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     kept = await _keep(
         client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
@@ -605,7 +598,7 @@ async def test_a_full_workspace_still_keeps_a_converted_files_original(
 
 @respx.mock
 async def test_the_sweep_files_an_original_the_worker_never_did(
-    make_client, tmp_path, documents, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/jobs.md § Retention: a worker that dies between a failed parse's terminal
     commit and its copies leaves the converted file in the upload directory alone; the
@@ -619,7 +612,7 @@ async def test_the_sweep_files_an_original_the_worker_never_did(
         raise RuntimeError("the worker died here")
 
     monkeypatch.setattr(runner, "_retain_source", died)
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     settings = client.app.state.settings
     root = user_root(settings.workspaces_dir, client.user_id)
     kept = await _keep(
@@ -647,7 +640,7 @@ async def test_the_sweep_files_an_original_the_worker_never_did(
 
 @respx.mock
 async def test_the_sweeps_filing_leaves_no_lone_copy_in_the_tree(
-    make_client, tmp_path, documents, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/workspace.md § Layout: the sweep files the original of a succeeded parse whose
     worker died before its copies and its materialization, and puts no `source.*` in the
@@ -661,7 +654,7 @@ async def test_the_sweeps_filing_leaves_no_lone_copy_in_the_tree(
 
     monkeypatch.setattr(runner, "_retain_source", died)
     monkeypatch.setattr(runner, "materialize_document", died)
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     settings = client.app.state.settings
     root = user_root(settings.workspaces_dir, client.user_id)
     kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
@@ -685,14 +678,12 @@ async def test_the_sweeps_filing_leaves_no_lone_copy_in_the_tree(
 
 
 @respx.mock
-async def test_a_stop_before_the_claim_starts_no_run(
-    make_client, tmp_path, documents, monkeypatch
-) -> None:
+async def test_a_stop_before_the_claim_starts_no_run(make_client, documents, monkeypatch) -> None:
     """docs/chat.md § Tools, *A conversion runs inside the turn*: no job is claimed once a
     Stop or the turn's end has come — a run started then would only be cancelled, its
     first page calls paid — and the job waits on the queue for the worker."""
     vision = respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     converted = await client.post(
         f"/api/library/documents/{kept['id']}/convert", json={}, headers=CSRF_HEADERS
@@ -766,7 +757,7 @@ async def test_a_failed_finish_outlasts_every_cancel_of_its_caller() -> None:
 
 @respx.mock
 async def test_a_failing_wait_puts_the_conversion_back_on_the_queue(
-    make_client, tmp_path, documents, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/chat.md § Tools: a wait that fails otherwise than by a cancel — the look for a
     Stop meets a database error — puts the job back on the queue as a Stop does, so the
@@ -780,7 +771,7 @@ async def test_a_failing_wait_puts_the_conversion_back_on_the_queue(
         return _completion(VISION_MARKDOWN)
 
     respx.post(KANO_CHAT_URL).mock(side_effect=slow)
-    client = await _ready(make_client, tmp_path)
+    client = await _ready(make_client)
     kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     converted = await client.post(
         f"/api/library/documents/{kept['id']}/convert", json={}, headers=CSRF_HEADERS

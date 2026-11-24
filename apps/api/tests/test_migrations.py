@@ -27,12 +27,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sightread.db.models import Base
-from tests.conftest import DATABASE_URL
+from tests.conftest import TEST_DATABASE_URL, postgres_only
 
-pytestmark = pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="migration tests need TEST_DATABASE_URL on PostgreSQL",
-)
+pytestmark = postgres_only
 
 API_DIR = Path(__file__).resolve().parents[1]
 ALEMBIC_TIMEOUT_SECONDS = 300
@@ -61,7 +58,7 @@ def _alembic(url: str, *args: str) -> None:
 
 @asynccontextmanager
 async def _scratch_database():
-    server = make_url(DATABASE_URL)
+    server = make_url(TEST_DATABASE_URL)
     name = f"sightread_migration_{uuid.uuid4().hex[:12]}"
     admin = create_async_engine(server, isolation_level="AUTOCOMMIT")
     async with admin.connect() as connection:

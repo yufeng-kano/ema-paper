@@ -22,7 +22,14 @@ from sightread.config import Settings
 from sightread.db.models import AuditLog, CreditEntry, Job, JobPage, UsageLog, utcnow
 from sightread.jobs import queue
 from sightread.routes import admin as admin_routes
-from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_MODELS_URL, PAY_SETTINGS
+from tests.conftest import (
+    CSRF_HEADERS,
+    KANO_API_KEY,
+    KANO_MODELS_URL,
+    PAY_SETTINGS,
+    postgres_only,
+)
+from tests.factories import job_row
 from tests.test_admin import (
     OWNERS,
     _account,
@@ -32,20 +39,14 @@ from tests.test_admin import (
     _group,
     _last_audit_id,
     _owner,
-    postgres_only,
 )
 from tests.test_pay import CATALOG_URL, catalog
 
 JOB_FIELDS = {
-    "agent": "parse",
-    "kind": "pdf",
     "filename": "confidential-thesis.pdf",
-    "media_type": "application/pdf",
     "size_bytes": 2048,
     "sha256": "a" * 64,
     "pages_spec": "",
-    "model": "vendor/vision-model",
-    "bbox_format": "yxyx_norm1000",
     "prompt": "SECRET-PROMPT transcribe page {page}",
     "prompt_sha256": "p" * 64,
     "page_count": 3,
@@ -54,7 +55,7 @@ JOB_FIELDS = {
 
 async def _job(client: AsyncClient, user_id: int, **fields) -> Job:
     async with client.app.state.sessionmaker() as db:
-        job = Job(user_id=user_id, **{**JOB_FIELDS, "status": "queued", **fields})
+        job = job_row(user_id, **{**JOB_FIELDS, "status": "queued", **fields})
         db.add(job)
         await db.commit()
         return job

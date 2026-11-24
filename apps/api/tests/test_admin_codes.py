@@ -19,7 +19,7 @@ from sightread import codes as cli
 from sightread.billing import codes
 from sightread.config import Settings
 from sightread.db.models import RedeemCode, utcnow
-from tests.conftest import CSRF_HEADERS, PRO_PLANS_JSON
+from tests.conftest import CSRF_HEADERS, PRO_PLANS_JSON, postgres_only
 from tests.test_admin import (
     _account,
     _add,
@@ -28,7 +28,6 @@ from tests.test_admin import (
     _group,
     _last_audit_id,
     _owner,
-    postgres_only,
 )
 
 CODES = "/api/admin/codes"

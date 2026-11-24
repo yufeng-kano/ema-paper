@@ -18,7 +18,14 @@ from sightread.errors import ApiError
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from sightread.upstream.client import Connection, fetch_models
-from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_BASE, KANO_MODELS_URL, PARSE_MODEL
+from tests.conftest import (
+    CSRF_HEADERS,
+    KANO_API_KEY,
+    KANO_BASE,
+    KANO_MODELS_URL,
+    PARSE_MODEL,
+    api_key_client,
+)
 
 FALLBACK = "vendor/fallback-model"
 
@@ -193,12 +200,6 @@ async def test_unknown_agents_are_refused(signed_in) -> None:
 # --- the parse model at enqueue ---------------------------------------------------------
 
 
-async def _keyed(client: AsyncClient) -> None:
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    key = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
-    client.headers["Authorization"] = f"Bearer {key.json()['key']}"
-
-
 async def _parse(client: AsyncClient, documents, **data) -> httpx.Response:
     return await client.post(
         "/v1/parse",
@@ -212,8 +213,7 @@ async def test_a_request_model_must_be_one_of_the_parse_agents(
 ) -> None:
     """The deployment's parse model by default; the fallback by name; anything else
     refused before a job exists (docs/agents.md § Enqueue rules)."""
-    client = make_client(parse_fallback_model=FALLBACK)
-    await _keyed(client)
+    client = await api_key_client(make_client(parse_fallback_model=FALLBACK))
 
     default = await _parse(client, documents)
     named = await _parse(client, documents, model=FALLBACK)
@@ -234,8 +234,7 @@ async def test_no_parse_model_or_no_kano_proxy_refuses_every_parse(
     make_client, sessionmaker, documents
 ) -> None:
     for overrides in ({"parse_model": ""}, {"kano_proxy_api_key": ""}, {"kano_proxy_base_url": ""}):
-        client = make_client(**overrides)
-        await _keyed(client)
+        client = await api_key_client(make_client(**overrides))
         refused = await _parse(client, documents)
         assert refused.status_code == 503, overrides
         assert refused.json()["error"]["type"] == "upstream"
@@ -253,8 +252,7 @@ async def test_a_job_with_no_endpoint_snapshot_never_runs_on_kano_proxy(
     called: it would transcribe only the pages the other upstream failed, under a Kano
     Proxy dedup key (docs/database.md § Rules)."""
     gone = "this parse ran on an upstream this deployment no longer has; upload the file again"
-    client = make_client()
-    await _keyed(client)
+    client = await api_key_client(make_client())
     accepted = await _parse(client, documents)
     assert accepted.status_code == 202, accepted.text
     job_id = uuid.UUID(accepted.json()["job_id"])
@@ -301,8 +299,7 @@ async def test_a_queued_job_reconciles_its_endpoint_snapshot_at_claim_time(
         )
     )
 
-    client = make_client()
-    await _keyed(client)
+    client = await api_key_client(make_client())
     accepted = await _parse(client, documents)
     assert accepted.status_code == 202, accepted.text
     job_id = uuid.UUID(accepted.json()["job_id"])

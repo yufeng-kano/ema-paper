@@ -30,7 +30,8 @@ from sightread.db.models import (
     PackCheckout,
     UsageLog,
 )
-from tests.conftest import CSRF_HEADERS, PAY_APP_ID, PAY_SETTINGS, PAY_URL, grant_plan
+from tests.conftest import CSRF_HEADERS, PAY_APP_ID, PAY_SETTINGS, PAY_URL, grant_plan, sign_in
+from tests.factories import job_row
 from tests.test_ledger import _period, _user, settings_with
 from tests.test_pay import (
     CATALOG_URL,
@@ -38,7 +39,6 @@ from tests.test_pay import (
     _events,
     _ms,
     _notify,
-    _signed_in,
     canonical,
     catalog,
 )
@@ -109,19 +109,14 @@ async def _pack(
 
 
 def _job(user_id: int) -> Job:
-    return Job(
-        user_id=user_id,
-        agent="parse",
+    return job_row(
+        user_id,
         kind="image",
         filename="a.png",
         media_type="image/png",
-        size_bytes=1,
         sha256="x",
         status="queued",
         model="m",
-        bbox_format="yxyx_norm1000",
-        prompt="Transcribe page {page}.",
-        page_count=1,
         pages_done=0,
     )
 
@@ -482,7 +477,7 @@ def _created(purchase_id: str = "pur_1") -> httpx.Response:
 
 
 async def _pro(client: AsyncClient) -> int:
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     await grant_plan(client.app.state.sessionmaker, user_id)
     return user_id
 
@@ -507,7 +502,7 @@ async def _buy(client: AsyncClient, pack_id: str = "credits") -> httpx.Response:
 @respx.mock
 async def test_a_pack_checkout_is_for_a_paid_plan_and_a_pack_on_sale(make_client) -> None:
     client = make_client(**PACK_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog()))
     create = respx.post(PURCHASES_URL).mock(return_value=_created())
 
@@ -535,7 +530,7 @@ async def test_a_pack_checkout_is_for_a_paid_plan_and_a_pack_on_sale(make_client
 
     # A deployment that configures no pack sells none, whatever Pay prices.
     bare = make_client(**PAY_SETTINGS)
-    await _signed_in(bare)  # the same user, on Pro already
+    await sign_in(bare)  # the same user, on Pro already
     bare.app.state.pay_catalog = pay.CatalogCache()
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog()))
     none = await _buy(bare)

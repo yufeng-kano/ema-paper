@@ -7,13 +7,14 @@ from decimal import Decimal
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from sightread.db.models import UsageLog, User
+from sightread.db.models import UsageLog
+from tests.factories import user_row
 
 
 async def test_an_unknown_cost_cannot_be_stored_as_zero(sessionmaker) -> None:
     """The check constraint holds the invariant the usage figures rely on (docs/database.md)."""
     async with sessionmaker() as db:
-        user = User(google_sub="sub-1", email="a@example.com")
+        user = user_row("a@example.com")
         db.add(user)
         await db.flush()
         db.add(

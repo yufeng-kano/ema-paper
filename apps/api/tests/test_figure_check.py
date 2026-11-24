@@ -12,7 +12,6 @@ import uuid
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
 from httpx import AsyncClient
 from PIL import Image, ImageDraw
@@ -35,7 +34,7 @@ from sightread.parsing.figure_check import (
 )
 from sightread.parsing.figures import CROP_MARGIN, crop_rect
 from tests.conftest import KANO_CHAT_URL
-from tests.test_parse_end_to_end import MODEL, _authorize, _completion, _drain_queue
+from tests.test_parse_end_to_end import MODEL, _completion, _drain_queue
 
 # A chart's plotted area on a 1000 x 1000 page, and the box a model that boxes only that
 # area draws around it: its crop runs from 292 to 708 on both axes.
@@ -234,11 +233,6 @@ OK = '{"figures": [{"n": 1, "ok": true}]}'
 
 def _corrected(*box: int) -> str:
     return json.dumps({"figures": [{"n": 1, "ok": False, "box": list(box)}]})
-
-
-@pytest.fixture
-async def api_client(make_client, sessionmaker) -> AsyncClient:
-    return await _authorize(make_client(), sessionmaker)
 
 
 class Upstream:

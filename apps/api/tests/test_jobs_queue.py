@@ -28,12 +28,8 @@ from sightread.jobs.queue import (
     requeue_job,
 )
 from sightread.jobs.sweeper import sweep_uploads
-from tests.conftest import DATABASE_URL
-
-postgres_only = pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="needs TEST_DATABASE_URL pointing at PostgreSQL",
-)
+from tests.conftest import path_settings, postgres_only
+from tests.factories import user_row
 
 JOB_DEFAULTS = {
     "kind": "pdf",
@@ -53,7 +49,7 @@ JOB_DEFAULTS = {
 
 
 async def _user(db, email: str = "queue@example.com") -> User:
-    user = User(google_sub=email, email=email)
+    user = user_row(email)
     db.add(user)
     await db.flush()
     return user
@@ -438,16 +434,7 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(
         done.status = "succeeded"
         await db.commit()
         job_id, done_id = job.id, done.id
-    from sightread.config import Settings
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
-
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-    )
+    settings = path_settings(tmp_path)
     await fail_job(sessionmaker, settings, job_id, "internal error")
     await fail_job(sessionmaker, settings, done_id, "internal error")
     async with sessionmaker() as db:
@@ -580,12 +567,10 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
     except the usage its calls billed (docs/jobs.md § Queue)."""
     from sqlalchemy import func, select
 
-    from sightread.config import Settings
     from sightread.db.models import JobPage, UsageLog
     from sightread.jobs.queue import next_worker_generation, requeue_orphaned_jobs
     from sightread.jobs.runner import PageOutcome, _record_page, fail_job
     from sightread.upstream.client import Usage
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
 
     async with sessionmaker() as db:
         user = await _user(db)
@@ -626,13 +611,7 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
             )
         ],
     )
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-    )
+    settings = path_settings(tmp_path)
 
     async def counts(db) -> tuple[int, int]:
         pages = select(func.count()).select_from(JobPage).where(JobPage.job_id == job_id)
@@ -690,10 +669,9 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(sessionmaker
     from sqlalchemy import Update
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from sightread.config import Settings
     from sightread.jobs import runner
     from sightread.jobs.queue import next_worker_generation
-    from tests.conftest import KANO_API_KEY, TEST_SECRET_KEY
+    from tests.conftest import KANO_API_KEY
 
     async with sessionmaker() as db:
         user = await _user(db)
@@ -727,12 +705,9 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(sessionmaker
     interposed = async_sessionmaker(
         sessionmaker.kw["bind"], class_=Interposed, expire_on_commit=False, autoflush=False
     )
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
+    settings = path_settings(
+        tmp_path,
         upload_dir=str(tmp_path / "uploads"),
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
         # The worker restarted on another origin: the run's first write is the reconcile.
         kano_proxy_base_url="https://moved.test",
         kano_proxy_api_key=KANO_API_KEY,
@@ -753,9 +728,7 @@ async def test_the_crops_are_published_under_the_backup_lock(
     § Queue, docs/workspace.md § Backups)."""
     import contextlib
 
-    from sightread.config import Settings
     from sightread.jobs import runner
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
 
     async with sessionmaker() as db:
         user = await _user(db)
@@ -796,13 +769,7 @@ async def test_the_crops_are_published_under_the_backup_lock(
     async with sessionmaker() as db:
         db.add(Document(user_id=user.id, folder_id=None, job_id=job_id, name="e.pdf"))
         await db.commit()
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-    )
+    settings = path_settings(tmp_path)
     assert await runner._finish(
         sessionmaker, job_id, status="succeeded", settings=settings, publish=publish
     )

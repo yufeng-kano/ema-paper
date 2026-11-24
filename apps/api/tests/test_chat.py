@@ -24,155 +24,50 @@ from sightread.db.models import (
     ChatTurn,
     Conversation,
     Document,
-    Folder,
     Job,
     Message,
-    Result,
     UsageLog,
-    User,
 )
 from sightread.errors import ApiError
 from sightread.jobs import chat_runner, chat_tools
-from sightread.jobs.queue import claim_next_turn, fail_turn
+from sightread.jobs.queue import fail_turn
 from sightread.sandbox.client import ExecResult, SandboxClient
 from sightread.upstream.anthropic import ChatUsage
 from sightread.upstream.client import RateLimited
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, KANO_BASE, image_view
-from tests.test_jobs_queue import postgres_only
+from tests.chat_helpers import (
+    MESSAGES_URL,
+    assistant_turn,
+    chatting_client,
+    run_queued_turn,
+    seed_document,
+)
+from tests.conftest import (
+    CSRF_HEADERS,
+    KANO_BASE,
+    image_view,
+    path_settings,
+    postgres_only,
+    sign_in,
+)
+from tests.factories import user_row
 
-MESSAGES_URL = f"{KANO_BASE}/anthropic/v1/messages"
 MODELS_URL = f"{KANO_BASE}/openai/v1/models"
-MARKDOWN = "<!-- page: 1 -->\n\n# Title\n\n| Policy | Return |\n| --- | --- |\n| Greedy | 3450 |\n"
-
-
-def sse(*events: dict) -> bytes:
-    return "".join(
-        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
-    ).encode()
-
-
-def assistant_turn(
-    blocks: list[dict], stop_reason: str, *, output_tokens: int = 10, model: str = "claude-opus-5-5"
-) -> bytes:
-    events: list[dict] = [
-        {
-            "type": "message_start",
-            "message": {
-                "model": model,
-                "usage": {"input_tokens": 300, "cache_read_input_tokens": 200},
-            },
-        }
-    ]
-    for index, block in enumerate(blocks):
-        if block["type"] == "text":
-            events += [
-                {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "text", "text": ""},
-                },
-                {
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "text_delta", "text": block["text"]},
-                },
-                {"type": "content_block_stop", "index": index},
-            ]
-        elif block["type"] == "tool_use":
-            events += [
-                {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": block["id"],
-                        "name": block["name"],
-                        "input": {},
-                    },
-                },
-                {
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": json.dumps(block["input"]),
-                    },
-                },
-                {"type": "content_block_stop", "index": index},
-            ]
-    events += [
-        {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason},
-            "usage": {"output_tokens": output_tokens},
-        },
-        {"type": "message_stop"},
-    ]
-    return sse(*events)
-
-
-async def _seed_document(client: AsyncClient, user_id: int) -> int:
-    """A finished parse filed in the library, with a result to materialize."""
-    async with client.app.state.sessionmaker() as db:
-        folder = Folder(user_id=user_id, parent_id=None, name="Papers")
-        db.add(folder)
-        await db.flush()
-        job = Job(
-            id=uuid.uuid4(),
-            user_id=user_id,
-            agent="parse",
-            kind="pdf",
-            filename="paper.pdf",
-            media_type="application/pdf",
-            size_bytes=10,
-            sha256="b" * 64,
-            model="claude-x",
-            bbox_format="yxyx_norm1000",
-            prompt="Transcribe page {page}.",
-            status="succeeded",
-            page_count=1,
-        )
-        db.add(job)
-        await db.flush()
-        db.add(Result(job_id=job.id, markdown=MARKDOWN, pages=[], figures=[], errors=[], meta={}))
-        document = Document(user_id=user_id, folder_id=folder.id, job_id=job.id, name="paper.pdf")
-        db.add(document)
-        await db.commit()
-        return document.id
 
 
 @pytest.fixture
-async def chatting(make_client, tmp_path) -> AsyncClient:
-    """Signed in, Kano Proxy connected, a model chosen for the chat agent, one document."""
-    client = make_client(workspaces_dir=str(tmp_path / "workspaces"))
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    # Stored as a save leaves it: a test with its own catalog stubs it only once it runs.
-    async with client.app.state.sessionmaker() as db:
-        db.add(AgentSetting(user_id=user_id, agent="chat", model="claude-code/claude-opus-5-5"))
-        await db.commit()
-    client.document_id = await _seed_document(client, user_id)
-    client.user_id = user_id
-    return client
+async def chatting(make_client) -> AsyncClient:
+    """Signed in, a chat model chosen, one document; the setting stored directly, so a test
+    with its own catalog stubs it only once the turn runs."""
+    return await chatting_client(make_client(), store_directly=True)
 
 
 def _paper_history(client: AsyncClient) -> list[git.Revision]:
     """The commits that touched the seeded document's directory, newest first."""
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     return git.log(root, Path("files/Papers/paper.pdf"))
-
-
-async def _run_queued_turn(client: AsyncClient) -> None:
-    settings = client.app.state.settings
-    async with client.app.state.sessionmaker() as db:
-        turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
-    assert turn_id is not None
-    await chat_runner.run_turn(
-        client.app.state.sessionmaker, settings, turn_id, asyncio.Semaphore(2)
-    )
 
 
 def test_strict_tool_schemas_hold_only_what_strict_accepts() -> None:
@@ -313,7 +208,7 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkey
     )
     assert again.status_code == 409
 
-    await _run_queued_turn(chatting)
+    await run_queued_turn(chatting)
 
     # The request shape: tools in their fixed order, system cached, the guard off.
     first = requests[0]
@@ -416,7 +311,7 @@ async def test_a_refusal_fails_the_turn_and_a_cancel_stops_it(chatting) -> None:
     await chatting.post(
         f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
     )
-    await _run_queued_turn(chatting)
+    await run_queued_turn(chatting)
     thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][-1]["status"] == "failed"
     assert "declined" in thread["turns"][-1]["error"]
@@ -488,9 +383,7 @@ async def test_a_first_message_needs_a_model_the_catalog_still_serves(chatting) 
         assert (await db.execute(select(ChatTurn.id))).all() == []
 
 
-async def test_messages_need_an_offered_model_and_a_configured_kano_proxy(
-    make_client, tmp_path
-) -> None:
+async def test_messages_need_an_offered_model_and_a_configured_kano_proxy(make_client) -> None:
     """A deployment offering no chat model — no catalog model priced — or no Kano Proxy
     refuses the send with 503 before a turn exists (docs/agents.md § Enqueue rules)."""
     document_id: int | None = None
@@ -498,11 +391,11 @@ async def test_messages_need_an_offered_model_and_a_configured_kano_proxy(
         {"vendor/vision-model": {"input": 1, "cache_read": 1, "cache_write": 1, "output": 1}}
     )
     for overrides in ({"model_prices_json": parse_only}, {"kano_proxy_api_key": ""}):
-        client = make_client(workspaces_dir=str(tmp_path / "ws"), **overrides)
+        client = make_client(**overrides)
         await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
         if document_id is None:
             user_id = (await client.get("/api/me")).json()["user"]["id"]
-            document_id = await _seed_document(client, user_id)
+            document_id = await seed_document(client, user_id)
         conversation_id = (
             await client.post(
                 f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
@@ -624,7 +517,7 @@ def test_truncate_keeps_head_and_tail() -> None:
 
 
 @postgres_only
-async def test_a_finished_library_parse_keeps_its_source(chatting, tmp_path) -> None:
+async def test_a_finished_library_parse_keeps_its_source(chatting) -> None:
     """The retention exception (docs/jobs.md): the upload moves into the document dir."""
     settings = chatting.app.state.settings
     sessionmaker = chatting.app.state.sessionmaker
@@ -999,7 +892,7 @@ async def test_a_cancel_drops_a_silent_stream(chatting, monkeypatch) -> None:
 
     canceller = asyncio.create_task(cancel_soon())
     async with asyncio.timeout(5):
-        await _run_queued_turn(chatting)
+        await run_queued_turn(chatting)
     await canceller
     assert closed.is_set()
     async with chatting.app.state.sessionmaker() as db:
@@ -1290,11 +1183,10 @@ async def test_a_worker_stopping_finishes_a_cancelled_turn(chatting) -> None:
     assert again.status_code == 202
 
 
-async def test_an_oversized_json_body_is_refused_before_it_is_read(make_client, tmp_path) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), content_max_bytes=1_000)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    document_id = await _seed_document(client, user_id)
+async def test_an_oversized_json_body_is_refused_before_it_is_read(make_client) -> None:
+    client = make_client(content_max_bytes=1_000)
+    user_id = (await sign_in(client)).user_id
+    document_id = await seed_document(client, user_id)
     huge = {"markdown": "x" * 200_000, "base_revision": "0" * 64}
     declared = await client.put(
         f"/api/library/documents/{document_id}/content", json=huge, headers=CSRF_HEADERS
@@ -1369,13 +1261,10 @@ async def test_a_stop_ends_the_round_before_the_next_write(monkeypatch) -> None:
     assert calls == ["a"]
 
 
-async def test_the_body_cap_ignores_a_multipart_label_off_the_upload_routes(
-    make_client, tmp_path
-) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), content_max_bytes=1_000)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    document_id = await _seed_document(client, user_id)
+async def test_the_body_cap_ignores_a_multipart_label_off_the_upload_routes(make_client) -> None:
+    client = make_client(content_max_bytes=1_000)
+    user_id = (await sign_in(client)).user_id
+    document_id = await seed_document(client, user_id)
     spoofed = await client.put(
         f"/api/library/documents/{document_id}/content",
         content=b"x" * 200_000,
@@ -1384,20 +1273,16 @@ async def test_the_body_cap_ignores_a_multipart_label_off_the_upload_routes(
     assert spoofed.status_code == 413
 
 
-async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
-    make_client, tmp_path
-) -> None:
+async def test_the_agent_page_lists_only_the_tools_the_deployment_has(make_client) -> None:
     from tests.conftest import PAY_SETTINGS, grant_plan
 
     # A shell needs both a runner and a plan that grants one (docs/billing.md § Plans).
     with_runner = make_client(
-        workspaces_dir=str(tmp_path / "ws1"),
         sandbox_url="http://sandbox:8100",
         sandbox_token="runner-token-not-a-real-one",
         **PAY_SETTINGS,
     )
-    await with_runner.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await with_runner.get("/api/me")).json()["user"]["id"]
+    user_id = (await sign_in(with_runner)).user_id
     await grant_plan(with_runner.app.state.sessionmaker, user_id)
     with_sandbox = next(
         agent
@@ -1417,7 +1302,7 @@ async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
         "convert_file",
         "insert_image",
     ]
-    bare = make_client(workspaces_dir=str(tmp_path / "ws2"), sandbox_url="")
+    bare = make_client(sandbox_url="")
     await bare.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     without = next(
         agent
@@ -1580,7 +1465,7 @@ async def test_a_kano_proxy_model_answered_under_its_bare_id_is_not_a_fallback(c
             headers=CSRF_HEADERS,
         )
         assert sent.status_code == 202, sent.text
-        await _run_queued_turn(chatting)
+        await run_queued_turn(chatting)
         async with chatting.app.state.sessionmaker() as db:
             return (await db.get(Conversation, conversation_id)).model
 
@@ -1623,7 +1508,7 @@ async def test_a_fallback_answer_moves_the_conversation_to_its_model(chatting) -
         f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
     )
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(chatting)
+    await run_queued_turn(chatting)
     assert requests[0]["model"] == "claude-code/claude-opus-5-5"
     async with chatting.app.state.sessionmaker() as db:
         # The safety fallback answered from another model: its thinking blocks are that
@@ -1637,7 +1522,7 @@ async def test_a_fallback_answer_moves_the_conversation_to_its_model(chatting) -
         headers=CSRF_HEADERS,
     )
     assert again.status_code == 202, again.text
-    await _run_queued_turn(chatting)
+    await run_queued_turn(chatting)
     assert requests[1]["model"] == "claude-code/claude-fallback-9"
 
 
@@ -1678,7 +1563,7 @@ async def test_an_answer_under_an_unpriced_name_is_kept_as_the_model_asked_for(
             headers=CSRF_HEADERS,
         )
         assert sent.status_code == 202, sent.text
-        await _run_queued_turn(chatting)
+        await run_queued_turn(chatting)
     assert [request["model"] for request in requests] == ["claude-code/claude-opus-5-5"] * 2
     async with chatting.app.state.sessionmaker() as db:
         assert (await db.get(Conversation, conversation_id)).model == "claude-code/claude-opus-5-5"
@@ -1705,7 +1590,7 @@ async def test_the_history_cap_counts_bytes_not_characters(chatting) -> None:
     )
     turn_id = uuid.UUID(sent.json()["turn_id"])
     settings.chat_history_max_bytes = 3000
-    await _run_queued_turn(chatting)
+    await run_queued_turn(chatting)
     async with chatting.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "failed" and "start a new conversation" in turn.error
@@ -1727,7 +1612,7 @@ async def test_a_conversation_past_the_history_cap_is_refused(chatting) -> None:
     )
     turn_id = uuid.UUID(sent.json()["turn_id"])
     settings.chat_history_max_bytes = 50
-    await _run_queued_turn(chatting)
+    await run_queued_turn(chatting)
     async with chatting.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "failed"
@@ -1746,7 +1631,7 @@ async def test_a_conversation_past_the_history_cap_is_refused(chatting) -> None:
     settings.chat_history_max_bytes = 256 * 1024 * 1024
 
 
-async def test_a_command_the_runner_could_not_settle_commits_no_tree(tmp_path) -> None:
+async def test_a_command_the_runner_could_not_settle_commits_no_tree() -> None:
     from sightread.sandbox.client import SandboxUnavailable
 
     class Client:
@@ -2644,7 +2529,7 @@ async def test_an_answer_cut_at_the_output_limit_fails_the_turn(chatting) -> Non
     await chatting.post(
         f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
     )
-    await _run_queued_turn(chatting)
+    await run_queued_turn(chatting)
     thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][-1]["status"] == "failed"
     assert "output limit" in thread["turns"][-1]["error"]
@@ -2667,7 +2552,7 @@ async def test_an_answer_cut_at_the_output_limit_fails_the_turn(chatting) -> Non
         json={"text": "again"},
         headers=CSRF_HEADERS,
     )
-    await _run_queued_turn(chatting)
+    await run_queued_turn(chatting)
     thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][-1]["status"] == "failed"
     assert "pause_turn" in thread["turns"][-1]["error"]
@@ -2972,22 +2857,12 @@ def test_the_exec_deadline_covers_a_cold_start() -> None:
 async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_until_a_restart_does(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    from sightread.config import Settings
     from sightread.jobs.queue import UNSETTLED_REVISION_MESSAGE, recover_unsettled_commands
     from sightread.sandbox.client import SandboxUnavailable
     from sightread.workspace.locks import read_writing, writing_marker
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
     from tests.test_workspace import _seed
 
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-        sandbox_url="http://sandbox:8100",
-        sandbox_token="t",
-    )
+    settings = path_settings(tmp_path, sandbox_url="http://sandbox:8100", sandbox_token="t")
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await workspace_documents.materialize_document(db, settings, document)
@@ -3111,18 +2986,10 @@ async def test_a_figure_read_is_bounded_by_the_image_budget_not_the_text_cap(
 async def test_a_shell_command_stands_marked_as_writing_for_its_whole_run(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    from sightread.config import Settings
     from sightread.workspace.locks import writing_marker
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
     from tests.test_workspace import _seed
 
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-    )
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await workspace_documents.materialize_document(db, settings, document)
@@ -3441,11 +3308,11 @@ async def test_a_rename_is_one_clean_line_and_keeps_the_order(chatting) -> None:
 
 async def test_a_rename_reaches_only_the_callers_conversations(chatting) -> None:
     async with chatting.app.state.sessionmaker() as db:
-        stranger = User(google_sub="stranger", email="stranger@example.com")
+        stranger = user_row("stranger@example.com")
         db.add(stranger)
         await db.commit()
         stranger_id = stranger.id
-    theirs_document = await _seed_document(chatting, stranger_id)
+    theirs_document = await seed_document(chatting, stranger_id)
     async with chatting.app.state.sessionmaker() as db:
         theirs = Conversation(
             user_id=stranger_id, document_id=theirs_document, title="Theirs", session="s"

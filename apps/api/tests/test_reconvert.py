@@ -38,9 +38,9 @@ RECONVERTED = (
 
 
 @pytest.fixture
-async def library(make_client, tmp_path) -> AsyncClient:
+async def library(make_client) -> AsyncClient:
     """A signed-in client that can parse, whose library keeps originals under tmp_path."""
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), parse_fallback_model=FALLBACK)
+    client = make_client(parse_fallback_model=FALLBACK)
     await _ready_to_parse(client)
     client.user_id = (await client.get("/api/me")).json()["user"]["id"]
     return client

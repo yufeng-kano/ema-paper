@@ -22,7 +22,8 @@ from sightread.upstream.client import (
     UpstreamError,
     transcribe_page,
 )
-from tests.conftest import KANO_BASE, KANO_CHAT_URL
+from tests.conftest import KANO_CHAT_URL
+from tests.helpers import stub_connection
 
 SECRET = "test-secret-key-not-a-real-one"
 PROMPT = "Transcribe page {page} in {bbox_format}."
@@ -35,10 +36,7 @@ CAPS = {"max_response_bytes": MAX_BYTES, "max_output_tokens": 16_000}
 @pytest.fixture
 def key() -> Connection:
     """Kano Proxy, as `kano_connection` resolves it on the operator's key."""
-    return Connection(
-        api_key="sk-kano-proxy-test",
-        base_url=f"{KANO_BASE}/openai/v1",
-    )
+    return stub_connection()
 
 
 def completion(content: str, cost: float | None = 0.00042) -> dict:

@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
-from sightread.config import Settings
 from sightread.db.models import Document, Folder, Job, Result, User
 from sightread.errors import ApiError
 from sightread.jobs import sweeper
@@ -30,41 +29,18 @@ from sightread.workspace.layout import (
     sources_dir,
     user_root,
 )
-from tests.conftest import KANO_BASE, TEST_SECRET_KEY
-
-
-def _settings(tmp_path: Path) -> Settings:
-    return Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-    )
+from tests.conftest import path_settings
+from tests.factories import job_row, user_row
 
 
 async def _seed(db, *, markdown: str = "# Title\n\nBody\n") -> tuple[User, Document]:
-    user = User(google_sub="ws", email="ws@example.com")
+    user = user_row("ws@example.com")
     db.add(user)
     await db.flush()
     folder = Folder(user_id=user.id, parent_id=None, name="Papers")
     db.add(folder)
     await db.flush()
-    job = Job(
-        id=uuid.uuid4(),
-        user_id=user.id,
-        agent="parse",
-        kind="pdf",
-        filename="paper.pdf",
-        media_type="application/pdf",
-        size_bytes=10,
-        sha256="a" * 64,
-        model="claude-x",
-        bbox_format="yxyx_norm1000",
-        prompt="Transcribe page {page}.",
-        status="succeeded",
-        page_count=2,
-    )
+    job = job_row(user.id, size_bytes=10, sha256="a" * 64, model="claude-x", page_count=2)
     db.add(job)
     await db.flush()
     db.add(Result(job_id=job.id, markdown=markdown, pages=[], figures=[], errors=[], meta={}))
@@ -96,7 +72,7 @@ def test_path_segments_cannot_escape_or_shadow_the_workspace() -> None:
 
 
 async def test_materialize_writes_once_and_edits_commit_revisions(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         content = await documents.read_content(db, settings, document)
@@ -142,7 +118,7 @@ async def test_materialize_writes_once_and_edits_commit_revisions(sessionmaker, 
 
 
 async def test_reconcile_follows_a_directory_the_shell_moved(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -190,7 +166,7 @@ async def test_keep_source_moves_the_upload_into_the_document_directory(tmp_path
 
 
 async def test_revert_follows_a_rename(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         content = await documents.read_content(db, settings, document)
@@ -211,7 +187,7 @@ async def test_revert_follows_a_rename(sessionmaker, tmp_path) -> None:
 
 
 async def test_materialize_refuses_a_full_workspace(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     settings.workspace_quota_bytes = 1
     async with sessionmaker() as db:
         _, document = await _seed(db)
@@ -226,7 +202,7 @@ async def test_materialize_refuses_a_full_workspace(sessionmaker, tmp_path) -> N
 async def test_the_git_directory_is_outside_the_tree_and_a_planted_hook_never_runs(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -251,7 +227,7 @@ async def test_the_git_directory_is_outside_the_tree_and_a_planted_hook_never_ru
 
 
 async def test_a_symlinked_document_file_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     outside = tmp_path / "secret.txt"
     outside.write_text("not yours")
     async with sessionmaker() as db:
@@ -290,7 +266,7 @@ def test_segments_decode_and_know_whether_they_are_canonical() -> None:
 
 
 async def test_reconcile_canonicalizes_a_directory_the_shell_named(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -325,7 +301,7 @@ def test_long_names_become_bounded_distinct_segments() -> None:
 
 
 async def test_an_inflated_document_file_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     settings.content_max_bytes = 64
     async with sessionmaker() as db:
         _, document = await _seed(db)
@@ -342,7 +318,7 @@ async def test_an_inflated_document_file_is_refused(sessionmaker, tmp_path) -> N
 
 
 async def test_a_fifo_or_oversized_save_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     settings.content_max_bytes = 64
     async with sessionmaker() as db:
         _, document = await _seed(db)
@@ -362,7 +338,7 @@ async def test_a_fifo_or_oversized_save_is_refused(sessionmaker, tmp_path) -> No
 
 
 async def test_a_move_puts_the_document_where_the_row_says(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -401,7 +377,7 @@ def test_shell_diffs_and_revisions_are_read_within_a_bound(tmp_path) -> None:
 
 
 async def test_reconcile_ignores_oversized_metadata(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -414,7 +390,7 @@ async def test_reconcile_ignores_oversized_metadata(sessionmaker, tmp_path) -> N
 
 
 async def test_a_directory_where_a_file_belongs_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -428,7 +404,7 @@ async def test_a_directory_where_a_file_belongs_is_refused(sessionmaker, tmp_pat
 async def test_the_lock_lives_outside_the_mount_and_saves_commit_only_their_file(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -449,7 +425,7 @@ async def test_the_lock_lives_outside_the_mount_and_saves_commit_only_their_file
 
 
 async def test_revert_undoes_every_path_of_a_shell_commit(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -468,7 +444,7 @@ async def test_revert_undoes_every_path_of_a_shell_commit(sessionmaker, tmp_path
 async def test_reconcile_leaves_a_row_alone_when_its_id_is_in_two_places(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -479,7 +455,7 @@ async def test_reconcile_leaves_a_row_alone_when_its_id_is_in_two_places(
 
 
 async def test_a_late_library_row_adopts_the_finished_upload(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one()
@@ -511,7 +487,7 @@ async def test_a_tree_a_dead_workers_command_may_write_takes_no_host_write(
 ) -> None:
     from sightread.workspace.locks import clear_writing, mark_writing, workspace_lock
 
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -538,7 +514,7 @@ async def test_a_tree_a_dead_workers_command_may_write_takes_no_host_write(
 async def test_a_document_named_like_an_excluded_artifact_keeps_its_revisions(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         document.name = "source.pdf"
@@ -633,7 +609,7 @@ def test_renames_since_follows_chains_and_paths_that_meet(tmp_path) -> None:
 async def test_a_folder_set_aside_by_a_crashed_delete_comes_back_whole(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -658,7 +634,7 @@ async def test_a_folder_set_aside_by_a_crashed_delete_comes_back_whole(
 async def test_an_aside_holding_a_deleted_document_does_not_come_back_whole(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         other = Document(
@@ -687,7 +663,7 @@ async def test_an_aside_holding_a_deleted_document_does_not_come_back_whole(
 async def test_a_failed_library_parse_keeps_its_original(sessionmaker, tmp_path) -> None:
     from sightread.jobs import runner
 
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one()
@@ -716,7 +692,7 @@ async def test_retention_copies_for_its_recipients_when_a_late_row_took_the_uplo
 ) -> None:
     from sightread.jobs import runner
 
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, first = await _seed(db)
         job = (await db.execute(select(Job).where(Job.id == first.job_id))).scalar_one()
@@ -750,7 +726,7 @@ async def test_retention_copies_for_its_recipients_when_a_late_row_took_the_uplo
 async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -775,7 +751,7 @@ async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
 
 
 async def test_non_utf8_content_is_refused_not_a_crash(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -786,7 +762,7 @@ async def test_non_utf8_content_is_refused_not_a_crash(sessionmaker, tmp_path) -
 
 
 async def test_a_cached_library_upload_keeps_its_fresh_file(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one()
@@ -802,7 +778,7 @@ async def test_a_cached_library_upload_keeps_its_fresh_file(sessionmaker, tmp_pa
 
 
 async def test_a_revert_that_cannot_complete_touches_nothing(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -824,7 +800,7 @@ async def test_a_revert_that_cannot_complete_touches_nothing(sessionmaker, tmp_p
 
 
 async def test_deleting_through_a_linked_ancestor_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -893,7 +869,7 @@ def test_a_failed_write_leaves_the_file_as_it_was(tmp_path) -> None:
 async def test_figure_crops_are_copied_file_by_file_and_never_through_a_link(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         crops = tmp_path / "figures" / str(document.job_id)
@@ -942,7 +918,7 @@ def test_missing_parents_are_made_through_descriptors(tmp_path) -> None:
 async def test_a_revert_never_writes_over_what_sits_at_the_old_place(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -962,7 +938,7 @@ async def test_a_revert_never_writes_over_what_sits_at_the_old_place(
 
 
 async def test_missing_crops_are_copied_on_a_later_materialization(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         crops = tmp_path / "figures" / str(document.job_id)
@@ -977,7 +953,7 @@ async def test_missing_crops_are_copied_on_a_later_materialization(sessionmaker,
 
 
 async def test_reconcile_records_no_folder_under_a_documents_name(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1002,7 +978,7 @@ async def test_reconcile_records_no_folder_under_a_documents_name(sessionmaker, 
 async def test_reconcile_follows_a_document_into_a_directory_that_replaced_a_file(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1031,7 +1007,7 @@ async def test_reconcile_follows_a_document_into_a_directory_that_replaced_a_fil
 async def test_a_revert_of_a_rename_that_also_edited_restores_the_bytes(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     # Long enough that git still sees the edited file as the renamed one (R, not D + A).
     original = "# Title\n\n" + "".join(f"Paragraph {index}.\n\n" for index in range(30))
     async with sessionmaker() as db:
@@ -1069,7 +1045,7 @@ def test_a_staging_failure_is_an_error_not_a_silent_save(tmp_path) -> None:
 async def test_reconcile_never_walks_through_a_linked_files_directory(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1299,7 +1275,7 @@ def test_reaches_beyond_tells_a_documents_own_revision_from_a_shells(tmp_path) -
 
 
 async def test_a_removal_whose_rows_stay_is_put_back(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1315,7 +1291,7 @@ async def test_a_removal_whose_rows_stay_is_put_back(sessionmaker, tmp_path) -> 
 
 
 async def test_a_reverted_rename_takes_the_untracked_assets_along(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -1356,7 +1332,7 @@ def test_a_git_that_stalls_is_ended_at_the_deadline(tmp_path, monkeypatch) -> No
 async def test_a_revert_whose_revision_cannot_be_recorded_is_rolled_back(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1457,7 +1433,7 @@ def test_a_removal_whose_revision_cannot_be_recorded_moves_back(tmp_path, monkey
 
 
 async def test_a_move_whose_commit_fails_is_undone(sessionmaker, tmp_path, monkeypatch) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -1488,7 +1464,7 @@ async def test_a_move_whose_commit_fails_is_undone(sessionmaker, tmp_path, monke
 async def test_reconcile_leaves_what_a_command_made_inside_a_document(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1514,7 +1490,7 @@ async def test_reconcile_leaves_what_a_command_made_inside_a_document(
 
 
 async def test_reconcile_follows_two_documents_that_traded_places(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, first = await _seed(db, markdown="# First\n")
         second = Document(
@@ -1551,7 +1527,7 @@ async def test_reconcile_follows_two_documents_that_traded_places(sessionmaker, 
 async def test_reconcile_refuses_a_document_that_took_a_folders_name(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1572,7 +1548,7 @@ async def test_reconcile_refuses_a_document_that_took_a_folders_name(
 async def test_a_save_whose_commit_fails_leaves_the_file_as_it_was(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1598,7 +1574,7 @@ async def test_a_save_whose_commit_fails_leaves_the_file_as_it_was(
 async def test_a_materialization_whose_commit_fails_is_written_again(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         real = git.commit_paths
@@ -1620,7 +1596,7 @@ async def test_a_materialization_whose_commit_fails_is_written_again(
 
 
 async def test_reconcile_records_an_empty_folder_the_shell_made(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1643,7 +1619,7 @@ async def test_reconcile_records_an_empty_folder_the_shell_made(sessionmaker, tm
 async def test_a_canonicalization_whose_commit_fails_is_undone(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1690,7 +1666,7 @@ def test_a_directory_the_disk_refuses_to_move_stays_and_the_others_are_recorded(
 async def test_the_documents_own_rename_revision_does_not_reach_beyond_it(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -1722,7 +1698,7 @@ async def test_the_documents_own_rename_revision_does_not_reach_beyond_it(
 async def test_a_delete_the_process_died_in_is_restored_by_reconciliation(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1755,7 +1731,7 @@ async def test_a_delete_the_process_died_in_is_restored_by_reconciliation(
 async def test_a_move_that_fails_after_displacing_a_squatter_puts_it_back(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -1824,7 +1800,7 @@ async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
     a document whose `.meta.json` a command removed: nothing inside names a row, so the
     origin written beside the aside is what brings it back while a row still names that
     path (docs/workspace.md § Revisions)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         drafts = Folder(user_id=user.id, parent_id=None, name="Drafts")
@@ -1887,7 +1863,7 @@ async def test_a_removal_whose_origin_cannot_be_written_is_refused_whole(
 ) -> None:
     """A full disk at the origin marker must not leave the directory aside with nothing
     to bring it back: it goes back where it was, and the delete is refused."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1913,7 +1889,7 @@ async def test_undoing_a_move_puts_the_displaced_squatter_back_too(sessionmaker,
     """A move whose row did not commit is undone whole: the document back where it was,
     and the directory the move displaced back under the name it had (docs/workspace.md
     § Layout)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -1936,7 +1912,7 @@ async def test_a_file_moved_in_from_another_document_reaches_beyond(sessionmaker
     """The exemption for the old side of a rename is the document's own rename only: a
     shell revision that moved a file in from another document is that document's too,
     so its revert waits for every turn of the user (docs/workspace.md § Revisions)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         other = Document(
@@ -1965,7 +1941,7 @@ async def test_reconciliation_removes_the_originals_of_rows_that_are_gone(
     """A delete the process died in after its rows' commit leaves the originals beside the
     git directory, a writer that died between its copy and its rename a staging copy; the
     next reconciliation takes them, and only them."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1987,7 +1963,7 @@ async def test_materialized_files_left_uncommitted_are_committed_next_time(
     """The process died between the write and the commit: the files are in place and
     untracked, and the next materialization — which writes nothing — commits them, so
     the first edit is a change against the parse baseline (docs/workspace.md § Layout)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         real = git.commit_paths
@@ -2014,7 +1990,7 @@ async def test_the_origin_is_written_before_the_directory_moves_aside(
     two leaves a marker beside no aside — swept, the directory where it was — and never
     an aside no marker names; a rename that is refused takes its marker with it
     (docs/workspace.md § Revisions)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -2052,7 +2028,7 @@ async def test_a_revert_whose_reconciliation_fails_is_reported_as_reverted_and_f
     after its commit is reported as such, and the next read of the document brings the
     row in line rather than writing a fresh copy at the path it still names
     (docs/workspace.md § Revisions)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -2276,7 +2252,7 @@ def test_a_file_with_several_names_counts_once(tmp_path) -> None:
 async def test_a_workspace_too_deep_to_measure_is_refused_not_undercounted(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)

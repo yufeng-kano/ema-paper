@@ -22,10 +22,10 @@ from sightread.jobs.check import CheckFailed, run_check
 from sightread.parsing import joins
 from sightread.routes.library import document_payload
 from sightread.upstream.anthropic import ChatUsage
-from sightread.upstream.client import Connection
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_BASE, KANO_CHAT_URL, TEST_SECRET_KEY
-from tests.test_chat import MESSAGES_URL, assistant_turn, sse
+from tests.chat_helpers import MESSAGES_URL, assistant_turn, sse
+from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_CHAT_URL, TEST_SECRET_KEY
+from tests.helpers import job_by_id, stub_connection
 from tests.test_library import MODEL, _ready_to_parse
 from tests.test_parse_end_to_end import _drain_queue
 from tests.test_retry_failed_pages import FALLBACK, Upstream, _answer, _retry, _row, _upload
@@ -73,13 +73,6 @@ def _done() -> httpx.Response:
     return _turn([{"type": "text", "text": "Done."}], "end_turn")
 
 
-def _connection() -> Connection:
-    return Connection(
-        api_key=KANO_API_KEY,
-        base_url=f"{KANO_BASE}/anthropic/v1",
-    )
-
-
 def _settings(**overrides) -> Settings:
     return Settings(secret_key=TEST_SECRET_KEY, **overrides)
 
@@ -91,7 +84,7 @@ async def _check(markdown: str, billed: list[ChatUsage] | None = None, **overrid
         billed.append(usage)
 
     outcome = await run_check(
-        _connection(),
+        stub_connection("anthropic", KANO_API_KEY),
         _settings(**overrides),
         model="claude-code/claude-opus-5-5",
         effort="medium",
@@ -453,11 +446,11 @@ async def test_the_spots_past_the_cap_stay_as_they_are() -> None:
 
 
 @pytest.fixture
-async def library(make_client, tmp_path) -> AsyncClient:
+async def library(make_client) -> AsyncClient:
     from tests.test_library import _ready_to_parse
 
     # The deployment names a fallback, the model a retry may send failed pages to.
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), parse_fallback_model=FALLBACK)
+    client = make_client(parse_fallback_model=FALLBACK)
     await _ready_to_parse(client)
     client.user_id = (await client.get("/api/me")).json()["user"]["id"]
     return client
@@ -467,11 +460,6 @@ def _vision() -> Upstream:
     return Upstream(
         {(MODEL, page): (lambda text=text: _answer(text)) for page, text in PAGES.items()}
     )
-
-
-async def _job(sessionmaker, job_id: str) -> Job:
-    async with sessionmaker() as db:
-        return await db.get(Job, uuid.UUID(job_id))
 
 
 @respx.mock
@@ -494,7 +482,7 @@ async def test_a_files_upload_opens_checked(library, sessionmaker, documents) ->
         ]
     )
     uploaded = await _upload(library, documents["mixed_pdf"])
-    job = await _job(sessionmaker, uploaded["job_id"])
+    job = await job_by_id(sessionmaker, uploaded["job_id"])
     # Snapshotted at the upload: no model of its own is the parse's, and the default prompt.
     assert (job.check_model, job.check_effort, job.check_prompt) == (
         MODEL,
@@ -580,7 +568,7 @@ async def test_a_retry_takes_the_check_settings_of_its_moment(
     )
     assert off.status_code == 200, off.text
     assert (await _retry(library, uploaded["id"])).status_code == 202
-    assert (await _job(sessionmaker, uploaded["job_id"])).check_model is None
+    assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model is None
     await _drain_queue(library, sessionmaker)
     async with sessionmaker() as db:
         result = await db.get(Result, uuid.UUID(uploaded["job_id"]))
@@ -613,20 +601,16 @@ async def test_a_retry_checks_on_the_model_it_names_when_the_check_has_none(
     # The page goes to another model, and the check, with no model of its own, follows it:
     # the model that blocked the page is not sent its text again.
     assert (await _retry(library, uploaded["id"], model=FALLBACK)).status_code == 202
-    assert (await _job(sessionmaker, uploaded["job_id"])).check_model == FALLBACK
+    assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model == FALLBACK
     await _drain_queue(library, sessionmaker)
     assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
     assert [json.loads(call.request.content)["model"] for call in agent.calls] == [FALLBACK]
 
 
-async def test_the_check_takes_its_own_settings(
-    make_client, tmp_path, sessionmaker, documents
-) -> None:
+async def test_the_check_takes_its_own_settings(make_client, sessionmaker, documents) -> None:
     """Its model is the deployment's `CHECK_MODEL`; the effort and the instructions are
     the reader's (docs/agents.md § Enqueue rules)."""
-    library = make_client(
-        workspaces_dir=str(tmp_path / "ws"), check_model="claude-code/claude-haiku-5-5"
-    )
+    library = make_client(check_model="claude-code/claude-haiku-5-5")
     await _ready_to_parse(library)
     saved = await library.put(
         "/api/agents/check/settings",
@@ -637,7 +621,7 @@ async def test_the_check_takes_its_own_settings(
     assert saved.json()["auto_check"] is True
     assert saved.json()["model"] == "claude-code/claude-haiku-5-5"
     uploaded = await _upload(library, documents["mixed_pdf"])
-    job = await _job(sessionmaker, uploaded["job_id"])
+    job = await job_by_id(sessionmaker, uploaded["job_id"])
     assert (job.check_model, job.check_effort) == ("claude-code/claude-haiku-5-5", "low")
     assert job.check_prompt == check_agent.system_prompt(CHECK.default_prompt_template, "Use $.")
     assert job.check_prompt.endswith("# The reader's instructions\n\nUse $.\n")
@@ -651,7 +635,7 @@ async def test_no_check_when_switched_off_and_an_api_parse_checked_as_an_upload(
     )
     assert off.status_code == 200, off.text
     uploaded = await _upload(library, documents["mixed_pdf"])
-    assert (await _job(sessionmaker, uploaded["job_id"])).check_model is None
+    assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model is None
 
     # An API parse — the connector's too — is checked as a Files upload is, since
     # 2026-10-31 (docs/parsing.md § Format check); test_data_plane_parity.py reads it back.
@@ -666,7 +650,7 @@ async def test_no_check_when_switched_off_and_an_api_parse_checked_as_an_upload(
         headers={"Authorization": f"Bearer {created.json()['key']}"},
     )
     assert accepted.status_code == 202, accepted.text
-    assert (await _job(sessionmaker, accepted.json()["job_id"])).check_model == MODEL
+    assert (await job_by_id(sessionmaker, accepted.json()["job_id"])).check_model == MODEL
 
 
 def test_checking_is_a_running_parse_past_its_last_page_with_a_check() -> None:

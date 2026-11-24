@@ -8,23 +8,22 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-import pytest
 import respx
 from httpx import AsyncClient
 
 from sightread.agents import chat as chat_agent
 from sightread.workspace.agents_file import UNREADABLE, agents_file_chain, render_chain
 from sightread.workspace.layout import user_root
+from tests.chat_helpers import (
+    conversation_row,
+    new_conversation,
+    run_queued_turn,
+    send,
+    stub_messages,
+)
 from tests.conftest import CSRF_HEADERS
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_compact import DONE, SUMMARY, conversation_row
-from tests.test_chat_extensions import chatting_client, new_conversation, send, stub_messages
+from tests.test_chat_compact import DONE, SUMMARY
 from tests.test_chat_versions import edit
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
 
 
 def _root(client: AsyncClient) -> Path:
@@ -112,7 +111,7 @@ async def test_a_conversation_keeps_the_agents_files_it_started_with(chat_client
     main, _ = stub_messages([DONE, DONE, SUMMARY, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="one")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     expected = chat_agent.AGENTS_FILE_INTRO + (
         "## /workspace/files/AGENTS.md\n\n- Notes in English\n\n"
@@ -134,15 +133,15 @@ async def test_a_conversation_keeps_the_agents_files_it_started_with(chat_client
 
     _write(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n- Tables, never lists\n")
     await send(client, conversation_id, text="two")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert _agents_part(main[1]) == expected
 
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert _agents_part(main[2]) == expected
     assert "Tables, never lists" in (await conversation_row(client, conversation_id)).agents_file
     await send(client, conversation_id, text="three")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert _agents_part(main[3]).endswith("- Cite with the DOI\n- Tables, never lists")
 
 
@@ -152,7 +151,7 @@ async def test_a_conversation_without_agents_files_sends_no_block(chat_client) -
     main, _ = stub_messages([DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="one")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert _agents_part(main[0]) is None
     assert (await conversation_row(client, conversation_id)).agents_file == ""
 
@@ -198,7 +197,7 @@ async def test_init_carries_the_instruction_and_nothing_of_the_passage(chat_clie
         sections=[{"heading": "1 Intro", "text": "..."}],
     )
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     content = main[0]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "/init my thesis papers"}
     assert content[1]["text"] == chat_agent.INIT_INSTRUCTION + chat_agent.INIT_NOTE.format(
@@ -219,7 +218,7 @@ async def test_init_carries_the_instruction_and_nothing_of_the_passage(chat_clie
     # Edited, it is an `/init` again, its instruction rendered with the new note.
     edited = await edit(client, conversation_id, detail["messages"][0]["id"], text="")
     assert edited.status_code == 202, edited.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     content = main[1]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "/init"}
     assert content[1]["text"] == chat_agent.INIT_INSTRUCTION

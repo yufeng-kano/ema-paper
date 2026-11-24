@@ -19,7 +19,9 @@ from sightread.upstream.anthropic import (
     stream_messages,
 )
 from sightread.upstream.client import Connection, PaymentRequired, RateLimited, UpstreamError
+from tests.chat_helpers import sse
 from tests.conftest import KANO_BASE
+from tests.helpers import stub_connection
 
 SECRET = "test-secret-key-not-a-real-one"
 MESSAGES_URL = f"{KANO_BASE}/anthropic/v1/messages"
@@ -30,16 +32,7 @@ BOUNDS = {"max_bytes": 33_554_432, "line_max_bytes": 4 * 1024 * 1024, "blocks_ma
 
 @pytest.fixture
 def key() -> Connection:
-    return Connection(
-        api_key="sk-kano-proxy-test",
-        base_url=f"{KANO_BASE}/anthropic/v1",
-    )
-
-
-def sse(*events: dict) -> bytes:
-    return "".join(
-        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
-    ).encode()
+    return stub_connection("anthropic")
 
 
 def a_turn(*, with_tool: bool = True, cost: float | None = 0.0123) -> bytes:

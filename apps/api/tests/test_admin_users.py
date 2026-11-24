@@ -21,6 +21,7 @@ from sightread.errors import ApiError
 from sightread.routes import admin as admin_routes
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, grant_plan
+from tests.factories import job_row
 from tests.test_admin import _account, _add, _audit, _error, _group, _last_audit_id, _owner
 from tests.test_ledger import settings_with
 from tests.test_redeem import TWO_PLANS_JSON
@@ -38,23 +39,16 @@ def _when(value: str) -> datetime:
 
 
 def _job(user_id: int, **fields) -> Job:
-    return Job(
+    return job_row(
+        user_id,
         **{
-            "user_id": user_id,
-            "agent": "parse",
-            "kind": "pdf",
             "filename": "report.pdf",
-            "media_type": "application/pdf",
-            "size_bytes": 1,
             "sha256": "x",
-            "status": "succeeded",
             "model": "m",
-            "bbox_format": "yxyx_norm1000",
-            "prompt": "Transcribe page {page}.",
             "page_count": 3,
             "pages_done": 3,
             **fields,
-        }
+        },
     )
 
 
@@ -75,14 +69,13 @@ async def _bank(client, user_id: int) -> PlanGrant | None:
 # --- the list -------------------------------------------------------------------------
 
 
-async def test_the_list_searches_filters_by_plan_and_pages(make_client, tmp_path) -> None:
-    settings = {**PLANS, "workspaces_dir": str(tmp_path / "ws")}
-    owner = await _owner(make_client, **settings)
-    alice = await _account(make_client, "alice@example.test", "Alice Example", **settings)
-    bob = await _account(make_client, "bob@example.test", "bob_smith", **settings)
-    carol = await _account(make_client, "carol@example.test", "Carol 100%", **settings)
-    dave = await _account(make_client, "dave@example.test", "Dave", **settings)
-    erin = await _account(make_client, "erin@example.test", None, **settings)
+async def test_the_list_searches_filters_by_plan_and_pages(make_client) -> None:
+    owner = await _owner(make_client, **PLANS)
+    alice = await _account(make_client, "alice@example.test", "Alice Example", **PLANS)
+    bob = await _account(make_client, "bob@example.test", "bob_smith", **PLANS)
+    carol = await _account(make_client, "carol@example.test", "Carol 100%", **PLANS)
+    dave = await _account(make_client, "dave@example.test", "Dave", **PLANS)
+    erin = await _account(make_client, "erin@example.test", None, **PLANS)
     sessionmaker = owner.app.state.sessionmaker
     now = utcnow()
     # bob pays for pro; erin pays for pro with team days waiting, which wait; carol has
@@ -115,7 +108,7 @@ async def test_the_list_searches_filters_by_plan_and_pages(make_client, tmp_path
         )
         db.add_all([_job(alice.user_id), _job(alice.user_id, status="failed")])
         await db.commit()
-    root = user_root(tmp_path / "ws", alice.user_id)
+    root = user_root(alice.app.state.settings.workspaces_dir, alice.user_id)
     root.mkdir(parents=True)
     (root / "notes.md").write_bytes(b"x" * 1234)
 
@@ -176,7 +169,7 @@ async def test_the_list_searches_filters_by_plan_and_pages(make_client, tmp_path
     assert filtered.json()["plans"] == page["plans"]
 
     # Pages of ADMIN_PAGE_SIZE, empty past the end.
-    small = await _owner(make_client, admin_page_size=4, **settings)
+    small = await _owner(make_client, admin_page_size=4, **PLANS)
     second = (await small.get(f"{USERS}?page=2")).json()
     assert [row["id"] for row in second["items"]] == [alice.user_id, owner.user_id]
     assert (second["total"], second["page"], second["page_size"]) == (6, 2, 4)
@@ -188,10 +181,8 @@ async def test_the_list_searches_filters_by_plan_and_pages(make_client, tmp_path
         assert _error(refused)["type"] == "invalid_request"
 
 
-async def test_a_workspace_that_cannot_be_measured_reads_unknown(
-    make_client, tmp_path, monkeypatch
-) -> None:
-    owner = await _owner(make_client, workspaces_dir=str(tmp_path / "ws"))
+async def test_a_workspace_that_cannot_be_measured_reads_unknown(make_client, monkeypatch) -> None:
+    owner = await _owner(make_client)
     deep = await _account(make_client, "deep@example.test")
     measure = admin_routes.measure_storage
 

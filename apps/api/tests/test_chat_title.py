@@ -25,9 +25,16 @@ from sightread.db.models import (
     UsageLog,
     utcnow,
 )
+from tests.chat_helpers import (
+    MESSAGES_URL,
+    assistant_turn,
+    chatting_client,
+    conversation_row,
+    new_conversation,
+    run_queued_turn,
+    send,
+)
 from tests.conftest import CSRF_HEADERS
-from tests.test_chat import MESSAGES_URL, _run_queued_turn, assistant_turn
-from tests.test_chat_extensions import chatting_client, new_conversation, send
 
 SUMMARY_MODEL = "codex/gpt-5.5"
 
@@ -58,14 +65,7 @@ def stub_calls(turn_answers: list[str], title_answers: list) -> list[dict]:
 async def talk(client: AsyncClient, conversation_id: int, **body) -> None:
     sent = await send(client, conversation_id, **body)
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
-
-
-async def conversation_row(client: AsyncClient, conversation_id: int) -> Conversation:
-    async with client.app.state.sessionmaker() as db:
-        row = await db.get(Conversation, conversation_id)
-        db.expunge(row)
-        return row
+    await run_queued_turn(client)
 
 
 async def title_entries(client: AsyncClient) -> list[CreditEntry]:
@@ -90,11 +90,6 @@ async def name_it(client: AsyncClient, conversation_id: int, **body) -> httpx.Re
     return await client.post(
         f"/api/conversations/{conversation_id}/title", json=body, headers=CSRF_HEADERS
     )
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
 
 
 @respx.mock
@@ -148,14 +143,10 @@ async def test_a_title_is_written_from_the_first_and_the_latest_exchange(chat_cl
 
 
 @respx.mock
-async def test_the_summary_model_and_the_chosen_answer_language_are_used(
-    make_client, tmp_path
-) -> None:
+async def test_the_summary_model_and_the_chosen_answer_language_are_used(make_client) -> None:
     """`SUMMARY_MODEL` runs the call when it names one, and the answer language the reader
     chose wins over the request's locale; a conversation of one turn is read once."""
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), summary_model=SUMMARY_MODEL)
-    )
+    client = await chatting_client(make_client(summary_model=SUMMARY_MODEL))
     async with client.app.state.sessionmaker() as db:
         await db.execute(
             update(AgentSetting)

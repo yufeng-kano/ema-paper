@@ -17,12 +17,18 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from sqlalchemy import select
 
-from sightread.db.models import ChatAttachment, User, utcnow
+from sightread.db.models import ChatAttachment, utcnow
 from sightread.parsing import attachments as attachment_prep
 from sightread.parsing import poppler
+from tests.chat_helpers import (
+    chatting_client,
+    new_conversation,
+    run_queued_turn,
+    send,
+    stub_messages,
+)
 from tests.conftest import CSRF_HEADERS
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_extensions import chatting_client, new_conversation, send, stub_messages
+from tests.factories import user_row
 
 
 async def attach(
@@ -40,11 +46,9 @@ def waiting(client: AsyncClient) -> list[Path]:
 
 @respx.mock
 async def test_attachments_are_prepared_embedded_and_shown_without_their_bytes(
-    make_client, tmp_path, documents
+    make_client, documents
 ) -> None:
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_attachment_cache_seconds=600)
-    )
+    client = await chatting_client(make_client(chat_attachment_cache_seconds=600))
     image = await attach(client, "wide.png", documents["wide_png"].read_bytes(), "image/png")
     assert image.status_code == 201, image.text
     image = image.json()
@@ -79,7 +83,7 @@ async def test_attachments_are_prepared_embedded_and_shown_without_their_bytes(
     assert waiting(client) == []
     async with client.app.state.sessionmaker() as db:
         assert (await db.execute(select(ChatAttachment))).scalars().all() == []
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     again = await send(client, conversation_id, text="Again", attachments=[image["id"]])
     assert again.status_code == 409
 
@@ -215,12 +219,8 @@ async def test_the_attachment_route_streams_past_the_json_body_cap(make_client) 
     assert created.status_code == 201, created.text
 
 
-async def test_an_attachment_is_removed_expires_or_is_another_readers(
-    make_client, tmp_path
-) -> None:
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_attachments_per_message=2)
-    )
+async def test_an_attachment_is_removed_expires_or_is_another_readers(make_client) -> None:
+    client = await chatting_client(make_client(chat_attachments_per_message=2))
     removed = (await attach(client, "a.txt", b"alpha", "text/plain")).json()
     deleted = await client.delete(f"/api/attachments/{removed['id']}", headers=CSRF_HEADERS)
     assert deleted.status_code == 204
@@ -244,7 +244,7 @@ async def test_an_attachment_is_removed_expires_or_is_another_readers(
     # Another reader's attachment is not the caller's to send or to remove.
     stranger_id = uuid.uuid4()
     async with client.app.state.sessionmaker() as db:
-        stranger = User(google_sub="stranger", email="stranger@example.com")
+        stranger = user_row("stranger@example.com")
         db.add(stranger)
         await db.flush()
         db.add(
@@ -302,14 +302,12 @@ async def test_the_attachments_waiting_for_a_message_are_capped(make_client) -> 
 
 @respx.mock
 async def test_attachments_that_would_fill_the_history_stay_for_another_conversation(
-    make_client, tmp_path, documents
+    make_client, documents
 ) -> None:
     """The cap counts the message being sent: an image that would carry the history past it
     is refused before it is spent, rather than embedded into a turn that then cannot run
     (docs/chat.md § History is append-only)."""
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_history_max_bytes=2000)
-    )
+    client = await chatting_client(make_client(chat_history_max_bytes=2000))
     image = (
         await attach(client, "wide.png", documents["wide_png"].read_bytes(), "image/png")
     ).json()

@@ -12,25 +12,15 @@ import re
 from pathlib import Path
 
 import httpx
-import pytest
 from httpx import AsyncClient
 from PIL import Image
 
 from sightread.workspace.documents import sweep_orphaned_images
-from sightread.workspace.layout import images_dir, user_root
+from sightread.workspace.layout import images_dir
+from tests.chat_helpers import seed_document
 from tests.conftest import CSRF_HEADERS
-from tests.test_chat import _seed_document
 
 IMAGE_PATH = re.compile(r"figures/img-[0-9a-f]{16}\.(png|jpg)")
-
-
-@pytest.fixture
-async def writer(make_client, tmp_path) -> AsyncClient:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
 
 
 def _image(image_format: str, size: tuple[int, int] = (40, 30), mode: str = "RGB") -> bytes:
@@ -97,8 +87,8 @@ async def test_an_inserted_image_is_kept_copied_and_served(writer) -> None:
     assert sorted(entry.name for entry in kept.parent.iterdir()) == [name]
 
 
-async def test_an_image_is_kept_as_png_or_jpeg_within_the_long_edge(make_client, tmp_path) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), document_image_long_edge=50)
+async def test_an_image_is_kept_as_png_or_jpeg_within_the_long_edge(make_client) -> None:
+    client = make_client(document_image_long_edge=50)
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     document_id = await _document(client)
     jpeg = await _insert(client, document_id, _image("JPEG", (200, 100)), "photo.jpg", "image/jpeg")
@@ -128,9 +118,8 @@ async def test_only_the_accepted_formats_are_decoded(writer) -> None:
     assert list(Path(writer.app.state.settings.upload_dir).iterdir()) == []
 
 
-async def test_an_image_past_its_caps_is_refused(make_client, tmp_path) -> None:
+async def test_an_image_past_its_caps_is_refused(make_client) -> None:
     client = make_client(
-        workspaces_dir=str(tmp_path / "ws"),
         document_image_max_bytes=2048,
         chat_page_image_max_pixels=1000,
     )
@@ -176,7 +165,7 @@ async def test_an_image_needs_the_callers_document_and_the_csrf_header(writer, m
 async def test_an_image_goes_into_a_parsed_document_and_comes_back_when_removed(
     writer,
 ) -> None:
-    document_id = await _seed_document(writer, writer.user_id)
+    document_id = await seed_document(writer, writer.user_id)
     path = (await _insert(writer, document_id, _image("PNG"))).json()["path"]
     copy = writer.root / "files" / "Papers" / "paper.pdf" / path
     assert copy.is_file()

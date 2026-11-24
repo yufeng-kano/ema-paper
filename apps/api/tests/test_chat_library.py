@@ -6,39 +6,34 @@ Turns run against a stubbed Messages stream; no test reaches the network (docs/t
 
 from __future__ import annotations
 
-import pytest
 import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
 from sightread.agents import chat as chat_agent
-from sightread.db.models import ChatTurn, Conversation, Document, Folder, Message, User
+from sightread.db.models import ChatTurn, Conversation, Document, Folder, Message
 from sightread.errors import ApiError
 from sightread.jobs import chat_compact, chat_library, chat_memory
 from sightread.jobs.chat_tools import ToolOutcome
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import filing, git
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, DATABASE_URL
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_agents_file import _agents_part, _write
-from tests.test_chat_compact import DONE, SUMMARY, conversation_row, detail, set_clock, turns_of
-from tests.test_chat_extensions import (
-    chatting_client,
+from tests.chat_helpers import (
+    conversation_row,
     new_conversation,
     one_call,
+    run_queued_turn,
     send,
     stub_messages,
 )
+from tests.conftest import CSRF_HEADERS, postgres_only
+from tests.factories import user_row
+from tests.test_chat_agents_file import _agents_part, _write
+from tests.test_chat_compact import DONE, SUMMARY, detail, set_clock, turns_of
 from tests.test_chat_versions import edit
 from tests.test_chat_web import tool_results
 
 LIBRARY_PROMPT_START = "You are the library agent inside Ema Paper"
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
 
 
 async def new_library_conversation(client: AsyncClient) -> int:
@@ -97,9 +92,9 @@ async def test_the_files_page_lists_its_own_threads_and_no_one_elses(chat_client
     about_document = await new_conversation(client)
     for conversation_id in (first, second, about_document):
         await send(client, conversation_id, text="hello")
-        await _run_queued_turn(client)
+        await run_queued_turn(client)
     async with client.app.state.sessionmaker() as db:
-        other = User(google_sub="other", email="other@example.test")
+        other = user_row("other@example.test")
         db.add(other)
         await db.flush()
         theirs = Conversation(user_id=other.id, document_id=None, title="", session="o")
@@ -162,7 +157,7 @@ async def test_a_message_carries_the_files_page_and_no_passage(chat_client) -> N
         },
     )
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     content = main[0]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "Tidy this up"}
@@ -197,12 +192,12 @@ async def test_an_edit_keeps_the_files_page_it_was_sent_with(chat_client) -> Non
     papers = await _papers(client)
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, text="one", library={"folder_id": papers})
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     message_id = (await detail(client, conversation_id))["messages"][0]["id"]
 
     kept = await edit(client, conversation_id, message_id, text="two")
     assert kept.status_code == 202, kept.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert main[1]["messages"][0]["content"][1]["text"] == (
         f"The Files page as the user sent this message:\n- open folder: Papers (folder {papers})"
     )
@@ -218,7 +213,7 @@ async def test_a_message_from_the_top_of_files_names_the_top(chat_client) -> Non
     for turn, folder_id in enumerate((None, 999_999)):
         sent = await send(client, conversation_id, text="hi", library={"folder_id": folder_id})
         assert sent.status_code == 202, sent.text
-        await _run_queued_turn(client)
+        await run_queued_turn(client)
         assert main[turn]["messages"][-1]["content"][1] == {
             "type": "text",
             "text": "The Files page as the user sent this message:\n"
@@ -254,7 +249,7 @@ async def test_a_library_turn_runs_on_the_library_prompt_and_tools(chat_client) 
     )
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, text="What is here?")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     request = main[0]
     assert request["system"][0]["text"].startswith(LIBRARY_PROMPT_START)
@@ -280,7 +275,7 @@ async def test_a_library_turn_runs_on_the_library_prompt_and_tools(chat_client) 
 
     # A document's conversation declares none of the library tools.
     await send(client, await new_conversation(client), text="hello")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     declared = {tool["name"] for tool in main[3]["tools"]}
     assert set(chat_agent.DOCUMENT_TOOL_NAMES) <= declared
     assert not set(chat_agent.LIBRARY_TOOL_NAMES) & declared
@@ -320,7 +315,7 @@ async def test_the_library_tools_change_the_library_and_say_how_to_undo_it(chat_
     )
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, text="Organize my papers")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     folders, documents = await _rows(client)
     reading = next(row.id for row in folders.values() if row.name == "Reading")
@@ -683,7 +678,7 @@ async def test_a_listing_sees_what_the_calls_before_it_in_the_round_changed(chat
     )
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, text="Make Later and show me")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     results = {result["id"]: result for result in await tool_results(client, conversation_id)}
     folders, _ = await _rows(client)
@@ -766,7 +761,7 @@ async def test_a_memory_for_this_document_has_no_document_to_go_with(chat_client
     stub_messages([call("d", "document"), call("a", "all"), DONE])
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, text="Remember query is 查詢")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     results = {result["id"]: result for result in await tool_results(client, conversation_id)}
     assert results["d"]["is_error"] is True
@@ -783,9 +778,9 @@ async def test_init_in_a_library_conversation_names_the_open_folders_agents_md(
     papers = await _papers(client)
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, command="init", library={"folder_id": papers})
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     await send(client, conversation_id, command="init", text="short")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     first = main[0]["messages"][0]["content"]
     assert first[-2]["text"] == chat_agent.library_init_instruction(
@@ -801,7 +796,7 @@ async def test_init_in_a_library_conversation_names_the_open_folders_agents_md(
     first_id = (await detail(client, conversation_id))["messages"][0]["id"]
     edited = await edit(client, conversation_id, first_id, text="")
     assert edited.status_code == 202, edited.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert main[2]["messages"][0]["content"][-2]["text"] == chat_agent.library_init_instruction(
         "Reading", "/workspace/files/Reading/AGENTS.md", ""
     )
@@ -814,7 +809,7 @@ async def test_the_idle_pass_compacts_a_library_conversation(chat_client) -> Non
     main, _ = stub_messages([DONE, SUMMARY])
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, text="hello")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     await set_clock(
         client,
         conversation_id,
@@ -823,7 +818,7 @@ async def test_the_idle_pass_compacts_a_library_conversation(chat_client) -> Non
     )
 
     assert await chat_compact.idle_compact_once(client.app.state.sessionmaker, settings) == 1
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     turns = await turns_of(client, conversation_id)
     assert [turn.status for turn in turns] == ["succeeded", "succeeded"]
     instruction = main[1]["messages"][-1]["content"]
@@ -832,10 +827,7 @@ async def test_the_idle_pass_compacts_a_library_conversation(chat_client) -> Non
     assert (await conversation_row(client, conversation_id)).compacted_message_id is not None
 
 
-@pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="the foreign key cascades only on PostgreSQL",
-)
+@postgres_only  # the foreign key cascades only on PostgreSQL
 @respx.mock
 async def test_deleting_a_document_leaves_the_library_conversations(chat_client) -> None:
     """The document's conversations go with it; a library conversation, about none, stays
@@ -846,7 +838,7 @@ async def test_deleting_a_document_leaves_the_library_conversations(chat_client)
     about_document = await new_conversation(client)
     for conversation_id in (library, about_document):
         await send(client, conversation_id, text="hello")
-        await _run_queued_turn(client)
+        await run_queued_turn(client)
 
     trashed = await client.post(
         f"/api/library/documents/{client.document_id}/trash", headers=CSRF_HEADERS

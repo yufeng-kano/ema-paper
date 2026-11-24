@@ -9,7 +9,6 @@ import uuid
 from types import SimpleNamespace
 
 import httpx
-import pytest
 import respx
 from httpx import AsyncClient
 from sqlalchemy import update
@@ -20,22 +19,18 @@ from sightread.jobs import chat_compact, chat_versions
 from sightread.jobs.queue import history_bytes
 from sightread.routes import chat as chat_routes
 from sightread.routes.chat import QUOTE_PREFIX, SECTION_CONTEXT, SELECTION_PREFIX, TURN_CONTEXT
-from tests.conftest import CSRF_HEADERS
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_attachments import attach
-from tests.test_chat_compact import DONE, SUMMARY, conversation_row, detail, set_clock, texts
-from tests.test_chat_extensions import (
+from tests.chat_helpers import (
     chatting_client,
+    conversation_row,
     new_conversation,
     replayed_events,
+    run_queued_turn,
     send,
     stub_messages,
 )
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
+from tests.conftest import CSRF_HEADERS
+from tests.test_chat_attachments import attach
+from tests.test_chat_compact import DONE, SUMMARY, detail, set_clock, texts
 
 
 async def edit(
@@ -80,9 +75,9 @@ async def test_an_edit_is_a_new_version_and_the_old_one_can_be_shown_again(chat_
     main, _ = stub_messages([DONE, DONE, DONE, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello there")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     await send(client, conversation_id, text="second")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     before = await detail(client, conversation_id)
     first, second = (turn["id"] for turn in before["turns"])
     assert [turn["versions"] for turn in before["turns"]] == [None, None]
@@ -106,7 +101,7 @@ async def test_an_edit_is_a_new_version_and_the_old_one_can_be_shown_again(chat_
     # An edit continues the thread: the list moves it up, as a send does.
     assert shown["conversation"]["updated_at"] > before["conversation"]["updated_at"]
 
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert first_texts(main[2]["messages"]) == ["hello there", "Done.", "second, revised"]
     events = await replayed_events(client, conversation_id)
     assert {data["turn_id"] for _, data in events} == {first, third}
@@ -133,7 +128,7 @@ async def test_an_edit_is_a_new_version_and_the_old_one_can_be_shown_again(chat_
     # shows the old version with what continued it.
     sent = await send(client, conversation_id, text="third")
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert first_texts(main[3]["messages"]) == ["hello there", "Done.", "second", "Done.", "third"]
     fourth = (await detail(client, conversation_id))["turns"][2]["id"]
     assert (await switch(client, conversation_id, third)).status_code == 200
@@ -163,7 +158,7 @@ async def test_an_edit_takes_the_sends_refusals_and_only_a_messages_own_row(chat
     message_id = sent.json()["message_id"]
     busy = await edit(client, conversation_id, message_id, text="hi")
     assert busy.status_code == 409, busy.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     shown = await detail(client, conversation_id)
     answer = next(message["id"] for message in shown["messages"] if message["role"] == "assistant")
@@ -174,7 +169,7 @@ async def test_an_edit_takes_the_sends_refusals_and_only_a_messages_own_row(chat
     assert (await edit(client, conversation_id, message_id, text="   ")).status_code == 400
 
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     shown = await detail(client, conversation_id)
     compaction = shown["turns"][1]["id"]
     for message in shown["messages"]:
@@ -215,7 +210,7 @@ async def test_an_edit_carries_the_messages_context_and_renders_its_command_agai
         quote="an answer",
     )
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     edited = await edit(
         client, conversation_id, sent.json()["message_id"], text="look again", locale="zh-TW"
@@ -237,7 +232,7 @@ async def test_an_edit_carries_the_messages_context_and_renders_its_command_agai
         stored = (await db.get(Message, edited.json()["message_id"])).content
     assert stored[-1]["context"] == TURN_CONTEXT
     assert "- reader locale: zh-TW" in stored[-1]["text"]
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     request = main[1]["messages"][-1]["content"]
     assert request[0]["text"].startswith("Attached file: notes.txt")
     assert request[1]["text"] == "look again"
@@ -258,7 +253,7 @@ async def test_an_edit_carries_the_messages_context_and_renders_its_command_agai
         client, conversation_id, text="the abstract", command="outline", selection="passage two"
     )
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     edited = await edit(
         client, conversation_id, sent.json()["message_id"], text="the abstract, briefly"
     )
@@ -266,7 +261,7 @@ async def test_an_edit_carries_the_messages_context_and_renders_its_command_agai
     shown = (await detail(client, conversation_id))["messages"][-1]["content"]
     assert shown[0] == {"type": "text", "text": "/outline the abstract, briefly"}
     assert shown[-1] == {"type": "text", "context": "skill", "skill": "outline"}
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     request = main[3]["messages"][-1]["content"]
     assert request[0]["text"] == "/outline the abstract, briefly"
     assert request[1]["text"] == SELECTION_PREFIX + "passage two"
@@ -296,13 +291,13 @@ async def test_an_edit_joins_its_branch_with_that_branchs_summary(chat_client) -
     main, _ = stub_messages([DONE, SUMMARY, DONE, DONE, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello there")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     boundary = (await conversation_row(client, conversation_id)).compacted_message_id
     assert boundary is not None
     await send(client, conversation_id, text="after")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     shown = await detail(client, conversation_id)
     first, compaction, third = (turn["id"] for turn in shown["turns"])
 
@@ -315,7 +310,7 @@ async def test_an_edit_joins_its_branch_with_that_branchs_summary(chat_client) -
     assert (await conversation_row(client, conversation_id)).compacted_message_id == boundary
     # The one answer since the summary is on the other branch: nothing to compact yet.
     assert not (await detail(client, conversation_id))["conversation"]["compactable"]
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     replay = main[3]["messages"]
     assert [message["role"] for message in replay] == ["user", "user"]
     assert texts(replay[0]["content"]) == [chat_agent.SUMMARY_PREFIX + SUMMARY[0][0]["text"]]
@@ -336,7 +331,7 @@ async def test_an_edit_joins_its_branch_with_that_branchs_summary(chat_client) -
     assert [message["turn_id"] for message in shown["messages"]] == [fresh]
     # No answer on this branch yet: nothing to compact, whatever the other branch holds.
     assert not shown["conversation"]["compactable"]
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert first_texts(main[4]["messages"]) == ["hi there"]
     assert (await detail(client, conversation_id))["conversation"]["compactable"]
 
@@ -366,19 +361,19 @@ async def test_an_edit_writes_its_branchs_summary_row_over_a_switch_that_landed_
     main, _ = stub_messages([DONE, SUMMARY, DONE, DONE, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello there")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     boundary = (await conversation_row(client, conversation_id)).compacted_message_id
     await send(client, conversation_id, text="after")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     shown = await detail(client, conversation_id)
     first, _, third = (turn["id"] for turn in shown["turns"])
     # A version of the first message: the root branch, which has no summary row.
     edited = await edit(client, conversation_id, user_message_of(shown, first), text="hi there")
     assert edited.status_code == 202, edited.text
     fresh = edited.json()["turn_id"]
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert (await conversation_row(client, conversation_id)).compacted_message_id is None
     shown = await detail(client, conversation_id)
 
@@ -406,7 +401,7 @@ async def test_an_edit_writes_its_branchs_summary_row_over_a_switch_that_landed_
     row = await conversation_row(client, conversation_id)
     assert str(row.head_id) == edited.json()["turn_id"]
     assert row.compacted_message_id is None
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert first_texts(main[4]["messages"]) == ["hi again"]
 
 
@@ -421,7 +416,7 @@ async def test_the_stream_shows_the_turn_that_starts_as_it_opens(chat_client, mo
     stub_messages([DONE, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello there")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     turns_read = chat_versions.conversation_turns
     landed: list[str] = []
@@ -432,7 +427,7 @@ async def test_the_stream_shows_the_turn_that_starts_as_it_opens(chat_client, mo
             response = await send(client, conversation_id, text="and again")
             assert response.status_code == 202, response.text
             landed[0] = response.json()["turn_id"]
-            await _run_queued_turn(client)
+            await run_queued_turn(client)
         return await turns_read(db, conversation_id_read)
 
     monkeypatch.setattr(chat_versions, "conversation_turns", a_send_lands_first)
@@ -442,21 +437,19 @@ async def test_the_stream_shows_the_turn_that_starts_as_it_opens(chat_client, mo
 
 
 @respx.mock
-async def test_the_history_cap_measures_the_branch_a_message_joins(make_client, tmp_path) -> None:
+async def test_the_history_cap_measures_the_branch_a_message_joins(make_client) -> None:
     """A branch edited away counts for nothing: a message on the shown branch is accepted
     while the conversation's rows together are past the cap (docs/chat.md § History is
     append-only)."""
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_history_max_bytes=2500)
-    )
+    client = await chatting_client(make_client(chat_history_max_bytes=2500))
     long_answer = ([{"type": "text", "text": "y" * 3000}], "end_turn")
     stub_messages([DONE, long_answer, DONE, DONE, DONE])
     conversation_id = await new_conversation(client)
     first = await send(client, conversation_id, text="hello there")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     second = await send(client, conversation_id, text="second")
     assert second.status_code == 202, second.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     async with client.app.state.sessionmaker() as db:
         assert await history_bytes(db, conversation_id) > 2500
     # On the branch as shown, the next message is past the cap.
@@ -465,10 +458,10 @@ async def test_the_history_cap_measures_the_branch_a_message_joins(make_client, 
     # Edited away, the long answer counts for nothing: the edit and the next message pass.
     edited = await edit(client, conversation_id, second.json()["message_id"], text="second, short")
     assert edited.status_code == 202, edited.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     accepted = await send(client, conversation_id, text="go on")
     assert accepted.status_code == 202, accepted.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     # Back on the long branch the cap holds again; the first message's edit measures the
     # root alone and passes.
     versions = (await detail(client, conversation_id))["turns"][1]["versions"]
@@ -488,13 +481,13 @@ async def test_the_idle_compaction_continues_the_shown_branch(chat_client) -> No
     stub_messages([DONE, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello there")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     shown = await detail(client, conversation_id)
     first = shown["turns"][0]["id"]
     edited = await edit(client, conversation_id, user_message_of(shown, first), text="hi there")
     assert edited.status_code == 202, edited.text
     second = edited.json()["turn_id"]
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     before = await conversation_row(client, conversation_id)
     await set_clock(
         client,

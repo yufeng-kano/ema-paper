@@ -24,7 +24,6 @@ from sightread.db.models import (
     Conversation,
     Document,
     Folder,
-    Job,
     Memory,
     Message,
     Result,
@@ -32,23 +31,19 @@ from sightread.db.models import (
 )
 from sightread.jobs import chat_events, chat_memory, chat_runner, chat_subagent, chat_tools
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, DATABASE_URL
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_extensions import (
+from tests.chat_helpers import (
     chatting_client,
     new_conversation,
     one_call,
     replayed_events,
+    run_queued_turn,
     send,
     stub_messages,
 )
+from tests.conftest import CSRF_HEADERS, postgres_only
+from tests.factories import job_row, user_row
 
 DONE = ([{"type": "text", "text": "Done."}], "end_turn")
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
 
 
 async def put_chat(client: AsyncClient, **fields):
@@ -64,20 +59,8 @@ async def save_memory(client: AsyncClient, **body) -> dict:
 async def another_document(client: AsyncClient, user_id: int, name: str) -> int:
     """A second document of the reader's, at the library's root."""
     async with client.app.state.sessionmaker() as db:
-        job = Job(
-            id=uuid.uuid4(),
-            user_id=user_id,
-            agent="parse",
-            kind="pdf",
-            filename=name,
-            media_type="application/pdf",
-            size_bytes=10,
-            sha256="c" * 64,
-            model="claude-x",
-            bbox_format="yxyx_norm1000",
-            prompt="Transcribe page {page}.",
-            status="succeeded",
-            page_count=2,
+        job = job_row(
+            user_id, filename=name, size_bytes=10, sha256="c" * 64, model="claude-x", page_count=2
         )
         db.add(job)
         await db.flush()
@@ -93,25 +76,11 @@ async def another_document(client: AsyncClient, user_id: int, name: str) -> int:
 async def stranger_rows(client: AsyncClient) -> SimpleNamespace:
     """Another reader with a document, a conversation and a memory of their own."""
     async with client.app.state.sessionmaker() as db:
-        stranger = User(google_sub="stranger", email="stranger@example.com")
+        stranger = user_row("stranger@example.com")
         db.add(stranger)
         await db.flush()
         folder = Folder(user_id=stranger.id, parent_id=None, name="Theirs")
-        job = Job(
-            id=uuid.uuid4(),
-            user_id=stranger.id,
-            agent="parse",
-            kind="pdf",
-            filename="theirs.pdf",
-            media_type="application/pdf",
-            size_bytes=1,
-            sha256="d" * 64,
-            model="m",
-            bbox_format="yxyx_norm1000",
-            prompt="Transcribe page {page}.",
-            status="succeeded",
-            page_count=1,
-        )
+        job = job_row(stranger.id, filename="theirs.pdf", sha256="d" * 64, model="m")
         db.add_all([folder, job])
         await db.flush()
         document = Document(user_id=stranger.id, folder_id=folder.id, job_id=job.id, name="t.pdf")
@@ -442,12 +411,8 @@ async def test_memories_are_listed_edited_and_deleted(chat_client) -> None:
     )
 
 
-async def test_a_memory_is_checked_capped_and_the_callers_own(make_client, tmp_path) -> None:
-    client = await chatting_client(
-        make_client(
-            workspaces_dir=str(tmp_path / "ws"), chat_memories_max=2, chat_memory_max_chars=10
-        )
-    )
+async def test_a_memory_is_checked_capped_and_the_callers_own(make_client) -> None:
+    client = await chatting_client(make_client(chat_memories_max=2, chat_memory_max_chars=10))
     for body in (
         {"kind": "fact", "text": "x"},
         {"kind": "term", "text": "  \n\u200b "},
@@ -498,10 +463,7 @@ async def test_a_memory_is_checked_capped_and_the_callers_own(make_client, tmp_p
     assert left == [theirs.memory_id]
 
 
-@pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="row locks only block on PostgreSQL",
-)
+@postgres_only  # row locks only block on PostgreSQL
 async def test_the_readers_memory_writes_wait_for_a_call_in_flight(chat_client) -> None:
     """A Pause, an edit, a delete and *Clear all* each take the reader's row before they
     act, as the `memory` tool does before it reads the switch, so none lands under a call
@@ -639,16 +601,15 @@ async def test_a_message_carries_whole_sections_after_the_selection(chat_client)
         {"type": "text", "context": "section", "section": "4 Results"},
     ]
 
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     upstream = main[0]["messages"][0]["content"]
     assert all("section" not in block and "context" not in block for block in upstream)
     assert upstream[2]["text"].endswith("## 3.2 Attention\n\nBody.")
 
 
-async def test_sections_are_capped_and_never_a_message_alone(make_client, tmp_path) -> None:
+async def test_sections_are_capped_and_never_a_message_alone(make_client) -> None:
     client = await chatting_client(
         make_client(
-            workspaces_dir=str(tmp_path / "ws"),
             chat_sections_per_message=2,
             chat_section_heading_max_chars=20,
             chat_selection_max_chars=50,
@@ -697,7 +658,7 @@ async def test_the_instructions_follow_the_prompt_verbatim(chat_client) -> None:
     main, _ = stub_messages([DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     system = main[0]["system"]
     assert len(system) == 4
@@ -732,7 +693,7 @@ async def test_a_conversation_renders_the_snapshot_its_first_turn_took(chat_clie
     main, _ = stub_messages([DONE, DONE, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="one")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     first = main[0]["system"][-1]["text"]
     assert f"## Terms\n- [m{kept['id']}] query → 查詢" in first
     assert f"- [m{scoped['id']}] d is 512 (this document)" in first
@@ -751,7 +712,7 @@ async def test_a_conversation_renders_the_snapshot_its_first_turn_took(chat_clie
         f"/api/memories/{narrowed['id']}", json={"document_id": other}, headers=CSRF_HEADERS
     )
     await send(client, conversation_id, text="two")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     second = main[1]["system"][-1]["text"]
     assert f"- [m{kept['id']}] query → 查询" in second
     assert f"m{added['id']}" not in second and "d is 512" not in second
@@ -764,7 +725,7 @@ async def test_a_conversation_renders_the_snapshot_its_first_turn_took(chat_clie
     # A new conversation reads them as they are now.
     fresh = await new_conversation(client)
     await send(client, fresh, text="three")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert f"m{added['id']}" in main[2]["system"][-1]["text"]
 
 
@@ -786,7 +747,7 @@ async def test_paused_memory_loads_nothing_and_the_tool_refuses(chat_client) -> 
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="remember I am a student")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     assert main[0]["system"][-1]["text"] == memory_defs.PAUSED
     # Still declared: a changed tool list would cost the cached prefix.
@@ -804,7 +765,7 @@ async def test_paused_memory_loads_nothing_and_the_tool_refuses(chat_client) -> 
     # Resumed, with auto-remember off: the next turn takes the snapshot.
     await put_chat(client, memory_paused=False, memory_auto=False)
     await send(client, conversation_id, text="go on")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     block = main[2]["system"][-1]["text"]
     assert f"- [m{kept['id']}] query → 查詢" in block and memory_defs.ON_REQUEST_ONLY in block
     assert await memory_ids_of(client, conversation_id) == [kept["id"]]
@@ -828,7 +789,7 @@ async def test_the_memory_tool_saves_updates_and_forgets(chat_client) -> None:
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Remember query is 查詢")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     async with client.app.state.sessionmaker() as db:
         rows = (await db.execute(select(Memory).order_by(Memory.id))).scalars().all()
@@ -854,7 +815,7 @@ async def test_the_memory_tool_saves_updates_and_forgets(chat_client) -> None:
         ]
     )
     await send(client, conversation_id, text="Actually 查询, and forget d_model")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     events = [
         data for name, data in await replayed_events(client, conversation_id) if name == "memory"

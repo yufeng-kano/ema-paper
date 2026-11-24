@@ -9,7 +9,6 @@ ticket that files nothing. The vision upstream is stubbed (docs/testing.md § Co
 from __future__ import annotations
 
 import uuid
-from pathlib import Path
 
 import httpx
 import pytest
@@ -24,23 +23,20 @@ from sightread.errors import ApiError
 from sightread.jobs.intake import retry_filed_parse
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, mcp_running
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, api_key_client, mcp_running
+from tests.helpers import bearer, credits_spent, staged_uploads, v1_parse
 from tests.test_mcp import _mcp_session, _payload
-from tests.test_parse_end_to_end import _authorize, _drain_queue, _vision_stub
+from tests.test_parse_end_to_end import _drain_queue, _vision_stub
 from tests.test_retry_failed_pages import FALLBACK, Upstream
-from tests.test_upload_tickets import _bearer
 
 MODEL = "vendor/vision-model"
 
 
 @pytest.fixture
-async def api(make_client, sessionmaker, tmp_path) -> AsyncClient:
+async def api(make_client) -> AsyncClient:
     """An API key with a workspace, the format check off so a parse makes one upstream call
     per page; its session cookie makes folders and reads billing."""
-    client = await _authorize(
-        make_client(workspaces_dir=str(tmp_path / "ws"), parse_fallback_model=FALLBACK),
-        sessionmaker,
-    )
+    client = await api_key_client(make_client(parse_fallback_model=FALLBACK))
     off = await client.put(
         "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
     )
@@ -79,17 +75,6 @@ async def _mint(
     return token
 
 
-async def _parse(
-    client: AsyncClient, path: Path, token: str | None = None, **fields
-) -> httpx.Response:
-    return await client.post(
-        "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "application/pdf")},
-        data=fields,
-        headers=_bearer(token) if token is not None else {},
-    )
-
-
 async def _documents(sessionmaker) -> list[Document]:
     async with sessionmaker() as db:
         return list((await db.execute(select(Document).order_by(Document.id))).scalars())
@@ -102,15 +87,6 @@ async def _ticket(sessionmaker, token: str) -> UploadTicket:
                 select(UploadTicket).where(UploadTicket.token_hash == hash_token(token))
             )
         ).scalar_one()
-
-
-async def _spent(client: AsyncClient) -> int:
-    return (await client.get("/api/billing")).json()["period"]["spent"]
-
-
-def _uploads(client: AsyncClient) -> list[str]:
-    upload_dir = Path(client.app.state.settings.upload_dir)
-    return sorted(path.name for path in upload_dir.iterdir()) if upload_dir.exists() else []
 
 
 # --- the parse tool's folder -----------------------------------------------------------------
@@ -181,13 +157,8 @@ async def test_the_parse_tool_files_into_a_folder_as_listed_or_made(api, session
     assert len((await api.get("/v1/library")).json()["folders"]) == 4
 
 
-async def test_a_parse_the_mint_rate_refuses_makes_no_folder(
-    make_client, sessionmaker, tmp_path
-) -> None:
-    client = await _authorize(
-        make_client(workspaces_dir=str(tmp_path / "ws"), upload_ticket_rate_per_hour=1),
-        sessionmaker,
-    )
+async def test_a_parse_the_mint_rate_refuses_makes_no_folder(make_client) -> None:
+    client = await api_key_client(make_client(upload_ticket_rate_per_hour=1))
     async with mcp_running(client), _mcp_session(client) as session:
         first = await session.call_tool("parse", {})
         refused = await session.call_tool("parse", {"folder": "New/Sub"})
@@ -209,7 +180,7 @@ async def test_a_filing_ticket_files_the_parse_as_a_files_upload(
     dino = await _folder(api, "DINO")
     token = await _mint(api, sessionmaker, into_library=True, folder_id=dino)
 
-    accepted = await _parse(api, documents["text_pdf"], token)
+    accepted = await v1_parse(api, documents["text_pdf"], token)
     assert accepted.status_code == 202, accepted.text
     job_id = accepted.json()["job_id"]
     document_id = accepted.json()["document_id"]
@@ -227,8 +198,8 @@ async def test_a_filing_ticket_files_the_parse_as_a_files_upload(
     await _drain_queue(api, sessionmaker)
     # The worker filed the upload as the document's original, as for a Files upload.
     assert workspace_documents.original_of(api.root, document_id) is not None
-    assert _uploads(api) == []
-    landed = await api.get("/v1/jobs/last/result.md", headers=_bearer(token))
+    assert staged_uploads(api) == []
+    landed = await api.get("/v1/jobs/last/result.md", headers=bearer(token))
     assert landed.status_code == 200, landed.text
     listed = (await api.get("/v1/library")).json()["documents"]
     assert [(entry["path"], entry["status"]) for entry in listed] == [
@@ -242,28 +213,28 @@ async def test_a_file_parsed_without_a_folder_is_filed_from_that_parse_once(
 ) -> None:
     route = respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     plain = await _mint(api, sessionmaker)
-    job_id = (await _parse(api, documents["mixed_pdf"], plain)).json()["job_id"]
+    job_id = (await v1_parse(api, documents["mixed_pdf"], plain)).json()["job_id"]
     await _drain_queue(api, sessionmaker)
     assert await _documents(sessionmaker) == []
-    calls, spent = len(route.calls), await _spent(api)
+    calls, spent = len(route.calls), await credits_spent(api)
 
     papers = await _folder(api, "Papers")
     filing = await _mint(api, sessionmaker, into_library=True, folder_id=papers)
-    cached = await _parse(api, documents["mixed_pdf"], filing)
+    cached = await v1_parse(api, documents["mixed_pdf"], filing)
     assert cached.status_code == 200, cached.text
     assert cached.json()["meta"]["cached"] is True
     document_id = cached.json()["document_id"]
     (row,) = await _documents(sessionmaker)
     assert (row.id, str(row.job_id), row.folder_id) == (document_id, job_id, papers)
     # Nothing parsed or charged again; the fresh upload is the original the parse never kept.
-    assert (len(route.calls), await _spent(api)) == (calls, spent)
+    assert (len(route.calls), await credits_spent(api)) == (calls, spent)
     assert workspace_documents.original_of(api.root, document_id) is not None
-    assert _uploads(api) == []
-    landed = await api.get("/v1/jobs/last/result.md", headers=_bearer(filing))
+    assert staged_uploads(api) == []
+    landed = await api.get("/v1/jobs/last/result.md", headers=bearer(filing))
     assert landed.status_code == 200, landed.text
 
     # The command run again files no twin: the same document answers, its copy discarded.
-    again = await _parse(
+    again = await v1_parse(
         api,
         documents["mixed_pdf"],
         await _mint(api, sessionmaker, into_library=True, folder_id=papers),
@@ -271,9 +242,9 @@ async def test_a_file_parsed_without_a_folder_is_filed_from_that_parse_once(
     assert again.status_code == 200, again.text
     assert again.json()["document_id"] == document_id
     assert [entry.id for entry in await _documents(sessionmaker)] == [document_id]
-    assert _uploads(api) == []
+    assert staged_uploads(api) == []
     # Another folder is another place to keep it: a second entry of the same parse.
-    other = await _parse(
+    other = await v1_parse(
         api, documents["mixed_pdf"], await _mint(api, sessionmaker, into_library=True)
     )
     assert other.status_code == 200, other.text
@@ -286,7 +257,7 @@ async def test_a_filing_refused_after_a_cache_hit_leaves_the_ticket_unspent(
     api, sessionmaker, documents, monkeypatch
 ) -> None:
     respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    await _parse(api, documents["text_pdf"], await _mint(api, sessionmaker))
+    await v1_parse(api, documents["text_pdf"], await _mint(api, sessionmaker))
     await _drain_queue(api, sessionmaker)
 
     async def full(*args, **kwargs) -> None:
@@ -295,7 +266,7 @@ async def test_a_filing_refused_after_a_cache_hit_leaves_the_ticket_unspent(
     # The quota the filing checks when it keeps the original, after the cache answered.
     monkeypatch.setattr(workspace_documents, "ensure_within_quota", full)
     filing = await _mint(api, sessionmaker, into_library=True)
-    refused = await _parse(api, documents["text_pdf"], filing)
+    refused = await v1_parse(api, documents["text_pdf"], filing)
     assert refused.status_code == 409, refused.text
     assert refused.json()["error"]["type"] == "storage_full"
     assert await _documents(sessionmaker) == []
@@ -303,7 +274,7 @@ async def test_a_filing_refused_after_a_cache_hit_leaves_the_ticket_unspent(
     # connector's command exits non-zero instead of landing a parse it did not file.
     ticket = await _ticket(sessionmaker, filing)
     assert (ticket.spent_at, ticket.job_id) == (None, None)
-    read = await api.get("/v1/jobs/last/result.md", headers=_bearer(filing))
+    read = await api.get("/v1/jobs/last/result.md", headers=bearer(filing))
     assert read.status_code == 409, read.text
 
 
@@ -313,20 +284,20 @@ async def test_a_filing_refuses_pages_a_folder_field_and_a_trashed_destination(
     papers = await _folder(api, "Papers")
     token = await _mint(api, sessionmaker, into_library=True, folder_id=papers)
 
-    pages = await _parse(api, documents["mixed_pdf"], token, pages="1-2")
+    pages = await v1_parse(api, documents["mixed_pdf"], token, pages="1-2")
     assert pages.status_code == 400, pages.text
     assert "covers every page" in pages.json()["error"]["message"]
-    field = await _parse(api, documents["mixed_pdf"], token, folder="Papers")
+    field = await v1_parse(api, documents["mixed_pdf"], token, folder="Papers")
     assert field.status_code == 400, field.text
     assert "call parse with `folder`" in field.json()["error"]["message"]
     # A retry resumes a parse where it is and files nothing: its ticket has no folder.
-    retry = await _parse(api, documents["mixed_pdf"], token, retry="true")
+    retry = await v1_parse(api, documents["mixed_pdf"], token, retry="true")
     assert retry.status_code == 400, retry.text
     assert "parse without `folder`" in retry.json()["error"]["message"]
 
     trashed = await api.post(f"/api/library/folders/{papers}/trash", headers=CSRF_HEADERS)
     assert trashed.status_code == 200, trashed.text
-    gone = await _parse(api, documents["mixed_pdf"], token)
+    gone = await v1_parse(api, documents["mixed_pdf"], token)
     assert gone.status_code == 404, gone.text
     assert "in the Trash" in gone.json()["error"]["message"]
 
@@ -334,13 +305,13 @@ async def test_a_filing_refuses_pages_a_folder_field_and_a_trashed_destination(
     ticket = await _ticket(sessionmaker, token)
     assert (ticket.spent_at, ticket.job_id) == (None, None)
     assert await _documents(sessionmaker) == []
-    assert _uploads(api) == []
+    assert staged_uploads(api) == []
 
 
 @respx.mock
 async def test_an_api_key_files_with_the_folder_field(api, sessionmaker, documents) -> None:
     respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    accepted = await _parse(api, documents["text_pdf"], folder="Papers/2026")
+    accepted = await v1_parse(api, documents["text_pdf"], folder="Papers/2026")
     assert accepted.status_code == 202, accepted.text
     (row,) = await _documents(sessionmaker)
     assert accepted.json()["document_id"] == row.id
@@ -349,7 +320,7 @@ async def test_an_api_key_files_with_the_folder_field(api, sessionmaker, documen
     assert [entry["path"] for entry in listed["documents"]] == ["Papers/2026/text.pdf"]
 
     # A retry resumes a parse where it is; it is never a filing.
-    retry = await _parse(api, documents["text_pdf"], folder="Papers", retry="true")
+    retry = await v1_parse(api, documents["text_pdf"], folder="Papers", retry="true")
     assert retry.status_code == 400, retry.text
     assert len(await _documents(sessionmaker)) == 1
 
@@ -364,7 +335,7 @@ async def test_a_filed_parse_that_failed_is_retried_where_it_is(
     upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     filing = await _mint(api, sessionmaker, into_library=True)
-    accepted = await _parse(api, documents["mixed_pdf"], filing)
+    accepted = await v1_parse(api, documents["mixed_pdf"], filing)
     job_id, document_id = accepted.json()["job_id"], accepted.json()["document_id"]
     await _drain_queue(api, sessionmaker)
     async with sessionmaker() as db:
@@ -374,14 +345,14 @@ async def test_a_filed_parse_that_failed_is_retried_where_it_is(
 
     upstream.calls.clear()
     token = await _mint(api, sessionmaker)
-    retried = await _parse(api, documents["mixed_pdf"], token, retry="true", model=FALLBACK)
+    retried = await v1_parse(api, documents["mixed_pdf"], token, retry="true", model=FALLBACK)
     assert retried.status_code == 202, retried.text
     assert retried.json() == {"job_id": job_id, "status": "queued"}
     async with sessionmaker() as db:
         job = await db.get(Job, uuid.UUID(job_id))
     assert (job.status, job.pages_done, job.retry_model) == ("queued", 2, FALLBACK)
     # The library's retry runs on a copy of the original; the upload sent is not kept.
-    assert [name.split(".retry-")[0] for name in _uploads(api)] == [job_id]
+    assert [name.split(".retry-")[0] for name in staged_uploads(api)] == [job_id]
     ticket = await _ticket(sessionmaker, token)
     assert (str(ticket.job_id), ticket.spent_at is not None) == (job_id, True)
 
@@ -401,10 +372,10 @@ async def test_a_filed_parse_that_failed_is_retried_where_it_is(
     assert str(answered) == job_id
     late = await _ticket(sessionmaker, second)
     assert (str(late.job_id), late.spent_at is not None) == (job_id, True)
-    assert [name.split(".retry-")[0] for name in _uploads(api)] == [job_id]
+    assert [name.split(".retry-")[0] for name in staged_uploads(api)] == [job_id]
 
     await _drain_queue(api, sessionmaker)
     assert upstream.calls == [(FALLBACK, 2)]
-    landed = await api.get("/v1/jobs/last/result.md", headers=_bearer(token))
+    landed = await api.get("/v1/jobs/last/result.md", headers=bearer(token))
     assert landed.status_code == 200, landed.text
     assert [entry.id for entry in await _documents(sessionmaker)] == [document_id]

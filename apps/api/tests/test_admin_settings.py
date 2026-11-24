@@ -43,6 +43,7 @@ from sightread.jobs import chat_compact, chat_runner
 from sightread.jobs.queue import claim_next_turn
 from sightread.runtime_settings import OVERRIDABLE, RuntimeSettings, effective
 from sightread.sandbox import egress
+from tests.chat_helpers import MESSAGES_URL, assistant_turn, seed_document
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_API_KEY,
@@ -51,9 +52,10 @@ from tests.conftest import (
     TEST_MODEL_PRICES,
     TEST_SECRET_KEY,
     grant_plan,
+    sign_in,
 )
+from tests.factories import user_row
 from tests.test_admin import _account, _add, _audit, _error, _group, _last_audit_id, _owner
-from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn
 
 # Every secret the tests' settings carry: none may appear in an answer or a log line.
 KNOWN_SECRETS = (TEST_SECRET_KEY, KANO_API_KEY, PAY_SETTINGS["kano_pay_api_key"])
@@ -630,7 +632,7 @@ async def test_removing_a_price_in_use_asks_first_then_applies(make_client) -> N
         "/api/agents/chat/settings", json={"model": "codex/gpt-5.5"}, headers=CSRF_HEADERS
     )
     assert chosen.status_code == 200, chosen.text
-    document_id = await _seed_document(owner, owner.user_id)
+    document_id = await seed_document(owner, owner.user_id)
     async with sessionmaker() as db:
         db.add(
             Conversation(
@@ -851,7 +853,7 @@ async def test_the_worker_reads_again_for_a_turn_on_a_model_priced_since_its_cop
     prices = json.loads(TEST_MODEL_PRICES)
     prices["vendor/new-model"] = {"input": 2, "cache_read": 2, "cache_write": 2, "output": 2}
     async with sessionmaker() as db:
-        user = User(google_sub="worker-user", email="worker@example.test")
+        user = user_row("worker@example.test")
         db.add(user)
         await db.flush()
         document = Document(user_id=user.id, name="d.md")
@@ -1026,18 +1028,17 @@ async def test_a_list_the_worker_cannot_write_is_warned_of_once(
 
 
 @respx.mock
-async def test_a_turn_keeps_the_prices_of_its_claim(make_client, tmp_path) -> None:
+async def test_a_turn_keeps_the_prices_of_its_claim(make_client) -> None:
     """Each stubbed call is 510 tokens at US$1 per million: 6 credits at US$0.0001 a
     credit. A rate saved mid-turn — ten times cheaper — applies from the next turn."""
-    client = make_client(workspaces_dir=str(tmp_path / "workspaces"), credit_usd="0.0001")
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    client = make_client(credit_usd="0.0001")
+    user_id = (await sign_in(client)).user_id
     await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},
         headers=CSRF_HEADERS,
     )
-    document_id = await _seed_document(client, user_id)
+    document_id = await seed_document(client, user_id)
     created = await client.post(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )

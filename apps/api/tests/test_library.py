@@ -19,12 +19,14 @@ from httpx import AsyncClient
 from sqlalchemy import select, update
 
 from sightread.auth.sessions import SESSION_COOKIE, create_session
-from sightread.db.models import Document, Job, JobPage, Result, User
+from sightread.db.models import Document, Job, JobPage, Result
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from sightread.workspace.filing import DOCUMENT_NAME_MAX, clean_name, free_name
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_CHAT_URL, convert_on_upload
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload, postgres_only
+from tests.factories import user_row
+from tests.helpers import post_folder, read_library
 
 MODEL = "vendor/vision-model"
 
@@ -36,20 +38,9 @@ async def _ready_to_parse(client: AsyncClient) -> None:
 
 @pytest.fixture
 async def library(client: AsyncClient) -> AsyncClient:
-    """A signed-in client whose account can enqueue a parse (Kano Proxy connected, a
-    model chosen for the parse agent)."""
+    """A signed-in client whose uploads are converted."""
     await _ready_to_parse(client)
     return client
-
-
-async def _folder(client: AsyncClient, name: str, parent_id: int | None = None) -> dict:
-    response = await client.post(
-        "/api/library/folders",
-        json={"name": name, "parent_id": parent_id},
-        headers=CSRF_HEADERS,
-    )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 async def _upload(
@@ -104,20 +95,14 @@ async def _upload_markdown(client: AsyncClient) -> httpx.Response:
     )
 
 
-async def _read(client: AsyncClient) -> dict:
-    response = await client.get("/api/library")
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
 # --- folders --------------------------------------------------------------------------
 
 
 async def test_folders_nest_and_the_whole_tree_comes_back_in_one_read(library) -> None:
-    parent = await _folder(library, "Invoices")
-    child = await _folder(library, "2026", parent_id=parent["id"])
+    parent = await post_folder(library, "Invoices")
+    child = await post_folder(library, "2026", parent_id=parent["id"])
 
-    body = await _read(library)
+    body = await read_library(library)
     by_id = {row["id"]: row for row in body["folders"]}
     assert by_id[parent["id"]]["parent_id"] is None
     assert by_id[child["id"]]["parent_id"] == parent["id"]
@@ -125,19 +110,19 @@ async def test_folders_nest_and_the_whole_tree_comes_back_in_one_read(library) -
 
 
 async def test_a_repeated_folder_name_is_suffixed_rather_than_refused(library) -> None:
-    first = await _folder(library, "Invoices")
-    second = await _folder(library, "Invoices")
+    first = await post_folder(library, "Invoices")
+    second = await post_folder(library, "Invoices")
     assert first["name"] == "Invoices"
     assert second["name"] == "Invoices (2)"
 
     # The suffix is per place, so the same name is free again one level down.
-    nested = await _folder(library, "Invoices", parent_id=first["id"])
+    nested = await post_folder(library, "Invoices", parent_id=first["id"])
     assert nested["name"] == "Invoices"
 
 
 async def test_a_rename_onto_a_taken_name_is_refused(library) -> None:
-    await _folder(library, "Invoices")
-    other = await _folder(library, "Receipts")
+    await post_folder(library, "Invoices")
+    other = await post_folder(library, "Receipts")
 
     clash = await library.put(
         f"/api/library/folders/{other['id']}", json={"name": "Invoices"}, headers=CSRF_HEADERS
@@ -152,9 +137,9 @@ async def test_a_rename_onto_a_taken_name_is_refused(library) -> None:
 
 
 async def test_a_move_that_collides_is_suffixed(library) -> None:
-    destination = await _folder(library, "Archive")
-    await _folder(library, "2026", parent_id=destination["id"])
-    moving = await _folder(library, "2026")
+    destination = await post_folder(library, "Archive")
+    await post_folder(library, "2026", parent_id=destination["id"])
+    moving = await post_folder(library, "2026")
 
     moved = await library.put(
         f"/api/library/folders/{moving['id']}",
@@ -167,9 +152,9 @@ async def test_a_move_that_collides_is_suffixed(library) -> None:
 
 
 async def test_a_folder_cannot_be_moved_into_its_own_subtree(library) -> None:
-    root = await _folder(library, "Invoices")
-    child = await _folder(library, "2026", parent_id=root["id"])
-    grandchild = await _folder(library, "Q1", parent_id=child["id"])
+    root = await post_folder(library, "Invoices")
+    child = await post_folder(library, "2026", parent_id=root["id"])
+    grandchild = await post_folder(library, "Q1", parent_id=child["id"])
 
     for target in (root["id"], grandchild["id"]):
         response = await library.put(
@@ -184,8 +169,8 @@ async def test_a_folder_cannot_be_moved_into_its_own_subtree(library) -> None:
 async def test_deleting_a_folder_takes_its_subtree_and_the_files_in_it(
     library, sessionmaker, documents
 ) -> None:
-    root = await _folder(library, "Invoices")
-    child = await _folder(library, "2026", parent_id=root["id"])
+    root = await post_folder(library, "Invoices")
+    child = await post_folder(library, "2026", parent_id=root["id"])
     inside = await _upload(library, documents, folder_id=child["id"])
     assert inside.status_code == 201, inside.text
     outside = await _upload(library, documents, name="kept.png")
@@ -194,7 +179,7 @@ async def test_deleting_a_folder_takes_its_subtree_and_the_files_in_it(
     deleted = await library.delete(f"/api/library/folders/{root['id']}", headers=CSRF_HEADERS)
     assert deleted.status_code == 204
 
-    body = await _read(library)
+    body = await read_library(library)
     assert body["folders"] == []
     assert [row["name"] for row in body["documents"]] == ["kept.png"]
     # The parse itself is history, and history is not deleted with the folder.
@@ -217,7 +202,7 @@ async def test_an_upload_becomes_a_queued_job_and_a_file(library, sessionmaker, 
     assert body["page_count"] == 1
     assert body["size_bytes"] > 0
 
-    listed = (await _read(library))["documents"]
+    listed = (await read_library(library))["documents"]
     assert [row["id"] for row in listed] == [body["id"]]
 
     async with sessionmaker() as db:
@@ -317,7 +302,7 @@ async def test_a_body_past_the_cap_is_refused_while_it_streams(make_client, docu
 
 
 async def test_moving_a_file_onto_a_taken_name_is_suffixed(library, documents) -> None:
-    folder = await _folder(library, "Invoices")
+    folder = await post_folder(library, "Invoices")
     await _upload(library, documents, folder_id=folder["id"])
     moving = (await _upload(library, documents)).json()
 
@@ -343,13 +328,13 @@ async def test_an_upload_without_a_configured_model_is_refused(make_client, docu
 async def test_an_upload_into_a_folder_that_is_not_yours_is_a_404(library, documents) -> None:
     response = await _upload(library, documents, folder_id=9999)
     assert response.status_code == 404
-    assert (await _read(library))["documents"] == []
+    assert (await read_library(library))["documents"] == []
 
 
 async def test_a_file_is_renamed_moved_and_deleted_without_touching_its_parse(
     library, sessionmaker, documents
 ) -> None:
-    folder = await _folder(library, "Invoices")
+    folder = await post_folder(library, "Invoices")
     created = (await _upload(library, documents)).json()
     job_id = created["job_id"]
 
@@ -372,7 +357,7 @@ async def test_a_file_is_renamed_moved_and_deleted_without_touching_its_parse(
 
     deleted = await library.delete(f"/api/library/documents/{created['id']}", headers=CSRF_HEADERS)
     assert deleted.status_code == 204
-    assert (await _read(library))["documents"] == []
+    assert (await read_library(library))["documents"] == []
 
     # Deleting the file deletes the entry, not its parse: that is the retention's to
     # delete (docs/jobs.md § Retention).
@@ -474,12 +459,12 @@ async def test_a_documents_stored_figure_crop_is_served(library, tmp_path, docum
 async def test_another_accounts_library_is_invisible(
     library, make_client, sessionmaker, documents
 ) -> None:
-    folder = await _folder(library, "Invoices")
+    folder = await post_folder(library, "Invoices")
     document = (await _upload(library, documents)).json()
 
     stranger = make_client()
     async with sessionmaker() as db:
-        other = User(google_sub="stranger", email="stranger@example.com")
+        other = user_row("stranger@example.com")
         db.add(other)
         await db.flush()
         token = await create_session(db, other)
@@ -508,7 +493,7 @@ async def test_another_accounts_library_is_invisible(
         await stranger.delete(f"/api/library/documents/{document['id']}", headers=CSRF_HEADERS)
     ).status_code == 404
     # Nothing the stranger tried removed anything.
-    assert len((await _read(library))["folders"]) == 1
+    assert len((await read_library(library))["folders"]) == 1
 
 
 async def test_library_mutations_need_the_csrf_header(library, documents) -> None:
@@ -549,9 +534,9 @@ async def test_folders_and_files_share_one_namespace(library, documents) -> None
     # A folder and a file in one parent would be one directory in the workspace, so the
     # names are taken from one set: the folder gets the suffix, the rename is refused.
     uploaded = (await _upload(library, documents)).json()
-    folder = await _folder(library, "tiny.png")
+    folder = await post_folder(library, "tiny.png")
     assert folder["name"] == "tiny (2).png"
-    other = await _folder(library, "Receipts")
+    other = await post_folder(library, "Receipts")
     clash = await library.put(
         f"/api/library/folders/{other['id']}", json={"name": "tiny.png"}, headers=CSRF_HEADERS
     )
@@ -567,9 +552,9 @@ async def test_folders_and_files_share_one_namespace(library, documents) -> None
 async def test_a_move_the_tree_refuses_leaves_the_row_where_the_files_are(
     make_client, sessionmaker, documents, tmp_path
 ) -> None:
-    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    library = make_client()
     await _ready_to_parse(library)
-    folder = await _folder(library, "Invoices")
+    folder = await post_folder(library, "Invoices")
     await _upload(library, documents)
     # The second upload of the same bytes joins the first's parse; once it has run, this
     # row's directory holds its files (docs/workspace.md § Layout).
@@ -610,25 +595,25 @@ async def test_the_library_read_reuses_the_request_session_for_its_snapshot(libr
 
     from sqlalchemy.exc import SAWarning
 
-    await _folder(library, "Invoices")
+    await post_folder(library, "Invoices")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        body = await _read(library)
+        body = await read_library(library)
     assert [row["name"] for row in body["folders"]] == ["Invoices"]
     # The isolation level landed on a fresh transaction, not on one already begun by the
     # authentication query (docs/api.md): SQLAlchemy would warn it had been ignored.
     assert not [w for w in caught if issubclass(w.category, SAWarning)]
     # A mutation after the read, on the same client: the session serves both.
-    again = await _folder(library, "2026")
+    again = await post_folder(library, "2026")
     assert again["name"] == "2026"
 
 
 async def test_deleting_a_document_discards_its_original(
-    make_client, sessionmaker, documents, tmp_path
+    make_client, sessionmaker, documents
 ) -> None:
     from sightread.workspace.documents import original_of
 
-    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    library = make_client()
     await _ready_to_parse(library)
     await _upload(library, documents)
     uploaded = (await _upload(library, documents)).json()
@@ -646,13 +631,13 @@ async def test_deleting_a_document_discards_its_original(
 
 
 async def test_an_upload_whose_original_cannot_be_kept_files_nothing(
-    make_client, sessionmaker, documents, tmp_path, monkeypatch
+    make_client, sessionmaker, documents, monkeypatch
 ) -> None:
     from sightread.workspace import documents as workspace_documents
     from sightread.workspace.documents import original_of
     from sightread.workspace.layout import sources_dir
 
-    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    library = make_client()
     await _ready_to_parse(library)
     first = (await _upload(library, documents)).json()
     async with sessionmaker() as db:
@@ -668,7 +653,7 @@ async def test_an_upload_whose_original_cannot_be_kept_files_nothing(
     monkeypatch.setattr(workspace_documents, "keep_source", failing)
     refused = await _upload(library, documents)
     assert refused.status_code == 409, refused.text
-    assert [row["name"] for row in (await _read(library))["documents"]] == ["tiny.png"]
+    assert [row["name"] for row in (await read_library(library))["documents"]] == ["tiny.png"]
     assert not (root / "files" / "tiny (2).png").exists()
     # The first upload's own original comes with its parse, which no worker ran here:
     # nothing at all is kept, least of all under the id of the row that is gone.
@@ -681,14 +666,14 @@ async def test_an_upload_whose_original_cannot_be_kept_files_nothing(
 
 
 async def test_a_move_whose_commit_landed_despite_the_error_is_not_undone(
-    make_client, sessionmaker, documents, tmp_path, monkeypatch
+    make_client, sessionmaker, documents, monkeypatch
 ) -> None:
     import contextlib
 
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    library = make_client()
     await _ready_to_parse(library)
     await _upload(library, documents)
     uploaded = (await _upload(library, documents)).json()
@@ -728,7 +713,7 @@ async def test_a_move_whose_commit_landed_despite_the_error_is_not_undone(
 
 
 async def test_a_delete_whose_commit_landed_despite_the_error_is_finished(
-    make_client, sessionmaker, documents, tmp_path, monkeypatch
+    make_client, sessionmaker, documents, monkeypatch
 ) -> None:
     import contextlib
 
@@ -737,7 +722,7 @@ async def test_a_delete_whose_commit_landed_despite_the_error_is_finished(
 
     from sightread.workspace.documents import original_of
 
-    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    library = make_client()
     await _ready_to_parse(library)
     await _upload(library, documents)
     uploaded = (await _upload(library, documents)).json()
@@ -762,21 +747,21 @@ async def test_a_delete_whose_commit_landed_despite_the_error_is_finished(
     assert failing["on"] is False
     # The row is gone for good, so the delete finished: nothing restored, nothing aside,
     # the original discarded.
-    assert [row["name"] for row in (await _read(library))["documents"]] == ["tiny.png"]
+    assert [row["name"] for row in (await read_library(library))["documents"]] == ["tiny.png"]
     assert not (root / "files" / "tiny (2).png").exists()
     assert not [name for name in os.listdir(root) if name.startswith(".sr-tmp-")]
     assert original_of(root, uploaded["id"]) is None
 
 
-async def test_a_created_folder_is_a_directory_at_once(make_client, tmp_path) -> None:
+async def test_a_created_folder_is_a_directory_at_once(make_client) -> None:
     from sightread.workspace import git
     from sightread.workspace.locks import mark_writing
 
-    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    library = make_client()
     await _ready_to_parse(library)
     user_id = (await library.get("/api/me")).json()["user"]["id"]
-    papers = await _folder(library, "Papers")
-    await _folder(library, "2024", papers["id"])
+    papers = await post_folder(library, "Papers")
+    await post_folder(library, "2024", papers["id"])
     root = user_root(library.app.state.settings.workspaces_dir, user_id)
     # The shell sees the folder before any document lands in it; git records no empty
     # directory, so nothing was committed (docs/workspace.md § Layout).
@@ -794,10 +779,7 @@ async def test_a_created_folder_is_a_directory_at_once(make_client, tmp_path) ->
     }
 
 
-@pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="the foreign key only fails on PostgreSQL",
-)
+@postgres_only  # the foreign key only fails on PostgreSQL
 async def test_a_parent_deleted_during_the_insert_is_a_404_not_a_500(
     library, sessionmaker, monkeypatch
 ) -> None:
@@ -809,7 +791,7 @@ async def test_a_parent_deleted_during_the_insert_is_a_404_not_a_500(
     from sightread.db.models import Folder
     from sightread.workspace import filing
 
-    parent = await _folder(library, "Doomed")
+    parent = await post_folder(library, "Doomed")
     real = filing.sibling_names
     pulled = False
 
@@ -832,11 +814,11 @@ async def test_a_parent_deleted_during_the_insert_is_a_404_not_a_500(
     assert pulled
 
 
-async def test_an_upload_the_quota_refuses_files_nothing(make_client, documents, tmp_path) -> None:
+async def test_an_upload_the_quota_refuses_files_nothing(make_client, documents) -> None:
     """A cached parse's upload is the row's only original: at the quota the filing is
     refused whole rather than a document filed that could never render a page
     (docs/workspace.md § Layout)."""
-    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    library = make_client()
     await _ready_to_parse(library)
     assert (await _upload(library, documents)).status_code == 201
     # The second upload of the same bytes keeps its own copy, so the workspace holds
@@ -850,7 +832,7 @@ async def test_an_upload_the_quota_refuses_files_nothing(make_client, documents,
     finally:
         library.app.state.settings.workspace_quota_bytes = 10 * 1024 * 1024 * 1024
     assert refused.status_code == 409, refused.text
-    names = [row["name"] for row in (await _read(library))["documents"]]
+    names = [row["name"] for row in (await read_library(library))["documents"]]
     assert sorted(names) == ["tiny (2).png", "tiny.png"]
     # The refused upload is gone from the upload directory; the parse's own stays for
     # the worker.
@@ -887,7 +869,7 @@ async def test_a_retry_after_a_failed_finish_does_not_buy_a_second_parse(
 
 
 async def test_a_filing_whose_commit_landed_despite_the_error_is_answered_as_made(
-    make_client, sessionmaker, documents, tmp_path, monkeypatch
+    make_client, sessionmaker, documents, monkeypatch
 ) -> None:
     """The commit went through and the acknowledgement was lost: the row is read on a
     fresh connection and the filing is answered as made — reported as nothing filed, the
@@ -895,7 +877,7 @@ async def test_a_filing_whose_commit_landed_despite_the_error_is_answered_as_mad
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    library = make_client()
     await _ready_to_parse(library)
 
     original = AsyncSession.commit
@@ -914,11 +896,11 @@ async def test_a_filing_whose_commit_landed_despite_the_error_is_answered_as_mad
     assert failing["on"] is False
     assert filed.status_code == 201, filed.text
     assert filed.json()["name"] == "notes.md"
-    assert [row["name"] for row in (await _read(library))["documents"]] == ["notes.md"]
+    assert [row["name"] for row in (await read_library(library))["documents"]] == ["notes.md"]
 
 
 async def test_a_filing_whose_commit_rolled_back_leaves_no_file_behind(
-    make_client, sessionmaker, documents, tmp_path, monkeypatch
+    make_client, sessionmaker, documents, monkeypatch
 ) -> None:
     """The commit failed and the fresh read says the row is gone: the copy of the original
     taken for it goes too, so nothing stands for a row that is not there and the retry
@@ -928,7 +910,7 @@ async def test_a_filing_whose_commit_rolled_back_leaves_no_file_behind(
 
     from sightread.workspace.layout import sources_dir
 
-    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    library = make_client()
     await _ready_to_parse(library)
     user_id = (await library.get("/api/me")).json()["user"]["id"]
     root = user_root(library.app.state.settings.workspaces_dir, user_id)
@@ -951,7 +933,7 @@ async def test_a_filing_whose_commit_rolled_back_leaves_no_file_behind(
     # The original kept for the lost row is gone with it, and no entry stands.
     assert not sources_dir(root).exists() or list(sources_dir(root).iterdir()) == []
     assert not (root / "files" / "notes.md").exists()
-    assert (await _read(library))["documents"] == []
+    assert (await read_library(library))["documents"] == []
     # The retry lands under the name the lost row would have had.
     filed = await _upload_markdown(library)
     assert filed.status_code == 201 and filed.json()["name"] == "notes.md"

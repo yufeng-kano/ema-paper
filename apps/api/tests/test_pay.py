@@ -18,6 +18,7 @@ from sqlalchemy import select
 
 from sightread.billing import pay
 from sightread.db.models import Checkout, Job, PayEvent, Subscription, utcnow
+from tests.chat_helpers import MESSAGES_URL, assistant_turn, seed_document
 from tests.conftest import (
     CSRF_HEADERS,
     PAY_APP_ID,
@@ -26,8 +27,9 @@ from tests.conftest import (
     PAY_WEBHOOK_SECRET,
     TEST_MODEL_PRICES,
     grant_plan,
+    sign_in,
 )
-from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn
+from tests.factories import job_row
 from tests.test_library import MODEL, _ready_to_parse, _upload
 
 SUBSCRIPTIONS_URL = f"{PAY_URL}/v1/subscriptions/"
@@ -93,11 +95,6 @@ def catalog(*, enabled: bool = True, plans: tuple[str, ...] = ("pro",)) -> dict:
             for plan in plans
         ],
     }
-
-
-async def _signed_in(client: AsyncClient) -> int:
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    return (await client.get("/api/me")).json()["user"]["id"]
 
 
 def _event(user_id: int, event_id: str = "evt_1", **subscription) -> bytes:
@@ -178,7 +175,7 @@ async def test_a_notification_is_written_from_the_canonical_fetch_not_its_body(
     make_client,
 ) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     assert await _plan_shown(client) == "free"
     answer = canonical(user_id, version=7)
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
@@ -212,7 +209,7 @@ async def test_a_wrong_or_stale_signature_is_refused_before_anything_is_read(
     make_client,
 ) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
         return_value=httpx.Response(200, json=canonical(user_id))
     )
@@ -232,7 +229,7 @@ async def test_a_wrong_or_stale_signature_is_refused_before_anything_is_read(
 @respx.mock
 async def test_a_duplicate_event_id_is_answered_without_a_second_write(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     first, second = canonical(user_id, version=1), canonical(user_id, version=2, cancel=True)
     answers = iter([first, second])
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
@@ -254,7 +251,7 @@ async def test_a_duplicate_event_id_is_answered_without_a_second_write(make_clie
 @respx.mock
 async def test_a_stale_version_never_rolls_access_backwards(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     newer = canonical(user_id, version=5)
     answers = iter([newer, canonical(user_id, version=3, status="canceled")])
     respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
@@ -273,7 +270,7 @@ async def test_a_stale_version_never_rolls_access_backwards(make_client) -> None
 @respx.mock
 async def test_an_unknown_plan_is_stored_and_grants_free(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
         return_value=httpx.Response(200, json=canonical(user_id, plan_id="legacy"))
     )
@@ -291,7 +288,7 @@ async def test_an_unknown_plan_is_stored_and_grants_free(make_client) -> None:
 @respx.mock
 async def test_a_notification_pay_cannot_confirm_is_left_for_its_retry(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}")
 
     fetch.mock(return_value=httpx.Response(500))
@@ -318,7 +315,7 @@ async def test_a_notification_that_is_not_about_a_user_of_this_app_records_nothi
     make_client,
 ) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     fetch = respx.get(url__startswith=SUBSCRIPTIONS_URL).mock(
         return_value=httpx.Response(200, json=canonical(user_id))
     )
@@ -379,7 +376,7 @@ async def _checkout_row(client: AsyncClient, user_id: int) -> Checkout | None:
 @respx.mock
 async def test_a_checkout_keeps_its_idempotency_key_across_a_retry(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog()))
     create = respx.post(CHECKOUTS_URL)
 
@@ -432,7 +429,7 @@ async def test_a_refresh_completes_the_checkout_a_missed_notification_left_open(
     the subscription and closes the checkout, so a later purchase of the same plan is
     a new checkout, not the consumed one's key sent again."""
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog()))
     create = respx.post(CHECKOUTS_URL).mock(
         return_value=httpx.Response(
@@ -474,7 +471,7 @@ async def test_a_plan_not_on_sale_or_a_closed_checkout_is_refused(make_client) -
 
     # Priced at Pay but not configured here: not on sale.
     client = make_client(**PAY_SETTINGS)
-    await _signed_in(client)
+    await sign_in(client)
     respx.get(CATALOG_URL).mock(
         return_value=httpx.Response(200, json=catalog(plans=("pro", "team")))
     )
@@ -486,7 +483,7 @@ async def test_a_plan_not_on_sale_or_a_closed_checkout_is_refused(make_client) -
 
     # Configured here but not priced at Pay: not on sale either.
     client = make_client(**PAY_SETTINGS)
-    await _signed_in(client)
+    await sign_in(client)
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog(plans=("team",))))
     unpriced = await client.post(
         "/api/billing/checkout", json={"plan_id": "pro"}, headers=CSRF_HEADERS
@@ -495,7 +492,7 @@ async def test_a_plan_not_on_sale_or_a_closed_checkout_is_refused(make_client) -
 
     # Pay's checkout closed.
     client = make_client(**PAY_SETTINGS)
-    await _signed_in(client)
+    await sign_in(client)
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog(enabled=False)))
     closed = await client.post(
         "/api/billing/checkout", json={"plan_id": "pro"}, headers=CSRF_HEADERS
@@ -505,7 +502,7 @@ async def test_a_plan_not_on_sale_or_a_closed_checkout_is_refused(make_client) -
 
     # Pay refuses on its own terms (a subscription already stands): refused, not retried.
     client = make_client(**PAY_SETTINGS)
-    await _signed_in(client)
+    await sign_in(client)
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog()))
     create.mock(return_value=httpx.Response(409, json={"error": "subscription_exists"}))
     refused = await client.post(
@@ -527,12 +524,12 @@ async def test_a_plan_not_on_sale_or_a_closed_checkout_is_refused(make_client) -
 
     # Pay unconfigured or unreachable: unavailable.
     bare = make_client()
-    await _signed_in(bare)
+    await sign_in(bare)
     assert (
         await bare.post("/api/billing/checkout", json={"plan_id": "pro"}, headers=CSRF_HEADERS)
     ).status_code == 503
     client = make_client(**PAY_SETTINGS)
-    await _signed_in(client)
+    await sign_in(client)
     respx.get(CATALOG_URL).mock(side_effect=httpx.ConnectError("down"))
     down = await client.post("/api/billing/checkout", json={"plan_id": "pro"}, headers=CSRF_HEADERS)
     assert down.status_code == 503
@@ -633,7 +630,7 @@ async def test_an_unconfigured_or_unreachable_pay_gives_an_empty_catalog(make_cl
 @respx.mock
 async def test_the_billing_view_reconciles_with_pay_once_per_window(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog()))
     answers = iter([canonical(user_id, version=1), canonical(user_id, version=2, cancel=True)])
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
@@ -662,7 +659,7 @@ async def test_the_billing_view_reconciles_with_pay_once_per_window(make_client)
 @respx.mock
 async def test_a_pay_outage_keeps_the_stored_row(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     await grant_plan(client.app.state.sessionmaker, user_id)
     respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(side_effect=httpx.ConnectError("down"))
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog()))
@@ -675,7 +672,7 @@ async def test_a_pay_outage_keeps_the_stored_row(make_client) -> None:
     assert billing["subscription"]["status"] == "active"
 
     bare = make_client()
-    await _signed_in(bare)
+    await sign_in(bare)
     unconfigured = (await bare.get("/api/billing")).json()
     assert unconfigured["pay_reachable"] is None
     assert unconfigured["checkout_available"] is False
@@ -688,7 +685,7 @@ async def test_a_pay_outage_keeps_the_stored_row(make_client) -> None:
 @respx.mock
 async def test_the_portal_needs_a_subscription_of_ones_own(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     portal = respx.post(PORTAL_URL).mock(
         return_value=httpx.Response(200, json={"url": "https://portal.test/session/abc"})
     )
@@ -707,7 +704,7 @@ async def test_the_portal_needs_a_subscription_of_ones_own(make_client) -> None:
     assert (await client.post("/api/billing/portal", headers=CSRF_HEADERS)).status_code == 503
 
     bare = make_client()
-    await _signed_in(bare)
+    await sign_in(bare)
     assert (await bare.post("/api/billing/portal", headers=CSRF_HEADERS)).status_code == 503
 
 
@@ -716,7 +713,7 @@ async def test_a_subscription_pay_does_not_hold_has_no_portal(make_client) -> No
     """A row written by hand (version 0) has no customer at Pay: Pay's 404 is nothing to
     manage, never a closed checkout; Pay down is still an outage."""
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     await grant_plan(client.app.state.sessionmaker, user_id, version=0)
     portal = respx.post(PORTAL_URL).mock(
         return_value=httpx.Response(404, json={"error": "No subscription to manage"})
@@ -740,10 +737,10 @@ async def _chat_tools(client: AsyncClient) -> list[str]:
     return next(agent["tools"] for agent in agents if agent["name"] == "chat")
 
 
-async def test_the_plan_decides_whether_the_agent_gets_a_shell(make_client, tmp_path) -> None:
+async def test_the_plan_decides_whether_the_agent_gets_a_shell(make_client) -> None:
     runner = {"sandbox_url": "http://sandbox:8100", "sandbox_token": "runner-token-not-a-real-one"}
-    client = make_client(workspaces_dir=str(tmp_path / "ws1"), **PAY_SETTINGS, **runner)
-    user_id = await _signed_in(client)
+    client = make_client(**PAY_SETTINGS, **runner)
+    user_id = (await sign_in(client)).user_id
     assert "bash" not in await _chat_tools(client)  # Free: a runner, no grant
 
     await grant_plan(client.app.state.sessionmaker, user_id)
@@ -751,31 +748,30 @@ async def test_the_plan_decides_whether_the_agent_gets_a_shell(make_client, tmp_
 
     # A deployment without a runner gives nobody a shell, whatever the plan says (the
     # same database, so the same user, still on Pro).
-    bare = make_client(workspaces_dir=str(tmp_path / "ws2"), **PAY_SETTINGS)
-    assert await _signed_in(bare) == user_id
+    bare = make_client(**PAY_SETTINGS)
+    assert (await sign_in(bare)).user_id == user_id
     assert await _plan_shown(bare) == "pro"
     assert "bash" not in await _chat_tools(bare)
 
 
 @respx.mock
-async def test_a_turn_on_a_paid_plan_offers_the_shell_to_the_model(make_client, tmp_path) -> None:
+async def test_a_turn_on_a_paid_plan_offers_the_shell_to_the_model(make_client) -> None:
     from sightread.jobs import chat_runner
     from sightread.jobs.queue import claim_next_turn
 
     client = make_client(
-        workspaces_dir=str(tmp_path / "workspaces"),
         sandbox_url="http://sandbox:8100",
         sandbox_token="runner-token-not-a-real-one",
         **PAY_SETTINGS,
     )
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     chosen = await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},
         headers=CSRF_HEADERS,
     )
     assert chosen.status_code == 200, chosen.text
-    document_id = await _seed_document(client, user_id)
+    document_id = await seed_document(client, user_id)
     await grant_plan(client.app.state.sessionmaker, user_id)
     requests: list[dict] = []
 
@@ -820,21 +816,15 @@ async def test_the_plan_caps_the_parses_a_user_runs_at_once(make_client, documen
         async with client.app.state.sessionmaker() as db:
             for index in range(count):
                 db.add(
-                    Job(
-                        user_id=user_id,
-                        kind="pdf",
+                    job_row(
+                        user_id,
                         filename="busy.pdf",
-                        media_type="application/pdf",
                         size_bytes=10,
                         sha256=str(index) * 64,
                         pages_spec="",
                         model=MODEL,
-                        agent="parse",
                         pipeline_version=1,
-                        bbox_format="yxyx_norm1000",
-                        prompt="Transcribe page {page}.",
                         status="running",
-                        page_count=1,
                         started_at=utcnow(),
                     )
                 )
@@ -865,9 +855,9 @@ async def test_the_plan_caps_the_parses_a_user_runs_at_once(make_client, documen
     assert another.status_code == 429, another.text
 
 
-async def test_the_plan_sets_the_storage_the_usage_shows(make_client, tmp_path) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), **PAY_SETTINGS)
-    user_id = await _signed_in(client)
+async def test_the_plan_sets_the_storage_the_usage_shows(make_client) -> None:
+    client = make_client(**PAY_SETTINGS)
+    user_id = (await sign_in(client)).user_id
     status = (await client.get("/api/sandbox")).json()
     free = status["workspace"]["quota_bytes"]
     # Free gives no sandbox; the paid plan below does (docs/billing.md § Plans).
@@ -890,25 +880,19 @@ async def test_the_claim_applies_the_users_plan_cap_as_it_stands(make_client, se
     from sightread.jobs.queue import claim_next_job
 
     client = make_client(**PAY_SETTINGS)
-    user_id = await _signed_in(client)
+    user_id = (await sign_in(client)).user_id
     async with sessionmaker() as db:
         for index in range(3):
             db.add(
-                Job(
-                    user_id=user_id,
-                    kind="pdf",
+                job_row(
+                    user_id,
                     filename=f"queued-{index}.pdf",
-                    media_type="application/pdf",
                     size_bytes=10,
                     sha256=str(index) * 64,
                     pages_spec="",
                     model=MODEL,
-                    agent="parse",
                     pipeline_version=1,
-                    bbox_format="yxyx_norm1000",
-                    prompt="Transcribe page {page}.",
                     status="queued",
-                    page_count=1,
                 )
             )
         await db.commit()
