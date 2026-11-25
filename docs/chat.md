@@ -602,7 +602,7 @@ Parallel tool calls are answered in one user message, in the order they were mad
 
 - `max_tokens`: an answer cut at `CHAT_MAX_OUTPUT_TOKENS` is not a complete one, and a tool call cut with it is never run, so the thread shows what came through and says the output limit was reached;
 - any other stop reason, the same way, as unexpected;
-- `CHAT_MAX_TOOL_CALLS_PER_TURN` (1000) tool calls — a guard against a loop, set high enough that a document translated block by block (§ Translation) fits in one turn;
+- more than `CHAT_MAX_TOOL_CALLS_PER_TURN` (1000) tool calls — a guard against a loop, set high enough that a document translated block by block (§ Translation) fits in one turn;
 - `CHAT_TURN_TIMEOUT_SECONDS` (3600, an hour);
 - a stream silent for `CHAT_STREAM_TIMEOUT_SECONDS` (900): the silence fails the turn outright, never retried, so a long silence is the turn's timeout and not a second request billed on top of an attempt that may have generated tokens that never arrived;
 - `stop_reason: refusal`, when the fallback did not take it either.
@@ -1230,7 +1230,7 @@ The stored message is the record: an attached image is replayed like a page a to
   - The same predicate as deletion's (below) — a turn with `finished_at` null — is what makes a conversation busy for a new message: a cancelled turn whose worker is still winding down a tool call must not be followed by a prompt its late results would land after.
   - The user message is stored with the turn's id, so a reloaded thread groups it with its answer.
   - An accepted message touches the conversation's `updated_at`, which orders the conversation list, so the thread continued last is listed first.
-- **The per-user cap.** The per-user cap on active turns is decided under a lock on the user's row, so two sends to different conversations cannot both slip under it. The same unfinished turns (`finished_at` null) count against `MAX_CHAT_TURNS_PER_USER`, at enqueue and at claim.
+- **The per-user cap.** The per-user cap on active turns is decided under a lock on the user's row, so two sends to different conversations cannot both slip under it. At enqueue, every unfinished turn (`finished_at` null) counts against `MAX_CHAT_TURNS_PER_USER`; at claim, only the started ones (not `queued`, `finished_at` null).
 - **Deleting.** Deleting a conversation — or the document it is about, or a folder holding that document — is decided under the locks a send takes (the user's row, then the conversations') and refused (**409**) while any of its turns is unfinished: queued, running, or cancelled but not yet wound down by the worker (`finished_at` is null).
   - The reason: the worker would carry on with the model and the shell against rows that no longer exist.
   - Deleting a document never touches a library conversation.

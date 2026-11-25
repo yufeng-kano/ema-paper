@@ -572,7 +572,7 @@ Refusals:
 - **400** `nothing_to_compact` for a `compact` on a conversation with no assistant message since its last summary.
 - **409** `storage_full` when the workspace is at the plan's storage, checked before anything is stored ([workspace.md](./workspace.md) § Quota).
 - **409** for an attachment that is not the caller's pending one or whose prepared file is gone (swept after a day).
-- 429 with `Retry-After: CHAT_RETRY_AFTER_SECONDS` (15) when the caller already has `MAX_CHAT_TURNS_PER_USER` turns running.
+- 429 with `Retry-After: CHAT_RETRY_AFTER_SECONDS` (15) when the caller already has `MAX_CHAT_TURNS_PER_USER` unfinished turns (queued, running, or cancelled and not yet wound down).
 - 409 while this conversation is still answering, or when its stored history, with this message and its attachments, would exceed `CHAT_HISTORY_MAX_BYTES` ([chat.md](./chat.md) § History is append-only). The attachments are not claimed then, so a new conversation can carry them.
 - **503** `upstream` when Kano Proxy is not configured.
 - On a conversation's first message, its model is read from `GET /api/agents/chat/models`'s list, fetched then, and then fixed on the conversation ([chat.md](./chat.md) § Upstream):

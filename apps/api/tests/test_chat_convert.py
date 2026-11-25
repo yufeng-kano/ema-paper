@@ -28,14 +28,17 @@ from sightread.jobs.runner import run_job
 from sightread.workspace.documents import original_of
 from tests.chat_helpers import (
     chatting_client,
+    keep_file,
     new_conversation,
     one_call,
+    papers_folder,
     run_queued_turn,
     send,
     stub_messages,
+    tool_results,
+    turn_credits,
 )
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload
-from tests.test_chat_web import tool_results, turn_credits
 
 VISION_MARKDOWN = "## Page one\n\nBody text."
 DONE = ([{"type": "text", "text": "Read."}], "end_turn")
@@ -62,34 +65,13 @@ async def _ready(make_client, **overrides) -> httpx.AsyncClient:
     return client
 
 
-async def _keep(
-    client: httpx.AsyncClient, name: str, data: bytes, media_type: str, folder_id: int | None
-) -> dict:
-    """A Files upload kept as a file: `auto_convert` is off by default (docs/agents.md)."""
-    response = await client.post(
-        "/api/library/documents",
-        files={"file": (name, data, media_type)},
-        data={} if folder_id is None else {"folder_id": str(folder_id)},
-        headers=CSRF_HEADERS,
-    )
-    assert response.status_code == 201, response.text
-    assert response.json()["kind"] == "file"
-    return response.json()
-
-
 async def _kept_paper(make_client, documents) -> tuple[httpx.AsyncClient, dict]:
     """A ready client and the text PDF it keeps as a file, `paper.pdf` at the top."""
     client = await _ready(make_client)
-    kept = await _keep(
+    kept = await keep_file(
         client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
     )
     return client, kept
-
-
-async def _papers(client: httpx.AsyncClient) -> int:
-    """The `Papers` folder the seeded document sits in."""
-    library = (await client.get("/api/library")).json()
-    return next(folder["id"] for folder in library["folders"] if folder["name"] == "Papers")
 
 
 async def _run(client: httpx.AsyncClient, *calls: dict) -> tuple[int, list[dict]]:
@@ -136,7 +118,7 @@ async def test_convert_file_turns_a_kept_file_into_a_document_inside_the_turn(
     client = await _ready(make_client)
     settings = client.app.state.settings
     png = documents["png"].read_bytes()
-    kept = await _keep(client, "tiny.png", png, "image/png", await _papers(client))
+    kept = await keep_file(client, "tiny.png", png, "image/png", await papers_folder(client))
     conversation_id, (first, second) = await _run(
         client, {"path": "Papers/tiny.png"}, {"path": "/workspace/files/Papers/tiny.png"}
     )
@@ -182,9 +164,9 @@ async def test_a_file_converted_before_costs_nothing_again(make_client, document
     client = await _ready(make_client)
     settings = client.app.state.settings
     png = documents["png"].read_bytes()
-    papers = await _papers(client)
-    await _keep(client, "tiny.png", png, "image/png", papers)
-    again = await _keep(client, "again.png", png, "image/png", None)
+    papers = await papers_folder(client)
+    await keep_file(client, "tiny.png", png, "image/png", papers)
+    again = await keep_file(client, "again.png", png, "image/png", None)
     _, (first, second) = await _run(client, {"path": "Papers/tiny.png"}, {"path": "again.png"})
     assert first["is_error"] is False and second["is_error"] is False, (first, second)
     assert second["output"].startswith(
@@ -209,10 +191,10 @@ async def test_a_trashed_twin_does_not_hide_the_live_file(make_client, documents
     respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
     client = await _ready(make_client)
     png = documents["png"].read_bytes()
-    first = await _keep(client, "tiny.png", png, "image/png", None)
+    first = await keep_file(client, "tiny.png", png, "image/png", None)
     trashed = await client.post(f"/api/library/documents/{first['id']}/trash", headers=CSRF_HEADERS)
     assert trashed.status_code == 200, trashed.text
-    again = await _keep(client, "tiny.png", png, "image/png", None)
+    again = await keep_file(client, "tiny.png", png, "image/png", None)
     assert again["name"] == "tiny.png" and again["id"] != first["id"]
     _, (result,) = await _run(client, {"path": "tiny.png"})
     assert result["is_error"] is False, result["output"]
@@ -255,7 +237,9 @@ async def test_convert_file_refuses_what_is_not_a_file_to_convert(make_client) -
     the parse agent does not take and a document already are each refused with nothing
     changed."""
     client = await _ready(make_client)
-    zipped = await _keep(client, "archive.zip", b"PK\x05\x06" + b"\0" * 18, "application/zip", None)
+    zipped = await keep_file(
+        client, "archive.zip", b"PK\x05\x06" + b"\0" * 18, "application/zip", None
+    )
     _, results = await _run(
         client,
         {"path": "../etc/passwd"},
@@ -292,7 +276,7 @@ async def test_convert_file_stops_at_the_balance_and_at_the_turn_cap(
     counts the calls, a refused one among them."""
     vision = respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
     client = await _ready(make_client, convert_file_max_per_turn=1, parse_credits_per_page=10**9)
-    kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
+    kept = await keep_file(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     _, (first, second) = await _run(client, {"path": "tiny.png"}, {"path": "tiny.png"})
     assert first["is_error"] is True and first["output"].startswith("tiny.png was not converted: ")
     assert second["is_error"] is True
@@ -326,7 +310,7 @@ async def test_a_conversion_past_its_time_goes_back_on_the_queue(
     respx.post(KANO_CHAT_URL).mock(side_effect=slow_once)
     client = await _ready(make_client, convert_file_timeout_seconds=1.0)
     settings = client.app.state.settings
-    kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
+    kept = await keep_file(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     started = asyncio.get_running_loop().time()
     _, (result,) = await _run(client, {"path": "tiny.png"})
     assert asyncio.get_running_loop().time() - started < 4
@@ -649,7 +633,7 @@ async def test_the_sweeps_filing_leaves_no_lone_copy_in_the_tree(
     monkeypatch.setattr(runner, "materialize_document", died)
     client = await _ready(make_client)
     settings = client.app.state.settings
-    kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
+    kept = await keep_file(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     converted = await client.post(
         f"/api/library/documents/{kept['id']}/convert", json={}, headers=CSRF_HEADERS
     )
@@ -676,7 +660,7 @@ async def test_a_stop_before_the_claim_starts_no_run(make_client, documents, mon
     first page calls paid — and the job waits on the queue for the worker."""
     vision = respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
     client = await _ready(make_client)
-    kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
+    kept = await keep_file(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     converted = await client.post(
         f"/api/library/documents/{kept['id']}/convert", json={}, headers=CSRF_HEADERS
     )
@@ -756,7 +740,7 @@ async def test_a_failing_wait_puts_the_conversion_back_on_the_queue(
 
     respx.post(KANO_CHAT_URL).mock(side_effect=slow)
     client = await _ready(make_client)
-    kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
+    kept = await keep_file(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     converted = await client.post(
         f"/api/library/documents/{kept['id']}/convert", json={}, headers=CSRF_HEADERS
     )

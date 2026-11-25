@@ -44,6 +44,8 @@ from sightread.jobs.events import open_listener
 from sightread.jobs.queue import (
     ORPHAN_REVISION_MESSAGE,
     UNSETTLED_REVISION_MESSAGE,
+    claim_next_turn,
+    enqueue_turn,
     fail_orphaned_turns,
     fail_turn,
     recover_unsettled_commands,
@@ -59,7 +61,7 @@ from sightread.upstream.anthropic import ChatUsage
 from sightread.upstream.client import RateLimited
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git, safe_io
-from sightread.workspace.layout import sources_dir, user_root
+from sightread.workspace.layout import sources_dir
 from sightread.workspace.locks import (
     _backup_lock_path,
     mark_writing,
@@ -72,11 +74,15 @@ from tests.chat_helpers import (
     assistant_turn,
     chatting_client,
     new_conversation,
+    record_round,
+    round_ctx,
     run_queued_turn,
     seed_document,
     send,
+    stub_messages,
 )
 from tests.conftest import (
+    CATALOG_MODELS,
     CSRF_HEADERS,
     KANO_MODELS_URL,
     PAY_SETTINGS,
@@ -90,17 +96,9 @@ from tests.factories import user_row
 from tests.test_workspace import _seed
 
 
-@pytest.fixture
-async def chatting(make_client) -> AsyncClient:
-    """Signed in, a chat model chosen, one document; the setting stored directly, so a test
-    with its own catalog stubs it only once the turn runs."""
-    return await chatting_client(make_client(), store_directly=True)
-
-
 def _paper_history(client: AsyncClient) -> list[git.Revision]:
     """The commits that touched the seeded document's directory, newest first."""
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return git.log(root, Path("files/Papers/paper.pdf"))
+    return git.log(client.root, Path("files/Papers/paper.pdf"))
 
 
 def _sandbox_client(**overrides) -> SandboxClient:
@@ -151,25 +149,25 @@ def test_strict_tool_schemas_hold_only_what_strict_accepts() -> None:
     assert [hit for tool in strict for hit in walk(tool["input_schema"], tool["name"])] == []
 
 
-async def test_the_chat_effort_is_validated_and_echoed(chatting) -> None:
-    bad = await chatting.put(
+async def test_the_chat_effort_is_validated_and_echoed(chat_client) -> None:
+    bad = await chat_client.put(
         "/api/agents/chat/settings", json={"effort": "ultra"}, headers=CSRF_HEADERS
     )
     assert bad.status_code == 400
-    ok = await chatting.put(
+    ok = await chat_client.put(
         "/api/agents/chat/settings", json={"effort": "high"}, headers=CSRF_HEADERS
     )
     assert ok.json()["effort"] == "high"
-    agents = (await chatting.get("/api/agents")).json()["agents"]
+    agents = (await chat_client.get("/api/agents")).json()["agents"]
     chat = next(agent for agent in agents if agent["name"] == "chat")
     assert chat["settings"]["effort"] == "high"
     assert chat["output"] == "edits"
 
 
 @respx.mock
-async def test_a_turn_edits_the_document_and_streams_its_events(chatting) -> None:
-    document_id = chatting.document_id
-    conversation_id = await new_conversation(chatting)
+async def test_a_turn_edits_the_document_and_streams_its_events(chat_client) -> None:
+    document_id = chat_client.document_id
+    conversation_id = await new_conversation(chat_client)
 
     # The model views the page, edits the table, then finishes.
     turns = iter(
@@ -209,14 +207,14 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting) -> Non
     respx.post(MESSAGES_URL).mock(side_effect=answer)
 
     sent = await send(
-        chatting, conversation_id, text="Fix the Greedy row", selection="| Greedy | 3450 |"
+        chat_client, conversation_id, text="Fix the Greedy row", selection="| Greedy | 3450 |"
     )
     assert sent.status_code == 202, sent.text
     # A second message while the first is unanswered is refused, not queued twice.
-    again = await send(chatting, conversation_id, text="and?")
+    again = await send(chat_client, conversation_id, text="and?")
     assert again.status_code == 409
 
-    await run_queued_turn(chatting)
+    await run_queued_turn(chat_client)
 
     # The request shape: tools in their fixed order, system cached, the guard off.
     first = requests[0]
@@ -255,13 +253,13 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting) -> Non
     assert result.get("is_error") is True
 
     # The document changed on disk, as a revision.
-    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    content = (await chat_client.get(f"/api/library/documents/{document_id}/content")).json()
     assert "| Greedy | 3.45 |" in content["markdown"]
-    history = _paper_history(chatting)
+    history = _paper_history(chat_client)
     assert history[0].author == f"agent:{conversation_id}"
 
     # The thread: user, assistant, tool results, assistant, tool results, assistant.
-    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    thread = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     assert [message["role"] for message in thread["messages"]] == [
         "user",
         "assistant",
@@ -274,7 +272,7 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting) -> Non
     assert thread["conversation"]["title"] == "Fix the Greedy row"
 
     # The event stream replays everything from 0 and ends, since no turn is running.
-    async with chatting.stream(
+    async with chat_client.stream(
         "GET", f"/api/conversations/{conversation_id}/events?after=0"
     ) as stream:
         body = (await stream.aread()).decode()
@@ -290,52 +288,58 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting) -> Non
     assert "-| Greedy | 3450 |" in edit["diff"] and "+| Greedy | 3.45 |" in edit["diff"]
 
     # Usage: three calls billed to the chat agent with their cache reads.
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         rows = (await db.execute(select(UsageLog).where(UsageLog.agent == "chat"))).scalars().all()
     assert len(rows) == 3
     assert all(row.turn_id is not None and row.cache_read_tokens == 200 for row in rows)
 
     # Revert the agent's edit from the thread.
-    reverted = await chatting.post(
+    reverted = await chat_client.post(
         f"/api/library/documents/{document_id}/revisions/{history[0].commit}/revert",
         headers=CSRF_HEADERS,
     )
     assert reverted.status_code == 200
-    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    content = (await chat_client.get(f"/api/library/documents/{document_id}/content")).json()
     assert "| Greedy | 3450 |" in content["markdown"]
 
 
 @respx.mock
-async def test_a_refusal_fails_the_turn(chatting) -> None:
-    conversation_id = await new_conversation(chatting)
+async def test_a_refusal_fails_the_turn(chat_client) -> None:
+    conversation_id = await new_conversation(chat_client)
     respx.post(MESSAGES_URL).mock(
         return_value=httpx.Response(200, content=assistant_turn([], "refusal"))
     )
-    await send(chatting, conversation_id, text="hi")
-    await run_queued_turn(chatting)
-    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    await send(chat_client, conversation_id, text="hi")
+    await run_queued_turn(chat_client)
+    thread = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][-1]["status"] == "failed"
     assert "declined" in thread["turns"][-1]["error"]
 
 
 @pytest.mark.own_catalog
 @respx.mock
-async def test_a_first_message_needs_a_model_the_catalog_still_serves(chatting) -> None:
+async def test_a_first_message_needs_a_model_the_catalog_still_serves(make_client) -> None:
     """The pick was offered when it was saved but Kano Proxy dropped it: refused before it
     is fixed on the conversation; a catalog that cannot be read is the upstream's failure."""
-    conversation_id = await new_conversation(chatting)
+    respx.get(KANO_MODELS_URL).mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": model} for model in CATALOG_MODELS.split(",")]}
+        )
+    )
+    chat_client = await chatting_client(make_client())
+    conversation_id = await new_conversation(chat_client)
     respx.get(KANO_MODELS_URL).mock(
         return_value=httpx.Response(200, json={"data": [{"id": "codex/gpt-5.5"}]})
     )
-    dropped = await send(chatting, conversation_id, text="hi")
+    dropped = await send(chat_client, conversation_id, text="hi")
     assert dropped.status_code == 400
     assert dropped.json()["error"]["message"] == (
         "That model is no longer served: pick another on the Agent page"
     )
     respx.get(KANO_MODELS_URL).mock(return_value=httpx.Response(500))
-    unreadable = await send(chatting, conversation_id, text="hi")
+    unreadable = await send(chat_client, conversation_id, text="hi")
     assert unreadable.status_code == 502
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         assert (await db.get(Conversation, conversation_id)).model is None
         assert (await db.execute(select(ChatTurn.id))).all() == []
 
@@ -348,16 +352,11 @@ async def test_messages_need_an_offered_model_and_a_configured_kano_proxy(make_c
         {"vendor/vision-model": {"input": 1, "cache_read": 1, "cache_write": 1, "output": 1}}
     )
     for overrides in ({"model_prices_json": parse_only}, {"kano_proxy_api_key": ""}):
-        client = make_client(**overrides)
-        await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+        client = await sign_in(make_client(**overrides))
         if document_id is None:
-            user_id = (await client.get("/api/me")).json()["user"]["id"]
-            document_id = await seed_document(client, user_id)
-        conversation_id = (
-            await client.post(
-                f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
-            )
-        ).json()["id"]
+            document_id = await seed_document(client, client.user_id)
+        client.document_id = document_id
+        conversation_id = await new_conversation(client)
         refused = await send(client, conversation_id, text="hi")
         assert refused.status_code == 503, overrides
         assert refused.json()["error"]["type"] == "upstream"
@@ -712,30 +711,34 @@ def test_thinking_made_under_another_prompt_is_left_out_from_the_start() -> None
 
 
 async def test_a_message_belongs_to_its_turn_and_a_live_thread_cannot_be_deleted(
-    chatting,
+    chat_client,
 ) -> None:
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi", locale="zh-TW")
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi", locale="zh-TW")
     assert sent.status_code == 202, sent.text
     turn_id = sent.json()["turn_id"]
-    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    thread = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["messages"][0]["turn_id"] == turn_id
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, uuid.UUID(turn_id))
         assert turn.locale == "zh-TW"
 
-    refused = await chatting.delete(f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS)
+    refused = await chat_client.delete(
+        f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS
+    )
     assert refused.status_code == 409
-    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
-    deleted = await chatting.delete(f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS)
+    await chat_client.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    deleted = await chat_client.delete(
+        f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS
+    )
     assert deleted.status_code == 204
 
 
-async def test_a_cancel_drops_a_silent_stream(chatting, monkeypatch) -> None:
+async def test_a_cancel_drops_a_silent_stream(chat_client, monkeypatch) -> None:
     """The upstream has sent nothing for a while; the cancel must not wait for it."""
     monkeypatch.setattr(chat_runner, "CANCEL_POLL_SECONDS", 0.05)
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi")
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi")
     turn_id = uuid.UUID(sent.json()["turn_id"])
     closed = asyncio.Event()
     started = asyncio.Event()
@@ -755,17 +758,17 @@ async def test_a_cancel_drops_a_silent_stream(chatting, monkeypatch) -> None:
         # pre-call check would stop the turn without ever opening the stream.
         await started.wait()
         await asyncio.sleep(0.1)
-        async with chatting.app.state.sessionmaker() as db:
+        async with chat_client.app.state.sessionmaker() as db:
             turn = await db.get(ChatTurn, turn_id)
             turn.status = "cancelled"
             await db.commit()
 
     canceller = asyncio.create_task(cancel_soon())
     async with asyncio.timeout(5):
-        await run_queued_turn(chatting)
+        await run_queued_turn(chat_client)
     await canceller
     assert closed.is_set()
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "cancelled"
         stored = (
@@ -776,69 +779,30 @@ async def test_a_cancel_drops_a_silent_stream(chatting, monkeypatch) -> None:
     assert [row.role for row in stored] == ["user"]
 
 
-async def test_a_cancelled_turn_blocks_deletion_until_the_worker_is_done(chatting) -> None:
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi")
+async def test_a_cancelled_turn_blocks_deletion_until_the_worker_is_done(chat_client) -> None:
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi")
     turn_id = uuid.UUID(sent.json()["turn_id"])
     # The worker claimed it and is mid-stream.
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         turn.status = "running"
         await db.commit()
-    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
-    still_running = await chatting.delete(
+    await chat_client.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    still_running = await chat_client.delete(
         f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS
     )
     assert still_running.status_code == 409
     # The worker wound it down.
     await chat_runner._finish(
-        chatting.app.state.sessionmaker, turn_id, status="cancelled", error="cancelled"
+        chat_client.app.state.sessionmaker, turn_id, status="cancelled", error="cancelled"
     )
-    gone = await chatting.delete(f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS)
+    gone = await chat_client.delete(f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS)
     assert gone.status_code == 204
-
-
-def _round_ctx(
-    *, round_budget: int = 32 << 20, turn_budget: int = 128 << 20, **fields
-) -> SimpleNamespace:
-    """What `_run_tools` reads from its context, made fresh per call: the turn's image
-    budgets for the round and the whole turn, the document a page renders from, the
-    conversation's shell, and the turn's writes in flight with the gate that starts them
-    one at a time. `fields` replace any of these or add more."""
-    return SimpleNamespace(
-        **{
-            "settings": SimpleNamespace(
-                upload_max_bytes=1,
-                chat_page_image_max_pixels=1,
-                chat_tool_result_max_chars=1000,
-                chat_bash_timeout_seconds=1,
-            ),
-            "turn": SimpleNamespace(id=uuid.uuid4(), user_id=1),
-            "images": chat_runner.ImageBudget(
-                round_budget, turn_budget, chat_runner.IMAGE_TURN_BUDGET_SPENT
-            ),
-            "round_admission": lambda calls: lambda index: True,
-            "tools": [{"name": "view_page"}, {"name": "view_figure"}],
-            "paths": None,
-            "document": SimpleNamespace(id=1),
-            "job": SimpleNamespace(page_count=12, kind="pdf"),
-            "render_slots": None,
-            "decode_slot": asyncio.Semaphore(1),
-            "conversation": SimpleNamespace(id=1, session="s"),
-            "sandbox": None,
-            "writers": {},
-            "write_gate": asyncio.Lock(),
-            **fields,
-        }
-    )
 
 
 async def _no_events(ctx, event, data) -> None:
     return None
-
-
-async def _never_cancelled(ctx) -> bool:
-    return False
 
 
 async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
@@ -847,9 +811,8 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
         return chat_tools.ToolOutcome([image, {"type": "text", "text": "Page."}])
 
     monkeypatch.setattr(chat_tools, "view_page", fake_view_page)
-    monkeypatch.setattr(chat_runner, "_emit", _no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", _never_cancelled)
-    ctx = _round_ctx(round_budget=250, turn_budget=1 << 30)
+    record_round(monkeypatch)
+    ctx = round_ctx(round_budget=250, turn_budget=1 << 30)
     tool_uses = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
         for index in range(12)
@@ -884,7 +847,7 @@ async def test_a_stop_drops_a_round_of_reads(monkeypatch) -> None:
     ]
     # No write in the round to notice the Stop: the reads look for it themselves.
     with pytest.raises(chat_runner.TurnCancelled):
-        await chat_runner._run_tools(_round_ctx(), tool_uses, set())
+        await chat_runner._run_tools(round_ctx(), tool_uses, set())
     assert rendered == []
 
 
@@ -913,14 +876,14 @@ async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) 
         return {"type": "tool_result", "tool_use_id": tool_id, "content": block["name"]}
 
     monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
-    monkeypatch.setattr(chat_runner, "_cancelled", _never_cancelled)
+    record_round(monkeypatch)
     tool_uses = [
         {"type": "tool_use", "id": "a", "name": "view_page", "input": {}},
         {"type": "tool_use", "id": "b", "name": "bash", "input": {}},
         {"type": "tool_use", "id": "c", "name": "str_replace_based_edit_tool", "input": {}},
         {"type": "tool_use", "id": "d", "name": "view_figure", "input": {}},
     ]
-    results = await chat_runner._run_tools(_round_ctx(), tool_uses, set())
+    results = await chat_runner._run_tools(round_ctx(), tool_uses, set())
     assert [result["tool_use_id"] for result in results] == ["a", "b", "c", "d"]
     assert not writer_overlap
     assert reads_overlapped
@@ -928,13 +891,13 @@ async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) 
 
 
 async def test_a_cancelled_queued_turn_ends_its_stream_and_a_winding_down_turn_blocks_sends(
-    chatting,
+    chat_client,
 ) -> None:
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi")
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi")
     turn_id = uuid.UUID(sent.json()["turn_id"])
-    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
-    async with chatting.app.state.sessionmaker() as db:
+    await chat_client.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "cancelled" and turn.finished_at is not None
         events = (
@@ -949,47 +912,51 @@ async def test_a_cancelled_queued_turn_ends_its_stream_and_a_winding_down_turn_b
     assert [event.event for event in events] == ["turn_error"]
     assert events[0].data["status"] == "cancelled"
     # Finished: a new message is accepted.
-    again = await send(chatting, conversation_id, text="more")
+    again = await send(chat_client, conversation_id, text="more")
     assert again.status_code == 202
     second = uuid.UUID(again.json()["turn_id"])
     # The worker took it, the user cancelled mid-tool: until the worker winds it down, no
     # further message may be queued behind it.
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, second)
         turn.status = "running"
         await db.commit()
-    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
-    blocked = await send(chatting, conversation_id, text="wait")
+    await chat_client.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    blocked = await send(chat_client, conversation_id, text="wait")
     assert blocked.status_code == 409
 
 
-async def test_a_file_with_a_live_conversation_cannot_be_deleted(chatting) -> None:
-    document_id = chatting.document_id
-    conversation_id = await new_conversation(chatting)
-    await send(chatting, conversation_id, text="hi")
-    refused = await chatting.delete(f"/api/library/documents/{document_id}", headers=CSRF_HEADERS)
+async def test_a_file_with_a_live_conversation_cannot_be_deleted(chat_client) -> None:
+    document_id = chat_client.document_id
+    conversation_id = await new_conversation(chat_client)
+    await send(chat_client, conversation_id, text="hi")
+    refused = await chat_client.delete(
+        f"/api/library/documents/{document_id}", headers=CSRF_HEADERS
+    )
     assert refused.status_code == 409
-    folders = (await chatting.get("/api/library")).json()["folders"]
+    folders = (await chat_client.get("/api/library")).json()["folders"]
     folder_id = folders[0]["id"]
-    refused_folder = await chatting.delete(
+    refused_folder = await chat_client.delete(
         f"/api/library/folders/{folder_id}", headers=CSRF_HEADERS
     )
     assert refused_folder.status_code == 409
-    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
-    deleted = await chatting.delete(f"/api/library/documents/{document_id}", headers=CSRF_HEADERS)
+    await chat_client.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    deleted = await chat_client.delete(
+        f"/api/library/documents/{document_id}", headers=CSRF_HEADERS
+    )
     assert deleted.status_code == 204
 
 
-async def test_a_worker_stopping_finishes_a_cancelled_turn(chatting) -> None:
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi")
+async def test_a_worker_stopping_finishes_a_cancelled_turn(chat_client) -> None:
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi")
     turn_id = uuid.UUID(sent.json()["turn_id"])
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         turn.status = "running"
         await db.commit()
-    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
-    async with chatting.app.state.sessionmaker() as db:
+    await chat_client.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    async with chat_client.app.state.sessionmaker() as db:
         await fail_turn(db, turn_id, "worker stopped")
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "cancelled" and turn.finished_at is not None
@@ -999,7 +966,7 @@ async def test_a_worker_stopping_finishes_a_cancelled_turn(chatting) -> None:
             .all()
         )
     assert [event.event for event in events] == ["turn_error"]
-    again = await send(chatting, conversation_id, text="more")
+    again = await send(chat_client, conversation_id, text="more")
     assert again.status_code == 202
 
 
@@ -1066,7 +1033,7 @@ async def test_a_stop_ends_the_round_before_the_next_write(monkeypatch) -> None:
         {"type": "tool_use", "id": "b", "name": "bash", "input": {}},
     ]
     with pytest.raises(chat_runner.TurnCancelled):
-        await chat_runner._run_tools(_round_ctx(), tool_uses, set())
+        await chat_runner._run_tools(round_ctx(), tool_uses, set())
     assert calls == ["a"]
 
 
@@ -1111,11 +1078,11 @@ async def test_the_agent_page_lists_only_the_tools_the_deployment_has(make_clien
     ]
 
 
-async def test_a_file_with_a_live_conversation_cannot_be_renamed(chatting) -> None:
-    document_id = chatting.document_id
-    conversation_id = await new_conversation(chatting)
-    await send(chatting, conversation_id, text="hi")
-    refused = await chatting.put(
+async def test_a_file_with_a_live_conversation_cannot_be_renamed(chat_client) -> None:
+    document_id = chat_client.document_id
+    conversation_id = await new_conversation(chat_client)
+    await send(chat_client, conversation_id, text="hi")
+    refused = await chat_client.put(
         f"/api/library/documents/{document_id}", json={"name": "other.pdf"}, headers=CSRF_HEADERS
     )
     assert refused.status_code == 409
@@ -1145,7 +1112,7 @@ async def test_a_stop_seen_by_the_reads_lets_the_running_write_finish(monkeypatc
         for index in range(8)
     ]
     with pytest.raises(chat_runner.TurnCancelled):
-        await chat_runner._run_tools(_round_ctx(), tool_uses, set())
+        await chat_runner._run_tools(round_ctx(), tool_uses, set())
     # The reads still queued saw the Stop and ended quietly; the command in flight was
     # not cancelled and finished.
     assert "w" in finished
@@ -1186,7 +1153,7 @@ async def test_a_stop_during_backoff_and_a_running_read_are_both_cut(monkeypatch
         {"type": "tool_use", "id": "b", "name": "bash", "input": {}},
     ]
     with pytest.raises(chat_runner.TurnCancelled):
-        await chat_runner._run_tools(_round_ctx(), tool_uses, set())
+        await chat_runner._run_tools(round_ctx(), tool_uses, set())
     assert read_cancelled.is_set()
 
 
@@ -1206,10 +1173,10 @@ def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
 
 
 @respx.mock
-async def test_a_kano_proxy_model_answered_under_its_bare_id_is_not_a_fallback(chatting) -> None:
+async def test_a_kano_proxy_model_answered_under_its_bare_id_is_not_a_fallback(chat_client) -> None:
     """Kano Proxy routes `provider/model`; the upstream answers with the bare id. That is
     the same model, and a real fallback is followed under the provider's name."""
-    conversation_id = await new_conversation(chatting)
+    conversation_id = await new_conversation(chat_client)
     requests: list[dict] = []
     turns = iter(
         [
@@ -1226,10 +1193,10 @@ async def test_a_kano_proxy_model_answered_under_its_bare_id_is_not_a_fallback(c
     respx.post(MESSAGES_URL).mock(side_effect=answer)
 
     async def answered_on(text: str) -> str:
-        sent = await send(chatting, conversation_id, text=text)
+        sent = await send(chat_client, conversation_id, text=text)
         assert sent.status_code == 202, sent.text
-        await run_queued_turn(chatting)
-        async with chatting.app.state.sessionmaker() as db:
+        await run_queued_turn(chat_client)
+        async with chat_client.app.state.sessionmaker() as db:
             return (await db.get(Conversation, conversation_id)).model
 
     assert await answered_on("hi") == "claude-code/claude-opus-5-5"
@@ -1244,12 +1211,12 @@ async def test_a_kano_proxy_model_answered_under_its_bare_id_is_not_a_fallback(c
 
 @respx.mock
 async def test_an_answer_under_an_unpriced_name_is_kept_as_the_model_asked_for(
-    chatting,
+    chat_client,
 ) -> None:
     """A group alias the upstream answers under the target's own id (`claude-sonnet-5.5`
     answered as `claude-sonnet-5-5`): following it would strand the conversation on a name
     no turn may run, and bill the call nothing."""
-    conversation_id = await new_conversation(chatting)
+    conversation_id = await new_conversation(chat_client)
     requests: list[dict] = []
     turns = iter(
         [
@@ -1268,52 +1235,52 @@ async def test_an_answer_under_an_unpriced_name_is_kept_as_the_model_asked_for(
 
     respx.post(MESSAGES_URL).mock(side_effect=answer)
     for text in ("hi", "more"):
-        sent = await send(chatting, conversation_id, text=text)
+        sent = await send(chat_client, conversation_id, text=text)
         assert sent.status_code == 202, sent.text
-        await run_queued_turn(chatting)
+        await run_queued_turn(chat_client)
     assert [request["model"] for request in requests] == ["claude-code/claude-opus-5-5"] * 2
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         assert (await db.get(Conversation, conversation_id)).model == "claude-code/claude-opus-5-5"
         logged = (await db.execute(select(UsageLog.model))).scalars().all()
     assert set(logged) == {"claude-code/claude-opus-5-5"}
-    turns_now = (await chatting.get(f"/api/conversations/{conversation_id}")).json()["turns"]
+    turns_now = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()["turns"]
     assert [turn["status"] for turn in turns_now] == ["succeeded", "succeeded"]
     assert all(turn["credits"] > 0 for turn in turns_now)
 
 
 @postgres_only
-async def test_the_history_cap_counts_bytes_not_characters(chatting) -> None:
+async def test_the_history_cap_counts_bytes_not_characters(chat_client) -> None:
     """PostgreSQL only: SQLite stores non-ASCII JSON escaped, so there a message's bytes
     equal its characters and the test could not tell the two apart."""
-    settings = chatting.app.state.settings
-    conversation_id = await new_conversation(chatting)
+    settings = chat_client.app.state.settings
+    conversation_id = await new_conversation(chat_client)
     # 2000 two-byte characters: about 2040 characters stored, about 4040 bytes.
-    sent = await send(chatting, conversation_id, text="é" * 2000)
+    sent = await send(chat_client, conversation_id, text="é" * 2000)
     turn_id = uuid.UUID(sent.json()["turn_id"])
     settings.chat_history_max_bytes = 3000
-    await run_queued_turn(chatting)
-    async with chatting.app.state.sessionmaker() as db:
+    await run_queued_turn(chat_client)
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "failed" and "start a new conversation" in turn.error
 
 
-async def test_a_conversation_past_the_history_cap_is_refused(chatting) -> None:
-    settings = chatting.app.state.settings
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hello " * 20)
+async def test_a_conversation_past_the_history_cap_is_refused(chat_client) -> None:
+    settings = chat_client.app.state.settings
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hello " * 20)
     turn_id = uuid.UUID(sent.json()["turn_id"])
     settings.chat_history_max_bytes = 50
-    await run_queued_turn(chatting)
-    async with chatting.app.state.sessionmaker() as db:
+    await run_queued_turn(chat_client)
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "failed"
         assert "start a new conversation" in turn.error
     # Past the cap, the conversation takes no further message: the overflow is not grown
     # by capped-size sends that each fail a turn (docs/chat.md § History is append-only).
-    refused = await send(chatting, conversation_id, text="once more")
+    refused = await send(chat_client, conversation_id, text="once more")
     assert refused.status_code == 409
     assert "start a new conversation" in refused.json()["error"]["message"]
-    detail = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    detail = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     assert len(detail["messages"]) == 1 and len(detail["turns"]) == 1
 
 
@@ -1332,14 +1299,14 @@ async def test_a_command_the_runner_could_not_settle_commits_no_tree() -> None:
 
 
 async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
-    chatting, monkeypatch
+    chat_client, monkeypatch
 ) -> None:
-    settings = chatting.app.state.settings
-    document_id = chatting.document_id
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi")
+    settings = chat_client.app.state.settings
+    document_id = chat_client.document_id
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi")
     turn_id = uuid.UUID(sent.json()["turn_id"])
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         turn.status = "running"
         await db.commit()
@@ -1350,7 +1317,7 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
     (paths.directory / "helper.py").write_text("print(1)\n")
     (paths.directory / "doc.md").write_text("# Title\n\nHalf done\n")
     mark_writing(paths.root, conversation_id, "s")
-    refused = await chatting.put(
+    refused = await chat_client.put(
         f"/api/library/documents/{document_id}/content",
         json={"markdown": "# Mine\n", "base_revision": "x"},
         headers=CSRF_HEADERS,
@@ -1371,22 +1338,22 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
     runner = Runner()
     # No runner to stop the shell the marker names: the VM may still run the command,
     # so the turn and the marker wait rather than the tree being declared safe.
-    async with chatting.app.state.sessionmaker() as db:
-        assert await fail_orphaned_turns(db, None, settings) == (0, {chatting.user_id})
+    async with chat_client.app.state.sessionmaker() as db:
+        assert await fail_orphaned_turns(db, None, settings) == (0, {chat_client.user_id})
         assert (await db.get(ChatTurn, turn_id)).finished_at is None
     assert writing_marker(paths.root).exists()
     # A tree that cannot be committed leaves the turn for the next pass: finishing it
     # would let the next revision carry these changes as its own.
     monkeypatch.setattr(git, "commit_all", failing)
-    async with chatting.app.state.sessionmaker() as db:
-        assert await fail_orphaned_turns(db, runner, settings) == (0, {chatting.user_id})
+    async with chat_client.app.state.sessionmaker() as db:
+        assert await fail_orphaned_turns(db, runner, settings) == (0, {chat_client.user_id})
         assert (await db.get(ChatTurn, turn_id)).finished_at is None
     assert writing_marker(paths.root).exists()  # still recovering: host writes wait
     monkeypatch.setattr(git, "commit_all", real)
 
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         assert await fail_orphaned_turns(db, runner, settings) == (1, set())
-        assert runner.restarted and runner.restarted[-1][0] == chatting.user_id
+        assert runner.restarted and runner.restarted[-1][0] == chat_client.user_id
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "failed" and turn.finished_at is not None
     assert not writing_marker(paths.root).exists()  # recorded: host writes resume
@@ -1396,15 +1363,15 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
     assert set(head.files) == {"files/Papers/paper.pdf/helper.py", "files/Papers/paper.pdf/doc.md"}
     # The tree is clean: a later tool's revision carries only its own changes.
     assert git.commit_all(paths.root, "user", "anything left?") is None
-    assert _paper_history(chatting)[0].message == ORPHAN_REVISION_MESSAGE
+    assert _paper_history(chat_client)[0].message == ORPHAN_REVISION_MESSAGE
 
 
-async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) -> None:
-    settings = chatting.app.state.settings
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi")
+async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chat_client) -> None:
+    settings = chat_client.app.state.settings
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi")
     turn_id = uuid.UUID(sent.json()["turn_id"])
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         turn.status = "running"  # claimed by a worker that then died
         await db.commit()
@@ -1419,18 +1386,18 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
             self.restarted.append((user_id, session))
 
     runner = Runner()
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         # The runner does not answer: the turn is left for the next pass, since the
         # command the dead worker had running may still be writing.
-        assert await fail_orphaned_turns(db, runner, settings) == (0, {chatting.user_id})
+        assert await fail_orphaned_turns(db, runner, settings) == (0, {chat_client.user_id})
         await db.commit()
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         assert (await db.get(ChatTurn, turn_id)).finished_at is None
         runner.away = False
         assert await fail_orphaned_turns(db, runner, settings) == (1, set())
         turn = await db.get(ChatTurn, turn_id)
         session = (await db.get(Conversation, turn.conversation_id)).session
-        assert runner.restarted == [(chatting.user_id, session)]
+        assert runner.restarted == [(chat_client.user_id, session)]
         assert turn.status == "failed" and turn.error == "worker restarted"
         assert turn.finished_at is not None
         events = (
@@ -1441,7 +1408,7 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
         assert [event.event for event in events] == ["turn_error"]
         assert await fail_orphaned_turns(db, None, settings) == (0, set())
     # The conversation takes messages again.
-    again = await send(chatting, conversation_id, text="more")
+    again = await send(chat_client, conversation_id, text="more")
     assert again.status_code == 202
 
 
@@ -1513,17 +1480,17 @@ async def test_a_shell_commit_that_fails_is_an_error_and_leaves_the_index_clean(
     assert git._git(root, "diff", "--cached", "--quiet", check=False).returncode == 0
 
 
-async def test_the_event_replay_is_read_in_batches(chatting, monkeypatch) -> None:
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi")
+async def test_the_event_replay_is_read_in_batches(chat_client, monkeypatch) -> None:
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi")
     turn_id = uuid.UUID(sent.json()["turn_id"])
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         for index in range(7):
             await chat_events.emit(db, conversation_id, turn_id, "text_delta", {"text": str(index)})
         await fail_turn(db, turn_id, "over")
         await db.commit()
     monkeypatch.setattr(chat_events, "REPLAY_BATCH_SIZE", 3)
-    async with chatting.stream(
+    async with chat_client.stream(
         "GET", f"/api/conversations/{conversation_id}/events?after=0"
     ) as stream:
         body = (await stream.aread()).decode()
@@ -1531,13 +1498,22 @@ async def test_the_event_replay_is_read_in_batches(chatting, monkeypatch) -> Non
     assert ids == list(range(1, 9))
     names = [line.split(": ", 1)[1] for line in body.splitlines() if line.startswith("event: ")]
     assert names == ["text_delta"] * 7 + ["turn_error"]
+    # A reconnect resumes after the last id it saw: only the events after it, then the end.
+    async with chat_client.stream(
+        "GET", f"/api/conversations/{conversation_id}/events?after=5"
+    ) as stream:
+        body = (await stream.aread()).decode()
+    ids = [int(line.split(": ", 1)[1]) for line in body.splitlines() if line.startswith("id: ")]
+    assert ids == [6, 7, 8]
+    names = [line.split(": ", 1)[1] for line in body.splitlines() if line.startswith("event: ")]
+    assert names == ["text_delta", "text_delta", "turn_error"]
 
 
-async def test_the_conversation_is_read_in_batches(chatting, monkeypatch) -> None:
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi")
+async def test_the_conversation_is_read_in_batches(chat_client, monkeypatch) -> None:
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi")
     turn_id = uuid.UUID(sent.json()["turn_id"])
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         for index in range(5):
             db.add(
                 Message(
@@ -1551,7 +1527,7 @@ async def test_the_conversation_is_read_in_batches(chatting, monkeypatch) -> Non
         await db.commit()
     # Six rows in batches of three: the last batch is full, and an empty one ends the read.
     monkeypatch.setattr(chat_events, "REPLAY_BATCH_SIZE", 3)
-    body = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    body = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     assert [message["role"] for message in body["messages"]] == ["user"] + ["assistant"] * 5
     assert [message["content"][0]["text"] for message in body["messages"][1:]] == [
         str(index) for index in range(5)
@@ -1561,23 +1537,17 @@ async def test_the_conversation_is_read_in_batches(chatting, monkeypatch) -> Non
     assert body["conversation"]["compactable"] is True
 
 
-async def test_a_delete_whose_commit_fails_keeps_the_edited_files(chatting, monkeypatch) -> None:
-    document_id = chatting.document_id
-    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
-    saved = await chatting.put(
+async def test_a_delete_whose_commit_fails_keeps_the_edited_files(chat_client, monkeypatch) -> None:
+    document_id = chat_client.document_id
+    content = (await chat_client.get(f"/api/library/documents/{document_id}/content")).json()
+    saved = await chat_client.put(
         f"/api/library/documents/{document_id}/content",
         json={"markdown": "# Edited\n", "base_revision": content["revision"]},
         headers=CSRF_HEADERS,
     )
     assert saved.status_code == 200, saved.text
     # The original, outside history: it must come back with the rest.
-    source = (
-        user_root(chatting.app.state.settings.workspaces_dir, chatting.user_id)
-        / "files"
-        / "Papers"
-        / "paper.pdf"
-        / "source.pdf"
-    )
+    source = chat_client.root / "files" / "Papers" / "paper.pdf" / "source.pdf"
     source.write_bytes(b"%PDF-1.4 kept")
 
     original = AsyncSession.commit
@@ -1591,27 +1561,27 @@ async def test_a_delete_whose_commit_fails_keeps_the_edited_files(chatting, monk
 
     monkeypatch.setattr(AsyncSession, "commit", commit)
     with contextlib.suppress(Exception):
-        await chatting.delete(f"/api/library/documents/{document_id}", headers=CSRF_HEADERS)
+        await chat_client.delete(f"/api/library/documents/{document_id}", headers=CSRF_HEADERS)
     assert source.read_bytes() == b"%PDF-1.4 kept"
     assert failing["on"] is False  # the commit was attempted
     monkeypatch.setattr(AsyncSession, "commit", original)
 
     # The row stayed, and so did the edit: not a fresh copy of the parse.
-    listed = (await chatting.get("/api/library")).json()["documents"]
+    listed = (await chat_client.get("/api/library")).json()["documents"]
     assert [row["id"] for row in listed] == [document_id]
-    after = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    after = (await chat_client.get(f"/api/library/documents/{document_id}/content")).json()
     assert after["markdown"] == "# Edited\n"
-    assert _paper_history(chatting)[0].message.startswith("restore ")
+    assert _paper_history(chat_client)[0].message.startswith("restore ")
 
 
-async def test_a_shell_revision_beyond_the_document_waits_for_every_turn(chatting) -> None:
-    first_id = chatting.document_id
-    settings = chatting.app.state.settings
-    async with chatting.app.state.sessionmaker() as db:
+async def test_a_shell_revision_beyond_the_document_waits_for_every_turn(chat_client) -> None:
+    first_id = chat_client.document_id
+    settings = chat_client.app.state.settings
+    async with chat_client.app.state.sessionmaker() as db:
         first = await db.get(Document, first_id)
         job_id, folder_id = first.job_id, first.folder_id
     # A copy: a second document on the same parse.
-    second = await chatting.post(
+    second = await chat_client.post(
         f"/api/library/documents/{first_id}/copy",
         json={"folder_id": folder_id},
         headers=CSRF_HEADERS,
@@ -1619,7 +1589,7 @@ async def test_a_shell_revision_beyond_the_document_waits_for_every_turn(chattin
     assert second.status_code == 201, second.text
     assert second.json()["job_id"] == str(job_id)
     second_id = second.json()["id"]
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         paths_a = await workspace_documents.materialize_document(
             db, settings, await db.get(Document, first_id)
         )
@@ -1636,25 +1606,25 @@ async def test_a_shell_revision_beyond_the_document_waits_for_every_turn(chattin
 
     # A turn on the second document is unfinished.
     conversation_id = (
-        await chatting.post(
+        await chat_client.post(
             f"/api/library/documents/{second_id}/conversations", headers=CSRF_HEADERS
         )
     ).json()["id"]
-    await send(chatting, conversation_id, text="hi")
-    refused = await chatting.post(
+    await send(chat_client, conversation_id, text="hi")
+    refused = await chat_client.post(
         f"/api/library/documents/{first_id}/revisions/{both}/revert", headers=CSRF_HEADERS
     )
     assert refused.status_code == 409, refused.text
     assert paths_b.doc.read_text() == "b by the shell\n"
     # The first document's own revision is its own business.
-    allowed = await chatting.post(
+    allowed = await chat_client.post(
         f"/api/library/documents/{first_id}/revisions/{own}/revert", headers=CSRF_HEADERS
     )
     assert allowed.status_code == 200, allowed.text
     assert paths_a.doc.read_text() == "a by the shell\n"
     # Once that turn is finished, the shell revision can go.
-    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
-    reverted = await chatting.post(
+    await chat_client.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    reverted = await chat_client.post(
         f"/api/library/documents/{first_id}/revisions/{both}/revert", headers=CSRF_HEADERS
     )
     assert reverted.status_code == 200, reverted.text
@@ -1667,9 +1637,8 @@ async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
         return chat_tools.ToolOutcome([image, {"type": "text", "text": "Page."}])
 
     monkeypatch.setattr(chat_tools, "view_page", fake_view_page)
-    monkeypatch.setattr(chat_runner, "_emit", _no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", _never_cancelled)
-    ctx = _round_ctx(round_budget=1000, turn_budget=250)
+    record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=250)
     one_round = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
         for index in range(3)
@@ -1709,9 +1678,8 @@ async def test_a_shell_command_holds_the_workspace_lock(tmp_path, monkeypatch) -
         return chat_tools.ToolOutcome("done")
 
     monkeypatch.setattr(chat_tools, "run_bash", fake_run_bash)
-    monkeypatch.setattr(chat_runner, "_emit", _no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", _never_cancelled)
-    ctx = _round_ctx(paths=SimpleNamespace(root=root), sandbox=object())
+    record_round(monkeypatch)
+    ctx = round_ctx(paths=SimpleNamespace(root=root), sandbox=object())
     tool_uses = [{"type": "tool_use", "id": "b1", "name": "bash", "input": {"command": "sleep"}}]
     running = asyncio.create_task(chat_runner._run_tools(ctx, tool_uses, set()))
     # Bounded: a run that fails before the command starts must fail the test, not hang it.
@@ -1730,17 +1698,18 @@ async def test_a_shell_command_holds_the_workspace_lock(tmp_path, monkeypatch) -
     await asyncio.wait_for(take_lock(), 5)
 
 
-async def test_a_rename_whose_commit_fails_moves_the_directory_back(chatting, monkeypatch) -> None:
-    document_id = chatting.document_id
-    settings = chatting.app.state.settings
-    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
-    saved = await chatting.put(
+async def test_a_rename_whose_commit_fails_moves_the_directory_back(
+    chat_client, monkeypatch
+) -> None:
+    document_id = chat_client.document_id
+    content = (await chat_client.get(f"/api/library/documents/{document_id}/content")).json()
+    saved = await chat_client.put(
         f"/api/library/documents/{document_id}/content",
         json={"markdown": "# Edited\n", "base_revision": content["revision"]},
         headers=CSRF_HEADERS,
     )
     assert saved.status_code == 200, saved.text
-    root = user_root(settings.workspaces_dir, chatting.user_id)
+    root = chat_client.root
     before = root / "files" / "Papers" / "paper.pdf"
     after = root / "files" / "Papers" / "renamed.pdf"
 
@@ -1755,7 +1724,7 @@ async def test_a_rename_whose_commit_fails_moves_the_directory_back(chatting, mo
 
     monkeypatch.setattr(AsyncSession, "commit", commit)
     with contextlib.suppress(Exception):
-        await chatting.put(
+        await chat_client.put(
             f"/api/library/documents/{document_id}",
             json={"name": "renamed.pdf"},
             headers=CSRF_HEADERS,
@@ -1764,31 +1733,31 @@ async def test_a_rename_whose_commit_fails_moves_the_directory_back(chatting, mo
     monkeypatch.setattr(AsyncSession, "commit", original)
 
     # The row kept its name, and the directory is back where the row says, edits and all.
-    listed = (await chatting.get("/api/library")).json()["documents"]
+    listed = (await chat_client.get("/api/library")).json()["documents"]
     assert [row["name"] for row in listed] == ["paper.pdf"]
     assert (before / "doc.md").read_text() == "# Edited\n"
     assert not after.exists()
-    read = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    read = (await chat_client.get(f"/api/library/documents/{document_id}/content")).json()
     assert read["markdown"] == "# Edited\n"
 
 
 async def test_a_send_that_waited_for_a_deleted_conversation_is_a_404(
-    chatting, monkeypatch
+    chat_client, monkeypatch
 ) -> None:
-    conversation_id = await new_conversation(chatting)
+    conversation_id = await new_conversation(chat_client)
     original = chat_routes.owned_conversation
 
     async def deleted_underneath(db, user_id, cid):
         row = await original(db, user_id, cid)
         # The delete commits between the read and the lock: what a send that waited for
         # the lock behind a delete sees.
-        async with chatting.app.state.sessionmaker() as other:
+        async with chat_client.app.state.sessionmaker() as other:
             await other.delete(await other.get(Conversation, cid))
             await other.commit()
         return row
 
     monkeypatch.setattr(chat_routes, "owned_conversation", deleted_underneath)
-    sent = await send(chatting, conversation_id, text="hi")
+    sent = await send(chat_client, conversation_id, text="hi")
     assert sent.status_code == 404, sent.text
 
 
@@ -1845,9 +1814,8 @@ async def test_a_shell_move_is_reconciled_before_the_lock_is_released(
     monkeypatch.setattr(chat_tools, "run_bash", fake_run_bash)
     monkeypatch.setattr(chat_tools, "commit_shell_changes", fake_commit)
     monkeypatch.setattr(chat_runner, "reconcile_locked", fake_reconcile)
-    monkeypatch.setattr(chat_runner, "_emit", _no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", _never_cancelled)
-    ctx = _round_ctx(paths=SimpleNamespace(root=root), sandbox=object(), sessionmaker=Sessions())
+    record_round(monkeypatch)
+    ctx = round_ctx(paths=SimpleNamespace(root=root), sandbox=object(), sessionmaker=Sessions())
     tool_uses = [{"type": "tool_use", "id": "b1", "name": "bash", "input": {"command": "mv a b"}}]
     await chat_runner._run_tools(ctx, tool_uses, set())
     assert seen == [True]
@@ -1861,32 +1829,34 @@ def test_prompt_facts_are_substituted_in_one_pass() -> None:
     assert rendered == "Edit files/{network}/doc.md; network: none."
 
 
-async def test_a_message_or_selection_past_the_deployments_cap_is_refused(chatting) -> None:
-    settings = chatting.app.state.settings
+async def test_a_message_or_selection_past_the_deployments_cap_is_refused(chat_client) -> None:
+    settings = chat_client.app.state.settings
     settings.chat_message_max_chars = 10
     settings.chat_selection_max_chars = 5
-    conversation_id = await new_conversation(chatting)
-    long = await send(chatting, conversation_id, text="x" * 11)
+    conversation_id = await new_conversation(chat_client)
+    long = await send(chat_client, conversation_id, text="x" * 11)
     assert long.status_code == 400
-    wide = await send(chatting, conversation_id, text="hi", selection="y" * 6)
+    wide = await send(chat_client, conversation_id, text="hi", selection="y" * 6)
     assert wide.status_code == 400
-    fits = await send(chatting, conversation_id, text="hi", selection="yyy")
+    fits = await send(chat_client, conversation_id, text="hi", selection="yyy")
     assert fits.status_code == 202, fits.text
 
 
-async def test_a_thread_for_a_document_deleted_underneath_is_a_404(chatting, monkeypatch) -> None:
-    document_id = chatting.document_id
+async def test_a_thread_for_a_document_deleted_underneath_is_a_404(
+    chat_client, monkeypatch
+) -> None:
+    document_id = chat_client.document_id
     original = chat_routes.live_text_document
 
     async def deleted_underneath(db, user_id, did):
         row = await original(db, user_id, did)
-        async with chatting.app.state.sessionmaker() as other:
+        async with chat_client.app.state.sessionmaker() as other:
             await other.delete(await other.get(Document, did))
             await other.commit()
         return row
 
     monkeypatch.setattr(chat_routes, "live_text_document", deleted_underneath)
-    created = await chatting.post(
+    created = await chat_client.post(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )
     assert created.status_code == 404, created.text
@@ -1976,8 +1946,8 @@ async def test_a_writer_past_its_grace_is_killed_in_the_vm_and_waited_to_its_end
 
 
 @respx.mock
-async def test_an_answer_cut_at_the_output_limit_fails_the_turn(chatting) -> None:
-    conversation_id = await new_conversation(chatting)
+async def test_an_answer_cut_at_the_output_limit_fails_the_turn(chat_client) -> None:
+    conversation_id = await new_conversation(chat_client)
     respx.post(MESSAGES_URL).mock(
         return_value=httpx.Response(
             200,
@@ -1990,13 +1960,13 @@ async def test_an_answer_cut_at_the_output_limit_fails_the_turn(chatting) -> Non
             ),
         )
     )
-    await send(chatting, conversation_id, text="hi")
-    await run_queued_turn(chatting)
-    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    await send(chat_client, conversation_id, text="hi")
+    await run_queued_turn(chat_client)
+    thread = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][-1]["status"] == "failed"
     assert "output limit" in thread["turns"][-1]["error"]
     # What came through is kept; the tool call cut with the limit is not, and never ran.
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         stored = (await db.execute(select(Message).order_by(Message.id))).scalars().all()
     assistant = [row for row in stored if row.role == "assistant"]
     assert len(assistant) == 1
@@ -2009,9 +1979,9 @@ async def test_an_answer_cut_at_the_output_limit_fails_the_turn(chatting) -> Non
             200, content=assistant_turn([{"type": "text", "text": "..."}], "pause_turn")
         )
     )
-    await send(chatting, conversation_id, text="again")
-    await run_queued_turn(chatting)
-    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    await send(chat_client, conversation_id, text="again")
+    await run_queued_turn(chat_client)
+    thread = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][-1]["status"] == "failed"
     assert "pause_turn" in thread["turns"][-1]["error"]
 
@@ -2033,13 +2003,13 @@ async def test_the_sandbox_client_takes_an_empty_success_answer() -> None:
 
 
 async def test_a_conversation_with_a_stored_model_keeps_it_whatever_the_page_says(
-    chatting,
+    chat_client,
 ) -> None:
     """The conversation's model is its first turn's, though the reader's pick is no longer
     offered; a fresh conversation with no pick starts on the first offered (docs/chat.md,
     docs/agents.md)."""
-    conversation_id = await new_conversation(chatting)
-    async with chatting.app.state.sessionmaker() as db:
+    conversation_id = await new_conversation(chat_client)
+    async with chat_client.app.state.sessionmaker() as db:
         conversation = await db.get(Conversation, conversation_id)
         conversation.model = "claude-stored"
         setting = (
@@ -2047,19 +2017,19 @@ async def test_a_conversation_with_a_stored_model_keeps_it_whatever_the_page_say
         ).scalar_one()
         setting.model = "vendor/delisted"  # no longer offered
         await db.commit()
-    accepted = await send(chatting, conversation_id, text="hi")
+    accepted = await send(chat_client, conversation_id, text="hi")
     assert accepted.status_code == 202, accepted.text
-    fresh = await new_conversation(chatting)
-    restored = await chatting.put(
+    fresh = await new_conversation(chat_client)
+    restored = await chat_client.put(
         "/api/agents/chat/settings", json={"model": None}, headers=CSRF_HEADERS
     )
     assert restored.status_code == 200, restored.text
-    started = await send(chatting, fresh, text="hi")
+    started = await send(chat_client, fresh, text="hi")
     assert started.status_code == 202, started.text
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         assert (await db.get(Conversation, conversation_id)).model == "claude-stored"
         assert (await db.get(Conversation, fresh)).model == "claude-code/claude-opus-5-5"
-    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    thread = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][-1]["finished_at"] is None
 
 
@@ -2126,55 +2096,52 @@ def test_the_prompt_names_the_sites_and_promises_an_install_only_with_pypi() -> 
     assert "through a proxy: pypi.org" in rendered and "{network}" not in rendered
 
 
-async def test_the_panel_gets_the_selection_without_its_scaffolding(chatting) -> None:
-    conversation_id = await new_conversation(chatting)
+async def test_the_panel_gets_the_selection_without_its_scaffolding(chat_client) -> None:
+    conversation_id = await new_conversation(chat_client)
     sent = await send(
-        chatting, conversation_id, text="Fix the Greedy row", selection="| Greedy | 3450 |"
+        chat_client, conversation_id, text="Fix the Greedy row", selection="| Greedy | 3450 |"
     )
     assert sent.status_code == 202, sent.text
-    detail = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    detail = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     blocks = detail["messages"][0]["content"]
     assert blocks[0] == {"type": "text", "text": "Fix the Greedy row"}
     # The passage alone: the panel's note counts the selection, not the line that
     # introduces it to the model, which the stored row keeps.
     assert blocks[1] == {"type": "text", "text": "| Greedy | 3450 |", "context": "selection"}
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         stored = (await db.execute(select(Message))).scalars().one()
         assert stored.content[1]["text"].startswith("The passage selected in the document:")
 
 
-async def test_a_revert_is_refused_before_it_materializes(chatting) -> None:
-    document_id = chatting.document_id
-    settings = chatting.app.state.settings
-    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
-    saved = await chatting.put(
+async def test_a_revert_is_refused_before_it_materializes(chat_client) -> None:
+    document_id = chat_client.document_id
+    content = (await chat_client.get(f"/api/library/documents/{document_id}/content")).json()
+    saved = await chat_client.put(
         f"/api/library/documents/{document_id}/content",
         json={"markdown": "# Edited\n", "base_revision": content["revision"]},
         headers=CSRF_HEADERS,
     )
     assert saved.status_code == 200
-    commit = _paper_history(chatting)[0].commit
-    conversation_id = await new_conversation(chatting)
-    await send(chatting, conversation_id, text="hi")
+    commit = _paper_history(chat_client)[0].commit
+    conversation_id = await new_conversation(chat_client)
+    await send(chat_client, conversation_id, text="hi")
     # The turn is unfinished and, between tool calls, has removed the directory.
-    directory = (
-        user_root(settings.workspaces_dir, chatting.user_id) / "files" / "Papers" / "paper.pdf"
-    )
+    directory = chat_client.root / "files" / "Papers" / "paper.pdf"
     shutil.rmtree(directory)
-    refused = await chatting.post(
+    refused = await chat_client.post(
         f"/api/library/documents/{document_id}/revisions/{commit}/revert", headers=CSRF_HEADERS
     )
     assert refused.status_code == 409
     assert not directory.exists()
 
 
-async def test_the_conversation_detail_carries_no_image_bytes(chatting) -> None:
-    conversation_id = await new_conversation(chatting)
+async def test_the_conversation_detail_carries_no_image_bytes(chat_client) -> None:
+    conversation_id = await new_conversation(chat_client)
     image = {
         "type": "image",
         "source": {"type": "base64", "media_type": "image/png", "data": "x" * 4000},
     }
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         db.add(
             Message(
                 conversation_id=conversation_id,
@@ -2190,7 +2157,7 @@ async def test_the_conversation_detail_carries_no_image_bytes(chatting) -> None:
             )
         )
         await db.commit()
-    detail = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    detail = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     content = detail["messages"][-1]["content"]
     assert content[0]["content"][0] == {"type": "image"}
     assert content[0]["content"][1]["text"] == "Page 1."
@@ -2382,13 +2349,13 @@ async def test_a_request_the_runner_refuses_is_settled_not_unconfirmed() -> None
     assert "rejected the command" in outcome.content
 
 
-async def test_a_turn_another_worker_finished_is_left_as_it_is(chatting) -> None:
+async def test_a_turn_another_worker_finished_is_left_as_it_is(chat_client) -> None:
     """The worker that lost the lock finds its turn finished by the one that took it
     (docs/jobs.md § Queue): its loop stops, and its own terminal write changes nothing."""
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="hi")
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="hi")
     turn_id = uuid.UUID(sent.json()["turn_id"])
-    sessionmaker = chatting.app.state.sessionmaker
+    sessionmaker = chat_client.app.state.sessionmaker
     async with sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         turn.status = "running"
@@ -2448,16 +2415,16 @@ async def test_a_failed_create_leaves_no_directory_behind(tmp_path, monkeypatch)
     assert (root / "files" / "kept").is_dir()
 
 
-async def test_a_message_carries_the_documents_revision_and_the_locale(chatting) -> None:
+async def test_a_message_carries_the_documents_revision_and_the_locale(chat_client) -> None:
     """The per-turn context rides in the user message, marked, so the model learns of an
     edit made meanwhile and of the reader's language without the system prompt — the
     cached prefix — changing (docs/chat.md § Prompt caching); the thread never shows it."""
-    document_id = chatting.document_id
-    conversation_id = await new_conversation(chatting)
-    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
-    sent = await send(chatting, conversation_id, text="hi", locale="zh-TW")
+    document_id = chat_client.document_id
+    conversation_id = await new_conversation(chat_client)
+    content = (await chat_client.get(f"/api/library/documents/{document_id}/content")).json()
+    sent = await send(chat_client, conversation_id, text="hi", locale="zh-TW")
     assert sent.status_code == 202, sent.text
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         stored = (
             await db.execute(
                 select(Message).where(
@@ -2472,7 +2439,7 @@ async def test_a_message_carries_the_documents_revision_and_the_locale(chatting)
     assert f"document revision: {content['revision']}" in turn_blocks[0]["text"]
     assert "reader locale: zh-TW" in turn_blocks[0]["text"]
     # Nothing of it reaches the thread.
-    detail = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    detail = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
     user_blocks = detail["messages"][0]["content"]
     assert all(block.get("context") != chat_routes.TURN_CONTEXT for block in user_blocks)
     # The system prompt carries no locale: a switch of language leaves the prefix alone.
@@ -2502,100 +2469,100 @@ async def test_a_listener_refused_listen_is_closed(monkeypatch) -> None:
     assert listener is None and closed == [True]
 
 
-async def test_an_accepted_message_moves_the_conversation_up_the_list(chatting) -> None:
-    conversation_id = await new_conversation(chatting)
-    sent = await send(chatting, conversation_id, text="one")
-    before = (await chatting.get(f"/api/conversations/{conversation_id}")).json()["conversation"][
-        "updated_at"
-    ]
-    async with chatting.app.state.sessionmaker() as db:
+async def test_an_accepted_message_moves_the_conversation_up_the_list(chat_client) -> None:
+    conversation_id = await new_conversation(chat_client)
+    sent = await send(chat_client, conversation_id, text="one")
+    before = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()[
+        "conversation"
+    ]["updated_at"]
+    async with chat_client.app.state.sessionmaker() as db:
         await fail_turn(db, uuid.UUID(sent.json()["turn_id"]), "worker stopped")
-    again = await send(chatting, conversation_id, text="two")
+    again = await send(chat_client, conversation_id, text="two")
     assert again.status_code == 202, again.text
-    after = (await chatting.get(f"/api/conversations/{conversation_id}")).json()["conversation"][
+    after = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()["conversation"][
         "updated_at"
     ]
     # The second message changed neither title nor model; the timestamp moves all the same.
     assert after > before
 
 
-async def test_the_list_holds_only_conversations_with_a_message(chatting) -> None:
+async def test_the_list_holds_only_conversations_with_a_message(chat_client) -> None:
     """A conversation is listed once it holds a message. An empty one — a first send that
     was refused — stays readable by its id and takes the retry, but is no thread to pick
     (docs/chat.md § Conversations, turns, events)."""
-    listing = f"/api/library/documents/{chatting.document_id}/conversations"
-    empty = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
-    talked = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
-    sent = await send(chatting, talked, text="Summarize it")
+    listing = f"/api/library/documents/{chat_client.document_id}/conversations"
+    empty = (await chat_client.post(listing, headers=CSRF_HEADERS)).json()["id"]
+    talked = (await chat_client.post(listing, headers=CSRF_HEADERS)).json()["id"]
+    sent = await send(chat_client, talked, text="Summarize it")
     assert sent.status_code == 202, sent.text
 
-    listed = (await chatting.get(listing)).json()["conversations"]
+    listed = (await chat_client.get(listing)).json()["conversations"]
     assert [(row["id"], row["title"]) for row in listed] == [(talked, "Summarize it")]
-    assert (await chatting.get(f"/api/conversations/{empty}")).status_code == 200
+    assert (await chat_client.get(f"/api/conversations/{empty}")).status_code == 200
 
     # The retry lands on the empty row, which is listed from then on, first.
-    retried = await send(chatting, empty, text="Again")
+    retried = await send(chat_client, empty, text="Again")
     assert retried.status_code == 202, retried.text
-    listed = (await chatting.get(listing)).json()["conversations"]
+    listed = (await chat_client.get(listing)).json()["conversations"]
     assert [row["id"] for row in listed] == [empty, talked]
 
 
-async def test_a_rename_is_one_clean_line_and_keeps_the_order(chatting) -> None:
+async def test_a_rename_is_one_clean_line_and_keeps_the_order(chat_client) -> None:
     """The reader's title: cleaned like a memory's text, cut at the cap `/api/me` hands the
     field, never empty, and written without touching `updated_at`, so the thread keeps its
     place in the list — a turn queued on it refuses nothing (docs/chat.md § Conversations)."""
-    listing = f"/api/library/documents/{chatting.document_id}/conversations"
+    listing = f"/api/library/documents/{chat_client.document_id}/conversations"
     ids = []
     for text in ("Explain table 2\nin detail", "Summarize it"):
-        made = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
-        sent = await send(chatting, made, text=text)
+        made = (await chat_client.post(listing, headers=CSRF_HEADERS)).json()["id"]
+        sent = await send(chat_client, made, text=text)
         assert sent.status_code == 202, sent.text
         ids.append(made)
     first, second = ids
-    before = (await chatting.get(listing)).json()["conversations"]
+    before = (await chat_client.get(listing)).json()["conversations"]
     assert [(row["id"], row["title"]) for row in before] == [
         (second, "Summarize it"),
         (first, "Explain table 2"),
     ]
     url = f"/api/conversations/{first}"
 
-    renamed = await chatting.put(
+    renamed = await chat_client.put(
         url, json={"title": "  Table\u200b 2,\n\tthe \x07baseline  "}, headers=CSRF_HEADERS
     )
     assert renamed.status_code == 200, renamed.text
     assert renamed.json()["title"] == "Table 2, the baseline"
     assert renamed.json()["updated_at"] == before[1]["updated_at"]
-    after = (await chatting.get(listing)).json()["conversations"]
+    after = (await chat_client.get(listing)).json()["conversations"]
     assert [(row["id"], row["title"]) for row in after] == [
         (second, "Summarize it"),
         (first, "Table 2, the baseline"),
     ]
     assert after[1]["updated_at"] == before[1]["updated_at"]
 
-    limit = (await chatting.get("/api/me")).json()["limits"]["conversation_title_max_chars"]
-    capped = await chatting.put(url, json={"title": "x" * (limit + 20)}, headers=CSRF_HEADERS)
+    limit = (await chat_client.get("/api/me")).json()["limits"]["conversation_title_max_chars"]
+    capped = await chat_client.put(url, json={"title": "x" * (limit + 20)}, headers=CSRF_HEADERS)
     assert capped.status_code == 200, capped.text
     assert capped.json()["title"] == "x" * limit
 
     for blank in ("", " \n\t ", "\u200b"):
-        refused = await chatting.put(url, json={"title": blank}, headers=CSRF_HEADERS)
+        refused = await chat_client.put(url, json={"title": blank}, headers=CSRF_HEADERS)
         assert refused.status_code == 400, blank
     # Neither field: refused as the request it is (docs/api.md).
-    assert (await chatting.put(url, json={}, headers=CSRF_HEADERS)).status_code == 400
-    assert (await chatting.put(url, json={"title": "Plain"})).status_code == 403
-    detail = (await chatting.get(url)).json()["conversation"]
+    assert (await chat_client.put(url, json={}, headers=CSRF_HEADERS)).status_code == 400
+    assert (await chat_client.put(url, json={"title": "Plain"})).status_code == 403
+    detail = (await chat_client.get(url)).json()["conversation"]
     assert detail["title"] == "x" * limit
     assert detail["updated_at"] == before[1]["updated_at"]
 
 
-async def test_a_rename_reaches_only_the_callers_conversations(chatting) -> None:
-    async with chatting.app.state.sessionmaker() as db:
+async def test_a_rename_reaches_only_the_callers_conversations(chat_client) -> None:
+    async with chat_client.app.state.sessionmaker() as db:
         stranger = user_row("stranger@example.com")
         db.add(stranger)
         await db.commit()
         stranger_id = stranger.id
-    theirs_document = await seed_document(chatting, stranger_id)
-    async with chatting.app.state.sessionmaker() as db:
+    theirs_document = await seed_document(chat_client, stranger_id)
+    async with chat_client.app.state.sessionmaker() as db:
         theirs = Conversation(
             user_id=stranger_id, document_id=theirs_document, title="Theirs", session="s"
         )
@@ -2603,39 +2570,39 @@ async def test_a_rename_reaches_only_the_callers_conversations(chatting) -> None
         await db.commit()
         theirs_id = theirs.id
 
-    refused = await chatting.put(
+    refused = await chat_client.put(
         f"/api/conversations/{theirs_id}", json={"title": "Mine"}, headers=CSRF_HEADERS
     )
     assert refused.status_code == 404
-    async with chatting.app.state.sessionmaker() as db:
+    async with chat_client.app.state.sessionmaker() as db:
         assert (await db.get(Conversation, theirs_id)).title == "Theirs"
 
 
-async def test_a_title_given_before_the_first_message_is_kept(chatting) -> None:
+async def test_a_title_given_before_the_first_message_is_kept(chat_client) -> None:
     """The first message names only a conversation still untitled: read under the row lock
     the send takes, so a rename that came first stands (docs/chat.md § Conversations)."""
-    listing = f"/api/library/documents/{chatting.document_id}/conversations"
-    made = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
-    renamed = await chatting.put(
+    listing = f"/api/library/documents/{chat_client.document_id}/conversations"
+    made = (await chat_client.post(listing, headers=CSRF_HEADERS)).json()["id"]
+    renamed = await chat_client.put(
         f"/api/conversations/{made}", json={"title": "Reading notes"}, headers=CSRF_HEADERS
     )
     assert renamed.status_code == 200, renamed.text
-    sent = await send(chatting, made, text="Summarize it")
+    sent = await send(chat_client, made, text="Summarize it")
     assert sent.status_code == 202, sent.text
-    listed = (await chatting.get(listing)).json()["conversations"]
+    listed = (await chat_client.get(listing)).json()["conversations"]
     assert [(row["id"], row["title"]) for row in listed] == [(made, "Reading notes")]
 
 
-async def test_a_first_line_cut_at_a_space_names_the_conversation_trimmed(chatting) -> None:
+async def test_a_first_line_cut_at_a_space_names_the_conversation_trimmed(chat_client) -> None:
     """The first line is cut at the title cap and trimmed after the cut, as a rename is: the
     title never ends in the space the cut fell on (docs/chat.md § Conversations)."""
-    listing = f"/api/library/documents/{chatting.document_id}/conversations"
-    made = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
-    limit = (await chatting.get("/api/me")).json()["limits"]["conversation_title_max_chars"]
+    listing = f"/api/library/documents/{chat_client.document_id}/conversations"
+    made = (await chat_client.post(listing, headers=CSRF_HEADERS)).json()["id"]
+    limit = (await chat_client.get("/api/me")).json()["limits"]["conversation_title_max_chars"]
     line = "x" * (limit - 1) + " runs past the cap"
-    sent = await send(chatting, made, text=f"{line}\nsecond line")
+    sent = await send(chat_client, made, text=f"{line}\nsecond line")
     assert sent.status_code == 202, sent.text
-    listed = (await chatting.get(listing)).json()["conversations"]
+    listed = (await chat_client.get(listing)).json()["conversations"]
     assert [(row["id"], row["title"]) for row in listed] == [(made, "x" * (limit - 1))]
 
 
@@ -2755,8 +2722,6 @@ async def test_a_subagents_retry_is_not_made_once_the_allowance_is_used(monkeypa
 async def test_the_event_stream_closes_its_listener_when_its_first_read_fails(monkeypatch) -> None:
     """The conversation stream's LISTEN connection lives outside the pool: a first read that
     fails, or a client gone before the first frame, still closes it."""
-    from sightread.jobs import chat_events
-
     closed: list[bool] = []
 
     class Listener:
@@ -2775,3 +2740,58 @@ async def test_the_event_stream_closes_its_listener_when_its_first_read_fails(mo
     with pytest.raises(RuntimeError):
         await anext(stream)
     assert closed == [True]
+
+
+@respx.mock
+async def test_a_send_past_the_per_user_turn_cap_is_a_429(make_client) -> None:
+    """docs/api.md: every unfinished turn of the user counts against
+    `MAX_CHAT_TURNS_PER_USER` at the send, a queued one too; a finished one frees its place."""
+    client = await chatting_client(make_client(max_chat_turns_per_user=1))
+    first_id = await new_conversation(client)
+    second_id = await new_conversation(client)
+    assert (await send(client, first_id, text="hi")).status_code == 202
+    refused = await send(client, second_id, text="hi")
+    assert refused.status_code == 429, refused.text
+    assert refused.json()["error"]["type"] == "rate_limit"
+    assert refused.json()["error"]["message"] == (
+        "Too many running conversations; wait for one to finish"
+    )
+    settings = client.app.state.settings
+    assert refused.headers["Retry-After"] == str(settings.chat_retry_after_seconds)
+    async with client.app.state.sessionmaker() as db:
+        assert len((await db.execute(select(ChatTurn.id))).all()) == 1
+
+    stub_messages([([{"type": "text", "text": "Hello."}], "end_turn")])
+    await run_queued_turn(client)
+    assert (await send(client, second_id, text="hi")).status_code == 202
+
+
+async def test_the_claim_starts_no_more_of_a_users_turns_than_the_cap(make_client) -> None:
+    """docs/chat.md § Cancel, sends and deletion (*The per-user cap*): the claim counts a
+    user's started turns only, so a queued turn waits behind its own user's running ones,
+    never behind another user's."""
+    client = await chatting_client(make_client())
+    first = (await send(client, await new_conversation(client), text="hi")).json()["turn_id"]
+    second = (await send(client, await new_conversation(client), text="hi")).json()["turn_id"]
+    async with client.app.state.sessionmaker() as db:
+        other = user_row("other@example.com")
+        db.add(other)
+        await db.flush()
+        conversation = Conversation(user_id=other.id, document_id=None, session="o")
+        db.add(conversation)
+        await db.flush()
+        message = Message(
+            conversation_id=conversation.id, role="user", content=[{"type": "text", "text": "hi"}]
+        )
+        db.add(message)
+        await db.flush()
+        theirs = await enqueue_turn(
+            db, user_id=other.id, conversation_id=conversation.id, message_id=message.id
+        )
+        await db.commit()
+    async with client.app.state.sessionmaker() as db:
+        assert await claim_next_turn(db, 1) == uuid.UUID(first)
+        # The reader is at the cap: their second turn waits, the other user's starts.
+        assert await claim_next_turn(db, 1) == theirs.id
+        assert await claim_next_turn(db, 1) is None
+        assert await claim_next_turn(db, 2) == uuid.UUID(second)

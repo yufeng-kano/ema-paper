@@ -20,27 +20,22 @@ from sightread.jobs.queue import history_bytes
 from sightread.routes import chat as chat_routes
 from sightread.routes.chat import QUOTE_PREFIX, SECTION_CONTEXT, SELECTION_PREFIX, TURN_CONTEXT
 from tests.chat_helpers import (
+    DONE,
+    SUMMARY,
+    attach,
     chatting_client,
     conversation_row,
+    detail,
+    edit,
     new_conversation,
     replayed_events,
     run_queued_turn,
     send,
+    set_clock,
     stub_messages,
+    texts,
 )
 from tests.conftest import CSRF_HEADERS
-from tests.test_chat_attachments import attach
-from tests.test_chat_compact import DONE, SUMMARY, detail, set_clock, texts
-
-
-async def edit(
-    client: AsyncClient, conversation_id: int, message_id: int, **body
-) -> httpx.Response:
-    return await client.post(
-        f"/api/conversations/{conversation_id}/messages/{message_id}/edit",
-        json=body,
-        headers=CSRF_HEADERS,
-    )
 
 
 async def switch(client: AsyncClient, conversation_id: int, version: str) -> httpx.Response:

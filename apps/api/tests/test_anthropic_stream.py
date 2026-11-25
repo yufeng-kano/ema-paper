@@ -32,15 +32,14 @@ def key() -> Connection:
     return stub_connection("anthropic")
 
 
-def a_turn(*, with_tool: bool = True, cost: float | None = 0.0123) -> bytes:
+def a_turn() -> bytes:
     usage = {
         "input_tokens": 900,
         "cache_read_input_tokens": 700,
         "cache_creation_input_tokens": 100,
+        "cost": 0.0123,
     }
-    if cost is not None:
-        usage["cost"] = cost
-    events = [
+    return sse(
         {
             "type": "message_start",
             "message": {"id": "msg_1", "model": "claude-opus-5-5", "usage": usage},
@@ -73,35 +72,29 @@ def a_turn(*, with_tool: bool = True, cost: float | None = 0.0123) -> bytes:
             "delta": {"type": "text_delta", "text": "the table."},
         },
         {"type": "content_block_stop", "index": 1},
-    ]
-    if with_tool:
-        events += [
-            {
-                "type": "content_block_start",
-                "index": 2,
-                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {}},
-            },
-            {
-                "type": "content_block_delta",
-                "index": 2,
-                "delta": {"type": "input_json_delta", "partial_json": '{"comm'},
-            },
-            {
-                "type": "content_block_delta",
-                "index": 2,
-                "delta": {"type": "input_json_delta", "partial_json": 'and": "ls"}'},
-            },
-            {"type": "content_block_stop", "index": 2},
-        ]
-    events += [
+        {
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {}},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": '{"comm'},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": 'and": "ls"}'},
+        },
+        {"type": "content_block_stop", "index": 2},
         {
             "type": "message_delta",
-            "delta": {"stop_reason": "tool_use" if with_tool else "end_turn"},
+            "delta": {"stop_reason": "tool_use"},
             "usage": {"output_tokens": 42},
         },
         {"type": "message_stop"},
-    ]
-    return sse(*events)
+    )
 
 
 async def collect(key: Connection, body: dict) -> tuple[list[StreamEvent], CompletedMessage]:

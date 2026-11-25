@@ -30,7 +30,7 @@ from tests.chat_helpers import (
     streamed,
     stub_messages,
 )
-from tests.conftest import CSRF_HEADERS, postgres_only
+from tests.conftest import CSRF_HEADERS, postgres_only, sign_in
 
 
 def fake_pages(monkeypatch) -> list[int]:
@@ -201,7 +201,7 @@ def test_translate_takes_a_language_and_the_readers_instructions() -> None:
 
 async def test_skills_and_subagents_are_capped(make_client) -> None:
     client = make_client(chat_skills_max=1, chat_subagents_max=1, system_prompt_max_chars=2000)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     # An edit of a built-in is not one of the reader's own: it does not count.
     await client.put("/api/skills/fix-math", json={"description": "Mine"}, headers=CSRF_HEADERS)
     await client.put(
@@ -1202,3 +1202,40 @@ async def test_a_drop_the_upstream_reports_cuts_the_thinking_before_it(chat_clie
         for block in message["content"]
         if isinstance(block, dict)
     )
+
+
+@respx.mock
+async def test_a_turn_past_its_tool_call_cap_fails_before_the_rounds_tools_run(
+    make_client, monkeypatch
+) -> None:
+    """docs/chat.md § Tools: the calls count across the turn's rounds, each round by its
+    calls, and the round that takes the turn past `CHAT_MAX_TOOL_CALLS_PER_TURN` fails it
+    before any of its tools runs; every call made is billed."""
+    client = await chatting_client(make_client(chat_max_tool_calls_per_turn=2))
+    pages = fake_pages(monkeypatch)
+    # The over-cap round makes two calls and runs neither, so the one-call-a-round rule
+    # (`one_call`) does not apply to it.
+    over = [
+        {"type": "tool_use", "id": "p2", "name": "view_page", "input": {"page": 2}},
+        {"type": "tool_use", "id": "p3", "name": "view_page", "input": {"page": 3}},
+    ]
+    main, _ = stub_messages([one_call("p1", "view_page", {"page": 1}), (over, "tool_use")])
+    conversation_id = await new_conversation(client)
+    assert (await send(client, conversation_id, text="Read")).status_code == 202
+    await run_queued_turn(client)
+
+    assert len(main) == 2 and pages == [1]
+    thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
+    assert thread["turns"][-1]["status"] == "failed"
+    assert thread["turns"][-1]["error"] == "The turn made more than 2 tool calls"
+    # The second round's calls are kept in its answer, and no result is stored for them.
+    assert [message["role"] for message in thread["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert [block["id"] for block in thread["messages"][-1]["content"]] == ["p2", "p3"]
+    async with client.app.state.sessionmaker() as db:
+        billed = (await db.execute(select(UsageLog.id).where(UsageLog.agent == "chat"))).all()
+    assert len(billed) == 2

@@ -18,20 +18,25 @@ from sightread.jobs.chat_tools import ToolOutcome
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import filing, git
 from tests.chat_helpers import (
+    DONE,
+    SUMMARY,
+    agents_part,
     conversation_row,
+    detail,
+    edit,
     new_conversation,
     one_call,
+    papers_folder,
     run_queued_turn,
     send,
+    set_clock,
     stub_messages,
+    tool_results,
+    turns_of,
+    write_file,
 )
 from tests.conftest import CSRF_HEADERS, postgres_only
 from tests.factories import user_row
-from tests.test_chat_agents_file import _agents_part, _write
-from tests.test_chat_compact import DONE, SUMMARY, detail, set_clock, turns_of
-from tests.test_chat_convert import _papers
-from tests.test_chat_versions import edit
-from tests.test_chat_web import tool_results
 
 LIBRARY_PROMPT_START = "You are the library agent inside Ema Paper"
 
@@ -119,7 +124,7 @@ async def test_a_message_carries_the_files_page_and_no_passage(chat_client) -> N
     (docs/chat.md § Library conversations)."""
     client = chat_client
     main, _ = stub_messages([DONE])
-    papers = await _papers(client)
+    papers = await papers_folder(client)
     conversation_id = await new_library_conversation(client)
     for refused in (
         {"text": "x", "selection": "Greedy is 3.45."},
@@ -183,7 +188,7 @@ async def test_a_message_carries_the_files_page_and_no_passage(chat_client) -> N
 async def test_an_edit_keeps_the_files_page_it_was_sent_with(chat_client) -> None:
     client = chat_client
     main, _ = stub_messages([DONE, DONE])
-    papers = await _papers(client)
+    papers = await papers_folder(client)
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, text="one", library={"folder_id": papers})
     await run_queued_turn(client)
@@ -230,8 +235,8 @@ async def test_a_library_turn_runs_on_the_library_prompt_and_tools(chat_client) 
     alone, and no skill or subagent that works on a document: a call naming one, or a page
     tool, answers an error without running (docs/chat.md § Library conversations)."""
     client = chat_client
-    _write(client.root, "files/AGENTS.md", "- Notes in English\n")
-    _write(client.root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
+    write_file(client.root, "files/AGENTS.md", "- Notes in English\n")
+    write_file(client.root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
     main, _ = stub_messages(
         [
             one_call("v", "view_page", {"page": 1}),
@@ -254,7 +259,7 @@ async def test_a_library_turn_runs_on_the_library_prompt_and_tools(chat_client) 
     assert (
         chat_agent.LIBRARY_AGENTS_FILE_INTRO + "## /workspace/files/AGENTS.md\n\n- Notes in English"
     ) in [part["text"] for part in request["system"]]
-    assert _agents_part(request) is None
+    assert agents_part(request) is None
     catalogue = "\n".join(part["text"] for part in request["system"])
     assert "translate" not in catalogue and "fix-math" not in catalogue
     assert "check-figures" not in catalogue and "translator" not in catalogue
@@ -282,7 +287,7 @@ async def test_the_library_tools_change_the_library_and_say_how_to_undo_it(chat_
     every tree commit is the conversation's (docs/chat.md § Library conversations, *The
     library tools*)."""
     client = chat_client
-    papers = await _papers(client)
+    papers = await papers_folder(client)
     document = client.document_id
     main, _ = stub_messages(
         [
@@ -751,7 +756,7 @@ async def test_init_in_a_library_conversation_names_the_open_folders_agents_md(
 ) -> None:
     client = chat_client
     main, _ = stub_messages([DONE, DONE, DONE])
-    papers = await _papers(client)
+    papers = await papers_folder(client)
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, command="init", library={"folder_id": papers})
     await run_queued_turn(client)

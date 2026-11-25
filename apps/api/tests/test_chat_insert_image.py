@@ -22,20 +22,22 @@ from sightread.jobs import chat_runner
 from sightread.workspace.documents import measure_storage
 from sightread.workspace.layout import images_dir
 from tests.chat_helpers import (
+    DOC_PATH,
+    DONE,
     chatting_client,
+    keep_file,
     new_conversation,
     one_call,
+    papers_folder,
     run_queued_turn,
     send,
     stub_messages,
+    tool_results,
+    turn_credits,
 )
 from tests.conftest import PARSE_MODEL, TEST_MODEL_PRICES
-from tests.test_chat_compact import DONE
-from tests.test_chat_convert import _keep, _papers
-from tests.test_chat_web import tool_results, turn_credits
 from tests.test_document_images import _image
 
-DOCUMENT = "/workspace/files/Papers/paper.pdf"
 LINE = re.compile(r"!\[\]\(figures/(img-[0-9a-f]{16}\.(?:png|jpg))\)")
 NO_DOCUMENT = "give the doc.md or notes.md of one of the user's documents."
 
@@ -108,14 +110,14 @@ async def test_a_chart_and_a_kept_picture_become_images_of_the_document(chat_cli
     chart = _image("PNG")
     (root / ".cache").mkdir(exist_ok=True)
     (root / ".cache" / "loss.png").write_bytes(chart)
-    await _keep(client, "photo.jpg", _image("JPEG"), "image/jpeg", await _papers(client))
+    await keep_file(client, "photo.jpg", _image("JPEG"), "image/jpeg", await papers_folder(client))
     conversation_id = await new_conversation(client)
     first, second = await _turn(
         client,
         conversation_id,
-        {"image": "/workspace/.cache/loss.png", "document": f"{DOCUMENT}/notes.md"},
+        {"image": "/workspace/.cache/loss.png", "document": f"{DOC_PATH}/notes.md"},
         # A picture of the reader's, into the document named by its directory.
-        {"image": "/workspace/files/Papers/photo.jpg", "document": DOCUMENT},
+        {"image": "/workspace/files/Papers/photo.jpg", "document": DOC_PATH},
     )
     names = []
     for result, suffix in ((first, ".png"), (second, ".jpg")):
@@ -124,7 +126,7 @@ async def test_a_chart_and_a_kept_picture_become_images_of_the_document(chat_cli
         assert match and match.group(1).endswith(suffix), result["output"]
         names.append(match.group(1))
     assert first["output"].startswith(
-        f"Kept /workspace/.cache/loss.png as an image of the document at {DOCUMENT}."
+        f"Kept /workspace/.cache/loss.png as an image of the document at {DOC_PATH}."
     )
     for name in names:
         kept = images_dir(root) / str(client.document_id) / name
@@ -162,11 +164,11 @@ async def test_insert_image_refuses_what_it_cannot_keep(chat_client) -> None:
         client,
         conversation_id,
         # The VM's /tmp is the VM's alone: never a path the worker can read.
-        {"image": "/tmp/loss.png", "document": DOCUMENT},  # noqa: S108
+        {"image": "/tmp/loss.png", "document": DOC_PATH},  # noqa: S108
         {"image": chart, "document": ""},
-        {"image": "/workspace/.cache/none.png", "document": DOCUMENT},
-        {"image": "/workspace/.cache/link.png", "document": DOCUMENT},
-        {"image": "/workspace/.cache/notes.txt", "document": DOCUMENT},
+        {"image": "/workspace/.cache/none.png", "document": DOC_PATH},
+        {"image": "/workspace/.cache/link.png", "document": DOC_PATH},
+        {"image": "/workspace/.cache/notes.txt", "document": DOC_PATH},
         {"image": chart, "document": "/workspace/files/Papers"},
         {"image": chart, "document": "/workspace/.cache/forged/doc.md"},
     )
@@ -208,15 +210,15 @@ async def test_an_image_past_its_cap_or_the_quota_is_refused(make_client) -> Non
     stub_messages(
         [
             one_call(
-                "i0", "insert_image", {"image": "/workspace/.cache/big.png", "document": DOCUMENT}
+                "i0", "insert_image", {"image": "/workspace/.cache/big.png", "document": DOC_PATH}
             ),
             one_call(
-                "i1", "insert_image", {"image": "/workspace/.cache/first.png", "document": DOCUMENT}
+                "i1", "insert_image", {"image": "/workspace/.cache/first.png", "document": DOC_PATH}
             ),
             one_call(
                 "i2",
                 "insert_image",
-                {"image": "/workspace/.cache/second.png", "document": DOCUMENT},
+                {"image": "/workspace/.cache/second.png", "document": DOC_PATH},
             ),
             DONE,
         ]

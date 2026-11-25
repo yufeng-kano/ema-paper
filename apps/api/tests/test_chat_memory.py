@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -31,20 +30,20 @@ from sightread.db.models import (
 )
 from sightread.jobs import chat_events, chat_memory, chat_runner, chat_subagent, chat_tools
 from sightread.parsing.attachments import ATTACHMENT_EXTENSIONS
-from sightread.workspace.layout import user_root
 from tests.chat_helpers import (
+    DONE,
     chatting_client,
     new_conversation,
     one_call,
+    record_round,
     replayed_events,
+    round_ctx,
     run_queued_turn,
     send,
     stub_messages,
 )
 from tests.conftest import CSRF_HEADERS, postgres_only, sign_in
 from tests.factories import job_row, user_row
-
-DONE = ([{"type": "text", "text": "Done."}], "end_turn")
 
 
 async def put_chat(client: AsyncClient, **fields):
@@ -271,7 +270,7 @@ def test_the_turn_block_names_the_languages_only_when_chosen() -> None:
 
 async def test_the_chat_settings_take_instructions_languages_and_switches(make_client) -> None:
     client = make_client(chat_instructions_max_chars=16)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     agents = (await client.get("/api/agents")).json()["agents"]
     defaults = next(agent for agent in agents if agent["name"] == "chat")["settings"]
     assert {key: defaults[key] for key in memory_setting_keys()} == {
@@ -540,7 +539,7 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
         f"- reader locale: zh-TW\n{ANSWER_JA}\n{translation_line('en')}"
     )
     # Reads only: nothing was materialized for it.
-    assert not (user_root(client.app.state.settings.workspaces_dir, client.user_id)).exists()
+    assert not client.root.exists()
 
     await put_chat(client, prompt="Mine for {document_path}.")
     await put_chat(client, memory_paused=True)
@@ -989,52 +988,6 @@ async def test_control_characters_never_reach_a_stored_text(chat_client) -> None
 # --- the tool in a round ------------------------------------------------------------------
 
 
-def round_context() -> SimpleNamespace:
-    """What `_run_tools` reads of a turn, for a round of reads with no database behind it."""
-    return SimpleNamespace(
-        settings=SimpleNamespace(
-            chat_image_round_max_bytes=1000,
-            chat_image_turn_max_bytes=1000,
-            chat_page_image_max_pixels=1,
-            upload_max_bytes=1,
-            chat_bash_timeout_seconds=1,
-            sandbox_start_timeout_seconds=1,
-            sandbox_exec_grace_seconds=1,
-            chat_writer_grace_seconds=1,
-        ),
-        sessionmaker=None,
-        conversation=SimpleNamespace(id=1, session="s"),
-        paths=None,
-        document=SimpleNamespace(id=1),
-        decode_slot=asyncio.Semaphore(1),
-        job=SimpleNamespace(page_count=12, kind="pdf"),
-        render_slots=None,
-        sandbox=None,
-        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        images=chat_runner.ImageBudget(1000, 1000, chat_runner.IMAGE_TURN_BUDGET_SPENT),
-        credits_exhausted=False,
-        round_admission=lambda calls: lambda index: True,
-        writers={},
-        write_gate=asyncio.Lock(),
-    )
-
-
-@pytest.fixture
-def round_events(monkeypatch) -> list[tuple[str, dict]]:
-    """The events a round emits, recorded instead of written; the turn is never cancelled."""
-    emitted: list[tuple[str, dict]] = []
-
-    async def record(ctx, event, data):
-        emitted.append((event, data))
-
-    async def never_cancelled(ctx):
-        return False
-
-    monkeypatch.setattr(chat_runner, "_emit", record)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
-    return emitted
-
-
 SAVED = chat_tools.ToolOutcome(
     "Saved as m1.",
     memory={
@@ -1052,13 +1005,13 @@ MEMORY_CALL = {
 }
 
 
-@pytest.mark.usefixtures("round_events")
 async def test_a_spent_image_budget_never_refuses_the_memory_tool(monkeypatch) -> None:
     async def fake_memory_tool(sessionmaker, settings, **kwargs):
         return SAVED
 
     monkeypatch.setattr(chat_memory, "run_memory_tool", fake_memory_tool)
-    ctx = round_context()
+    record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
     ctx.images.total = ctx.settings.chat_image_turn_max_bytes
     page = {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}}
     viewed, remembered = await chat_runner._run_tools(ctx, [page, MEMORY_CALL], set())
@@ -1067,7 +1020,6 @@ async def test_a_spent_image_budget_never_refuses_the_memory_tool(monkeypatch) -
     assert remembered["content"] == "Saved as m1." and "is_error" not in remembered
 
 
-@pytest.mark.usefixtures("round_events")
 async def test_a_spent_image_budget_refuses_only_pages_and_figures_ahead(monkeypatch) -> None:
     """docs/chat.md § Tools: a skill and a subagent return no image before they run, so a
     spent turn budget refuses neither; a page and a figure are refused."""
@@ -1077,7 +1029,8 @@ async def test_a_spent_image_budget_refuses_only_pages_and_figures_ahead(monkeyp
 
     monkeypatch.setattr(chat_runner, "_load_skill", lambda ctx, tool_input: SKILL_TEXT)
     monkeypatch.setattr(chat_subagent, "run_subagent", fake_subagent)
-    ctx = round_context()
+    record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
     ctx.images.total = ctx.settings.chat_image_turn_max_bytes
     calls = [
         {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}},
@@ -1091,7 +1044,6 @@ async def test_a_spent_image_budget_refuses_only_pages_and_figures_ahead(monkeyp
     assert subagent["content"] == "The report." and "is_error" not in subagent
 
 
-@pytest.mark.usefixtures("round_events")
 async def test_a_subagents_spent_image_budget_still_lets_it_view_text(monkeypatch) -> None:
     """docs/chat.md § Subagents: a subagent whose own image budget is spent is refused a
     page ahead, but its editor still answers a `view` of a text file."""
@@ -1100,7 +1052,8 @@ async def test_a_subagents_spent_image_budget_still_lets_it_view_text(monkeypatc
         return chat_tools.ToolOutcome("1\tBody text.")
 
     monkeypatch.setattr(chat_tools, "run_editor", text_view)
-    ctx = round_context()
+    record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
     ctx.paths = SimpleNamespace(root=None)
     ctx.settings.chat_tool_result_max_chars = 1000
     ctx.settings.content_max_bytes = 1000
@@ -1133,7 +1086,7 @@ async def test_a_subagents_spent_image_budget_still_lets_it_view_text(monkeypatc
 
 
 async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(
-    monkeypatch, round_events
+    monkeypatch,
 ) -> None:
     """Cancelled between the row's commit and what reports it, the call runs on, and the
     end of the turn waits for its tool_result and `memory` event, as it does for a write:
@@ -1147,7 +1100,8 @@ async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(
         return SAVED
 
     monkeypatch.setattr(chat_memory, "run_memory_tool", slow_memory_tool)
-    ctx = round_context()
+    round_events = record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
     running = asyncio.create_task(chat_runner._run_tools(ctx, [MEMORY_CALL], set()))
     await asyncio.wait_for(in_flight.wait(), 5)
     running.cancel()
@@ -1165,7 +1119,7 @@ async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(
 
 
 async def test_a_memory_call_that_fails_after_a_cancel_is_logged_and_reported(
-    monkeypatch, caplog, round_events
+    monkeypatch, caplog
 ) -> None:
     """Nobody awaits the call once the round is cancelled, so its own failure is logged and
     answered as an error tool_result there, as `_run_tool` would have done."""
@@ -1178,7 +1132,8 @@ async def test_a_memory_call_that_fails_after_a_cancel_is_logged_and_reported(
         raise RuntimeError("the connection dropped")
 
     monkeypatch.setattr(chat_memory, "run_memory_tool", failing_memory_tool)
-    ctx = round_context()
+    round_events = record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
     running = asyncio.create_task(chat_runner._run_tools(ctx, [MEMORY_CALL], set()))
     await asyncio.wait_for(in_flight.wait(), 5)
     running.cancel()

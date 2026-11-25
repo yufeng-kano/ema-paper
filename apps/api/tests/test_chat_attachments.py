@@ -9,7 +9,6 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 
-import httpx
 import respx
 from httpx import AsyncClient
 from PIL import Image
@@ -21,22 +20,15 @@ from sightread.db.models import ChatAttachment, utcnow
 from sightread.parsing import attachments as attachment_prep
 from sightread.parsing import poppler
 from tests.chat_helpers import (
+    attach,
     chatting_client,
     new_conversation,
     run_queued_turn,
     send,
     stub_messages,
 )
-from tests.conftest import CSRF_HEADERS
+from tests.conftest import CSRF_HEADERS, sign_in
 from tests.factories import user_row
-
-
-async def attach(
-    client: AsyncClient, name: str, data: bytes, media_type: str = "application/octet-stream"
-) -> httpx.Response:
-    return await client.post(
-        "/api/attachments", files={"file": (name, data, media_type)}, headers=CSRF_HEADERS
-    )
 
 
 def waiting(client: AsyncClient) -> list[Path]:
@@ -130,7 +122,7 @@ async def test_attachments_are_prepared_embedded_and_shown_without_their_bytes(
 
 async def test_an_attachment_is_refused_by_size_type_and_content(make_client, documents) -> None:
     client = make_client(chat_attachment_max_bytes=1024 * 1024)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     big = await attach(client, "big.txt", b"x" * (1024 * 1024 + 1), "text/plain")
     assert big.status_code == 413
     assert "CHAT_ATTACHMENT_MAX_BYTES" in big.json()["error"]["message"]
@@ -163,7 +155,7 @@ async def test_an_attachment_is_refused_by_size_type_and_content(make_client, do
 
 async def test_a_long_text_keeps_its_head_and_tail(make_client, tmp_path) -> None:
     client = make_client(chat_attachment_text_max_chars=200)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     text = "HEAD " + "x" * 5000 + " TAIL"
     created = await attach(client, "long.txt", text.encode(), "text/plain")
     assert created.status_code == 201, created.text
@@ -197,7 +189,7 @@ async def test_a_pdf_is_read_only_to_its_text_cap(make_client, tmp_path) -> None
     assert not goes_on and len(whole) > source.stat().st_size
 
     client = make_client(chat_attachment_text_max_chars=300)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     created = await attach(client, "long.pdf", source.read_bytes(), "application/pdf")
     assert created.status_code == 201, created.text
     prepared = waiting(client)[0].read_text(encoding="utf-8")
@@ -214,7 +206,7 @@ async def test_a_pdf_is_read_only_to_its_text_cap(make_client, tmp_path) -> None
 async def test_the_attachment_route_streams_past_the_json_body_cap(make_client) -> None:
     """The general body cap is for JSON; an attachment streams under its own (docs/api.md)."""
     client = make_client(content_max_bytes=1024)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     created = await attach(client, "large.txt", b"line\n" * 100_000, "text/plain")
     assert created.status_code == 201, created.text
 
@@ -269,7 +261,7 @@ async def test_an_attachment_is_removed_expires_or_is_another_readers(make_clien
 
 async def test_a_new_upload_drops_the_rows_the_sweeper_has_taken(make_client) -> None:
     client = make_client()
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     stale = (await attach(client, "old.txt", b"old", "text/plain")).json()
     async with client.app.state.sessionmaker() as db:
         row = await db.get(ChatAttachment, uuid.UUID(stale["id"]))
@@ -285,7 +277,7 @@ async def test_the_attachments_waiting_for_a_message_are_capped(make_client) -> 
     """Each upload is bounded and so is their number: uploads never sent would otherwise fill
     the upload directory for a day (docs/api.md)."""
     client = make_client(chat_attachments_pending_max=2)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     first = await attach(client, "a.txt", b"one", "text/plain")
     second = await attach(client, "b.txt", b"two", "text/plain")
     assert (first.status_code, second.status_code) == (201, 201)

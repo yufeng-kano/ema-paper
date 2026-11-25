@@ -28,12 +28,13 @@ from tests.chat_helpers import (
     chatting_client,
     new_conversation,
     one_call,
-    replayed_events,
     run_queued_turn,
     send,
     stub_messages,
+    tool_results,
+    turn_credits,
 )
-from tests.conftest import CSRF_HEADERS, PARSE_MODEL, TEST_MODEL_PRICES, postgres_only
+from tests.conftest import PARSE_MODEL, TEST_MODEL_PRICES, postgres_only, sign_in
 
 PUBLIC_IP = "1.2.3.4"
 HOSTS = {
@@ -93,24 +94,10 @@ async def fetch(
     )
 
 
-async def tool_results(client, conversation_id: int) -> list[dict]:
-    return [
-        data
-        for name, data in await replayed_events(client, conversation_id)
-        if name == "tool_result"
-    ]
-
-
 async def recorded(client, tool: str) -> int:
     async with client.app.state.sessionmaker() as db:
         rows = (await db.execute(select(ChatToolCall).where(ChatToolCall.tool == tool))).scalars()
         return len(rows.all())
-
-
-async def turn_credits(client, conversation_id: int) -> tuple[str, int | None]:
-    thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
-    [turn] = thread["turns"]
-    return turn["status"], turn["credits"]
 
 
 # --- what is declared -------------------------------------------------------------------------
@@ -173,7 +160,7 @@ async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(mak
     """docs/api.md `GET /api/agents`, docs/billing.md § Routes: the tools the caller's turn
     declares, and the price of a web search — null where there is none."""
     client = make_client(**WEB_KEYS)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     chat = next(
         a for a in (await client.get("/api/agents")).json()["agents"] if a["name"] == "chat"
     )
@@ -189,7 +176,7 @@ async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(mak
     assert (await client.get("/api/billing")).json()["rates"]["web_search_per_call"] == 3
 
     bare = make_client()
-    await bare.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(bare)
     chat = next(a for a in (await bare.get("/api/agents")).json()["agents"] if a["name"] == "chat")
     assert chat["tools"][-5:] == [
         "memory",
@@ -201,7 +188,7 @@ async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(mak
     assert (await bare.get("/api/billing/catalog")).json()["rates"]["web_search_per_call"] is None
 
     off = make_client(chat_web_access=False, **WEB_KEYS)
-    await off.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(off)
     chat = next(a for a in (await off.get("/api/agents")).json()["agents"] if a["name"] == "chat")
     assert chat["tools"][-3:] == ["memory", "convert_file", "insert_image"]
     assert (await off.get("/api/billing/catalog")).json()["rates"]["web_search_per_call"] is None

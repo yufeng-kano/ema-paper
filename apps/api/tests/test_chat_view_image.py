@@ -14,7 +14,6 @@ import shlex
 import shutil
 import subprocess
 import threading
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +26,8 @@ from sightread.workspace.locks import workspace_lock
 from tests.chat_helpers import (
     new_conversation,
     one_call,
+    record_round,
+    round_ctx,
     run_queued_turn,
     send,
     stub_messages,
@@ -446,32 +447,13 @@ async def test_an_image_is_decoded_after_the_workspace_lock_is_released(
 
 
 def _editor_round_ctx(root: Path, *, round_budget: int, turn_budget: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        settings=SimpleNamespace(
-            chat_image_round_max_bytes=round_budget,
-            chat_image_turn_max_bytes=turn_budget,
-            chat_page_image_max_pixels=40_000_000,
-            chat_attachment_image_long_edge=1568,
-            chat_tool_result_max_chars=1000,
-            upload_max_bytes=1,
-            content_max_bytes=1000,
-            chat_bash_timeout_seconds=1,
-        ),
-        conversation=SimpleNamespace(id=1, session="s"),
+    """A round's context with the workspace at `root`, `view_page` declared, and a pixel cap
+    no test image reaches."""
+    return round_ctx(
+        round_budget=round_budget,
+        turn_budget=turn_budget,
+        settings={"chat_page_image_max_pixels": 40_000_000},
         paths=SimpleNamespace(root=root),
-        document=SimpleNamespace(id=1),
-        decode_slot=asyncio.Semaphore(1),
-        job=SimpleNamespace(page_count=12, kind="pdf"),
-        render_slots=None,
-        sandbox=None,
-        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        images=chat_runner.ImageBudget(
-            round_budget, turn_budget, chat_runner.IMAGE_TURN_BUDGET_SPENT
-        ),
-        credits_exhausted=False,
-        round_admission=lambda calls: lambda index: True,
-        writers={},
-        write_gate=asyncio.Lock(),
         tools=[{"name": "view_page"}],
     )
 
@@ -490,16 +472,9 @@ async def test_an_editor_image_counts_against_the_image_budgets(tmp_path, monkey
         image = {"type": "image", "source": {"type": "base64", "data": "x" * 100}}
         return chat_tools.ToolOutcome([image, {"type": "text", "text": "Page."}])
 
-    async def no_events(ctx, event, data):
-        return None
-
-    async def never_cancelled(ctx):
-        return False
-
     monkeypatch.setattr(chat_tools, "run_editor", fake_run_editor)
     monkeypatch.setattr(chat_tools, "view_page", fake_view_page)
-    monkeypatch.setattr(chat_runner, "_emit", no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    record_round(monkeypatch)
 
     def view(index: int) -> dict:
         return {
