@@ -141,9 +141,9 @@ class TurnFailed(Exception):
 
 
 class TurnOutOfCredits(Exception):
-    """The period's balance ran out mid-turn and the turn's last call, made with no tools
-    left to it, still asked for one — or a subagent's retry found the allowance used, which
-    its run answers on its own (docs/billing.md § A chat turn)."""
+    """The period's balance ran out mid-turn and the turn's last call, made with
+    `tool_choice` none, still asked for a tool — or a subagent's retry found the allowance
+    used, which its run answers on its own (docs/billing.md § A chat turn)."""
 
 
 @dataclass(frozen=True)

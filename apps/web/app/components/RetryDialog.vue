@@ -41,6 +41,8 @@ const models = ref<AgentModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 /** The parse agent's fallback, the first choice when there is one. */
 const fallback = ref<string | null>(null)
+/** The parse agent's own model (`PARSE_MODEL`), what a retry naming no model falls back to. */
+const own = ref<string | null>(null)
 /** The reader's pick; until there is one, the default below. */
 const chosen = ref<string | null>(null)
 /** Whether the format check is on now — a retry checks with the settings of its moment.
@@ -72,11 +74,17 @@ const jobError = computed(() => {
   return t('files.retry.checkFailed', { reason: key ? t(`files.retry.reasons.${key}`) : check })
 })
 
-/** The fallback, else the model the failed pages last ran on. */
+/** Whether the catalog lists `id`: a model the deployment no longer offers is refused. */
+const offered = (id: string | null | undefined) => !!id && (models.value ?? []).some((m) => m.id === id)
+/** The fallback, else the model the failed pages last ran on or the job's while the
+ *  deployment offers it, else the parse agent's own. */
 const model = computed(
   () =>
     chosen.value ??
-    (fallback.value || missing.value.find((page) => page.model)?.model || props.document.model || ''),
+    (fallback.value ||
+      [missing.value.find((page) => page.model)?.model, props.document.model].find(offered) ||
+      own.value ||
+      ''),
 )
 
 const submitLabel = computed(() => {
@@ -103,11 +111,14 @@ async function loadPages() {
   }
 }
 
-/** The picker's catalog and the fallback: without them the default model still retries. */
+/** The picker's catalog, the fallback and the agent's model: without them the server's
+ *  default still retries. */
 async function loadModels() {
   try {
     const loaded = await loadParseModels()
-    fallback.value = loaded.agents.find((agent) => agent.name === PARSE_AGENT)?.settings.fallback_model ?? null
+    const parse = loaded.agents.find((agent) => agent.name === PARSE_AGENT)
+    fallback.value = parse?.settings.fallback_model ?? null
+    own.value = parse?.settings.model ?? null
     checkOn.value = loaded.agents.find((agent) => agent.name === CHECK_AGENT)?.settings.auto_check ?? false
     models.value = loaded.models
   } catch (error) {

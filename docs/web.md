@@ -909,7 +909,7 @@ A file manager over everything the reader keeps — parse results, markdown docu
   - The retry dialog lists the pages a retry sends (`GET /api/library/documents/{id}/pages`):
     - Each page is a tile: the page as the original shows it (`…/pages/{n}/image`), its number, why it failed and which model failed it; a page never reached says so. Twelve tiles at most, then a count of the rest.
     - Above the tiles, the job's own error when no page carries one — a failed format check said in the reader's language, with its reason in the words a page's reason has (`the format check failed (<reason>)`, [parsing.md](./parsing.md) § Format check).
-    - Under them, **Model**: the parse agent's fallback when one is set, else the model a failed page last ran on, else the job's, picked from the same live catalog as the Agent page. It is left out when no page is missing, as after a failed format check, since such a retry sends no page to a model.
+    - Under them, **Model**: the parse agent's fallback when one is set, else the model a failed page last ran on, else the job's, while the deployment still offers it, else the parse agent's own (`PARSE_MODEL`), picked from the same live catalog as the Agent page. It is left out when no page is missing, as after a failed format check, since such a retry sends no page to a model.
     - Then one line:
       - with pages missing: only these pages are sent, the rest are kept, and the document opens once every page has succeeded;
       - with no page missing: none is sent again, and the document opens once the retry succeeds;

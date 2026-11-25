@@ -724,7 +724,7 @@ The tools' own descriptions say the same — search when the address is unknown 
 
 **A library conversation has a prompt of its own**, `LIBRARY_SYSTEM_PROMPT` (§ Library conversations, *Its system prompt*).
 
-The reader can rewrite the prompt — the Agent page's advanced option, under the instructions (§ Instructions). The prompt dialog opens on the default, takes edits in place and offers **Restore default** ([web.md](./web.md) § The Agent page).
+The reader can rewrite the prompt — the Agent page's advanced option, under the instructions (§ Instructions). The prompt dialog opens on the default, takes edits in place and offers **Restore default** ([web.md](./web.md) § The Agent section).
 
 - A saved prompt is `agent_settings.prompt` and **replaces the default whole** in a conversation about a document. A library conversation renders its own whatever the reader saved (§ Library conversations).
 - A saved prompt is rendered exactly as the default is: the same five tokens substituted in one pass, the same tool lines dropped for tools the turn lacks.
@@ -746,7 +746,7 @@ The Agent page's main text for the `chat` agent is not the prompt but **the read
   - The control characters U+0000–U+001F and U+007F, except tab, newline and carriage return. Nobody types them, and PostgreSQL's text refuses NUL outright.
     - The vertical tab, the form feed and the separators U+001C–U+001F are line breaks rather than nothing (a pasted Word line break, a page break in extracted text), so they become a newline instead of joining the words around them.
 
-Replacing the whole prompt is the Agent page's **advanced** option (§ System prompt, [web.md](./web.md) § The Agent page). It is the only way to change a rule of the default, and the page says what is given up with it.
+Replacing the whole prompt is the Agent page's **advanced** option (§ System prompt, [web.md](./web.md) § The Agent section). It is the only way to change a rule of the default, and the page says what is given up with it.
 
 Two choices sit beside the instructions.
 
@@ -1200,7 +1200,7 @@ The stored message is the record: an attached image is replayed like a page a to
 - **The estimate** counts only what streamed, so thinking the stream's short summaries leave out is not in it.
 - **Credits.** A turn is charged in credits as it runs, re-priced from its `usage_log` rows after every call ([billing.md](./billing.md) § A chat turn).
   - Each `web_search` call the turn made adds `WEB_SEARCH_CREDITS`, from its `chat_tool_calls` rows, settled as the call is answered (§ Tools).
-  - When the period's balance is gone, the turn gets at most `CHAT_OVERDRAFT_MAX_TOOL_CALLS` more tool calls. Then its next model call is its last: it goes with no tools, and the turn ends `succeeded` when it answers. Only if that call still stops on a tool call are its tool calls dropped, its text kept, and the turn ends with a `turn_error` whose `error` is `out_of_credits` ([billing.md](./billing.md) § A chat turn).
+  - When the period's balance is gone, the turn gets at most `CHAT_OVERDRAFT_MAX_TOOL_CALLS` more tool calls. Then its next model call is its last: it goes with `tool_choice: {"type": "none"}`, its tools still declared so the cached prefix holds, and the turn ends `succeeded` when it answers. Only if that call still stops on a tool call are its tool calls dropped, its text kept, and the turn ends with a `turn_error` whose `error` is `out_of_credits` ([billing.md](./billing.md) § A chat turn).
   - A turn whose model has no price fails `model_unpriced` before its first call.
 - **A full workspace.** A turn that finds the workspace at its storage fails `storage_full` before its first call ([workspace.md](./workspace.md) § Quota). The send refuses it first, so this is a turn queued just before the workspace filled.
 
