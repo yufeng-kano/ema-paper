@@ -846,7 +846,7 @@ class UploadTicket(Base):
 
 class DocumentTicket(Base):
     """A short-lived credential for one document, minted by the MCP library tools
-    (docs/auth.md § 7).
+    (docs/auth.md § 6).
 
     Not spent by use: within its lifetime it reads the document's routes under
     `/v1/library/documents/{id}` and, with `scope` `write`, saves its `doc.md` and `notes.md`.

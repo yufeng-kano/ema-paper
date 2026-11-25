@@ -206,7 +206,7 @@ class Settings(BaseSettings):
     # Upload tickets minted by the MCP `parse` tool (docs/auth.md § 5).
     upload_ticket_ttl_seconds: int = 3600
     upload_ticket_rate_per_hour: int = 30
-    # Document tickets minted by the MCP library tools, one document each (docs/auth.md § 7),
+    # Document tickets minted by the MCP library tools, one document each (docs/auth.md § 6),
     # and the most documents `list_library` answers with at once (docs/mcp.md).
     document_ticket_ttl_seconds: int = 3600
     document_ticket_rate_per_hour: int = 120
