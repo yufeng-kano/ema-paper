@@ -8,7 +8,7 @@ definePageMeta({ middleware: ['authed', 'admin'], adminArea: 'jobs' })
 </script>
 
 <template>
-  <AdminPage area="jobs">
+  <AdminPage>
     <AdminOverview />
   </AdminPage>
 </template>

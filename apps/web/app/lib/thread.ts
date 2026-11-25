@@ -17,6 +17,7 @@ import { INIT_COMMAND } from './composer'
 import {
   addedLines,
   diffFromInput,
+  EDITOR_TOOL,
   groupRuns,
   parseDiff,
   readStep,
@@ -26,30 +27,37 @@ import {
   type Step,
 } from './steps'
 
-/** The chat agent's editor tool and the commands of it that write (docs/chat.md § Tools). */
-export const EDITOR_TOOL = 'str_replace_based_edit_tool'
-export const EDITOR_WRITES = new Set(['str_replace', 'insert', 'create'])
-export const SUBAGENT_TOOL = 'subagent'
+/** The editor tool's commands that write (docs/chat.md § Tools). */
+const EDITOR_WRITES = new Set(['str_replace', 'insert', 'create'])
+const SUBAGENT_TOOL = 'subagent'
 /** A `memory` call is not a step: its `memory` event is a line under the answer instead
  *  (docs/web.md § The agent panel, *What the answer used, and memory lines*). */
-export const MEMORY_TOOL = 'memory'
+const MEMORY_TOOL = 'memory'
 
 /** A turn the backend has not finished: queued, running, or cancelled and still winding
  *  down a tool call — `finished_at` says, not the status (docs/chat.md § Conversations). */
 export const isLive = (turn: ChatTurn): boolean => turn.finished_at === null
 
+/** The events that end a turn, by name: its outcome is then on record. */
+export const TURN_END_EVENTS: ReadonlySet<string> = new Set(['turn_done', 'turn_error'])
+
+/** An event that ends its turn — `turn_done` or `turn_error`. */
+export function isTurnEnd(event: ChatEvent): event is Extract<ChatEvent, { event: 'turn_done' | 'turn_error' }> {
+  return TURN_END_EVENTS.has(event.event)
+}
+
 /** The turns that compact the conversation rather than answer a message (docs/chat.md
  *  § Compaction): the reader's `/compact` and the worker's idle pass. */
-export const COMPACTION_KINDS: ReadonlySet<TurnKind> = new Set(['compact', 'idle_compact'])
+const COMPACTION_KINDS: ReadonlySet<TurnKind> = new Set(['compact', 'idle_compact'])
 /** The marker of the summary row a compaction leaves, and the command's line as the
  *  reader's message carries it. */
-export const SUMMARY_CONTEXT = 'summary'
+const SUMMARY_CONTEXT = 'summary'
 const COMPACT_LINE = '/compact'
 
-/** A turn's kind: the record's, else what its `turn_start` said, else a message turn — a
- *  turn from before kinds existed, or one the panel pushed as it sent. */
+/** A turn's kind: the record's, else what its `turn_start` said for a turn only the stream
+ *  has named so far, else a message turn. */
 export function turnKind(turn: ChatTurn | undefined, group: readonly ChatEvent[] | undefined): TurnKind {
-  if (turn?.kind) {
+  if (turn) {
     return turn.kind
   }
   for (const event of group ?? []) {
@@ -64,7 +72,6 @@ export interface EditCard {
   /** The tool call that made it — the card's identity across reloads. */
   toolUseId: string
   path: string
-  command: string
   lines: DiffLine[]
   /** The commit the `edit` event named; null for a card rebuilt from history alone. */
   commit: string | null
@@ -95,7 +102,6 @@ export interface ToolStep {
   type: 'tool'
   key: string
   id: string
-  name: string
   step: Step
   status: StepStatus
   /** The result's text, once it arrived. */
@@ -110,7 +116,7 @@ export interface ToolStep {
   library: LibraryStep | null
 }
 
-export interface NoteStep {
+interface NoteStep {
   type: 'note'
   key: string
   text: string
@@ -135,7 +141,8 @@ export interface SubagentView {
   report: string | null
   /** From the stored record; null while it runs. */
   elapsedMs: number | null
-  model: string | null
+  /** From the stored record: the run's true call count; null while it runs. */
+  toolCalls: number | null
 }
 
 export interface UserAttachment {
@@ -178,8 +185,8 @@ export type ThreadItem =
       /** The turn that answers it: what an edit sends again, and whose `versions` the
        *  pager reads (docs/web.md § The agent panel, *Editing a sent message*). */
       turnId: string
-      /** The stored message the attachments belong to; null before one is known. */
-      messageId: number | null
+      /** The stored message the attachments belong to. */
+      messageId: number
       text: string
       /** The passage of the document that went with it. */
       selection: string | null
@@ -193,11 +200,13 @@ export type ThreadItem =
       picked: string[]
     }
   | { kind: 'text'; key: string; text: string }
-  | { kind: 'memory'; key: string; turnId: string; line: MemoryLine }
-  /** Under a finished turn's last answer, after its memory lines: what the turn used and
-   *  the control that copies the answer, as its markdown. */
-  | { kind: 'foot'; key: string; turnId: string; text: string; used: UsedContext | null }
-  | { kind: 'steps'; key: string; turnId: string; steps: StepItem[]; live: boolean }
+  | { kind: 'memory'; key: string; line: MemoryLine }
+  /** Under a finished turn's last answer, after its memory lines: what the turn used, what
+   *  it cost and the control that copies the answer, as its markdown. `credits` is the
+   *  record's, settled once the turn ends and the record is read again; null until then
+   *  (docs/billing.md § Routes). */
+  | { kind: 'foot'; key: string; turnId: string; text: string; used: UsedContext | null; credits: number | null }
+  | { kind: 'steps'; key: string; steps: StepItem[]; live: boolean }
   | { kind: 'subagent'; key: string; card: SubagentView }
   | { kind: 'error'; key: string; text: string }
   | { kind: 'cancelled'; key: string }
@@ -206,17 +215,18 @@ export type ThreadItem =
    *  steps shown above as any turn's (docs/web.md § The agent panel). */
   | { kind: 'compacting'; key: string }
   /** A compaction done: the divider everything above is dimmed under, with the focus the
-   *  reader gave and the summary the turn stored behind *View summary*. */
-  | { kind: 'compact'; key: string; turnId: string; focus: string | null; summary: string }
+   *  reader gave, the summary the turn stored behind *View summary* and what the turn cost,
+   *  as the foot's. */
+  | { kind: 'compact'; key: string; turnId: string; focus: string | null; summary: string; credits: number | null }
 
-export interface ThreadInput {
+interface ThreadInput {
   turns: readonly ChatTurn[]
   messages: readonly ChatMessage[]
   /** Each turn's frames, by the id every frame carries. */
   groups: ReadonlyMap<string, ChatEvent[]>
 }
 
-export interface Thread {
+interface Thread {
   items: ThreadItem[]
   /** The turns still in flight: the composer waits while there is one. */
   liveTurns: string[]
@@ -234,7 +244,7 @@ function blockText(block: ContentBlock): string {
 }
 
 /** The reader's own words: a block the backend marked as context is scaffolding. */
-export function textOf(blocks: readonly ContentBlock[]): string {
+function textOf(blocks: readonly ContentBlock[]): string {
   return blocks
     .filter((block) => block.type === 'text' && !block.context)
     .map(blockText)
@@ -243,7 +253,7 @@ export function textOf(blocks: readonly ContentBlock[]): string {
 }
 
 /** The passage of the document that went with the message as its selection, or null. */
-export function selectionOf(blocks: readonly ContentBlock[]): string | null {
+function selectionOf(blocks: readonly ContentBlock[]): string | null {
   const text = blocks
     .filter((block) => block.type === 'text' && block.context === 'selection')
     .map(blockText)
@@ -253,13 +263,13 @@ export function selectionOf(blocks: readonly ContentBlock[]): string | null {
 }
 
 /** The headings of the whole sections that went with the message, in the order sent. */
-export function sectionsOf(blocks: readonly ContentBlock[]): string[] {
+function sectionsOf(blocks: readonly ContentBlock[]): string[] {
   return blocks.flatMap((block) =>
     block.type === 'text' && block.context === 'section' && block.section ? [block.section] : [],
   )
 }
 
-export function isToolResultOnly(blocks: readonly ContentBlock[]): boolean {
+function isToolResultOnly(blocks: readonly ContentBlock[]): boolean {
   return blocks.length > 0 && blocks.every((block) => block.type === 'tool_result')
 }
 
@@ -282,23 +292,48 @@ export function compactFocus(blocks: readonly ContentBlock[]): string | null {
 
 /** The turns in order — those the record lists (oldest first, as the API sends them), then
  *  any a message or a frame names that it does not, in the order they were seen. */
-export function turnOrder(input: ThreadInput): string[] {
+function turnOrder(input: ThreadInput): string[] {
   const ids: string[] = input.turns.map((turn) => turn.id)
+  const seen = new Set(ids)
+  const add = (turnId: string) => {
+    if (!seen.has(turnId)) {
+      seen.add(turnId)
+      ids.push(turnId)
+    }
+  }
   for (const message of input.messages) {
-    if (message.turn_id !== null && !ids.includes(message.turn_id)) {
-      ids.push(message.turn_id)
+    if (message.turn_id !== null) {
+      add(message.turn_id)
     }
   }
   for (const turnId of input.groups.keys()) {
-    if (!ids.includes(turnId)) {
-      ids.push(turnId)
-    }
+    add(turnId)
   }
   return ids
 }
 
+/** `groups` with a batch of frames joined, as a new map: each turn the batch touches gets a
+ *  new array, every other turn keeps its own, and a turn first seen comes last. */
+export function appendFrames(
+  groups: ReadonlyMap<string, ChatEvent[]>,
+  batch: readonly ChatEvent[],
+): Map<string, ChatEvent[]> {
+  const next = new Map(groups)
+  const touched = new Map<string, ChatEvent[]>()
+  for (const event of batch) {
+    let list = touched.get(event.turn_id)
+    if (!list) {
+      list = [...(groups.get(event.turn_id) ?? [])]
+      touched.set(event.turn_id, list)
+      next.set(event.turn_id, list)
+    }
+    list.push(event)
+  }
+  return next
+}
+
 function isTerminal(turn: ChatTurn | undefined, group: ChatEvent[] | undefined, stored: boolean): boolean {
-  if (group?.some((event) => event.event === 'turn_done' || event.event === 'turn_error')) {
+  if (group?.some(isTurnEnd)) {
     return true
   }
   if (turn) {
@@ -374,16 +409,24 @@ interface Outcome {
 /** One flat entry of a turn before its steps are grouped. */
 type Flat = ThreadItem | { kind: 'step'; item: StepItem }
 
-/** The events of a stream past its last restart: a retried call starts over, so what the
- *  abandoned attempt streamed is noise. A subagent's retry restarts only that subagent. */
+/** The events of one scope's stream past what an abandoned attempt streamed: a retried call
+ *  starts over, so its earlier output is noise. A call starts after its scope's last
+ *  `tool_result`, so a retry cuts back to there and keeps the rounds before it. A subagent's
+ *  retry restarts only that subagent's call. */
 function sinceRestart(events: ChatEvent[], parent: string | undefined): ChatEvent[] {
-  let restart = -1
-  events.forEach((event, index) => {
+  const kept: ChatEvent[] = []
+  let attempt = 0
+  for (const event of events) {
     if (event.event === 'retry' && event.parent === parent) {
-      restart = index
+      kept.length = attempt
+      continue
     }
-  })
-  return restart === -1 ? events : events.slice(restart + 1)
+    kept.push(event)
+    if (event.event === 'tool_result') {
+      attempt = kept.length
+    }
+  }
+  return kept
 }
 
 function parentOf(event: ChatEvent): string | undefined {
@@ -424,11 +467,23 @@ export function buildThread(input: ThreadInput): Thread {
   const items: ThreadItem[] = []
   const liveTurns: string[] = []
   const turnById = new Map(input.turns.map((turn) => [turn.id, turn]))
+  // Each turn's messages in record order, indexed once: the thread rebuilds on every frame.
+  const byTurn = new Map<string, ChatMessage[]>()
+  for (const message of input.messages) {
+    if (message.turn_id !== null) {
+      const list = byTurn.get(message.turn_id)
+      if (list) {
+        list.push(message)
+      } else {
+        byTurn.set(message.turn_id, [message])
+      }
+    }
+  }
 
   for (const turnId of turnOrder(input)) {
     const turn = turnById.get(turnId)
     const group = input.groups.get(turnId)
-    const own = input.messages.filter((message) => message.turn_id === turnId)
+    const own = byTurn.get(turnId) ?? []
     // One assistant message per model round: a tool-using turn has several, and the
     // final answer is the last of them.
     const assistants = own.filter((message) => message.role === 'assistant')
@@ -498,7 +553,6 @@ export function buildThread(input: ThreadInput): Thread {
       return {
         toolUseId: id,
         path: event?.path ?? lineOf(input.path),
-        command: event?.command ?? command,
         lines: event ? parseDiff(event.diff) : diffFromInput(input),
         commit: event?.commit ?? null,
       }
@@ -510,7 +564,6 @@ export function buildThread(input: ThreadInput): Thread {
         type: 'tool',
         key,
         id,
-        name,
         step: readStep(name, input),
         status: statusOf(id),
         output: results.get(id)?.output ?? null,
@@ -558,7 +611,7 @@ export function buildThread(input: ThreadInput): Thread {
         steps,
         report: outcome ? outcome.output : null,
         elapsedMs: record?.elapsed_ms ?? null,
-        model: record?.model ?? null,
+        toolCalls: record?.tool_calls ?? null,
       }
     }
 
@@ -662,12 +715,18 @@ export function buildThread(input: ThreadInput): Thread {
     const under: Flat[] = memoryLines(group).map((line) => ({
       kind: 'memory',
       key: `${prefix}-memory-${line.toolUseId}`,
-      turnId,
       line,
     }))
     const answer = flat[lastText]
     if (done && answer?.kind === 'text') {
-      under.push({ kind: 'foot', key: `${prefix}-foot`, turnId, text: answer.text, used: usedContext(group) })
+      under.push({
+        kind: 'foot',
+        key: `${prefix}-foot`,
+        turnId,
+        text: answer.text,
+        used: usedContext(group),
+        credits: turn?.credits ?? null,
+      })
     }
     flat.splice(lastText === -1 ? flat.length : lastText + 1, 0, ...under)
 
@@ -692,7 +751,8 @@ export function buildThread(input: ThreadInput): Thread {
           key: `${prefix}-compact`,
           turnId,
           focus: typed.length ? compactFocus(typed[0]!.content) : null,
-          summary: textOf(summary.content.map((block) => ({ ...block, context: undefined }) as ContentBlock)),
+          summary: summary.content.map(blockText).filter(Boolean).join('\n').trim(),
+          credits: turn?.credits ?? null,
         })
       }
     }
@@ -703,7 +763,6 @@ export function buildThread(input: ThreadInput): Thread {
       (run) => ({
         kind: 'steps',
         key: `${(run[0] as { item: StepItem }).item.key}-group`,
-        turnId,
         steps: run.map((entry) => (entry as { item: StepItem }).item),
         live: false,
       }),
@@ -763,7 +822,7 @@ export function buildThread(input: ThreadInput): Thread {
  * (kind, text, scope): a pin the reader added since is theirs, not the call's. Whether this
  * line's Undo is what removed the row (`undoneHere`) is the line's own, kept while the page is.
  */
-export type MemoryLineState =
+type MemoryLineState =
   | { state: 'loading' }
   | { state: 'saved'; row: Memory }
   | { state: 'unsaved' }
@@ -776,7 +835,7 @@ export type MemoryLineState =
   | { state: 'restored'; row: Memory }
 
 /** Whether a row holds what a snapshot says, in the fields the `memory` tool writes. */
-export function sameMemory(row: Pick<Memory, 'kind' | 'text' | 'document_id'>, snapshot: MemorySnapshot): boolean {
+function sameMemory(row: Pick<Memory, 'kind' | 'text' | 'document_id'>, snapshot: MemorySnapshot): boolean {
   return row.kind === snapshot.kind && row.text === snapshot.text && row.document_id === snapshot.document_id
 }
 
@@ -819,7 +878,7 @@ export function memoryLineState(
 }
 
 /** Who a memory a running turn just saved is credited to, and when, until the list is read. */
-export interface MemoryEventContext {
+interface MemoryEventContext {
   conversationId: number | null
   conversationTitle: string | null
   now: string

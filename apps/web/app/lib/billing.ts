@@ -3,7 +3,7 @@ import type { ApiErrorType } from './api'
 /**
  * The payment refusals a reader meets — on the Usage section, in the top-up dialog, on the
  * pricing page and when deleting the account — and the catalog key that words each in the
- * reader's language, the backend's sentence being English (docs/web.md, `/settings/usage`).
+ * reader's language, the backend's sentence being English (docs/web.md, `?settings=usage`).
  */
 export const PAYMENT_REFUSALS: Partial<Record<ApiErrorType, string>> = {
   pay_unavailable: 'errors.payUnavailable',
@@ -11,3 +11,7 @@ export const PAYMENT_REFUSALS: Partial<Record<ApiErrorType, string>> = {
   portal_unavailable: 'errors.portalUnavailable',
   plan_required: 'errors.planRequired',
 }
+
+/** The billing intervals Pay's providers bill by that the catalog words and pluralizes
+ *  (`pricing.cycle.<interval>`); the pricing page prints any other as Pay names it. */
+export const CYCLE_INTERVALS = ['day', 'week', 'month', 'year'] as const

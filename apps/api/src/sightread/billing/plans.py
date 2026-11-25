@@ -18,9 +18,10 @@ ENDED_STATUSES = frozenset({"canceled", "expired", "failed"})
 # (`credit_periods.granted`, `credit_entries.amount`, `credit_packs.credits`), and a larger
 # number would fail every charge it reaches (docs/billing.md § Configuration).
 CREDITS_MAX = 2_147_483_647
-# The longest a pack may last: a century keeps `paid_at + validDays` a date PostgreSQL and
-# Python can hold.
-PACK_VALID_DAYS_MAX = 36_500
+# The most days a pack lasts, a code gives or a grant gives: a century keeps every date they
+# reach — a pack's `expires_at`, a granted period's end — one PostgreSQL and Python can hold
+# (a Python date ends in the year 9999). config.py checks `ADMIN_GRANT_MAX_DAYS` against it.
+DAYS_MAX = 36_500
 
 
 @dataclass(frozen=True)
@@ -134,9 +135,9 @@ def parse_packs(raw: str) -> dict[str, Pack]:
             raise ValueError(
                 f"KANO_PAY_PACKS_JSON: {pack_id!r}.credits must be at most {CREDITS_MAX}"
             )
-        if counts["validDays"] > PACK_VALID_DAYS_MAX:
+        if counts["validDays"] > DAYS_MAX:
             raise ValueError(
-                f"KANO_PAY_PACKS_JSON: {pack_id!r}.validDays must be at most {PACK_VALID_DAYS_MAX}"
+                f"KANO_PAY_PACKS_JSON: {pack_id!r}.validDays must be at most {DAYS_MAX}"
             )
         packs[pack_id] = Pack(id=pack_id, credits=counts["credits"], valid_days=counts["validDays"])
     return packs
@@ -167,7 +168,7 @@ class Period:
     # What the period grants: the plan's credits, pro-rated for a granted period shorter
     # than `GRANT_PERIOD_DAYS` (docs/billing.md § Periods, *Granted days*).
     credits: int
-    source: str = SUBSCRIPTION
+    source: str
 
 
 @dataclass(frozen=True)
@@ -265,13 +266,3 @@ def resolve_period(
             )
     start, end = month_bounds(now)
     return Decision(Period(start, end, free, free.credits, FREE), grant)
-
-
-def current_period(
-    subscription: Subscription | None,
-    plans: dict[str, Plan],
-    free: Plan,
-    now: datetime,
-) -> Period:
-    """The period of a user with no granted days: the paid one or Free's month."""
-    return resolve_period(subscription, None, plans, free, now, 1).period

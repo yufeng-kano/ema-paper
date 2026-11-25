@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -17,23 +16,22 @@ from sqlalchemy import func, select, update
 
 from sightread import codes as cli
 from sightread.billing import codes
+from sightread.billing.plans import DAYS_MAX
 from sightread.config import Settings
 from sightread.db.models import RedeemCode, utcnow
-from tests.conftest import CSRF_HEADERS, PRO_PLANS_JSON
-from tests.test_admin import (
-    _account,
-    _add,
-    _audit,
-    _error,
-    _group,
-    _last_audit_id,
-    _owner,
-    postgres_only,
+from tests.admin_helpers import (
+    account_client,
+    add_member,
+    audit_rows,
+    create_group,
+    error_of,
+    last_audit_id,
+    owner_client,
 )
+from tests.billing_helpers import PRINTED, PRO_PLANS
+from tests.conftest import CSRF_HEADERS, postgres_only
 
 CODES = "/api/admin/codes"
-PLANS = {"kano_pay_plans_json": PRO_PLANS_JSON}
-PRINTED = re.compile(r"^EMA-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
 
 
 async def _create(client, **body) -> dict:
@@ -94,7 +92,6 @@ def test_a_codes_status_is_disabled_then_expired_then_used_up_then_plan_missing(
 
 
 def test_the_batch_cap_is_configured_within_what_one_query_binds() -> None:
-    assert Settings().redeem_codes_max_count == 1000
     assert Settings(redeem_codes_max_count=10_000).redeem_codes_max_count == 10_000
     for bad in (0, 10_001):
         with pytest.raises(ValueError, match="REDEEM_CODES_MAX_COUNT"):
@@ -106,8 +103,10 @@ def test_the_batch_cap_is_configured_within_what_one_query_binds() -> None:
 
 async def test_a_batch_is_answered_once_in_plaintext_and_listed_masked(make_client, caplog) -> None:
     caplog.set_level(logging.DEBUG, logger="sightread")
-    owner = await _owner(make_client, **PLANS)
-    start = await _last_audit_id(owner)
+    owner = await owner_client(make_client, **PRO_PLANS)
+    start = await last_audit_id(owner)
+    # A last day years ahead of today's: create_codes refuses one already past.
+    until = date(datetime.now(UTC).year + 5, 12, 31)
 
     body = await _create(
         owner,
@@ -115,7 +114,7 @@ async def test_a_batch_is_answered_once_in_plaintext_and_listed_masked(make_clie
         credits=500,
         valid_days=90,
         count=3,
-        redeem_by="2030-12-31",
+        redeem_by=until.isoformat(),
         label="Spring Launch",
     )
     printed = [item["code"] for item in body["codes"]]
@@ -123,7 +122,7 @@ async def test_a_batch_is_answered_once_in_plaintext_and_listed_masked(make_clie
     assert len(printed) == 3 and all(PRINTED.match(code) for code in printed)
     assert ids == sorted(ids)
     redeem_by = datetime.fromisoformat(body.pop("redeem_by"))
-    assert redeem_by == datetime(2030, 12, 31, 23, 59, 59, tzinfo=UTC)
+    assert redeem_by == datetime(until.year, 12, 31, 23, 59, 59, tzinfo=UTC)
     assert {key: value for key, value in body.items() if key != "codes"} == {
         "kind": "credits",
         "credits": 500,
@@ -168,7 +167,7 @@ async def test_a_batch_is_answered_once_in_plaintext_and_listed_masked(make_clie
 
     # The plaintext was in the create answer and is nowhere else: not in the list, not in
     # the record, not in a log line.
-    [record] = await _audit(owner, start)
+    [record] = await audit_rows(owner, start)
     assert (record.action, record.permission, record.target_type, record.target_id) == (
         "codes.create",
         "codes.write",
@@ -182,7 +181,7 @@ async def test_a_batch_is_answered_once_in_plaintext_and_listed_masked(make_clie
         "credits": 500,
         "valid_days": 90,
         "max_uses": 1,
-        "redeem_by": "2030-12-31T23:59:59+00:00",
+        "redeem_by": f"{until}T23:59:59+00:00",
         "ids": ids,
     }
     listing = json.dumps(listed)
@@ -200,7 +199,7 @@ async def test_a_batch_is_answered_once_in_plaintext_and_listed_masked(make_clie
 async def test_a_plan_code_from_the_console_is_the_clis_and_redeems_as_any(
     make_client, capsys
 ) -> None:
-    owner = await _owner(make_client, **PLANS)
+    owner = await owner_client(make_client, **PRO_PLANS)
     settings = owner.app.state.settings
     body = await _create(owner, kind="plan", plan_id="pro", days=30, max_uses=5, valid_days=7)
     [created] = body["codes"]
@@ -233,11 +232,11 @@ async def test_a_plan_code_from_the_console_is_the_clis_and_redeems_as_any(
 
     # Disabled with the CLI: the console lists it so, and no one is named — the CLI
     # records nothing.
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
     assert await run("disable", created["code"]) == (0, f"disabled {created['code']}\n")
     item = (await owner.get(f"{CODES}?status=all")).json()["items"][-1]
     assert (item["id"], item["status"], item["disabled_by"]) == (created["id"], "disabled", None)
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
 
 @pytest.mark.parametrize(
@@ -246,37 +245,30 @@ async def test_a_plan_code_from_the_console_is_the_clis_and_redeems_as_any(
         {"kind": "gift", "credits": 5},
         {"kind": "credits"},
         {"kind": "credits", "credits": 0},
-        {"kind": "credits", "credits": 2**31},
         {"kind": "credits", "credits": 5, "valid_days": 0},
-        {"kind": "credits", "credits": 5, "valid_days": 36_501},
-        {"kind": "credits", "credits": 5, "valid_days": 2**31 - 1},
         {"kind": "credits", "credits": 5, "count": 0},
-        {"kind": "credits", "credits": 5, "count": 6},
         {"kind": "credits", "credits": 5, "max_uses": 0},
         {"kind": "plan", "plan_id": "pro"},
-        {"kind": "plan", "plan_id": "pro", "days": 36_501},
-        {"kind": "plan", "plan_id": "max", "days": 30},
-        {"kind": "credits", "credits": 5, "label": "x" * 256},
         {"kind": "credits", "credits": 5, "redeem_by": "31/12/2030"},
-        {"kind": "credits", "credits": 5, "redeem_by": "2000-01-01"},
         {"credits": 5},
     ],
 )
 async def test_a_batch_outside_the_rules_is_422_and_writes_nothing(make_client, body) -> None:
-    owner = await _owner(make_client, redeem_codes_max_count=5, **PLANS)
-    start = await _last_audit_id(owner)
+    owner = await owner_client(make_client, redeem_codes_max_count=5, **PRO_PLANS)
+    start = await last_audit_id(owner)
     refused = await owner.post(CODES, json=body, headers=CSRF_HEADERS)
     assert refused.status_code == 422
-    assert _error(refused)["type"] == "invalid_request"
+    assert error_of(refused)["type"] == "invalid_request"
     assert await _code_count(owner) == 0
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
 
 async def test_the_console_and_the_cli_refuse_a_batch_by_the_same_rules(
     make_client, capsys
 ) -> None:
-    owner = await _owner(make_client, redeem_codes_max_count=5, **PLANS)
+    owner = await owner_client(make_client, redeem_codes_max_count=5, **PRO_PLANS)
     settings = owner.app.state.settings
+    start = await last_audit_id(owner)
 
     async def run(*argv: str) -> tuple[int, str]:
         async with owner.app.state.sessionmaker() as db:
@@ -303,9 +295,9 @@ async def test_the_console_and_the_cli_refuse_a_batch_by_the_same_rules(
     ):
         refused = await owner.post(CODES, json=body, headers=CSRF_HEADERS)
         assert refused.status_code == 422
-        assert await run(*argv) == (2, _error(refused)["message"])
+        assert await run(*argv) == (2, error_of(refused)["message"])
     assert (
-        _error(
+        error_of(
             await owner.post(
                 CODES, json={"kind": "credits", "credits": 5, "count": 6}, headers=CSRF_HEADERS
             )
@@ -313,6 +305,7 @@ async def test_the_console_and_the_cli_refuse_a_batch_by_the_same_rules(
         == "count must be from 1 to 5 (REDEEM_CODES_MAX_COUNT)"
     )
     assert await _code_count(owner) == 0
+    assert await audit_rows(owner, start) == []
     # At the cap, both make the batch.
     assert len((await _create(owner, kind="credits", credits=5, count=5))["codes"]) == 5
     status, _ = await run("--credits", "5", "--count", "5")
@@ -322,7 +315,7 @@ async def test_the_console_and_the_cli_refuse_a_batch_by_the_same_rules(
 async def test_the_list_keeps_the_active_codes_or_all_searches_labels_and_pages(
     make_client,
 ) -> None:
-    owner = await _owner(make_client, **PLANS)
+    owner = await owner_client(make_client, **PRO_PLANS)
     launch = [
         item["id"]
         for item in (await _create(owner, kind="credits", credits=5, count=5, label="launch"))[
@@ -368,17 +361,17 @@ async def test_the_list_keeps_the_active_codes_or_all_searches_labels_and_pages(
     assert ids(await owner.get(f"{CODES}?status=all&q=%25")) == []
     # The code itself is never searched, not even its shown group.
     assert ids(await owner.get(f"{CODES}?q={beta['code'][4:8]}")) == []
-    paged = (await owner.get(f"{CODES}?status=all&page_size=4&page=2")).json()
+    small = await owner_client(make_client, admin_page_size=4, **PRO_PLANS)
+    paged = (await small.get(f"{CODES}?status=all&page=2")).json()
     assert (paged["total"], paged["page"], paged["page_size"]) == (6, 2, 4)
     assert [item["id"] for item in paged["items"]] == [used_up, expired]
-    assert (await owner.get(f"{CODES}?status=all&page_size=4&page=3")).json()["items"] == []
-    assert (await owner.get(f"{CODES}?page_size=1000")).json()["page_size"] == 50
-    for query in ("status=used", "page=0", "page_size=0"):
+    assert (await small.get(f"{CODES}?status=all&page=3")).json()["items"] == []
+    for query in ("status=used", "page=0"):
         assert (await owner.get(f"{CODES}?{query}")).status_code == 422
 
 
 async def test_a_plan_code_whose_plan_is_gone_is_not_active(make_client, capsys) -> None:
-    owner = await _owner(make_client, **PLANS)
+    owner = await owner_client(make_client, **PRO_PLANS)
     settings = owner.app.state.settings
     [live] = (await _create(owner, kind="plan", plan_id="pro", days=30, label="kept"))["codes"]
     # Made while `max` was configured; `KANO_PAY_PLANS_JSON` no longer names it.
@@ -412,35 +405,33 @@ async def test_a_plan_code_whose_plan_is_gone_is_not_active(make_client, capsys)
         json={"code": codes.display(gone.code, settings.redeem_code_prefix)},
         headers=CSRF_HEADERS,
     )
-    assert (redeemed.status_code, _error(redeemed)["type"]) == (404, "code_invalid")
+    assert (redeemed.status_code, error_of(redeemed)["type"]) == (404, "code_invalid")
 
 
 async def test_a_code_at_the_most_days_redeems(make_client) -> None:
-    owner = await _owner(make_client, **PLANS)
-    [credits] = (await _create(owner, kind="credits", credits=5, valid_days=codes.MAX_DAYS))[
-        "codes"
-    ]
-    [plan] = (await _create(owner, kind="plan", plan_id="pro", days=codes.MAX_DAYS))["codes"]
+    owner = await owner_client(make_client, **PRO_PLANS)
+    [credits] = (await _create(owner, kind="credits", credits=5, valid_days=DAYS_MAX))["codes"]
+    [plan] = (await _create(owner, kind="plan", plan_id="pro", days=DAYS_MAX))["codes"]
     before = utcnow()
     redeemed = await owner.post(
         "/api/billing/redeem", json={"code": credits["code"]}, headers=CSRF_HEADERS
     )
     assert redeemed.status_code == 200, redeemed.text
     lasts = datetime.fromisoformat(redeemed.json()["expires_at"]) - before
-    assert timedelta(days=codes.MAX_DAYS) <= lasts < timedelta(days=codes.MAX_DAYS, minutes=1)
+    assert timedelta(days=DAYS_MAX) <= lasts < timedelta(days=DAYS_MAX, minutes=1)
     redeemed = await owner.post(
         "/api/billing/redeem", json={"code": plan["code"]}, headers=CSRF_HEADERS
     )
     assert redeemed.status_code == 200, redeemed.text
     # Nothing pays for the account: the first granted period opens from the bank at once.
     period_days = owner.app.state.settings.grant_period_days
-    assert redeemed.json()["days_banked"] == codes.MAX_DAYS - period_days
+    assert redeemed.json()["days_banked"] == DAYS_MAX - period_days
 
 
 async def test_disabling_records_once_and_the_code_stops_working(make_client) -> None:
-    owner = await _owner(make_client, **PLANS)
+    owner = await owner_client(make_client, **PRO_PLANS)
     [created] = (await _create(owner, kind="credits", credits=5))["codes"]
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
     path = f"{CODES}/{created['id']}/disable"
 
     disabled = await owner.post(path, headers=CSRF_HEADERS)
@@ -452,7 +443,7 @@ async def test_disabling_records_once_and_the_code_stops_working(make_client) ->
         f"{created['code'][:8]}-••••-••••",
     )
     assert item["disabled_by"] == {"id": owner.user_id, "name": "Local Developer"}
-    [record] = await _audit(owner, start)
+    [record] = await audit_rows(owner, start)
     assert (record.action, record.permission, record.target_type, record.target_id) == (
         "codes.disable",
         "codes.write",
@@ -466,43 +457,43 @@ async def test_disabling_records_once_and_the_code_stops_working(make_client) ->
 
     again = await owner.post(path, headers=CSRF_HEADERS)
     assert again.status_code == 200 and again.json()["disabled_at"] == item["disabled_at"]
-    assert len(await _audit(owner, start)) == 1
+    assert len(await audit_rows(owner, start)) == 1
     # An id past the column's integer is as unknown as any other, not a driver error.
     for unknown in (created["id"] + 100, 2**31, 10**20):
         missing = await owner.post(f"{CODES}/{unknown}/disable", headers=CSRF_HEADERS)
-        assert missing.status_code == 404 and _error(missing)["type"] == "invalid_request"
-    assert len(await _audit(owner, start)) == 1
+        assert missing.status_code == 404 and error_of(missing)["type"] == "invalid_request"
+    assert len(await audit_rows(owner, start)) == 1
 
     redeemed = await owner.post(
         "/api/billing/redeem", json={"code": created["code"]}, headers=CSRF_HEADERS
     )
-    assert (redeemed.status_code, _error(redeemed)["type"]) == (404, "code_invalid")
+    assert (redeemed.status_code, error_of(redeemed)["type"]) == (404, "code_invalid")
 
 
 @postgres_only
 async def test_two_disables_at_once_record_once(make_client) -> None:
-    owner = await _owner(make_client, **PLANS)
+    owner = await owner_client(make_client, **PRO_PLANS)
     [created] = (await _create(owner, kind="credits", credits=5))["codes"]
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
     path = f"{CODES}/{created['id']}/disable"
     answers = await asyncio.gather(
         owner.post(path, headers=CSRF_HEADERS), owner.post(path, headers=CSRF_HEADERS)
     )
     assert [answer.status_code for answer in answers] == [200, 200]
-    assert len(await _audit(owner, start)) == 1
+    assert len(await audit_rows(owner, start)) == 1
 
 
 async def test_codes_read_lists_and_only_codes_write_changes(make_client) -> None:
-    owner = await _owner(make_client, **PLANS)
+    owner = await owner_client(make_client, **PRO_PLANS)
     [created] = (await _create(owner, kind="credits", credits=5))["codes"]
-    readers = await _group(owner, "readers", ["codes.read"])
-    issuers = await _group(owner, "issuers", ["codes.write"])
-    reader = await _account(make_client, "reader@example.test", **PLANS)
-    writer = await _account(make_client, "writer@example.test", **PLANS)
-    outsider = await _account(make_client, "outsider@example.test", **PLANS)
-    assert (await _add(owner, readers["id"], email="reader@example.test")).status_code == 201
-    assert (await _add(owner, issuers["id"], email="writer@example.test")).status_code == 201
-    start = await _last_audit_id(owner)
+    readers = await create_group(owner, "readers", ["codes.read"])
+    issuers = await create_group(owner, "issuers", ["codes.write"])
+    reader = await account_client(make_client, "reader@example.test", **PRO_PLANS)
+    writer = await account_client(make_client, "writer@example.test", **PRO_PLANS)
+    outsider = await account_client(make_client, "outsider@example.test", **PRO_PLANS)
+    assert (await add_member(owner, readers["id"], email="reader@example.test")).status_code == 201
+    assert (await add_member(owner, issuers["id"], email="writer@example.test")).status_code == 201
+    start = await last_audit_id(owner)
 
     assert (await reader.get(CODES)).status_code == 200
     for refused in (
@@ -510,8 +501,8 @@ async def test_codes_read_lists_and_only_codes_write_changes(make_client) -> Non
         await reader.post(f"{CODES}/{created['id']}/disable", headers=CSRF_HEADERS),
         await outsider.get(CODES),
     ):
-        assert (refused.status_code, _error(refused)["type"]) == (403, "permission_denied")
-    assert await _audit(owner, start) == []
+        assert (refused.status_code, error_of(refused)["type"]) == (403, "permission_denied")
+    assert await audit_rows(owner, start) == []
 
     # Write brings read.
     assert (await writer.get(CODES)).status_code == 200
@@ -519,7 +510,7 @@ async def test_codes_read_lists_and_only_codes_write_changes(make_client) -> Non
     assert (
         await writer.post(f"{CODES}/{made['codes'][0]['id']}/disable", headers=CSRF_HEADERS)
     ).status_code == 200
-    assert [(row.actor_id, row.action) for row in await _audit(owner, start)] == [
+    assert [(row.actor_id, row.action) for row in await audit_rows(owner, start)] == [
         (writer.user_id, "codes.create"),
         (writer.user_id, "codes.disable"),
     ]

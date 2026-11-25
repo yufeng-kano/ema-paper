@@ -1,16 +1,22 @@
-"""Migration backfills, run as a real upgrade from the previous revision with existing
-rows in place (docs/database.md). PostgreSQL only — the migration chain is PostgreSQL SQL —
-so this module skips unless `TEST_DATABASE_URL` points at one (tests/conftest.py). Each
-test gets its own scratch database on that server, dropped afterwards.
+"""The migration chain, run as real upgrades (docs/database.md § Migrations, docs/testing.md
+§ Backend). PostgreSQL only — the chain is PostgreSQL DDL — so this module skips unless
+`TEST_DATABASE_URL` points at one (tests/conftest.py). Each test gets its own scratch
+databases on that server, dropped afterwards.
+
+A migration that rewrites existing rows adds its upgrade test here: upgrade a scratch
+database to the revision before it, write synthetic existing rows, upgrade, and check what
+it left.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
 import uuid
-from decimal import Decimal
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -18,37 +24,25 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from tests.conftest import DATABASE_URL
+from sightread.db.models import Base
+from tests.conftest import TEST_DATABASE_URL, postgres_only
 
-pytestmark = pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="migration tests need TEST_DATABASE_URL on PostgreSQL",
-)
+pytestmark = postgres_only
 
 API_DIR = Path(__file__).resolve().parents[1]
+ALEMBIC_TIMEOUT_SECONDS = 300
 
 
-def test_the_name_migration_suffix_keeps_counting_past_a_column_long_extension() -> None:
-    """A legacy extension nearly as long as the column leaves no room for a stem; the
-    candidates must still change with the counter, or the upgrade never ends."""
-    import importlib.util
-
-    path = API_DIR / "migrations" / "versions" / "c8f28f7cd45e_normalize_library_names.py"
-    spec = importlib.util.spec_from_file_location("normalize_library_names", path)
+def _revision_module(revision: str):
+    """A revision file loaded as a module, for the data it writes out — the constants a
+    migration freezes, which the app's own may since have moved past."""
+    (path,) = (API_DIR / "migrations" / "versions").glob(f"{revision}_*.py")
+    spec = importlib.util.spec_from_file_location(f"revision_{revision}", path)
     module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
     spec.loader.exec_module(module)
-    extension = "x" * 253
-    name = f"a.{extension}"
-    taken = {name, f" (2).{extension}"[:255]}
-    chosen = module._free(taken, name, 255)
-    assert chosen not in taken and len(chosen) <= 255 and chosen.startswith(" (3).")
-
-
-BEFORE_COST_SOURCE = "cd77f4fe600f"
-COST_SOURCE = "5f1845730aa0"
+    return module
 
 
 def _alembic(url: str, *args: str) -> None:
@@ -58,12 +52,13 @@ def _alembic(url: str, *args: str) -> None:
         env={**os.environ, "DATABASE_URL": url},
         check=True,
         capture_output=True,
+        timeout=ALEMBIC_TIMEOUT_SECONDS,
     )
 
 
-@pytest_asyncio.fixture
-async def scratch_url():
-    server = make_url(DATABASE_URL)
+@asynccontextmanager
+async def _scratch_database():
+    server = make_url(TEST_DATABASE_URL)
     name = f"sightread_migration_{uuid.uuid4().hex[:12]}"
     admin = create_async_engine(server, isolation_level="AUTOCOMMIT")
     async with admin.connect() as connection:
@@ -76,2434 +71,724 @@ async def scratch_url():
         await admin.dispose()
 
 
-async def test_cost_source_backfill_separates_openrouter_from_discarded_connection_costs(
-    scratch_url,
-) -> None:
-    _alembic(scratch_url, "upgrade", BEFORE_COST_SOURCE)
+@pytest_asyncio.fixture
+async def scratch_url():
+    async with _scratch_database() as url:
+        yield url
 
-    engine = create_async_engine(scratch_url)
-    openrouter_job, connection_job = uuid.uuid4(), uuid.uuid4()
-    async with engine.begin() as db:
-        user_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO users (google_sub, email, created_at) "
-                    "VALUES ('sub', 'a@example.com', now()) RETURNING id"
-                )
-            )
-        ).scalar_one()
-        connection_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO provider_connections (user_id, name, base_url, ciphertext, "
-                    "masked, model, created_at, updated_at) VALUES (:user, 'kano', "
-                    "'https://proxy.example/openai/v1', '\\x00', '…cret', 'm', now(), now()) "
-                    "RETURNING id"
-                ),
-                {"user": user_id},
-            )
-        ).scalar_one()
-        for job_id, job_connection in ((openrouter_job, None), (connection_job, connection_id)):
-            await db.execute(
-                text(
-                    "INSERT INTO jobs (id, user_id, kind, filename, media_type, size_bytes, "
-                    "sha256, pages_spec, model, profile_version, pipeline_version, "
-                    "bbox_format, connection_id, status, pages_done, created_at) VALUES "
-                    "(:id, :user, 'image', 'a.png', 'image/png', 1, 'h', '', 'm', 0, 1, "
-                    "'yxyx_norm1000', :connection, 'succeeded', 1, now())"
-                ),
-                {"id": job_id, "user": user_id, "connection": job_connection},
-            )
-        for job_id, cost in (
-            (openrouter_job, "0.004200"),
-            (openrouter_job, "0"),  # OpenRouter really billed nothing
-            (connection_job, "0"),  # the connection's cost was discarded, not zero
-            (None, "0.001000"),
-        ):
-            await db.execute(
-                text(
-                    "INSERT INTO usage_log (user_id, job_id, model, prompt_tokens, "
-                    "completion_tokens, cost, created_at) "
-                    "VALUES (:user, :job, 'm', 1, 1, :cost, now())"
-                ),
-                {"user": user_id, "job": job_id, "cost": Decimal(cost)},
-            )
 
-    _alembic(scratch_url, "upgrade", COST_SOURCE)
-
-    async with engine.connect() as db:
-        rows = (
-            await db.execute(text("SELECT job_id, cost_source, cost FROM usage_log ORDER BY id"))
-        ).all()
-        report_cost = (
-            await db.execute(text("SELECT report_cost FROM provider_connections"))
-        ).scalar_one()
-    assert [(row.job_id, row.cost_source, row.cost) for row in rows] == [
-        (openrouter_job, "openrouter", Decimal("0.004200")),
-        (openrouter_job, "openrouter", Decimal("0")),
-        (connection_job, "unknown", None),
-        (None, "openrouter", Decimal("0.001000")),
-    ]
-    # Existing connections stay off: nothing they report is recorded until the user opts in.
-    assert report_cost is False
-
-    with pytest.raises(IntegrityError):
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO usage_log (user_id, model, prompt_tokens, completion_tokens, "
-                    "cost, cost_source, created_at) "
-                    "VALUES (:user, 'm', 1, 1, 0, 'unknown', now())"
-                ),
-                {"user": user_id},
-            )
-
-    # Down and up again: the old schema gets back the 0 it used to hold for a connection.
-    _alembic(scratch_url, "downgrade", BEFORE_COST_SOURCE)
-    async with engine.connect() as db:
-        costs = (await db.execute(text("SELECT cost FROM usage_log ORDER BY id"))).scalars().all()
-    assert costs == [Decimal("0.004200"), Decimal("0"), Decimal("0"), Decimal("0.001000")]
+@pytest_asyncio.fixture
+async def head_engine(scratch_url):
+    """An engine on a scratch database upgraded to head."""
     _alembic(scratch_url, "upgrade", "head")
-    await engine.dispose()
-
-
-async def test_kano_proxy_migration_moves_settings_to_the_parse_agent(scratch_url) -> None:
-    """From the last OpenRouter schema with existing users (docs/database.md § The Kano
-    Proxy migration): a connection user keeps connection and model, an OpenRouter user
-    lands on Kano Proxy without a model, presets carry over, history stays readable."""
-    _alembic(scratch_url, "upgrade", COST_SOURCE)
-
     engine = create_async_engine(scratch_url)
-    historical_job = uuid.uuid4()
-    async with engine.begin() as db:
-
-        async def user(sub: str) -> int:
-            return (
-                await db.execute(
-                    text(
-                        "INSERT INTO users (google_sub, email, created_at) "
-                        "VALUES (:sub, :email, now()) RETURNING id"
-                    ),
-                    {"sub": sub, "email": f"{sub}@example.com"},
-                )
-            ).scalar_one()
-
-        openrouter_user, connection_user, untouched_user = (
-            await user("openrouter"),
-            await user("connection"),
-            await user("untouched"),
-        )
-        await db.execute(
-            text(
-                "INSERT INTO openrouter_keys (user_id, ciphertext, masked, updated_at) "
-                "VALUES (:user, '\\x00', 'sk-or…', now())"
-            ),
-            {"user": openrouter_user},
-        )
-        preset_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO prompt_presets (user_id, name, text, created_at, updated_at) "
-                    "VALUES (:user, 'Tables', 'Only tables.', now(), now()) RETURNING id"
-                ),
-                {"user": openrouter_user},
-            )
-        ).scalar_one()
-        connection_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO provider_connections (user_id, name, base_url, ciphertext, "
-                    "masked, model, report_cost, created_at, updated_at) VALUES (:user, "
-                    "'custom', 'https://proxy.example/openai/v1', '\\x00', '…cret', "
-                    "'grok/grok-4.5', false, now(), now()) RETURNING id"
-                ),
-                {"user": connection_user},
-            )
-        ).scalar_one()
-        for user_id, model, profile, connection, preset in (
-            (openrouter_user, "google/gemini-2.5-flash", "gemini-yxyx", None, preset_id),
-            (connection_user, None, None, connection_id, None),
-            (untouched_user, "google/gemini-2.5-flash", None, None, None),
-        ):
-            await db.execute(
-                text(
-                    "INSERT INTO user_settings (user_id, default_model, default_profile, "
-                    "default_connection_id, prompt_preset_id) "
-                    "VALUES (:user, :model, :profile, :connection, :preset)"
-                ),
-                {
-                    "user": user_id,
-                    "model": model,
-                    "profile": profile,
-                    "connection": connection,
-                    "preset": preset,
-                },
-            )
-        await db.execute(
-            text(
-                "INSERT INTO jobs (id, user_id, kind, filename, media_type, size_bytes, "
-                "sha256, pages_spec, model, profile, profile_version, pipeline_version, "
-                "bbox_format, status, pages_done, created_at) VALUES "
-                "(:id, :user, 'image', 'a.png', 'image/png', 1, 'h', '', "
-                "'google/gemini-2.5-flash', 'gemini-yxyx', 1, 4, 'yxyx_norm1000', "
-                "'succeeded', 1, now())"
-            ),
-            {"id": historical_job, "user": openrouter_user},
-        )
-        await db.execute(
-            text(
-                "INSERT INTO usage_log (user_id, job_id, model, prompt_tokens, "
-                "completion_tokens, cost, cost_source, created_at) VALUES "
-                "(:user, :job, 'google/gemini-2.5-flash', 1, 1, 0.0042, 'openrouter', now())"
-            ),
-            {"user": openrouter_user, "job": historical_job},
-        )
-
-    # Up to the last revision that still has the connections (the operator upstream
-    # migration drops them, docs/database.md § Migrations).
-    _alembic(scratch_url, "upgrade", LEDGER)
-
-    async with engine.connect() as db:
-        settings = (
-            await db.execute(
-                text(
-                    "SELECT user_id, agent, connection_id, model, prompt_preset_id, prompt "
-                    "FROM agent_settings ORDER BY user_id"
-                )
-            )
-        ).all()
-        tables = set(
-            (
-                await db.execute(
-                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-                )
-            ).scalars()
-        )
-        connection_columns = set(
-            (
-                await db.execute(
-                    text(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_name = 'provider_connections'"
-                    )
-                )
-            ).scalars()
-        )
-        job = (
-            (await db.execute(text("SELECT * FROM jobs WHERE id = :id"), {"id": historical_job}))
-            .mappings()
-            .one()
-        )
-        preset_agent = (await db.execute(text("SELECT agent FROM prompt_presets"))).scalar_one()
-        usage = (await db.execute(text("SELECT cost_source, cost FROM usage_log"))).one()
-        dedup = (
-            await db.execute(
-                text("SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_jobs_dedup'")
-            )
-        ).scalar_one()
-        unvalidated = (
-            await db.execute(
-                text("SELECT conname FROM pg_constraint WHERE contype = 'f' AND NOT convalidated")
-            )
-        ).all()
-
-    assert [tuple(row) for row in settings] == [
-        # OpenRouter user: Kano Proxy, no model (its catalog is not OpenRouter's), preset kept
-        # — as the agent's own prompt since the agent prompt migration moved it there.
-        (openrouter_user, "parse", None, None, None, "Only tables."),
-        # Connection user: the connection and the model it carried.
-        (connection_user, "parse", connection_id, "grok/grok-4.5", None, None),
-        # A user who selected neither connection nor preset gets no row (defaults).
-    ]
-    assert {"user_settings", "openrouter_keys"}.isdisjoint(tables)
-    assert {"agent_settings", "kano_proxy_keys", "kano_connect_states"} <= tables
-    assert "model" not in connection_columns
-    assert job["agent"] == "parse"
-    assert job["source_job_id"] is None
-    assert "profile" not in job and "profile_version" not in job
-    assert preset_agent == "parse"
-    assert (usage.cost_source, usage.cost) == ("openrouter", Decimal("0.004200"))
-    assert "agent" in dedup and "profile" not in dedup
-    assert unvalidated == []
-
-    # The new foreign keys behave: a deleted connection points its agent back at Kano
-    # Proxy, a deleted user takes their settings along.
-    async with engine.begin() as db:
-        await db.execute(
-            text("DELETE FROM provider_connections WHERE id = :id"), {"id": connection_id}
-        )
-        assert (
-            await db.execute(
-                text("SELECT connection_id FROM agent_settings WHERE user_id = :user"),
-                {"user": connection_user},
-            )
-        ).scalar_one() is None
-        await db.execute(text("DELETE FROM users WHERE id = :id"), {"id": openrouter_user})
-        assert (
-            await db.execute(
-                text("SELECT count(*) FROM agent_settings WHERE user_id = :user"),
-                {"user": openrouter_user},
-            )
-        ).scalar_one() == 0
-
-    # Down and up again with rows in place.
-    _alembic(scratch_url, "downgrade", COST_SOURCE)
-    async with engine.connect() as db:
-        restored = (
-            await db.execute(
-                text("SELECT user_id, default_connection_id FROM user_settings ORDER BY user_id")
-            )
-        ).all()
-    assert [tuple(row) for row in restored] == [(connection_user, None)]
-    _alembic(scratch_url, "upgrade", "head")
+    yield engine
     await engine.dispose()
-
-
-BEFORE_CHAT = "837c0e9a9a4f"
-CHAT = "f74c75c0416e"
-
-
-async def test_chat_migration_backfills_the_agent_of_every_usage_row(scratch_url) -> None:
-    """`usage_log.agent` comes from the row's job; a row without one stays `parse`
-    (docs/database.md § Rules)."""
-    _alembic(scratch_url, "upgrade", BEFORE_CHAT)
-
-    engine = create_async_engine(scratch_url)
-    job_id = uuid.uuid4()
-    async with engine.begin() as db:
-        user_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO users (google_sub, email, created_at) "
-                    "VALUES ('sub', 'c@example.com', now()) RETURNING id"
-                )
-            )
-        ).scalar_one()
-        await db.execute(
-            text(
-                "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
-                "sha256, pages_spec, model, pipeline_version, bbox_format, status, pages_done, "
-                "prompt_sha256, created_at) VALUES (:id, :user, 'parse', 'image', 'a.png', "
-                "'image/png', 1, 'h', '', 'm', 1, 'yxyx_norm1000', 'succeeded', 1, '', now())"
-            ),
-            {"id": job_id, "user": user_id},
-        )
-        for job in (job_id, None):
-            await db.execute(
-                text(
-                    "INSERT INTO usage_log (user_id, job_id, model, prompt_tokens, "
-                    "completion_tokens, cost, cost_source, created_at) "
-                    "VALUES (:user, :job, 'm', 1, 1, NULL, 'unknown', now())"
-                ),
-                {"user": user_id, "job": job},
-            )
-        await db.execute(
-            text("INSERT INTO agent_settings (user_id, agent, model) VALUES (:user, 'parse', 'm')"),
-            {"user": user_id},
-        )
-
-    _alembic(scratch_url, "upgrade", CHAT)
-
-    async with engine.connect() as db:
-        rows = (
-            await db.execute(
-                text(
-                    "SELECT agent, turn_id, cache_read_tokens, cache_write_tokens "
-                    "FROM usage_log ORDER BY id"
-                )
-            )
-        ).all()
-        effort = (await db.execute(text("SELECT effort FROM agent_settings"))).scalar_one()
-        tables = {
-            row[0]
-            for row in (
-                await db.execute(
-                    text(
-                        "SELECT table_name FROM information_schema.tables "
-                        "WHERE table_schema = 'public'"
-                    )
-                )
-            ).all()
-        }
-    assert [tuple(row) for row in rows] == [("parse", None, 0, 0), ("parse", None, 0, 0)]
-    assert effort == "medium"
-    assert {"conversations", "messages", "chat_turns", "chat_events"} <= tables
-    await engine.dispose()
-
-
-BEFORE_AGENT_PROMPT = "d843179c6c58"
-AGENT_PROMPT = "90dc3c3c5c36"
-
-
-def _agent_prompt_migration():
-    import importlib.util
-
-    path = (
-        API_DIR
-        / "migrations"
-        / "versions"
-        / "90dc3c3c5c36_skills_subagents_attachments_and_agent_.py"
-    )
-    spec = importlib.util.spec_from_file_location("agent_prompt_migration", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-async def test_the_agent_prompt_migration_moves_every_selected_preset(scratch_url) -> None:
-    """From the last schema without `agent_settings.prompt`, with presets selected: a parse
-    preset becomes the parse prompt as it was, a chat preset the chat prompt behind that
-    release's default, the presets stay, unselected (docs/database.md § The agent prompt
-    migration) — and a downgrade takes back what the upgrade made."""
-    _alembic(scratch_url, "upgrade", BEFORE_AGENT_PROMPT)
-
-    engine = create_async_engine(scratch_url)
-    async with engine.begin() as db:
-
-        async def user(sub: str) -> int:
-            return (
-                await db.execute(
-                    text(
-                        "INSERT INTO users (google_sub, email, created_at) "
-                        "VALUES (:sub, :email, now()) RETURNING id"
-                    ),
-                    {"sub": sub, "email": f"{sub}@example.com"},
-                )
-            ).scalar_one()
-
-        async def preset(user_id: int, agent: str, name: str, body: str) -> int:
-            return (
-                await db.execute(
-                    text(
-                        "INSERT INTO prompt_presets (user_id, agent, name, text, created_at, "
-                        "updated_at) VALUES (:user, :agent, :name, :text, now(), now()) "
-                        "RETURNING id"
-                    ),
-                    {"user": user_id, "agent": agent, "name": name, "text": body},
-                )
-            ).scalar_one()
-
-        reader, plain, tokened = await user("reader"), await user("plain"), await user("tokened")
-        parse_preset = await preset(reader, "parse", "Tables", "  Only tables from page {page}. ")
-        chat_preset = await preset(reader, "chat", "Haiku", "Answer in haiku.")
-        await preset(plain, "parse", "Unused", "Never selected.")
-        # Appended verbatim until now: as part of the template its token would be rendered.
-        verbatim = await preset(tokened, "chat", "Literal", "Quote {document_path} as is.")
-        for user_id, agent, chosen in (
-            (reader, "parse", parse_preset),
-            (reader, "chat", chat_preset),
-            (plain, "parse", None),
-            (tokened, "chat", verbatim),
-        ):
-            await db.execute(
-                text(
-                    "INSERT INTO agent_settings (user_id, agent, model, prompt_preset_id) "
-                    "VALUES (:user, :agent, 'm', :preset)"
-                ),
-                {"user": user_id, "agent": agent, "preset": chosen},
-            )
-
-    _alembic(scratch_url, "upgrade", AGENT_PROMPT)
-
-    async with engine.connect() as db:
-        settings = {
-            (row.user_id, row.agent): (row.prompt, row.prompt_preset_id)
-            for row in (
-                await db.execute(
-                    text("SELECT user_id, agent, prompt, prompt_preset_id FROM agent_settings")
-                )
-            ).all()
-        }
-        presets = (await db.execute(text("SELECT count(*) FROM prompt_presets"))).scalar_one()
-    default = _agent_prompt_migration().CHAT_DEFAULT_PROMPT
-    assert default.startswith("You are the document agent inside Sightread")
-    assert settings == {
-        (reader, "parse"): ("Only tables from page {page}.", None),
-        (reader, "chat"): (f"{default.strip()}\n\nAnswer in haiku.", None),
-        (plain, "parse"): (None, None),
-        (tokened, "chat"): (None, verbatim),
-    }
-    assert presets == 4
-
-    async with engine.begin() as db:
-        # The new tables take rows, and a user's names are their own.
-        await db.execute(
-            text(
-                "INSERT INTO skills (user_id, name, description, argument_hint, body, "
-                "created_at, updated_at) VALUES (:user, 'mine', '', '', 'x', now(), now())"
-            ),
-            {"user": reader},
-        )
-        defaults = (
-            await db.execute(text("SELECT user_invocable, model_invocable FROM skills"))
-        ).one()
-    assert tuple(defaults) == (True, True)
-    with pytest.raises(IntegrityError):
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
-                    "created_at, updated_at) VALUES (:user, 'mine', '', '', 'y', now(), now())"
-                ),
-                {"user": reader},
-            )
-
-    async with engine.begin() as db:
-        # A prompt written after the upgrade, which no preset holds.
-        await db.execute(
-            text(
-                "UPDATE agent_settings SET prompt = 'Edited after the upgrade.' "
-                "WHERE user_id = :user AND agent = 'parse'"
-            ),
-            {"user": plain},
-        )
-
-    _alembic(scratch_url, "downgrade", BEFORE_AGENT_PROMPT)
-    async with engine.connect() as db:
-        # A rollback leaves every agent running what it ran: the moved presets are selected
-        # again, and the later prompt is a preset of its own.
-        selected = {
-            (row.user_id, row.agent): row.prompt_preset_id
-            for row in (
-                await db.execute(
-                    text("SELECT user_id, agent, prompt_preset_id FROM agent_settings")
-                )
-            ).all()
-        }
-        restored = (
-            await db.execute(
-                text(
-                    "SELECT p.name, p.text FROM agent_settings s "
-                    "JOIN prompt_presets p ON p.id = s.prompt_preset_id "
-                    "WHERE s.user_id = :user AND s.agent = 'parse'"
-                ),
-                {"user": plain},
-            )
-        ).one()
-        tables = {
-            row[0]
-            for row in (
-                await db.execute(
-                    text(
-                        "SELECT table_name FROM information_schema.tables "
-                        "WHERE table_schema = 'public'"
-                    )
-                )
-            ).all()
-        }
-        columns = {
-            row[0]
-            for row in (
-                await db.execute(
-                    text(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_name = 'agent_settings'"
-                    )
-                )
-            ).all()
-        }
-    assert selected[(reader, "parse")] == parse_preset
-    assert selected[(reader, "chat")] == chat_preset
-    assert selected[(tokened, "chat")] == verbatim
-    assert tuple(restored) == ("Custom prompt", "Edited after the upgrade.")
-    assert not {"skills", "subagents", "chat_attachments"} & tables
-    assert "prompt" not in columns
-    await engine.dispose()
-
-
-BEFORE_SUBAGENT_REMOVAL = "d4b5d736a2ff"
-SUBAGENT_REMOVAL = "ecd8f04df825"
-
-
-async def test_the_removed_built_in_subagents_take_the_readers_edits_with_them(
-    scratch_url,
-) -> None:
-    """The rows under `verifier`, `reader` and `translation-checker` go; the edit of the
-    built-in that stays, and a subagent of the reader's own, are left as they were
-    (docs/database.md § Rules)."""
-    _alembic(scratch_url, "upgrade", BEFORE_SUBAGENT_REMOVAL)
-
-    engine = create_async_engine(scratch_url)
-    async with engine.begin() as db:
-        user_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO users (google_sub, email, created_at) "
-                    "VALUES ('sub', 's@example.com', now()) RETURNING id"
-                )
-            )
-        ).scalar_one()
-        for name, writes in (
-            ("verifier", False),
-            ("reader", False),
-            ("translation-checker", True),
-            ("translator", True),
-            ("tables", False),
-        ):
-            await db.execute(
-                text(
-                    "INSERT INTO subagents (user_id, name, description, model, writes, tools, "
-                    "prompt, created_at, updated_at) VALUES (:user, :name, '', 'm', :writes, "
-                    "'[\"view_page\"]', 'x', now(), now())"
-                ),
-                {"user": user_id, "name": name, "writes": writes},
-            )
-
-    _alembic(scratch_url, "upgrade", SUBAGENT_REMOVAL)
-
-    async with engine.connect() as db:
-        names = (await db.execute(text("SELECT name FROM subagents ORDER BY name"))).scalars()
-        assert list(names) == ["tables", "translator"]
-    await engine.dispose()
-
-
-INSTRUCTIONS_AND_MEMORIES = "09bcc2e96c63"
-
-
-async def test_the_memory_migration_keeps_every_row_and_scopes_memories(scratch_url) -> None:
-    """Existing settings and conversations read as before — no instructions, memory on and
-    not paused, no snapshot yet — and a memory goes with its document but outlives the
-    conversation that saved it (docs/database.md § Rules)."""
-    _alembic(scratch_url, "upgrade", SUBAGENT_REMOVAL)
-
-    engine = create_async_engine(scratch_url)
-    job_id = uuid.uuid4()
-    async with engine.begin() as db:
-        user_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO users (google_sub, email, created_at) "
-                    "VALUES ('sub', 'm@example.com', now()) RETURNING id"
-                )
-            )
-        ).scalar_one()
-        await db.execute(
-            text(
-                "INSERT INTO agent_settings (user_id, agent, model, prompt) "
-                "VALUES (:user, 'chat', 'm', 'Mine.')"
-            ),
-            {"user": user_id},
-        )
-        await db.execute(
-            text(
-                "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
-                "sha256, pages_spec, model, pipeline_version, bbox_format, status, pages_done, "
-                "prompt_sha256, created_at) VALUES (:id, :user, 'parse', 'image', 'a.png', "
-                "'image/png', 1, 'h', '', 'm', 1, 'yxyx_norm1000', 'succeeded', 1, '', now())"
-            ),
-            {"id": job_id, "user": user_id},
-        )
-        document_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
-                    "updated_at) VALUES (:user, NULL, :job, 'a.png', now(), now()) RETURNING id"
-                ),
-                {"user": user_id, "job": job_id},
-            )
-        ).scalar_one()
-        conversation_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO conversations (user_id, document_id, title, session, model, "
-                    "created_at, updated_at) VALUES (:user, :document, 'Thread', 's', 'm', "
-                    "now(), now()) RETURNING id"
-                ),
-                {"user": user_id, "document": document_id},
-            )
-        ).scalar_one()
-
-    _alembic(scratch_url, "upgrade", INSTRUCTIONS_AND_MEMORIES)
-
-    async with engine.begin() as db:
-        indexes = dict(
-            (
-                await db.execute(
-                    text("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'memories'")
-                )
-            ).all()
-        )
-        # What a document's delete and a conversation's look memories up by is indexed, so
-        # neither scans every reader's memories.
-        assert "(document_id) WHERE (document_id IS NOT NULL)" in indexes["ix_memories_document_id"]
-        assert (
-            "(conversation_id) WHERE (conversation_id IS NOT NULL)"
-            in (indexes["ix_memories_conversation_id"])
-        )
-        setting = (
-            (
-                await db.execute(
-                    text(
-                        "SELECT prompt, instructions, answer_language, translate_language, "
-                        "memory_auto, memory_paused FROM agent_settings"
-                    )
-                )
-            )
-            .mappings()
-            .one()
-        )
-        assert dict(setting) == {
-            "prompt": "Mine.",
-            "instructions": None,
-            "answer_language": None,
-            "translate_language": None,
-            "memory_auto": True,
-            "memory_paused": False,
-        }
-        snapshot = (await db.execute(text("SELECT memory_ids FROM conversations"))).scalar_one()
-        assert snapshot is None
-        for scope in (document_id, None):
-            await db.execute(
-                text(
-                    "INSERT INTO memories (user_id, kind, text, document_id, conversation_id, "
-                    "source_ref, created_at, updated_at) VALUES (:user, 'document', :text, "
-                    ":document, :conversation, 'toolu_1', now(), now())"
-                ),
-                {
-                    "user": user_id,
-                    "text": f"scoped to {scope}",
-                    "document": scope,
-                    "conversation": conversation_id,
-                },
-            )
-    with pytest.raises(IntegrityError):
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO memories (user_id, kind, text, created_at, updated_at) "
-                    "VALUES (:user, 'fact', 'x', now(), now())"
-                ),
-                {"user": user_id},
-            )
-
-    async with engine.begin() as db:
-        await db.execute(text("DELETE FROM conversations WHERE id = :id"), {"id": conversation_id})
-        kept = (
-            await db.execute(
-                text("SELECT document_id, conversation_id, pinned FROM memories ORDER BY id")
-            )
-        ).all()
-        # Deleting the conversation keeps what it saved, its source cleared.
-        assert [tuple(row) for row in kept] == [(document_id, None, False), (None, None, False)]
-        await db.execute(text("DELETE FROM documents WHERE id = :id"), {"id": document_id})
-        left = (await db.execute(text("SELECT text FROM memories"))).scalars().all()
-        # A note about one document goes with it, never widened to every document.
-        assert left == ["scoped to None"]
-
-    _alembic(scratch_url, "downgrade", SUBAGENT_REMOVAL)
-    async with engine.connect() as db:
-        tables = set(
-            (
-                await db.execute(
-                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-                )
-            ).scalars()
-        )
-        columns = set(
-            (
-                await db.execute(
-                    text(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_name IN ('agent_settings', 'conversations')"
-                    )
-                )
-            ).scalars()
-        )
-    added = {
-        "instructions",
-        "answer_language",
-        "translate_language",
-        "memory_auto",
-        "memory_paused",
-        "memory_ids",
-    }
-    assert "memories" not in tables
-    assert not added & columns
-    _alembic(scratch_url, "upgrade", "head")
-    await engine.dispose()
-
-
-MARKDOWN_DOCUMENTS = "a19738bb7f6e"
-
-
-async def test_the_markdown_migration_keeps_every_job_and_refuses_to_downgrade_over_one(
-    scratch_url,
-) -> None:
-    """Existing documents keep their jobs; a document without one can be stored after the
-    upgrade, and the downgrade refuses while it stands rather than delete it to bring the
-    constraint back (docs/database.md § Rules)."""
-    _alembic(scratch_url, "upgrade", INSTRUCTIONS_AND_MEMORIES)
-
-    engine = create_async_engine(scratch_url)
-    job_id = uuid.uuid4()
-    async with engine.begin() as db:
-        user_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO users (google_sub, email, created_at) "
-                    "VALUES ('sub', 'm@example.com', now()) RETURNING id"
-                )
-            )
-        ).scalar_one()
-        await db.execute(
-            text(
-                "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
-                "sha256, pages_spec, model, pipeline_version, bbox_format, status, pages_done, "
-                "prompt_sha256, created_at) VALUES (:id, :user, 'parse', 'pdf', 'a.pdf', "
-                "'application/pdf', 1, 'h', '', 'm', 1, 'yxyx_norm1000', 'succeeded', 1, '', "
-                "now())"
-            ),
-            {"id": job_id, "user": user_id},
-        )
-        await db.execute(
-            text(
-                "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
-                "updated_at) VALUES (:user, NULL, :job, 'a.pdf', now(), now())"
-            ),
-            {"user": user_id, "job": job_id},
-        )
-    with pytest.raises(IntegrityError):
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
-                    "updated_at) VALUES (:user, NULL, NULL, 'notes.md', now(), now())"
-                ),
-                {"user": user_id},
-            )
-
-    _alembic(scratch_url, "upgrade", MARKDOWN_DOCUMENTS)
-
-    async with engine.begin() as db:
-        kept = (await db.execute(text("SELECT name, job_id FROM documents"))).all()
-        assert [tuple(row) for row in kept] == [("a.pdf", job_id)]
-        markdown_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
-                    "updated_at) VALUES (:user, NULL, NULL, 'notes.md', now(), now()) "
-                    "RETURNING id"
-                ),
-                {"user": user_id},
-            )
-        ).scalar_one()
-
-    with pytest.raises(subprocess.CalledProcessError) as refused:
-        _alembic(scratch_url, "downgrade", INSTRUCTIONS_AND_MEMORIES)
-    assert b"1 markdown document(s) have no job" in refused.value.stderr
-    async with engine.begin() as db:
-        # Refused whole: the row is still there, and so is the revision.
-        version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
-        assert version == MARKDOWN_DOCUMENTS
-        await db.execute(text("DELETE FROM documents WHERE id = :id"), {"id": markdown_id})
-
-    _alembic(scratch_url, "downgrade", INSTRUCTIONS_AND_MEMORIES)
-    async with engine.connect() as db:
-        nullable = (
-            await db.execute(
-                text(
-                    "SELECT is_nullable FROM information_schema.columns "
-                    "WHERE table_name = 'documents' AND column_name = 'job_id'"
-                )
-            )
-        ).scalar_one()
-    assert nullable == "NO"
-    _alembic(scratch_url, "upgrade", "head")
-    await engine.dispose()
-
-
-LIBRARY_TRASH = "593bad709660"
-
-
-async def test_the_trash_migration_frees_trashed_names_and_refuses_to_downgrade_over_them(
-    scratch_url,
-) -> None:
-    """Every existing row stays live; after the upgrade a row in the Trash no longer holds
-    its name, and the downgrade refuses while anything is in the Trash rather than choose
-    which of two same-named rows survives (docs/database.md § Rules)."""
-    _alembic(scratch_url, "upgrade", MARKDOWN_DOCUMENTS)
-
-    engine = create_async_engine(scratch_url)
-    async with engine.begin() as db:
-        user_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO users (google_sub, email, created_at) "
-                    "VALUES ('sub', 't@example.com', now()) RETURNING id"
-                )
-            )
-        ).scalar_one()
-        folder_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO folders (user_id, parent_id, name, created_at, updated_at) "
-                    "VALUES (:user, NULL, 'Papers', now(), now()) RETURNING id"
-                ),
-                {"user": user_id},
-            )
-        ).scalar_one()
-        await db.execute(
-            text(
-                "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
-                "updated_at) VALUES (:user, :folder, NULL, 'a.md', now(), now())"
-            ),
-            {"user": user_id, "folder": folder_id},
-        )
-
-    _alembic(scratch_url, "upgrade", LIBRARY_TRASH)
-
-    async with engine.begin() as db:
-        marks = (
-            await db.execute(
-                text("SELECT trashed_at FROM folders UNION ALL SELECT trashed_at FROM documents")
-            )
-        ).scalars()
-        assert list(marks) == [None, None]
-        # In the Trash, a folder and a file free their names, at the top level and inside
-        # a folder.
-        await db.execute(text("UPDATE folders SET trashed_at = now()"))
-        await db.execute(text("UPDATE documents SET trashed_at = now()"))
-        await db.execute(
-            text(
-                "INSERT INTO folders (user_id, parent_id, name, created_at, updated_at) "
-                "VALUES (:user, NULL, 'Papers', now(), now())"
-            ),
-            {"user": user_id},
-        )
-        await db.execute(
-            text(
-                "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
-                "updated_at) VALUES (:user, :folder, NULL, 'a.md', now(), now())"
-            ),
-            {"user": user_id, "folder": folder_id},
-        )
-    # Two live rows still cannot share a name.
-    with pytest.raises(IntegrityError):
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO folders (user_id, parent_id, name, created_at, updated_at) "
-                    "VALUES (:user, NULL, 'Papers', now(), now())"
-                ),
-                {"user": user_id},
-            )
-
-    with pytest.raises(subprocess.CalledProcessError) as refused:
-        _alembic(scratch_url, "downgrade", MARKDOWN_DOCUMENTS)
-    assert b"2 item(s) are in the Trash" in refused.value.stderr
-    async with engine.begin() as db:
-        version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
-        assert version == LIBRARY_TRASH
-        await db.execute(text("DELETE FROM documents WHERE trashed_at IS NOT NULL"))
-        # Put back under a free name: nothing left in the Trash, the downgrade goes ahead.
-        await db.execute(
-            text("UPDATE folders SET name = 'Old papers', trashed_at = NULL WHERE id = :id"),
-            {"id": folder_id},
-        )
-
-    _alembic(scratch_url, "downgrade", MARKDOWN_DOCUMENTS)
-    _alembic(scratch_url, "upgrade", "head")
-    await engine.dispose()
-
-
-RETRY_FAILED_PAGES = "556f2408fba9"
-
-
-async def test_the_failed_pages_migration_keeps_every_row_and_falls_back_to_nothing(
-    scratch_url,
-) -> None:
-    """Existing settings take no fallback, and existing jobs and pages keep every value —
-    a page that succeeded keeps the markdown a retry reads. The downgrade drops only what
-    the upgrade added (docs/database.md § Rules)."""
-    _alembic(scratch_url, "upgrade", LIBRARY_TRASH)
-
-    engine = create_async_engine(scratch_url)
-    job_id = uuid.uuid4()
-    async with engine.begin() as db:
-        user_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO users (google_sub, email, created_at) "
-                    "VALUES ('sub', 'f@example.com', now()) RETURNING id"
-                )
-            )
-        ).scalar_one()
-        await db.execute(
-            text("INSERT INTO agent_settings (user_id, agent, model) VALUES (:user, 'parse', 'm')"),
-            {"user": user_id},
-        )
-        await db.execute(
-            text(
-                "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
-                "sha256, pages_spec, model, pipeline_version, bbox_format, status, pages_done, "
-                "prompt_sha256, error, created_at) VALUES (:id, :user, 'parse', 'pdf', 'a.pdf', "
-                "'application/pdf', 1, 'h', '', 'm', 1, 'yxyx_norm1000', 'failed', 2, '', "
-                "'no page could be parsed', now())"
-            ),
-            {"id": job_id, "user": user_id},
-        )
-        await db.execute(
-            text(
-                "INSERT INTO job_pages (job_id, page_no, method, status, error, markdown) "
-                "VALUES (:job, 1, 'vision', 'succeeded', NULL, '# One'), "
-                "(:job, 2, 'vision', 'failed', 'upstream call failed', NULL)"
-            ),
-            {"job": job_id},
-        )
-
-    _alembic(scratch_url, "upgrade", RETRY_FAILED_PAGES)
-
-    async with engine.begin() as db:
-        setting = (
-            await db.execute(
-                text("SELECT model, fallback_model, auto_fallback FROM agent_settings")
-            )
-        ).one()
-        assert tuple(setting) == ("m", None, False)
-        job = (
-            await db.execute(text("SELECT status, error, fallback_model, retry_model FROM jobs"))
-        ).one()
-        assert tuple(job) == ("failed", "no page could be parsed", None, None)
-        pages = (
-            await db.execute(
-                text("SELECT page_no, status, markdown, model FROM job_pages ORDER BY page_no")
-            )
-        ).all()
-        assert [tuple(row) for row in pages] == [
-            (1, "succeeded", "# One", None),
-            (2, "failed", None, None),
-        ]
-
-    _alembic(scratch_url, "downgrade", LIBRARY_TRASH)
-    async with engine.connect() as db:
-        added = (
-            await db.execute(
-                text(
-                    "SELECT table_name || '.' || column_name FROM information_schema.columns "
-                    "WHERE (table_name = 'agent_settings' "
-                    "AND column_name IN ('fallback_model', 'auto_fallback')) "
-                    "OR (table_name = 'jobs' AND column_name IN ('fallback_model', 'retry_model')) "
-                    "OR (table_name = 'job_pages' AND column_name = 'model')"
-                )
-            )
-        ).all()
-        assert added == []
-        assert (await db.execute(text("SELECT count(*) FROM job_pages"))).scalar_one() == 2
-    _alembic(scratch_url, "upgrade", "head")
-    await engine.dispose()
-
-
-FORMAT_CHECK = "6f91eb4561a5"
-
-
-async def test_the_format_check_migration_checks_nothing_that_came_before(scratch_url) -> None:
-    """Existing settings take the check's default (on); a job queued before it runs
-    unchecked, and a result written before it has no reading copy. The downgrade drops
-    only what the upgrade added (docs/database.md § Rules)."""
-    _alembic(scratch_url, "upgrade", RETRY_FAILED_PAGES)
-
-    engine = create_async_engine(scratch_url)
-    queued, done = uuid.uuid4(), uuid.uuid4()
-    async with engine.begin() as db:
-        user_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO users (google_sub, email, created_at) "
-                    "VALUES ('sub', 'c@example.com', now()) RETURNING id"
-                )
-            )
-        ).scalar_one()
-        await db.execute(
-            text("INSERT INTO agent_settings (user_id, agent, model) VALUES (:user, 'parse', 'm')"),
-            {"user": user_id},
-        )
-        for job_id, status in ((queued, "queued"), (done, "succeeded")):
-            await db.execute(
-                text(
-                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
-                    "size_bytes, sha256, pages_spec, model, pipeline_version, bbox_format, "
-                    "status, pages_done, prompt_sha256, created_at) VALUES (:id, :user, "
-                    "'parse', 'pdf', 'a.pdf', 'application/pdf', 1, 'h', '', 'm', 1, "
-                    "'yxyx_norm1000', :status, 0, '', now())"
-                ),
-                {"id": job_id, "user": user_id, "status": status},
-            )
-        await db.execute(
-            text(
-                "INSERT INTO results (job_id, markdown, pages, figures, errors, meta, created_at) "
-                "VALUES (:job, '<!-- page: 1 -->\nOne', '[]', '[]', '[]', '{}', now())"
-            ),
-            {"job": done},
-        )
-
-    _alembic(scratch_url, "upgrade", FORMAT_CHECK)
-
-    async with engine.begin() as db:
-        setting = (await db.execute(text("SELECT model, auto_check FROM agent_settings"))).one()
-        assert tuple(setting) == ("m", True)
-        jobs = (
-            await db.execute(
-                text(
-                    "SELECT status, check_model, check_effort, check_prompt FROM jobs "
-                    "ORDER BY status"
-                )
-            )
-        ).all()
-        assert [tuple(row) for row in jobs] == [
-            ("queued", None, None, None),
-            ("succeeded", None, None, None),
-        ]
-        result = (await db.execute(text("SELECT markdown, reading_markdown FROM results"))).one()
-        assert tuple(result) == ("<!-- page: 1 -->\nOne", None)
-
-    _alembic(scratch_url, "downgrade", RETRY_FAILED_PAGES)
-    async with engine.connect() as db:
-        added = (
-            await db.execute(
-                text(
-                    "SELECT table_name || '.' || column_name FROM information_schema.columns "
-                    "WHERE (table_name = 'agent_settings' AND column_name = 'auto_check') "
-                    "OR (table_name = 'jobs' AND column_name IN "
-                    "('check_model', 'check_effort', 'check_prompt')) "
-                    "OR (table_name = 'results' AND column_name = 'reading_markdown')"
-                )
-            )
-        ).all()
-        assert added == []
-        assert (await db.execute(text("SELECT count(*) FROM results"))).scalar_one() == 1
-    _alembic(scratch_url, "upgrade", "head")
-    await engine.dispose()
-
-
-FIGURE_CHECK = "fe01cb0fe911"
-RECONVERT = "3241469fe768"
-
-
-async def test_the_reconvert_migration_leaves_every_document_on_its_own_parse(
-    scratch_url,
-) -> None:
-    """No existing document has a re-convert; the pointer names only a job, and a job
-    that goes takes only the pointer with it, never the document. The downgrade drops
-    only what the upgrade added (docs/database.md § Rules)."""
-    _alembic(scratch_url, "upgrade", FIGURE_CHECK)
-
-    engine = create_async_engine(scratch_url)
-    parse, reconvert = uuid.uuid4(), uuid.uuid4()
-    async with engine.begin() as db:
-        user_id = (
-            await db.execute(
-                text(
-                    "INSERT INTO users (google_sub, email, created_at) "
-                    "VALUES ('sub', 'r@example.com', now()) RETURNING id"
-                )
-            )
-        ).scalar_one()
-        for job_id in (parse, reconvert):
-            await db.execute(
-                text(
-                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
-                    "size_bytes, sha256, pages_spec, model, pipeline_version, bbox_format, "
-                    "status, pages_done, prompt_sha256, created_at) VALUES (:id, :user, "
-                    "'parse', 'pdf', 'a.pdf', 'application/pdf', 1, 'h', '', 'm', 1, "
-                    "'yxyx_norm1000', 'succeeded', 1, '', now())"
-                ),
-                {"id": job_id, "user": user_id},
-            )
-        await db.execute(
-            text(
-                "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
-                "updated_at) VALUES (:user, NULL, :job, 'a.pdf', now(), now())"
-            ),
-            {"user": user_id, "job": parse},
-        )
-
-    _alembic(scratch_url, "upgrade", RECONVERT)
-
-    async with engine.begin() as db:
-        row = (await db.execute(text("SELECT job_id, reconvert_job_id FROM documents"))).one()
-        assert tuple(row) == (parse, None)
-    with pytest.raises(IntegrityError):
-        async with engine.begin() as db:
-            await db.execute(
-                text("UPDATE documents SET reconvert_job_id = :job"), {"job": uuid.uuid4()}
-            )
-    async with engine.begin() as db:
-        await db.execute(text("UPDATE documents SET reconvert_job_id = :job"), {"job": reconvert})
-        await db.execute(text("DELETE FROM jobs WHERE id = :job"), {"job": reconvert})
-        row = (await db.execute(text("SELECT job_id, reconvert_job_id FROM documents"))).one()
-        assert tuple(row) == (parse, None)
-
-    _alembic(scratch_url, "downgrade", FIGURE_CHECK)
-    async with engine.connect() as db:
-        added = (
-            await db.execute(
-                text(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'documents' AND column_name = 'reconvert_job_id' "
-                    "UNION ALL SELECT indexname FROM pg_indexes "
-                    "WHERE indexname = 'ix_documents_reconvert_job_id'"
-                )
-            )
-        ).all()
-        assert added == []
-        assert (await db.execute(text("SELECT count(*) FROM documents"))).scalar_one() == 1
-    _alembic(scratch_url, "upgrade", "head")
-    await engine.dispose()
-
-
-BEFORE_BILLING = "3241469fe768"
-BILLING = "bd4210aa38cf"
-BILLING_TABLES = ("subscriptions", "checkouts", "pay_events", "credit_periods", "credit_entries")
 
 
 async def _count(connection, table: str) -> int:
-    """Rows of one of the tables named in this module — never a value from outside it."""
-    return (await connection.execute(text(f"SELECT count(*) FROM {table}"))).scalar()  # noqa: S608
+    """Rows of a table this module names or the catalog lists — never a value from outside."""
+    return (await connection.execute(text(f"SELECT count(*) FROM {table}"))).scalar_one()  # noqa: S608
 
 
-async def test_the_billing_migration_adds_five_empty_tables_and_touches_nothing(scratch_url):
-    """docs/billing.md § Acceptance: applied over existing users, jobs and usage rows,
-    which it leaves as they are; the downgrade drops the five tables and nothing else."""
-    _alembic(scratch_url, "upgrade", BEFORE_BILLING)
-    engine = create_async_engine(scratch_url)
-    try:
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, name, created_at) "
-                    "VALUES (1, 'sub-1', 'a@example.com', 'A', now())"
-                )
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
-                    "size_bytes, sha256, pages_spec, model, bbox_format, prompt_sha256, "
-                    "pipeline_version, status, pages_done, retain_source, created_at) VALUES "
-                    "('11111111-1111-1111-1111-111111111111', 1, 'parse', 'pdf', 'a.pdf', "
-                    "'application/pdf', 1, 'h', 'all', 'm', 'yxyx_norm1000', 'p', 1, "
-                    "'succeeded', 1, false, now())"
-                )
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO usage_log (user_id, job_id, agent, model, prompt_tokens, "
-                    "completion_tokens, cost, cost_source, created_at) VALUES (1, "
-                    "'11111111-1111-1111-1111-111111111111', 'parse', 'm', 1, 1, NULL, "
-                    "'unknown', now())"
-                )
-            )
-        _alembic(scratch_url, "upgrade", BILLING)
-        async with engine.begin() as connection:
-            for table in BILLING_TABLES:
-                assert await _count(connection, table) == 0, table
-            assert await _count(connection, "users") == 1
-            assert await _count(connection, "usage_log") == 1
-            # The constraints hold: a chat entry without a turn, a parse entry with one.
-            await connection.execute(
-                text(
-                    "INSERT INTO credit_periods (user_id, period_start, period_end, plan_id, "
-                    "granted, spent, created_at, updated_at) VALUES (1, '2026-10-01+00', "
-                    "'2026-11-01+00', NULL, 150, 0, now(), now())"
-                )
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
-                    "job_id, created_at) VALUES (1, '2026-10-01+00', 'parse', 'reserved', 3, "
-                    "'11111111-1111-1111-1111-111111111111', now())"
-                )
-            )
-        async with engine.connect() as connection:
-            with pytest.raises(IntegrityError):
-                await connection.execute(
-                    text(
-                        "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
-                        "created_at) VALUES (1, '2026-10-01+00', 'chat', 'consumed', 1, now())"
-                    )
-                )
-        async with engine.begin() as connection:
-            # A user deleted takes their ledger with them.
-            await connection.execute(text("DELETE FROM users WHERE id = 1"))
-            for table in ("credit_periods", "credit_entries"):
-                assert await _count(connection, table) == 0
-        _alembic(scratch_url, "downgrade", BEFORE_BILLING)
-        async with engine.connect() as connection:
-            names = {
-                row[0]
-                for row in await connection.execute(
-                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-                )
-            }
-        assert not names & set(BILLING_TABLES)
-        assert {"users", "jobs", "usage_log"} <= names
-    finally:
-        await engine.dispose()
-
-
-LEDGER = "1906f6693711"
-
-
-async def test_the_ledger_migration_keeps_a_deleted_conversations_entries(scratch_url):
-    """docs/database.md § Migrations: a chat entry outlives its turn after the upgrade,
-    and the downgrade refuses while any such entry stands rather than delete it."""
-    _alembic(scratch_url, "upgrade", BILLING)
-    engine = create_async_engine(scratch_url)
-    try:
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, name, created_at) "
-                    "VALUES (1, 'sub-1', 'a@example.com', 'A', now())"
-                )
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
-                    "updated_at) VALUES (1, 1, NULL, NULL, 'a.md', now(), now())"
-                )
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
-                    "model, created_at, updated_at) VALUES (1, 1, 1, 'Thread', 's', 'm', "
-                    "now(), now())"
-                )
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO chat_turns (id, user_id, conversation_id, message_id, status, "
-                    "locale, created_at, finished_at) VALUES "
-                    "('22222222-2222-2222-2222-222222222222', 1, 1, 1, 'succeeded', 'en', "
-                    "now(), now())"
-                )
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO credit_periods (user_id, period_start, period_end, plan_id, "
-                    "granted, spent, created_at, updated_at) VALUES (1, '2026-10-01+00', "
-                    "'2026-11-01+00', NULL, 150, 2, now(), now())"
-                )
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
-                    "turn_id, created_at, settled_at) VALUES (1, '2026-10-01+00', 'chat', "
-                    "'consumed', 2, '22222222-2222-2222-2222-222222222222', now(), now())"
-                )
-            )
-        _alembic(scratch_url, "upgrade", LEDGER)
-        async with engine.begin() as connection:
-            # The thread goes; its cost stays, in the period and in the record.
-            await connection.execute(text("DELETE FROM conversations WHERE id = 1"))
-            assert await _count(connection, "chat_turns") == 0
-            rows = (
-                await connection.execute(
-                    text("SELECT kind, state, amount, turn_id FROM credit_entries")
-                )
-            ).all()
-            assert rows == [("chat", "consumed", 2, None)]
-            spent = (await connection.execute(text("SELECT spent FROM credit_periods"))).scalar()
-            assert spent == 2
-        async with engine.connect() as connection:
-            # A parse entry still never has a turn.
-            with pytest.raises(IntegrityError):
-                await connection.execute(
-                    text(
-                        "INSERT INTO credit_entries (user_id, period_start, kind, state, "
-                        "amount, job_id, turn_id, created_at) VALUES (1, '2026-10-01+00', "
-                        "'parse', 'reserved', 1, NULL, NULL, now())"
-                    )
-                )
-        with pytest.raises(subprocess.CalledProcessError) as refused:
-            _alembic(scratch_url, "downgrade", BILLING)
-        assert b"1 chat credit entries have no turn" in refused.value.stderr
-        async with engine.begin() as connection:
-            version = (
-                await connection.execute(text("SELECT version_num FROM alembic_version"))
-            ).scalar()
-            assert version == LEDGER
-            await connection.execute(text("DELETE FROM credit_entries"))
-        _alembic(scratch_url, "downgrade", BILLING)
-    finally:
-        await engine.dispose()
-
-
-OPERATOR_UPSTREAM = "8431924126b1"
-
-
-async def test_the_operator_upstream_migration_drops_the_keys_and_keeps_the_history(
-    scratch_url,
-) -> None:
-    """docs/database.md § Migrations: the three key tables and the two columns go, a
-    parse row's model with them, a chat row's pick and a job's connection stay; the
-    downgrade puts the tables and columns back empty."""
-    _alembic(scratch_url, "upgrade", LEDGER)
-    engine = create_async_engine(scratch_url)
-    job_id = uuid.uuid4()
-    try:
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, created_at) "
-                    "VALUES (1, 'sub', 'o@example.com', now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO provider_connections (id, user_id, name, base_url, ciphertext, "
-                    "masked, report_cost, created_at, updated_at) VALUES (7, 1, 'own', "
-                    "'https://llm.example/v1', '\\x00'::bytea, '...ab', false, now(), now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO kano_proxy_keys (user_id, ciphertext, masked, updated_at) "
-                    "VALUES (1, '\\x00'::bytea, '...cd', now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO kano_connect_states (user_id, state_hash, verifier_ciphertext, "
-                    "created_at, expires_at) VALUES (1, 'h', '\\x00'::bytea, now(), now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO agent_settings (user_id, agent, connection_id, model, "
-                    "fallback_model, auto_fallback) VALUES (1, 'parse', 7, 'vendor/old', "
-                    "'vendor/older', true), (1, 'check', NULL, 'vendor/checker', NULL, false), "
-                    "(1, 'chat', NULL, 'vendor/chosen', NULL, false)"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
-                    "size_bytes, sha256, pages_spec, model, connection_id, connection_base_url, "
-                    "pipeline_version, bbox_format, status, pages_done, prompt_sha256, "
-                    "created_at) VALUES (:id, 1, 'parse', 'pdf', 'a.pdf', 'application/pdf', 1, "
-                    "'h', '', 'vendor/old', 7, 'https://llm.example/v1', 1, 'yxyx_norm1000', "
-                    "'queued', 0, '', now())"
-                ),
-                {"id": job_id},
-            )
-        _alembic(scratch_url, "upgrade", OPERATOR_UPSTREAM)
-        async with engine.begin() as db:
-            tables = {
-                row[0]
-                for row in await db.execute(
-                    text("SELECT table_name FROM information_schema.tables")
-                )
-            }
-            assert not tables & {"provider_connections", "kano_proxy_keys", "kano_connect_states"}
-            columns = {
-                row[0]
-                for row in await db.execute(
-                    text(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_name = 'agent_settings'"
-                    )
-                )
-            }
-            assert not columns & {"connection_id", "fallback_model"}
-            rows = (
-                await db.execute(
-                    text("SELECT agent, model, auto_fallback FROM agent_settings ORDER BY agent")
-                )
-            ).all()
-            assert rows == [
-                ("chat", "vendor/chosen", False),
-                ("check", None, False),
-                ("parse", None, True),
-            ]
-            job = (
-                await db.execute(text("SELECT connection_id, connection_base_url FROM jobs"))
-            ).one()
-            assert job == (7, "https://llm.example/v1")
-        _alembic(scratch_url, "downgrade", LEDGER)
-        async with engine.begin() as db:
-            for table in ("provider_connections", "kano_proxy_keys", "kano_connect_states"):
-                assert await _count(db, table) == 0
-            rows = (
-                await db.execute(
-                    text("SELECT agent, connection_id, fallback_model FROM agent_settings")
-                )
-            ).all()
-            assert {row[1:] for row in rows} == {(None, None)}
-    finally:
-        await engine.dispose()
-
-
-PARSE_RETENTION = "e014be293754"
-RETENTION_INDEXES = {
-    "ix_documents_job_id",
-    "ix_usage_log_job_id",
-    "ix_documents_trashed_at",
-    "ix_folders_trashed_at",
+# The catalog a schema is compared by: every column with its type, nullability and
+# default; every constraint by name with its definition (PK, UNIQUE, FK with its actions,
+# CHECK); every index with its definition, partial predicates included; the sequences; and
+# any enum or domain type. Alembic's own table is left out.
+CATALOG = {
+    "columns": (
+        "SELECT table_name, column_name, data_type, character_maximum_length, "
+        "numeric_precision, numeric_scale, is_nullable, column_default "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name <> 'alembic_version'"
+    ),
+    "constraints": (
+        "SELECT conrelid::regclass::text, conname, pg_get_constraintdef(oid) "
+        "FROM pg_constraint WHERE connamespace = 'public'::regnamespace "
+        "AND conrelid::regclass::text <> 'alembic_version'"
+    ),
+    "indexes": (
+        "SELECT tablename, indexname, indexdef FROM pg_indexes "
+        "WHERE schemaname = 'public' AND tablename <> 'alembic_version'"
+    ),
+    "sequences": (
+        "SELECT sequencename, data_type, start_value, min_value, max_value, increment_by, "
+        "cycle FROM pg_sequences WHERE schemaname = 'public'"
+    ),
+    "types": (
+        "SELECT t.typname, t.typtype FROM pg_type t "
+        "JOIN pg_namespace n ON n.oid = t.typnamespace "
+        "WHERE n.nspname = 'public' AND t.typtype IN ('e', 'd')"
+    ),
 }
 
 
-async def _indexes(connection) -> set[str]:
-    return {row[0] for row in await connection.execute(text("SELECT indexname FROM pg_indexes"))}
+async def _catalog(engine: AsyncEngine) -> dict[str, set[tuple]]:
+    async with engine.connect() as connection:
+        return {
+            part: {tuple(row) for row in await connection.execute(text(query))}
+            for part, query in CATALOG.items()
+        }
 
 
-async def test_the_retention_migration_keeps_a_deleted_parses_ledger_entry(scratch_url) -> None:
-    """docs/database.md § Migrations: after the upgrade a parse's credit entry outlives its
-    job with `job_id` NULL, the period's `spent` unchanged, as its usage row does; a chat
-    entry still never names a job; the downgrade refuses while such an entry stands rather
-    than delete it from the billing record, and drops the indexes once it may go."""
-    _alembic(scratch_url, "upgrade", OPERATOR_UPSTREAM)
-    engine = create_async_engine(scratch_url)
-    parse, other = uuid.uuid4(), uuid.uuid4()
-    try:
-        async with engine.begin() as db:
-            await db.execute(
+async def test_the_upgraded_head_is_the_schema_the_models_build(head_engine) -> None:
+    """A database the chain built and one `create_all` built — the one every other test
+    runs on — carry the same catalog, names included, compared both ways."""
+    async with _scratch_database() as models_url:
+        models_engine = create_async_engine(models_url)
+        try:
+            async with models_engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            built = await _catalog(models_engine)
+        finally:
+            await models_engine.dispose()
+    migrated = await _catalog(head_engine)
+    for part in CATALOG:
+        assert migrated[part] - built[part] == set(), f"{part} only the migrations create"
+        assert built[part] - migrated[part] == set(), f"{part} only the models create"
+    assert ("worker_generation_seq",) in {row[:1] for row in migrated["sequences"]}
+
+
+async def test_a_fresh_database_holds_the_built_in_group_and_nothing_else(head_engine) -> None:
+    async with head_engine.connect() as connection:
+        groups = (
+            await connection.execute(
+                text("SELECT name, permissions = '[]'::jsonb, builtin FROM groups")
+            )
+        ).all()
+        assert groups == [("owner", True, True)]
+        tables = (
+            await connection.execute(
                 text(
-                    "INSERT INTO users (id, google_sub, email, created_at) "
-                    "VALUES (1, 'sub', 'r@example.com', now())"
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+                    "AND tablename NOT IN ('groups', 'alembic_version')"
                 )
             )
-            for job_id in (parse, other):
+        ).scalars()
+        for table in tables:
+            assert await _count(connection, table) == 0, table
+
+
+async def test_the_downgrade_to_base_leaves_nothing(scratch_url) -> None:
+    _alembic(scratch_url, "upgrade", "head")
+    _alembic(scratch_url, "downgrade", "base")
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as connection:
+            relations = (
+                await connection.execute(
+                    text(
+                        "SELECT c.relname FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE n.nspname = 'public'"
+                    )
+                )
+            ).scalars()
+            assert set(relations) <= {"alembic_version", "alembic_version_pkc"}
+            types = (
+                await connection.execute(
+                    text(
+                        "SELECT t.typname FROM pg_type t "
+                        "JOIN pg_namespace n ON n.oid = t.typnamespace "
+                        "WHERE n.nspname = 'public'"
+                    )
+                )
+            ).scalars()
+            assert set(types) <= {"alembic_version", "_alembic_version"}
+            assert await _count(connection, "alembic_version") == 0
+    finally:
+        await engine.dispose()
+
+
+async def _refused(engine: AsyncEngine, sql: str, **params) -> None:
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as db:
+            await db.execute(text(sql), params)
+
+
+async def _user(db, n: int) -> int:
+    return (
+        await db.execute(
+            text(
+                "INSERT INTO users (google_sub, email, created_at) "
+                "VALUES (:sub, :email, now()) RETURNING id"
+            ),
+            {"sub": f"sub-{n}", "email": f"u{n}@example.com"},
+        )
+    ).scalar_one()
+
+
+async def _job(db, user_id: int) -> uuid.UUID:
+    job_id = uuid.uuid4()
+    await db.execute(
+        text(
+            "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
+            "sha256, pages_spec, model, pipeline_version, bbox_format, prompt, status, "
+            "pages_done, created_at) VALUES (:id, :user, 'parse', 'pdf', 'a.pdf', "
+            "'application/pdf', 1, 'x', '', 'm', 0, 'yxyx_norm1000', 'p', 'succeeded', 1, now())"
+        ),
+        {"id": job_id, "user": user_id},
+    )
+    return job_id
+
+
+async def test_the_head_refuses_what_its_constraints_forbid(head_engine) -> None:
+    """The constraints production relies on hold on a migrated head: the console's
+    groups, the ledger's kinds, a pack's source, live names, a memory's kind, the
+    foreign keys' actions (docs/database.md § Tables, § Rules)."""
+    engine = head_engine
+    async with engine.begin() as db:
+        owner = await _user(db, 1)
+        other = await _user(db, 2)
+        group_id = (await db.execute(text("SELECT id FROM groups WHERE builtin"))).scalar_one()
+        await db.execute(
+            text(
+                "INSERT INTO group_members (group_id, user_id, added_by, added_at) "
+                "VALUES (:group, :owner, :owner, now()), (:group, :other, :owner, now())"
+            ),
+            {"group": group_id, "owner": owner, "other": other},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO audit_log (actor_id, permission, action, target_type, target_id, "
+                "created_at) VALUES (:owner, 'groups.write', 'groups.add_member', 'user', "
+                ":other, now())"
+            ),
+            {"owner": owner, "other": str(other)},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO runtime_settings (key, value, updated_by, updated_at) "
+                "VALUES ('CREDIT_USD', '\"0.002\"'::jsonb, :owner, now())"
+            ),
+            {"owner": owner},
+        )
+        job_id = await _job(db, other)
+        conversation_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO conversations (user_id, title, session, created_at, "
+                    "updated_at) VALUES (:user, 't', 's', now(), now()) RETURNING id"
+                ),
+                {"user": other},
+            )
+        ).scalar_one()
+        turn_id = uuid.uuid4()
+        await db.execute(
+            text(
+                "INSERT INTO chat_turns (id, user_id, conversation_id, message_id, status, "
+                "created_at) VALUES (:id, :user, :conversation, 1, 'succeeded', now())"
+            ),
+            {"id": turn_id, "user": other, "conversation": conversation_id},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO credit_periods (user_id, period_start, period_end, granted, "
+                "created_at, updated_at) VALUES (:user, '2026-11-01+00', '2026-12-01+00', "
+                "150, now(), now())"
+            ),
+            {"user": other},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
+                "job_id, turn_id, created_at) VALUES "
+                "(:user, '2026-11-01+00', 'parse', 'consumed', 3, :job, NULL, now()), "
+                "(:user, '2026-11-01+00', 'chat', 'consumed', 2, NULL, :turn, now())"
+            ),
+            {"user": other, "job": job_id, "turn": turn_id},
+        )
+
+    # One built-in group, and a group name once.
+    await _refused(
+        engine,
+        "INSERT INTO groups (name, permissions, builtin, created_at, updated_at) "
+        "VALUES ('second', '[]'::jsonb, true, now(), now())",
+    )
+    await _refused(
+        engine,
+        "INSERT INTO groups (name, permissions, builtin, created_at, updated_at) "
+        "VALUES ('owner', '[]'::jsonb, false, now(), now())",
+    )
+
+    # A chat entry never names a job, a parse entry never a turn.
+    entry = (
+        "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, job_id, "
+        "turn_id, created_at) VALUES (:user, '2026-11-01+00', :kind, 'reserved', 1, :job, "
+        ":turn, now())"
+    )
+    await _refused(engine, entry, user=other, kind="chat", job=job_id, turn=None)
+    await _refused(engine, entry, user=other, kind="parse", job=None, turn=turn_id)
+
+    # A pack's source is one of three.
+    pack = (
+        "INSERT INTO credit_packs (id, user_id, pack_id, credits, status, purchased_at, "
+        "expires_at, source, created_at, updated_at) VALUES (:id, :user, 'p', 10, 'paid', "
+        "now(), now() + interval '1 day', :source, now(), now())"
+    )
+    async with engine.begin() as db:
+        for source in ("pay", "code", "grant"):
+            await db.execute(text(pack), {"id": source, "user": other, "source": source})
+    await _refused(engine, pack, id="gift", user=other, source="gift")
+
+    # A memory's kind is one of four.
+    await _refused(
+        engine,
+        "INSERT INTO memories (user_id, kind, text, created_at, updated_at) "
+        "VALUES (:user, 'fact', 'x', now(), now())",
+        user=other,
+    )
+
+    # Names are unique among the live rows of one parent, the root level included; a
+    # trashed row holds none.
+    folder = (
+        "INSERT INTO folders (user_id, parent_id, name, trashed_at, created_at, updated_at) "
+        "VALUES (:user, :parent, :name, :trashed, now(), now()) RETURNING id"
+    )
+    document = (
+        "INSERT INTO documents (user_id, folder_id, name, trashed_at, created_at, "
+        "updated_at) VALUES (:user, :folder, :name, :trashed, now(), now())"
+    )
+    async with engine.begin() as db:
+        trashed = {"user": other, "trashed": datetime(2026, 11, 1, tzinfo=UTC)}
+        live = {"user": other, "trashed": None}
+        await db.execute(text(folder), {**trashed, "parent": None, "name": "Papers"})
+        papers = (
+            await db.execute(text(folder), {**live, "parent": None, "name": "Papers"})
+        ).scalar_one()
+        await db.execute(text(folder), {**trashed, "parent": papers, "name": "2026"})
+        await db.execute(text(folder), {**live, "parent": papers, "name": "2026"})
+        for folder_id in (None, papers):
+            await db.execute(text(document), {**trashed, "folder": folder_id, "name": "a.md"})
+            await db.execute(text(document), {**live, "folder": folder_id, "name": "a.md"})
+    await _refused(engine, folder, user=other, parent=None, name="Papers", trashed=None)
+    await _refused(engine, folder, user=other, parent=papers, name="2026", trashed=None)
+    for folder_id in (None, papers):
+        await _refused(engine, document, user=other, folder=folder_id, name="a.md", trashed=None)
+
+    # A re-convert names a real job and lets go of it when the job is deleted.
+    await _refused(
+        engine,
+        "UPDATE documents SET reconvert_job_id = :job WHERE folder_id IS NULL",
+        job=uuid.uuid4(),
+    )
+    async with engine.begin() as db:
+        reconvert = await _job(db, other)
+        await db.execute(
+            text("UPDATE documents SET reconvert_job_id = :job WHERE folder_id IS NULL"),
+            {"job": reconvert},
+        )
+        await db.execute(text("DELETE FROM jobs WHERE id = :job"), {"job": reconvert})
+        assert (
+            await db.execute(
+                text("SELECT count(*) FROM documents WHERE reconvert_job_id IS NOT NULL")
+            )
+        ).scalar_one() == 0
+
+    # The ledger outlives a deleted job and a deleted conversation's turns.
+    async with engine.begin() as db:
+        await db.execute(text("DELETE FROM jobs WHERE id = :job"), {"job": job_id})
+        await db.execute(text("DELETE FROM conversations WHERE id = :id"), {"id": conversation_id})
+        entries = (
+            await db.execute(text("SELECT kind, job_id, turn_id FROM credit_entries ORDER BY kind"))
+        ).all()
+        assert entries == [("chat", None, None), ("parse", None, None)]
+
+    # Deleting an account takes its memberships and ledger; what it did is kept without it.
+    async with engine.begin() as db:
+        await db.execute(text("DELETE FROM users WHERE id = :id"), {"id": owner})
+        members = (await db.execute(text("SELECT user_id, added_by FROM group_members"))).all()
+        assert members == [(other, None)]
+        record = (await db.execute(text("SELECT actor_id, target_id FROM audit_log"))).one()
+        assert tuple(record) == (None, str(other))
+        setting = (await db.execute(text("SELECT updated_by FROM runtime_settings"))).one()
+        assert tuple(setting) == (None,)
+        await db.execute(text("DELETE FROM users WHERE id = :id"), {"id": other})
+        for table in ("group_members", "credit_entries", "credit_periods", "credit_packs"):
+            assert await _count(db, table) == 0, table
+        assert await _count(db, "groups") == 1
+
+
+async def _preset(db, user: int, agent: str, name: str, body: str) -> int:
+    return (
+        await db.execute(
+            text(
+                "INSERT INTO prompt_presets (user_id, agent, name, text, created_at, updated_at) "
+                "VALUES (:user, :agent, :name, :text, now(), now()) RETURNING id"
+            ),
+            {"user": user, "agent": agent, "name": name, "text": body},
+        )
+    ).scalar_one()
+
+
+async def _selected(db, user: int, agent: str, preset: int, **columns: str | None) -> None:
+    await db.execute(
+        text(
+            "INSERT INTO agent_settings (user_id, agent, prompt, prompt_preset_id, instructions) "
+            "VALUES (:user, :agent, :prompt, :preset, :instructions)"
+        ),
+        {
+            "user": user,
+            "agent": agent,
+            "preset": preset,
+            "prompt": columns.get("prompt"),
+            "instructions": columns.get("instructions"),
+        },
+    )
+
+
+async def test_the_presets_in_force_move_into_prompts_and_instructions(scratch_url) -> None:
+    """774fee25f32b: a preset still in force moves to where its agent keeps reading it —
+    `parse` and `check` into `prompt` verbatim, `chat` to the head of `instructions`,
+    uncapped — and nothing else moves; the downgrade restores the table and the column,
+    empty."""
+    _alembic(scratch_url, "upgrade", "4449f68533c0")
+    long_preset = "Answer as {document_path} says.\n" + "x" * 9000
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            one, two, three, four = [await _user(db, n) for n in range(1, 5)]
+            # In force: the row has no prompt of its own.
+            parse = await _preset(db, one, "parse", "p", "Tables of page {page}.\n")
+            await _selected(db, one, "parse", parse)
+            check = await _preset(db, one, "check", "c", "Check it.")
+            await _selected(db, one, "check", check, prompt="")
+            chat = await _preset(db, one, "chat", "t", "Use {document_path} as is.")
+            await _selected(db, one, "chat", chat, instructions="Be brief.")
+            long = await _preset(db, two, "chat", "long", long_preset)
+            await _selected(db, two, "chat", long)
+            terse = await _preset(db, three, "chat", "t", "Terse.")
+            await _selected(db, three, "chat", terse, instructions=" ")
+            # Not in force: a prompt of its own, a blank chat preset, an unselected preset.
+            never = await _preset(db, two, "parse", "p", "Never ran.")
+            await _selected(db, two, "parse", never, prompt="Mine {page}.")
+            never = await _preset(db, three, "check", "c", "Never ran.")
+            await _selected(db, three, "check", never, prompt="Own check.", instructions="Kept.")
+            blank = await _preset(db, four, "chat", "blank", " \n ")
+            await _selected(db, four, "chat", blank, instructions="Kept as is.")
+            await _preset(db, four, "parse", "unselected", "Nowhere.")
+    finally:
+        await engine.dispose()
+
+    _alembic(scratch_url, "upgrade", "head")
+    expected = {
+        (one, "parse"): ("Tables of page {page}.\n", None),
+        (one, "check"): ("Check it.", None),
+        (one, "chat"): (None, "Use {document_path} as is.\n\nBe brief."),
+        (two, "chat"): (None, long_preset),
+        (three, "chat"): (None, "Terse."),
+        (two, "parse"): ("Mine {page}.", None),
+        (three, "check"): ("Own check.", "Kept."),
+        (four, "chat"): (None, "Kept as is."),
+    }
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as db:
+            rows = await db.execute(
+                text("SELECT user_id, agent, prompt, instructions FROM agent_settings")
+            )
+            assert {(row[0], row[1]): (row[2], row[3]) for row in rows} == expected
+            left = await db.execute(
+                text(
+                    "SELECT to_regclass('prompt_presets'), count(*) "
+                    "FROM information_schema.columns WHERE table_name = 'agent_settings' "
+                    "AND column_name = 'prompt_preset_id'"
+                )
+            )
+            assert tuple(left.one()) == (None, 0)
+    finally:
+        await engine.dispose()
+
+    _alembic(scratch_url, "downgrade", "4449f68533c0")
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as db:
+            assert await _count(db, "prompt_presets") == 0
+            selected = await db.execute(
+                text("SELECT count(*) FROM agent_settings WHERE prompt_preset_id IS NOT NULL")
+            )
+            assert selected.scalar_one() == 0
+            assert await _count(db, "agent_settings") == len(expected)
+    finally:
+        await engine.dispose()
+    _alembic(scratch_url, "upgrade", "head")
+
+
+async def test_jobs_lose_the_provider_connection_and_always_hold_a_prompt(scratch_url) -> None:
+    """185b2581586c: a provider connection's job loses its endpoint snapshot — so it never
+    answers a dedup lookup and the worker fails it — and keeps its status, a queued one's
+    included, for the worker to fail through its finish; a job with no prompt takes the
+    parse agent's default template, verbatim; `connection_id` and `source_job_id` go, and
+    the dedup index with the first. The downgrade restores both columns, empty."""
+    _alembic(scratch_url, "upgrade", "774fee25f32b")
+    jobs = {
+        # name: (connection_id, connection_base_url, status, prompt)
+        "provider, succeeded": (7, "https://kano.test", "succeeded", "Mine {page}."),
+        "provider, queued": (8, "https://llm.example/v1", "queued", None),
+        "kano": (None, "https://kano.test", "succeeded", None),
+        "openrouter": (None, None, "failed", "Old {page}."),
+    }
+    ids = {name: uuid.uuid4() for name in jobs}
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            user = await _user(db, 1)
+            for name, (connection_id, base_url, status, prompt) in jobs.items():
                 await db.execute(
                     text(
                         "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
-                        "size_bytes, sha256, pages_spec, model, pipeline_version, bbox_format, "
-                        "status, pages_done, prompt_sha256, created_at, finished_at) VALUES "
-                        "(:id, 1, 'parse', 'pdf', 'a.pdf', 'application/pdf', 1, 'h', '', "
-                        "'vendor/m', 1, 'yxyx_norm1000', 'succeeded', 1, '', now(), now())"
+                        "size_bytes, sha256, pages_spec, model, pipeline_version, "
+                        "bbox_format, connection_id, connection_base_url, prompt, status, "
+                        "pages_done, created_at) VALUES (:id, :user, 'parse', 'pdf', 'a.pdf', "
+                        "'application/pdf', 1, 'x', '', 'm', 10, 'yxyx_norm1000', "
+                        ":connection, :base_url, :prompt, :status, 0, now())"
                     ),
-                    {"id": job_id},
+                    {
+                        "id": ids[name],
+                        "user": user,
+                        "connection": connection_id,
+                        "base_url": base_url,
+                        "prompt": prompt,
+                        "status": status,
+                    },
                 )
-            await db.execute(
-                text(
-                    "INSERT INTO credit_periods (user_id, period_start, period_end, plan_id, "
-                    "granted, spent, created_at, updated_at) VALUES (1, '2026-10-01+00', "
-                    "'2026-11-01+00', NULL, 150, 3, now(), now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
-                    "job_id, created_at, settled_at) VALUES (1, '2026-10-01+00', 'parse', "
-                    "'consumed', 3, :job, now(), now())"
-                ),
-                {"job": parse},
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO usage_log (user_id, job_id, agent, model, prompt_tokens, "
-                    "completion_tokens, cost_source, created_at) VALUES (1, :job, 'parse', "
-                    "'vendor/m', 10, 5, 'unknown', now())"
-                ),
-                {"job": parse},
-            )
-            assert not await _indexes(db) & RETENTION_INDEXES
-        _alembic(scratch_url, "upgrade", PARSE_RETENTION)
-        async with engine.begin() as db:
-            assert await _indexes(db) >= RETENTION_INDEXES
-            # The retention deletes the parse; what it cost stays, in the period and in
-            # the record.
-            await db.execute(text("DELETE FROM jobs WHERE id = :id"), {"id": parse})
-            entries = (
-                await db.execute(text("SELECT kind, state, amount, job_id FROM credit_entries"))
-            ).all()
-            assert entries == [("parse", "consumed", 3, None)]
-            spent = (await db.execute(text("SELECT spent FROM credit_periods"))).scalar()
-            assert spent == 3
-            usage = (await db.execute(text("SELECT job_id, prompt_tokens FROM usage_log"))).all()
-            assert usage == [(None, 10)]
+    finally:
+        await engine.dispose()
+
+    _alembic(scratch_url, "upgrade", "head")
+    default = _revision_module("185b2581586c").PARSE_DEFAULT_PROMPT
+    expected = {
+        "provider, succeeded": (None, "succeeded", "Mine {page}."),
+        "provider, queued": (None, "queued", default),
+        "kano": ("https://kano.test", "succeeded", default),
+        "openrouter": (None, "failed", "Old {page}."),
+    }
+    gone = (
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = 'jobs' "
+        "AND column_name IN ('connection_id', 'source_job_id')"
+    )
+    engine = create_async_engine(scratch_url)
+    try:
         async with engine.connect() as db:
-            # A chat entry still never names a job.
-            with pytest.raises(IntegrityError):
-                await db.execute(
-                    text(
-                        "INSERT INTO credit_entries (user_id, period_start, kind, state, "
-                        "amount, job_id, created_at) VALUES (1, '2026-10-01+00', 'chat', "
-                        "'reserved', 1, :job, now())"
-                    ),
-                    {"job": other},
-                )
-        with pytest.raises(subprocess.CalledProcessError) as refused:
-            _alembic(scratch_url, "downgrade", OPERATOR_UPSTREAM)
-        assert b"1 parse credit entries have no job" in refused.value.stderr
-        async with engine.begin() as db:
-            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
-            assert version == PARSE_RETENTION
-            await db.execute(text("DELETE FROM credit_entries"))
-        _alembic(scratch_url, "downgrade", OPERATOR_UPSTREAM)
-        async with engine.begin() as db:
-            assert not await _indexes(db) & RETENTION_INDEXES
-            # The cascade is back: a parse entry goes with its job again.
-            await db.execute(
-                text(
-                    "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
-                    "job_id, created_at) VALUES (1, '2026-10-01+00', 'parse', 'reserved', 1, "
-                    ":job, now())"
-                ),
-                {"job": other},
+            rows = await db.execute(
+                text("SELECT id, connection_base_url, status, prompt FROM jobs")
             )
-            await db.execute(text("DELETE FROM jobs WHERE id = :id"), {"id": other})
-            assert await _count(db, "credit_entries") == 0
+            names = {job_id: name for name, job_id in ids.items()}
+            assert {names[row[0]]: tuple(row[1:]) for row in rows} == expected
+            assert (await db.execute(text(gone))).scalar_one() == 0
+            nullable = await db.execute(
+                text(
+                    "SELECT is_nullable FROM information_schema.columns "
+                    "WHERE table_name = 'jobs' AND column_name = 'prompt'"
+                )
+            )
+            assert nullable.scalar_one() == "NO"
+            index = await db.execute(
+                text("SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_jobs_dedup'")
+            )
+            assert "connection_id" not in index.scalar_one()
     finally:
         await engine.dispose()
 
-
-LIBRARY_FILES = "da765b0142af"
-
-
-async def test_the_library_files_migration_tells_the_kinds_apart_and_guards_the_files(
-    scratch_url,
-) -> None:
-    """docs/database.md § Migrations: every row keeps what it was — a parse, or a markdown
-    document — under `kind`, the new columns empty, the parse agent's switch on; the
-    downgrade refuses while a file is kept in the library, since without `kind` its row
-    would read as a markdown document with no text anywhere."""
-    _alembic(scratch_url, "upgrade", PARSE_RETENTION)
-    engine = create_async_engine(scratch_url)
-    parse = uuid.uuid4()
-    try:
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, created_at) "
-                    "VALUES (1, 'sub', 'r@example.com', now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
-                    "size_bytes, sha256, pages_spec, model, pipeline_version, bbox_format, "
-                    "status, pages_done, prompt_sha256, created_at, finished_at) VALUES "
-                    "(:id, 1, 'parse', 'pdf', 'a.pdf', 'application/pdf', 1, 'h', '', "
-                    "'vendor/m', 1, 'yxyx_norm1000', 'succeeded', 1, '', now(), now())"
-                ),
-                {"id": parse},
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
-                    "updated_at) VALUES (1, 1, NULL, :job, 'paper.pdf', now(), now()), "
-                    "(2, 1, NULL, NULL, 'notes.md', now(), now())"
-                ),
-                {"job": parse},
-            )
-            await db.execute(
-                text("INSERT INTO agent_settings (user_id, agent, model) VALUES (1, 'parse', NULL)")
-            )
-        _alembic(scratch_url, "upgrade", LIBRARY_FILES)
-        async with engine.begin() as db:
-            rows = (
-                await db.execute(
-                    text("SELECT id, kind, media_type, size_bytes FROM documents ORDER BY id")
-                )
-            ).all()
-            assert rows == [(1, "parse", None, None), (2, "markdown", None, None)]
-            assert (await db.execute(text("SELECT auto_convert FROM agent_settings"))).scalar()
-            # A file names its type and size; a row that says nothing is a parse.
-            await db.execute(
-                text(
-                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, kind, "
-                    "media_type, size_bytes, created_at, updated_at) VALUES (3, 1, NULL, NULL, "
-                    "'clip.mov', 'file', 'video/quicktime', 3000000000, now(), now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
-                    "updated_at) VALUES (4, 1, NULL, :job, 'b.pdf', now(), now())"
-                ),
-                {"job": parse},
-            )
-            kinds = (await db.execute(text("SELECT id, kind FROM documents ORDER BY id"))).all()
-            assert kinds == [(1, "parse"), (2, "markdown"), (3, "file"), (4, "parse")]
-        with pytest.raises(subprocess.CalledProcessError) as refused:
-            _alembic(scratch_url, "downgrade", PARSE_RETENTION)
-        assert b"1 file(s) are kept in the library" in refused.value.stderr
-        async with engine.begin() as db:
-            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
-            assert version == LIBRARY_FILES
-            await db.execute(text("DELETE FROM documents WHERE id = 3"))
-        _alembic(scratch_url, "downgrade", PARSE_RETENTION)
-        async with engine.begin() as db:
-            columns = {
-                (table, column)
-                for table, column in (
-                    await db.execute(
-                        text(
-                            "SELECT table_name, column_name FROM information_schema.columns "
-                            "WHERE table_name IN ('documents', 'agent_settings')"
-                        )
-                    )
-                ).all()
-            }
-            assert not columns & {
-                ("documents", "kind"),
-                ("documents", "media_type"),
-                ("documents", "size_bytes"),
-                ("agent_settings", "auto_convert"),
-            }
-            assert (await db.execute(text("SELECT count(*) FROM documents"))).scalar() == 3
-    finally:
-        await engine.dispose()
-
-
-READER_VIEWS = "283c259880d3"
-
-
-async def test_the_reader_views_migration_turns_converting_off_and_adds_the_views(
-    scratch_url,
-) -> None:
-    """The switch everyone had on by default goes off for everyone; the two view columns
-    arrive on their defaults; the downgrade drops them and leaves the switch off."""
-    _alembic(scratch_url, "upgrade", LIBRARY_FILES)
+    _alembic(scratch_url, "downgrade", "774fee25f32b")
     engine = create_async_engine(scratch_url)
     try:
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, created_at) "
-                    "VALUES (1, 'sub', 'r@example.com', now()), (2, 'sub2', 's@example.com', now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO agent_settings (user_id, agent, model, auto_convert) VALUES "
-                    "(1, 'parse', NULL, true), (2, 'parse', NULL, false), (1, 'chat', NULL, true)"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, kind, "
-                    "created_at, updated_at) VALUES (1, 1, NULL, NULL, 'notes.md', 'markdown', "
-                    "now(), now())"
-                )
-            )
-        _alembic(scratch_url, "upgrade", READER_VIEWS)
-        async with engine.begin() as db:
-            switches = (
-                await db.execute(
-                    text("SELECT user_id, agent, auto_convert FROM agent_settings ORDER BY 1, 2")
-                )
-            ).all()
-            assert switches == [(1, "chat", False), (1, "parse", False), (2, "parse", False)]
-            views = (await db.execute(text("SELECT id, default_view FROM users ORDER BY id"))).all()
-            assert views == [(1, "markdown"), (2, "markdown")]
-            assert (await db.execute(text("SELECT view FROM documents"))).scalar() is None
-            # A row written without the switch is off, as the model would write it.
-            await db.execute(
-                text("INSERT INTO agent_settings (user_id, agent, model) VALUES (2, 'chat', NULL)")
-            )
-            assert not (
-                await db.execute(
-                    text(
-                        "SELECT auto_convert FROM agent_settings"
-                        " WHERE user_id = 2 AND agent = 'chat'"
-                    )
-                )
-            ).scalar()
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, created_at)"
-                    " VALUES (3, 'sub3', 't@example.com', now())"
-                )
-            )
-            assert (
-                await db.execute(text("SELECT default_view FROM users WHERE id = 3"))
-            ).scalar() == "markdown"
-        _alembic(scratch_url, "downgrade", LIBRARY_FILES)
-        async with engine.begin() as db:
-            columns = {
-                (table, column)
-                for table, column in (
-                    await db.execute(
-                        text(
-                            "SELECT table_name, column_name FROM information_schema.columns "
-                            "WHERE table_name IN ('documents', 'users')"
-                        )
-                    )
-                ).all()
-            }
-            assert not columns & {("documents", "view"), ("users", "default_view")}
-            # The rows stay as the upgrade left them; only the default comes back.
-            assert not (
-                await db.execute(text("SELECT bool_or(auto_convert) FROM agent_settings"))
-            ).scalar()
-            await db.execute(
-                text("INSERT INTO agent_settings (user_id, agent, model) VALUES (3, 'parse', NULL)")
-            )
-            assert (
-                await db.execute(text("SELECT auto_convert FROM agent_settings WHERE user_id = 3"))
-            ).scalar()
-    finally:
-        await engine.dispose()
-
-
-CHAT_TOOL_CALLS = "8d1142bbd272"
-COMPACTION = "d78cf7a42eea"
-
-
-async def test_the_compaction_migration_leaves_every_row_as_a_message_turn(scratch_url) -> None:
-    """Every turn that came before is a message turn, every reader has idle compaction on,
-    every conversation has no summary, no context and no clock; the downgrade drops the
-    columns and the partial index and keeps the rows (docs/database.md)."""
-    _alembic(scratch_url, "upgrade", CHAT_TOOL_CALLS)
-    engine = create_async_engine(scratch_url)
-    try:
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, created_at) "
-                    "VALUES (1, 'sub', 'r@example.com', now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO agent_settings (user_id, agent, model) VALUES "
-                    "(1, 'chat', 'm'), (1, 'parse', NULL)"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, kind, "
-                    "created_at, updated_at) VALUES (1, 1, NULL, NULL, 'notes.md', 'markdown', "
-                    "now(), now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
-                    "model, created_at, updated_at) VALUES (1, 1, 1, 'Thread', 's', 'm', "
-                    "now(), now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO chat_turns (id, user_id, conversation_id, message_id, status, "
-                    "locale, created_at, finished_at) VALUES "
-                    "('22222222-2222-2222-2222-222222222222', 1, 1, 1, 'succeeded', 'en', "
-                    "now(), now())"
-                )
-            )
-            # Skills named after the composer's commands, and one whose name the rename
-            # would otherwise take.
-            await db.execute(
-                text(
-                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
-                    "created_at, updated_at) VALUES "
-                    "(1, 'compact', '', '', 'x', now(), now()), "
-                    "(1, 'compact-2', '', '', 'y', now(), now()), "
-                    "(1, 'new', '', '', 'z', now(), now()), "
-                    "(1, 'mine', '', '', 'w', now(), now())"
-                )
-            )
-        _alembic(scratch_url, "upgrade", COMPACTION)
-        async with engine.begin() as db:
-            assert (await db.execute(text("SELECT kind FROM chat_turns"))).scalar() == "message"
-            names = (await db.execute(text("SELECT name, body FROM skills ORDER BY body"))).all()
-            assert names == [("mine", "w"), ("compact-3", "x"), ("compact-2", "y"), ("new-2", "z")]
-            switches = (
-                await db.execute(text("SELECT agent, idle_compact FROM agent_settings ORDER BY 1"))
-            ).all()
-            assert switches == [("chat", True), ("parse", True)]
-            assert (
-                await db.execute(
-                    text(
-                        "SELECT memory_file, compacted_message_id, context_tokens, "
-                        "cache_warm_until FROM conversations"
-                    )
-                )
-            ).one() == (None, None, None, None)
-            # A turn written without a kind is a message turn, as the model would write it.
-            await db.execute(
-                text(
-                    "INSERT INTO chat_turns (id, user_id, conversation_id, message_id, status, "
-                    "locale, created_at) VALUES "
-                    "('33333333-3333-3333-3333-333333333333', 1, 1, 2, 'queued', 'en', now())"
-                )
-            )
-            assert (
-                await db.execute(
-                    text(
-                        "SELECT kind FROM chat_turns "
-                        "WHERE id = '33333333-3333-3333-3333-333333333333'"
-                    )
-                )
-            ).scalar() == "message"
-            index = (
-                await db.execute(
-                    text(
-                        "SELECT indexdef FROM pg_indexes "
-                        "WHERE indexname = 'ix_conversations_cache_warm_until'"
-                    )
-                )
-            ).scalar()
-            assert index is not None and "cache_warm_until IS NOT NULL" in index
-            await db.execute(
-                text(
-                    "UPDATE conversations SET compacted_message_id = 7, context_tokens = 120000, "
-                    "cache_warm_until = now(), memory_file = 'notes' WHERE id = 1"
-                )
-            )
-        _alembic(scratch_url, "downgrade", CHAT_TOOL_CALLS)
-        async with engine.begin() as db:
-            columns = {
-                (table, column)
-                for table, column in (
-                    await db.execute(
-                        text(
-                            "SELECT table_name, column_name FROM information_schema.columns "
-                            "WHERE table_name IN ('conversations', 'chat_turns', 'agent_settings')"
-                        )
-                    )
-                ).all()
-            }
-            assert not columns & {
-                ("conversations", "memory_file"),
-                ("conversations", "compacted_message_id"),
-                ("conversations", "context_tokens"),
-                ("conversations", "cache_warm_until"),
-                ("chat_turns", "kind"),
-                ("agent_settings", "idle_compact"),
-            }
-            assert (
-                await db.execute(
-                    text(
-                        "SELECT count(*) FROM pg_indexes "
-                        "WHERE indexname = 'ix_conversations_cache_warm_until'"
-                    )
-                )
-            ).scalar() == 0
-            assert await _count(db, "chat_turns") == 2
-            assert await _count(db, "conversations") == 1
-    finally:
-        await engine.dispose()
-
-
-REDEEM_CODES = "fa9aedf01cfd"
-OPERATOR_CONSOLE = "52a2cf52bf36"
-CONSOLE_TABLES = ("groups", "group_members", "audit_log")
-
-
-async def test_the_operator_console_migration_seeds_the_owner_group_and_touches_nothing(
-    scratch_url,
-) -> None:
-    """Over existing users and sessions, which it leaves as they are, it creates the three
-    tables and one row, the built-in group; one built-in group only; a deleted account
-    takes its memberships and leaves its records with `actor_id` NULL; the downgrade drops
-    the three tables (docs/database.md § Rules, docs/admin.md § Acceptance)."""
-    _alembic(scratch_url, "upgrade", REDEEM_CODES)
-    engine = create_async_engine(scratch_url)
-    try:
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, name, created_at) VALUES "
-                    "(1, 'sub-1', 'owner@example.com', 'Owner', now()), "
-                    "(2, 'sub-2', 'member@example.com', 'Member', now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO sessions (user_id, token_hash, created_at, expires_at) "
-                    "VALUES (1, 'hash', now() - interval '1 hour', now() + interval '1 day')"
-                )
-            )
-        _alembic(scratch_url, "upgrade", OPERATOR_CONSOLE)
-        async with engine.begin() as db:
-            seeded = (
-                await db.execute(
-                    text("SELECT id, name, permissions = '[]'::jsonb, builtin FROM groups")
-                )
-            ).all()
-            assert [tuple(row)[1:] for row in seeded] == [("owner", True, True)]
-            owner_group = seeded[0][0]
-            assert await _count(db, "group_members") == 0
-            assert await _count(db, "audit_log") == 0
-            assert await _count(db, "users") == 2
-            assert await _count(db, "sessions") == 1
-            index = (
-                await db.execute(
-                    text("SELECT indexdef FROM pg_indexes WHERE indexname = 'uq_groups_builtin'")
-                )
-            ).scalar()
-            assert index is not None and "UNIQUE" in index and "WHERE builtin" in index
-            await db.execute(
-                text(
-                    "INSERT INTO group_members (group_id, user_id, added_by, added_at) VALUES "
-                    "(:group, 1, 1, now()), (:group, 2, 1, now())"
-                ),
-                {"group": owner_group},
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO audit_log (actor_id, permission, action, target_type, "
-                    "target_id, before, after, ip, created_at) VALUES (1, 'groups.write', "
-                    "'groups.add_member', 'user', '2', NULL, :after, '127.0.0.1', now())"
-                ),
-                {"after": '{"group_id": 1, "group": "owner"}'},
-            )
-            # A group is not built in unless it says so.
-            await db.execute(
-                text(
-                    "INSERT INTO groups (name, permissions, created_at, updated_at) "
-                    "VALUES ('ops', '[\"audit.read\"]', now(), now())"
-                )
-            )
-        for statement in (
-            # A second built-in group, under any name.
-            "INSERT INTO groups (name, permissions, builtin, created_at, updated_at) "
-            "VALUES ('second', '[]', true, now(), now())",
-            # A taken name.
-            "INSERT INTO groups (name, permissions, created_at, updated_at) "
-            "VALUES ('ops', '[]', now(), now())",
-        ):
-            async with engine.connect() as db:
-                with pytest.raises(IntegrityError):
-                    await db.execute(text(statement))
-        async with engine.begin() as db:
-            # The account that added a member goes: its own membership with it, the one
-            # it added kept with added_by NULL, its record kept with actor_id NULL.
-            await db.execute(text("DELETE FROM users WHERE id = 1"))
-            members = (await db.execute(text("SELECT user_id, added_by FROM group_members"))).all()
-            assert [tuple(row) for row in members] == [(2, None)]
-            record = (await db.execute(text("SELECT actor_id, target_id FROM audit_log"))).one()
-            assert tuple(record) == (None, "2")
-            # A deleted group takes its memberships.
-            await db.execute(text("DELETE FROM groups WHERE id = :group"), {"group": owner_group})
-            assert await _count(db, "group_members") == 0
-        _alembic(scratch_url, "downgrade", REDEEM_CODES)
         async with engine.connect() as db:
-            names = {
-                row[0]
-                for row in await db.execute(
-                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+            assert (await db.execute(text(gone))).scalar_one() == 2
+            left = await db.execute(
+                text(
+                    "SELECT count(*) FROM jobs "
+                    "WHERE connection_id IS NOT NULL OR source_job_id IS NOT NULL"
                 )
-            }
-            assert await _count(db, "users") == 1
-        assert not names & set(CONSOLE_TABLES)
-        assert {"users", "sessions", "redeem_codes"} <= names
+            )
+            assert left.scalar_one() == 0
+            assert await _count(db, "jobs") == len(jobs)
     finally:
         await engine.dispose()
+    _alembic(scratch_url, "upgrade", "head")
 
 
-CONSOLE_GRANTS = "d632652e713f"
-
-
-async def test_the_console_grants_migration_widens_the_pack_source_and_keeps_every_pack(
-    scratch_url,
-) -> None:
-    """Over a bought and a redeemed pack, which it leaves as they are, the check on
-    `credit_packs.source` takes `grant` too and still nothing else; the downgrade refuses
-    while a granted pack exists, and narrows the check once none does (docs/database.md
-    § Rules, docs/admin.md § Acceptance)."""
-    _alembic(scratch_url, "upgrade", OPERATOR_CONSOLE)
+async def test_the_upgrade_revokes_every_grant_without_the_library(scratch_url) -> None:
+    """d10760d56782: a grant whose scope lacks `library` is revoked, and an unspent ticket
+    minted under one deleted, so nothing reaches the library it was not granted; a spent
+    ticket keeps reading its job, and the downgrade gives every ticket left the library
+    (docs/auth.md § 4, § 5)."""
+    _alembic(scratch_url, "upgrade", "185b2581586c")
     engine = create_async_engine(scratch_url)
-    pack = (
-        "INSERT INTO credit_packs (id, user_id, pack_id, credits, spent, status, "
-        "purchased_at, expires_at, version, source, created_at, updated_at) VALUES "
-        "(:id, 1, :pack, 5, 0, 'paid', now(), now() + interval '1 year', 0, :source, "
-        "now(), now())"
+    revoked_before = datetime(2026, 11, 2, tzinfo=UTC)
+    grant = (
+        "INSERT INTO oauth_grants (client_id, user_id, kind, token_hash, scope, expires_at, "
+        "revoked_at, created_at) VALUES ('c', :user, :kind, :hash, :scope, "
+        "now() + interval '1 day', :revoked, now())"
+    )
+    ticket = (
+        "INSERT INTO upload_tickets (user_id, token_hash, prefix, job_id, created_at, "
+        "expires_at, spent_at, library_access) VALUES (:user, :hash, 'srt_...x', :job, "
+        "now(), now() + interval '1 hour', :spent, :library)"
     )
     try:
         async with engine.begin() as db:
+            user = await _user(db, 1)
+            job_id = await _job(db, user)
             await db.execute(
                 text(
-                    "INSERT INTO users (id, google_sub, email, created_at) "
-                    "VALUES (1, 'sub-1', 'a@example.com', now())"
+                    "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, "
+                    "created_at) VALUES ('c', 'Claude', '[]'::jsonb, now())"
                 )
             )
-            await db.execute(text(pack), {"id": "pur_1", "pack": "credits", "source": "pay"})
-            await db.execute(text(pack), {"id": "redeem-1", "pack": "code", "source": "code"})
-        # Refused before the upgrade.
-        async with engine.connect() as db:
-            with pytest.raises(IntegrityError):
-                await db.execute(text(pack), {"id": "grant-a", "pack": "grant", "source": "grant"})
-        _alembic(scratch_url, "upgrade", CONSOLE_GRANTS)
-        async with engine.begin() as db:
-            rows = (await db.execute(text("SELECT id, source FROM credit_packs ORDER BY id"))).all()
-            assert [tuple(row) for row in rows] == [("pur_1", "pay"), ("redeem-1", "code")]
-            await db.execute(text(pack), {"id": "grant-a", "pack": "grant", "source": "grant"})
-        async with engine.connect() as db:
-            with pytest.raises(IntegrityError):
-                await db.execute(text(pack), {"id": "gift-a", "pack": "gift", "source": "gift"})
-
-        with pytest.raises(subprocess.CalledProcessError) as refused:
-            _alembic(scratch_url, "downgrade", OPERATOR_CONSOLE)
-        assert b"1 credit pack(s) were granted from the operator console" in refused.value.stderr
-        async with engine.begin() as db:
-            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
-            assert version == CONSOLE_GRANTS
-            assert await _count(db, "credit_packs") == 3
-            await db.execute(text("DELETE FROM credit_packs WHERE source = 'grant'"))
-        _alembic(scratch_url, "downgrade", OPERATOR_CONSOLE)
-        async with engine.connect() as db:
-            assert await _count(db, "credit_packs") == 2
-            with pytest.raises(IntegrityError):
-                await db.execute(text(pack), {"id": "grant-b", "pack": "grant", "source": "grant"})
-        _alembic(scratch_url, "upgrade", "head")
-    finally:
-        await engine.dispose()
-
-
-RUNTIME_SETTINGS = "acaa414338bb"
-
-
-async def test_the_runtime_settings_migration_adds_an_empty_table_and_touches_nothing(
-    scratch_url,
-) -> None:
-    """Over existing users, conversations and records, which it leaves as they are, it
-    creates `runtime_settings`, empty, and the index on `conversations.model`; a stored
-    setting keeps its text, key order included; deleting the account that stored it sets
-    `updated_by` NULL; the downgrade drops both (docs/database.md § Rules, docs/admin.md
-    § Acceptance)."""
-    _alembic(scratch_url, "upgrade", CONSOLE_GRANTS)
-    engine = create_async_engine(scratch_url)
-    try:
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, name, created_at) VALUES "
-                    "(1, 'sub-1', 'owner@example.com', 'Owner', now()), "
-                    "(2, 'sub-2', 'reader@example.com', 'Reader', now())"
-                )
-            )
-            document_id = (
+            for kind, scope, revoked in (
+                ("access", "parse", None),
+                ("refresh", "parse", None),
+                ("code", "", None),
+                ("refresh", "parse", revoked_before),
+                ("access", "parse library", None),
+                ("refresh", "parse library", None),
+                ("code", "library parse", None),
+            ):
                 await db.execute(
-                    text(
-                        "INSERT INTO documents (user_id, folder_id, job_id, kind, name, "
-                        "created_at, updated_at) VALUES (2, NULL, NULL, 'markdown', "
-                        "'notes.md', now(), now()) RETURNING id"
-                    )
+                    text(grant),
+                    {
+                        "user": user,
+                        "kind": kind,
+                        "hash": f"{kind}-{scope}-{revoked}",
+                        "scope": scope,
+                        "revoked": revoked,
+                    },
                 )
-            ).scalar_one()
-            await db.execute(
-                text(
-                    "INSERT INTO conversations (user_id, document_id, title, session, model, "
-                    "created_at, updated_at) VALUES (2, :document, 'Thread', 's', 'm', "
-                    "now(), now())"
-                ),
-                {"document": document_id},
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO audit_log (actor_id, permission, action, target_type, "
-                    "target_id, before, after, ip, created_at) VALUES (1, 'users.write', "
-                    "'users.grant_credits', 'user', '2', NULL, :after, NULL, now())"
-                ),
-                {"after": '{"credits": 5}'},
-            )
-        _alembic(scratch_url, "upgrade", RUNTIME_SETTINGS)
-        async with engine.begin() as db:
-            assert await _count(db, "runtime_settings") == 0
-            assert await _count(db, "users") == 2
-            assert await _count(db, "conversations") == 1
-            assert await _count(db, "audit_log") == 1
-            index = (
+            for name, job, spent, library in (
+                ("unspent-parse-only", None, None, False),
+                ("spent-parse-only", job_id, revoked_before, False),
+                ("unspent-library", None, None, True),
+            ):
                 await db.execute(
-                    text(
-                        "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_conversations_model'"
-                    )
+                    text(ticket),
+                    {"user": user, "hash": name, "job": job, "spent": spent, "library": library},
                 )
-            ).scalar()
-            assert index is not None and "(model)" in index
-            prices = '{"z-model": {"input": 1}, "a-model": {"input": 2}}'
-            await db.execute(
-                text(
-                    "INSERT INTO runtime_settings (key, value, updated_by, updated_at) "
-                    "VALUES ('MODEL_PRICES_JSON', to_jsonb(CAST(:value AS text)), 1, now())"
-                ),
-                {"value": prices},
-            )
-            stored = (
-                await db.execute(text("SELECT value #>> '{}' FROM runtime_settings"))
-            ).scalar_one()
-            assert stored == prices
-            await db.execute(text("DELETE FROM users WHERE id = 1"))
-            row = (await db.execute(text("SELECT key, updated_by FROM runtime_settings"))).one()
-            assert tuple(row) == ("MODEL_PRICES_JSON", None)
-        _alembic(scratch_url, "downgrade", CONSOLE_GRANTS)
+
+        _alembic(scratch_url, "upgrade", "d10760d56782")
         async with engine.connect() as db:
-            names = {
-                row[0]
-                for row in await db.execute(
-                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+            grants = {
+                (kind, scope, revoked_at is None, revoked_at == revoked_before)
+                for kind, scope, revoked_at in await db.execute(
+                    text("SELECT kind, scope, revoked_at FROM oauth_grants")
                 )
             }
-            index = (
-                await db.execute(
-                    text("SELECT 1 FROM pg_indexes WHERE indexname = 'ix_conversations_model'")
-                )
-            ).scalar()
-            assert await _count(db, "conversations") == 1
-        assert "runtime_settings" not in names and index is None
-        _alembic(scratch_url, "upgrade", "head")
+            tickets = set(
+                (await db.execute(text("SELECT token_hash FROM upload_tickets"))).scalars()
+            )
+        assert grants == {
+            ("access", "parse", False, False),
+            ("refresh", "parse", False, False),
+            ("code", "", False, False),
+            ("refresh", "parse", False, True),
+            ("access", "parse library", True, False),
+            ("refresh", "parse library", True, False),
+            ("code", "library parse", True, False),
+        }
+        assert tickets == {"spent-parse-only", "unspent-library"}
+
+        _alembic(scratch_url, "downgrade", "-1")
+        async with engine.connect() as db:
+            restored = (
+                await db.execute(text("SELECT token_hash, library_access FROM upload_tickets"))
+            ).all()
+        assert set(restored) == {("spent-parse-only", True), ("unspent-library", True)}
     finally:
         await engine.dispose()
 
 
-LIBRARY_ON_DATA_PLANE = "67f4dce0969f"
-RENAME_COMMAND = "62b2a3fa78bd"
-AGENTS_FILES = "5684b657e66e"
-
-
-async def test_the_rename_command_migration_renames_a_skill_named_rename(scratch_url) -> None:
-    """`/rename` becomes the composer's own: a skill named `rename` takes its reader's next
-    free `rename-N`, every other skill keeps its name, and the downgrade changes nothing
-    (docs/database.md)."""
-    _alembic(scratch_url, "upgrade", LIBRARY_ON_DATA_PLANE)
+async def test_a_code_pack_keeps_its_redemption_through_its_id(scratch_url) -> None:
+    """49f93a27d36f: `credit_packs.redemption_id` goes and every pack stays; the downgrade
+    gives each code pack `redeem-<n>` whose redemption still exists `redemption_id` n back,
+    and every other pack NULL, under the unique and the foreign key it had."""
+    _alembic(scratch_url, "upgrade", "8ca4f1915c14")
+    pack = (
+        "INSERT INTO credit_packs (id, user_id, pack_id, credits, status, purchased_at, "
+        "expires_at, source, redemption_id, created_at, updated_at) VALUES (:id, :user, "
+        ":pack, 10, 'paid', now(), now() + interval '1 day', :source, :redemption, now(), now())"
+    )
     engine = create_async_engine(scratch_url)
     try:
         async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, created_at) VALUES "
-                    "(1, 'sub-1', 'a@example.com', now()), (2, 'sub-2', 'b@example.com', now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
-                    "created_at, updated_at) VALUES "
-                    "(1, 'rename', '', '', 'x', now(), now()), "
-                    "(1, 'rename-2', '', '', 'y', now(), now()), "
-                    "(1, 'mine', '', '', 'w', now(), now()), "
-                    "(2, 'rename', '', '', 'z', now(), now())"
-                )
-            )
-        _alembic(scratch_url, "upgrade", RENAME_COMMAND)
-        expected = [
-            (1, "mine", "w"),
-            (1, "rename-3", "x"),
-            (1, "rename-2", "y"),
-            (2, "rename-2", "z"),
-        ]
-        async with engine.connect() as db:
-            names = (
-                await db.execute(text("SELECT user_id, name, body FROM skills ORDER BY body"))
-            ).all()
-            assert [tuple(row) for row in names] == expected
-        _alembic(scratch_url, "downgrade", LIBRARY_ON_DATA_PLANE)
-        async with engine.connect() as db:
-            names = (
-                await db.execute(text("SELECT user_id, name, body FROM skills ORDER BY body"))
-            ).all()
-            assert [tuple(row) for row in names] == expected
-        _alembic(scratch_url, "upgrade", "head")
-    finally:
-        await engine.dispose()
-
-
-async def test_the_agents_files_migration_adds_the_snapshot_and_reserves_init(scratch_url) -> None:
-    """`conversations.agents_file` arrives NULL on every row, and `/init` becomes the
-    composer's own: a skill named `init` takes its reader's next free `init-N`, every other
-    skill keeps its name; the downgrade drops the column and renames nothing back
-    (docs/database.md)."""
-    _alembic(scratch_url, "upgrade", RENAME_COMMAND)
-    engine = create_async_engine(scratch_url)
-    try:
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, created_at) VALUES "
-                    "(1, 'sub-1', 'a@example.com', now()), (2, 'sub-2', 'b@example.com', now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
-                    "created_at, updated_at) VALUES "
-                    "(1, 'init', '', '', 'x', now(), now()), "
-                    "(1, 'init-2', '', '', 'y', now(), now()), "
-                    "(1, 'mine', '', '', 'w', now(), now()), "
-                    "(2, 'init', '', '', 'z', now(), now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
-                    "updated_at) VALUES (1, 1, NULL, NULL, 'a.md', now(), now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
-                    "memory_file, created_at, updated_at) "
-                    "VALUES (1, 1, 1, 't', 's', 'notes', now(), now())"
-                )
-            )
-        _alembic(scratch_url, "upgrade", AGENTS_FILES)
-        expected = [
-            (1, "mine", "w"),
-            (1, "init-3", "x"),
-            (1, "init-2", "y"),
-            (2, "init-2", "z"),
-        ]
-        async with engine.connect() as db:
-            names = (
-                await db.execute(text("SELECT user_id, name, body FROM skills ORDER BY body"))
-            ).all()
-            assert [tuple(row) for row in names] == expected
-            row = (
-                await db.execute(text("SELECT memory_file, agents_file FROM conversations"))
-            ).one()
-            assert tuple(row) == ("notes", None)
-        _alembic(scratch_url, "downgrade", RENAME_COMMAND)
-        async with engine.connect() as db:
-            names = (
-                await db.execute(text("SELECT user_id, name, body FROM skills ORDER BY body"))
-            ).all()
-            assert [tuple(row) for row in names] == expected
-            columns = {
-                column
-                for (column,) in (
+            user = await _user(db, 1)
+            redemptions = {}
+            for code in ("KEPT", "GONE"):
+                code_id = (
                     await db.execute(
                         text(
-                            "SELECT column_name FROM information_schema.columns "
-                            "WHERE table_name = 'conversations'"
-                        )
+                            "INSERT INTO redeem_codes (code, kind, credits, valid_days, "
+                            "created_at) VALUES (:code, 'credits', 10, 30, now()) RETURNING id"
+                        ),
+                        {"code": code},
                     )
-                ).all()
-            }
-            assert "agents_file" not in columns and "memory_file" in columns
-        _alembic(scratch_url, "upgrade", "head")
-    finally:
-        await engine.dispose()
-
-
-TICKET_FILING = "cfeffbf0a598"
-
-
-async def test_the_ticket_filing_migration_reads_every_ticket_as_one_that_files_nothing(
-    scratch_url,
-) -> None:
-    """An existing ticket files nothing and reaches no Files document; a folder deleted
-    for good leaves a ticket aimed at it filing at the top level (docs/database.md
-    § Rules, the ticket filing migration)."""
-    _alembic(scratch_url, "upgrade", AGENTS_FILES)
-    engine = create_async_engine(scratch_url)
-    try:
-        async with engine.begin() as db:
-            user_id = (
-                await db.execute(
-                    text(
-                        "INSERT INTO users (google_sub, email, created_at) "
-                        "VALUES ('sub', 'a@example.com', now()) RETURNING id"
-                    )
-                )
-            ).scalar_one()
-            await db.execute(
-                text(
-                    "INSERT INTO upload_tickets (user_id, token_hash, prefix, created_at, "
-                    "expires_at) VALUES (:user, 'h', 'srt_...abcd', now(), now())"
-                ),
-                {"user": user_id},
-            )
-        _alembic(scratch_url, "upgrade", TICKET_FILING)
-        async with engine.begin() as db:
-            row = (
-                await db.execute(
-                    text("SELECT library_access, into_library, folder_id FROM upload_tickets")
-                )
-            ).one()
-            assert tuple(row) == (False, False, None)
-            folder_id = (
-                await db.execute(
-                    text(
-                        "INSERT INTO folders (user_id, name, created_at, updated_at) "
-                        "VALUES (:user, 'Papers', now(), now()) RETURNING id"
-                    ),
-                    {"user": user_id},
-                )
-            ).scalar_one()
-            await db.execute(
-                text(
-                    "UPDATE upload_tickets SET library_access = true, into_library = true, "
-                    "folder_id = :folder"
-                ),
-                {"folder": folder_id},
-            )
-        async with engine.begin() as db:
-            await db.execute(text("DELETE FROM folders"))
-        async with engine.connect() as db:
-            row = (
-                await db.execute(text("SELECT into_library, folder_id FROM upload_tickets"))
-            ).one()
-            assert tuple(row) == (True, None)
-        _alembic(scratch_url, "downgrade", AGENTS_FILES)
-        async with engine.connect() as db:
-            columns = {
-                column
-                for (column,) in (
+                ).scalar_one()
+                redemptions[code] = (
                     await db.execute(
                         text(
-                            "SELECT column_name FROM information_schema.columns "
-                            "WHERE table_name = 'upload_tickets'"
-                        )
+                            "INSERT INTO redemptions (code_id, user_id, kind, credits, "
+                            "redeemed_at) VALUES (:code, :user, 'credits', 10, now()) "
+                            "RETURNING id"
+                        ),
+                        {"code": code_id, "user": user},
                     )
-                ).all()
-            }
-            assert columns.isdisjoint({"library_access", "into_library", "folder_id"})
-            assert (await db.execute(text("SELECT count(*) FROM upload_tickets"))).scalar_one() == 1
-        _alembic(scratch_url, "upgrade", "head")
+                ).scalar_one()
+            for redemption in redemptions.values():
+                await db.execute(
+                    text(pack),
+                    {
+                        "id": f"redeem-{redemption}",
+                        "user": user,
+                        "pack": "code",
+                        "source": "code",
+                        "redemption": redemption,
+                    },
+                )
+            await db.execute(
+                text(pack),
+                {"id": "pur_1", "user": user, "pack": "p", "source": "pay", "redemption": None},
+            )
+            # A code deleted by hand takes its redemption with it; its pack keeps NULL.
+            await db.execute(text("DELETE FROM redeem_codes WHERE code = 'GONE'"))
     finally:
         await engine.dispose()
 
-
-LIBRARY_CONVERSATIONS = "4449f68533c0"
-
-
-async def test_the_library_conversations_migration_keeps_every_document_and_refuses_to_downgrade(
-    scratch_url,
-) -> None:
-    """Every existing conversation keeps its document; after the upgrade a conversation may
-    have none — a library conversation — and the downgrade refuses while one exists rather
-    than delete it with its messages (docs/database.md § Rules)."""
-    _alembic(scratch_url, "upgrade", TICKET_FILING)
+    column = (
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_name = 'credit_packs' AND column_name = 'redemption_id'"
+    )
+    _alembic(scratch_url, "upgrade", "head")
     engine = create_async_engine(scratch_url)
     try:
-        async with engine.begin() as db:
-            await db.execute(
-                text(
-                    "INSERT INTO users (id, google_sub, email, created_at) "
-                    "VALUES (1, 'sub', 't@example.com', now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
-                    "updated_at) VALUES (1, 1, NULL, NULL, 'a.md', now(), now())"
-                )
-            )
-            await db.execute(
-                text(
-                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
-                    "created_at, updated_at) VALUES (1, 1, 1, 't', 's', now(), now())"
-                )
-            )
-        _alembic(scratch_url, "upgrade", LIBRARY_CONVERSATIONS)
-        async with engine.begin() as db:
-            kept = (await db.execute(text("SELECT document_id FROM conversations"))).scalars()
-            assert list(kept) == [1]
-            await db.execute(
-                text(
-                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
-                    "created_at, updated_at) VALUES (2, 1, NULL, '', 'l', now(), now())"
-                )
-            )
-            # Deleting the document takes its own conversation, never the library's.
-            await db.execute(text("DELETE FROM documents"))
-            left = (await db.execute(text("SELECT id FROM conversations"))).scalars()
-            assert list(left) == [2]
-
-        with pytest.raises(subprocess.CalledProcessError) as refused:
-            _alembic(scratch_url, "downgrade", TICKET_FILING)
-        assert b"1 library conversation(s) have no document" in refused.value.stderr
-        async with engine.begin() as db:
-            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
-            assert version == LIBRARY_CONVERSATIONS
-            await db.execute(text("DELETE FROM conversations"))
-
-        _alembic(scratch_url, "downgrade", TICKET_FILING)
-        _alembic(scratch_url, "upgrade", "head")
+        async with engine.connect() as db:
+            assert (await db.execute(text(column))).scalar_one() == 0
+            ids = set((await db.execute(text("SELECT id FROM credit_packs"))).scalars())
+            assert ids == {f"redeem-{n}" for n in redemptions.values()} | {"pur_1"}
     finally:
         await engine.dispose()
+
+    _alembic(scratch_url, "downgrade", "8ca4f1915c14")
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as db:
+            rows = await db.execute(text("SELECT id, redemption_id FROM credit_packs"))
+            assert dict(rows.all()) == {
+                f"redeem-{redemptions['KEPT']}": redemptions["KEPT"],
+                f"redeem-{redemptions['GONE']}": None,
+                "pur_1": None,
+            }
+            constraints = await db.execute(
+                text(
+                    "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+                    "WHERE conrelid = 'credit_packs'::regclass AND conname IN "
+                    "('uq_credit_packs_redemption_id', 'fk_credit_packs_redemption_id')"
+                )
+            )
+            assert dict(constraints.all()) == {
+                "uq_credit_packs_redemption_id": "UNIQUE (redemption_id)",
+                "fk_credit_packs_redemption_id": (
+                    "FOREIGN KEY (redemption_id) REFERENCES redemptions(id) ON DELETE SET NULL"
+                ),
+            }
+    finally:
+        await engine.dispose()
+    _alembic(scratch_url, "upgrade", "head")

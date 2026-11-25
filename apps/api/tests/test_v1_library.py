@@ -1,5 +1,5 @@
 """The library on the data plane and the connector's library tools (docs/api.md § The library
-on the data plane, docs/mcp.md § The library tools, docs/auth.md § 4 and § 7).
+on the data plane, docs/mcp.md § The library tools, docs/auth.md § 4 and § 6).
 
 No upstream traffic: every document is seeded in the database and its workspace, so nothing
 here parses (docs/testing.md § Cost safety).
@@ -20,18 +20,25 @@ from sightread.db.models import (
     Document,
     DocumentTicket,
     Folder,
-    Job,
-    OAuthGrant,
     Result,
     User,
     utcnow,
 )
 from sightread.parsing.figures import crop_path
-from sightread.workspace.layout import sources_dir, user_root
-from tests.conftest import CSRF_HEADERS, mcp_running
-from tests.test_mcp import _mcp_session, _payload
-from tests.test_oauth_as import CHALLENGE, REDIRECT_URI, VERIFIER, _authorize, _register, _token
-from tests.test_parse_end_to_end import _authorize as _with_api_key
+from sightread.workspace import git
+from sightread.workspace.layout import sources_dir
+from tests.conftest import CSRF_HEADERS, api_key_client, mcp_running
+from tests.connector_helpers import (
+    CHALLENGE,
+    REDIRECT_URI,
+    mcp_session,
+    oauth_connected,
+    register_client,
+    tool_payload,
+)
+from tests.factories import job_row, user_row
+from tests.helpers import bearer
+from tests.library_helpers import new_document
 
 FIGURE = "![fig1](sightread://p1/100,200,300,400)"
 MARKDOWN = f"<!-- page: 1 -->\n# Attention\n\nBody text.\n\n{FIGURE}\nFigure 1: the model.\n"
@@ -39,12 +46,9 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"crop"
 
 
 @pytest.fixture
-async def reader(make_client, sessionmaker, tmp_path) -> AsyncClient:
+async def reader(make_client) -> AsyncClient:
     """A signed-in account holding an API key, with a workspace of its own."""
-    client = await _with_api_key(make_client(workspaces_dir=str(tmp_path / "ws")), sessionmaker)
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
+    return await api_key_client(make_client())
 
 
 async def _seed_parse(client: AsyncClient, user_id: int, name: str = "paper.pdf") -> int:
@@ -56,21 +60,7 @@ async def _seed_parse(client: AsyncClient, user_id: int, name: str = "paper.pdf"
         year = Folder(user_id=user_id, parent_id=papers.id, name="2024")
         db.add(year)
         await db.flush()
-        job = Job(
-            id=uuid.uuid4(),
-            user_id=user_id,
-            agent="parse",
-            kind="pdf",
-            filename=name,
-            media_type="application/pdf",
-            size_bytes=10,
-            sha256="c" * 64,
-            model="vendor/vision-model",
-            bbox_format="yxyx_norm1000",
-            status="succeeded",
-            page_count=1,
-            finished_at=utcnow(),
-        )
+        job = job_row(user_id, filename=name, size_bytes=10, sha256="c" * 64, finished_at=utcnow())
         db.add(job)
         await db.flush()
         db.add(Result(job_id=job.id, markdown=MARKDOWN, pages=[], figures=[], errors=[], meta={}))
@@ -86,17 +76,9 @@ async def _seed_parse(client: AsyncClient, user_id: int, name: str = "paper.pdf"
 
 
 async def _new_markdown(client: AsyncClient, name: str, folder_id: int | None = None) -> int:
-    made = await client.post(
-        "/api/library/documents/new",
-        json={"name": name, "folder_id": folder_id},
-        headers=CSRF_HEADERS,
-    )
+    made = await new_document(client, name, folder_id)
     assert made.status_code == 201, made.text
     return made.json()["id"]
-
-
-def _bearer(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
 
 
 async def _mint(client: AsyncClient, document_id: int, scope: str) -> str:
@@ -152,7 +134,7 @@ async def test_the_library_lists_live_rows_with_their_paths(reader: AsyncClient)
 
 async def test_another_accounts_document_is_not_found(reader: AsyncClient) -> None:
     async with reader.app.state.sessionmaker() as db:
-        other = User(google_sub="other", email="other@example.com")
+        other = user_row("other@example.com")
         db.add(other)
         await db.commit()
         other_id = other.id
@@ -217,9 +199,9 @@ async def test_a_save_needs_the_etag_it_was_edited_from(reader: AsyncClient) -> 
     )
     assert again.status_code == 200, again.text
 
-    history = (await reader.get(f"/api/library/documents/{draft}/revisions")).json()["revisions"]
-    assert [entry["author"] for entry in history[:2]] == ["api", "api"]
-    assert history[0]["message"] == "edit files/Draft.md/doc.md"
+    history = git.log(reader.root, Path("files/Draft.md"))
+    assert [entry.author for entry in history[:2]] == ["api", "api"]
+    assert history[0].message == "edit files/Draft.md/doc.md"
 
 
 async def test_notes_save_the_same_way(reader: AsyncClient) -> None:
@@ -233,12 +215,8 @@ async def test_notes_save_the_same_way(reader: AsyncClient) -> None:
     assert content["notes_revision"] == saved.json()["revision"]
 
 
-async def test_a_save_past_the_cap_or_not_utf8_is_refused(
-    make_client, sessionmaker, tmp_path
-) -> None:
-    client = await _with_api_key(
-        make_client(workspaces_dir=str(tmp_path / "ws"), content_max_bytes=64), sessionmaker
-    )
+async def test_a_save_past_the_cap_or_not_utf8_is_refused(make_client) -> None:
+    client = await api_key_client(make_client(content_max_bytes=64))
     draft = await _new_markdown(client, "Draft")
     url = f"/v1/library/documents/{draft}/doc.md"
     etag = (await client.get(url)).headers["etag"]
@@ -282,23 +260,23 @@ async def test_a_document_ticket_reaches_its_own_document_and_nothing_else(
     assert token.startswith("srd_")
 
     for path in ("", "/doc.md", "/notes.md", "/figures/1/100,200,300,400"):
-        answer = await reader.get(f"/v1/library/documents/{paper}{path}", headers=_bearer(token))
+        answer = await reader.get(f"/v1/library/documents/{paper}{path}", headers=bearer(token))
         assert answer.status_code == 200, (path, answer.text)
 
-    other = await reader.get(f"/v1/library/documents/{draft}/doc.md", headers=_bearer(token))
+    other = await reader.get(f"/v1/library/documents/{draft}/doc.md", headers=bearer(token))
     assert other.status_code == 401
     assert other.json()["error"]["message"] == document_tickets.REJECTION_MESSAGE
-    assert (await reader.get("/v1/library", headers=_bearer(token))).status_code == 401
-    assert (await reader.get(f"/v1/jobs/{uuid.uuid4()}", headers=_bearer(token))).status_code == 401
-    assert (await reader.get("/v1/models", headers=_bearer(token))).status_code == 401
+    assert (await reader.get("/v1/library", headers=bearer(token))).status_code == 401
+    assert (await reader.get(f"/v1/jobs/{uuid.uuid4()}", headers=bearer(token))).status_code == 401
+    assert (await reader.get("/v1/models", headers=bearer(token))).status_code == 401
     assert (
-        await reader.post("/v1/parse", files={"file": ("a.pdf", b"%PDF")}, headers=_bearer(token))
+        await reader.post("/v1/parse", files={"file": ("a.pdf", b"%PDF")}, headers=bearer(token))
     ).status_code == 401
     async with mcp_running(reader):
         mcp = await reader.post(
             "/mcp",
             headers={
-                **_bearer(token),
+                **bearer(token),
                 "Accept": "application/json, text/event-stream",
                 "Content-Type": "application/json",
             },
@@ -313,14 +291,14 @@ async def test_only_a_write_ticket_saves(reader: AsyncClient) -> None:
     etag = (await reader.get(url)).headers["etag"]
 
     read = await _mint(reader, draft, document_tickets.READ)
-    refused = await reader.put(url, content=b"# no\n", headers={**_bearer(read), "If-Match": etag})
+    refused = await reader.put(url, content=b"# no\n", headers={**bearer(read), "If-Match": etag})
     assert refused.status_code == 401
     write = await _mint(reader, draft, document_tickets.WRITE)
-    saved = await reader.put(url, content=b"# yes\n", headers={**_bearer(write), "If-Match": etag})
+    saved = await reader.put(url, content=b"# yes\n", headers={**bearer(write), "If-Match": etag})
     assert saved.status_code == 200, saved.text
     # Not spent by use: the same ticket saves again on the new ETag.
     again = await reader.put(
-        url, content=b"# yes again\n", headers={**_bearer(write), "If-Match": saved.headers["etag"]}
+        url, content=b"# yes again\n", headers={**bearer(write), "If-Match": saved.headers["etag"]}
     )
     assert again.status_code == 200, again.text
 
@@ -331,47 +309,31 @@ async def test_an_expired_ticket_and_a_trashed_document_are_refused(reader: Asyn
     assert (
         await reader.post(f"/api/library/documents/{draft}/trash", headers=CSRF_HEADERS)
     ).status_code == 200
-    gone = await reader.get(f"/v1/library/documents/{draft}/doc.md", headers=_bearer(token))
+    gone = await reader.get(f"/v1/library/documents/{draft}/doc.md", headers=bearer(token))
     assert gone.status_code == 404
 
     async with reader.app.state.sessionmaker() as db:
         await db.execute(update(DocumentTicket).values(expires_at=utcnow() - timedelta(seconds=1)))
         await db.commit()
-    expired = await reader.get(f"/v1/library/documents/{draft}", headers=_bearer(token))
+    expired = await reader.get(f"/v1/library/documents/{draft}", headers=bearer(token))
     assert expired.status_code == 401
 
 
 # --- OAuth scopes ---------------------------------------------------------------------------
 
 
-async def _connected(client: AsyncClient) -> tuple[str, dict]:
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    client_id = (await _register(client)).json()["client_id"]
-    code = await _authorize(client, client_id)
-    tokens = await _token(
-        client,
-        grant_type="authorization_code",
-        code=code,
-        code_verifier=VERIFIER,
-        client_id=client_id,
-        redirect_uri=REDIRECT_URI,
-    )
-    assert tokens.status_code == 200, tokens.text
-    return client_id, tokens.json()
-
-
-async def test_a_new_grant_reaches_the_library(make_client, tmp_path) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    _, tokens = await _connected(client)
+async def test_a_new_grant_reaches_the_library(make_client) -> None:
+    client = make_client()
+    _, tokens = await oauth_connected(client)
     assert tokens["scope"] == "parse library"
-    listed = await client.get("/v1/library", headers=_bearer(tokens["access_token"]))
+    listed = await client.get("/v1/library", headers=bearer(tokens["access_token"]))
     assert listed.status_code == 200, listed.text
 
     consent = await client.get(
         "/oauth/authorize",
         params={
             "response_type": "code",
-            "client_id": (await _register(client)).json()["client_id"],
+            "client_id": (await register_client(client)).json()["client_id"],
             "redirect_uri": REDIRECT_URI,
             "code_challenge": CHALLENGE,
             "code_challenge_method": "S256",
@@ -382,58 +344,18 @@ async def test_a_new_grant_reaches_the_library(make_client, tmp_path) -> None:
     assert metadata["scopes_supported"] == ["parse", "library"]
 
 
-async def test_a_grant_from_before_the_library_scope_is_told_to_reconnect(
-    make_client, tmp_path
-) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    client_id, tokens = await _connected(client)
-    async with client.app.state.sessionmaker() as db:
-        await db.execute(update(OAuthGrant).values(scope="parse"))
-        await db.commit()
-
-    refused = await client.get("/v1/library", headers=_bearer(tokens["access_token"]))
-    assert refused.status_code == 403
-    assert "remove it in Claude's settings and add it again" in refused.json()["error"]["message"]
-    # Its parse rights stand: an unknown job is still a 404 to it, not a 401.
-    job = await client.get(f"/v1/jobs/{uuid.uuid4()}", headers=_bearer(tokens["access_token"]))
-    assert job.status_code == 404
-
-    async with mcp_running(client), _mcp_session(client, tokens["access_token"]) as session:
-        result = await session.call_tool("list_library", {})
-        parse = await session.call_tool("parse", {})
-    assert result.is_error is True
-    assert "add it again" in result.content[0].text
-    assert parse.is_error is False
-
-    # A refresh keeps the scope of the grant it rotates: never widened without consent.
-    refreshed = await _token(
-        client,
-        grant_type="refresh_token",
-        refresh_token=tokens["refresh_token"],
-        client_id=client_id,
-    )
-    assert refreshed.status_code == 200, refreshed.text
-    assert refreshed.json()["scope"] == "parse"
-    still = await client.get("/v1/library", headers=_bearer(refreshed.json()["access_token"]))
-    assert still.status_code == 403
-
-
 # --- the connector's tools --------------------------------------------------------------------
 
 
-async def test_list_library_filters_by_folder_and_name(make_client, sessionmaker, tmp_path) -> None:
-    client = await _with_api_key(
-        make_client(workspaces_dir=str(tmp_path / "ws"), mcp_library_list_max_items=1),
-        sessionmaker,
-    )
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
+async def test_list_library_filters_by_folder_and_name(make_client) -> None:
+    client = await api_key_client(make_client(mcp_library_list_max_items=1))
     paper = await _seed_parse(client, client.user_id)
     await _new_markdown(client, "Draft")
     await _new_markdown(client, "Another draft")
 
-    async with mcp_running(client), _mcp_session(client) as session:
-        everything = _payload(await session.call_tool("list_library", {}))
-        papers = _payload(await session.call_tool("list_library", {"folder": "Papers"}))
+    async with mcp_running(client), mcp_session(client) as session:
+        everything = tool_payload(await session.call_tool("list_library", {}))
+        papers = tool_payload(await session.call_tool("list_library", {"folder": "Papers"}))
         drafts = await session.call_tool("list_library", {"name": "DRAFT"})
         missing = await session.call_tool("list_library", {"folder": "Nowhere"})
 
@@ -450,7 +372,7 @@ async def test_list_library_filters_by_folder_and_name(make_client, sessionmaker
         }
     ]
     assert [entry["path"] for entry in papers["folders"]] == ["Papers", "Papers/2024"]
-    assert _payload(drafts)["total"] == 2
+    assert tool_payload(drafts)["total"] == 2
     assert missing.is_error is True
     assert "call list_library without `folder`" in missing.content[0].text
 
@@ -464,10 +386,10 @@ async def test_read_and_write_document_mint_tickets_for_their_commands(reader: A
     )
     file_id = kept.json()["id"]
 
-    async with mcp_running(reader), _mcp_session(reader) as session:
-        read = _payload(await session.call_tool("read_document", {"document_id": paper}))
-        write = _payload(await session.call_tool("write_document", {"document_id": paper}))
-        file_read = _payload(await session.call_tool("read_document", {"document_id": file_id}))
+    async with mcp_running(reader), mcp_session(reader) as session:
+        read = tool_payload(await session.call_tool("read_document", {"document_id": paper}))
+        write = tool_payload(await session.call_tool("write_document", {"document_id": paper}))
+        file_read = tool_payload(await session.call_tool("read_document", {"document_id": file_id}))
         file_write = await session.call_tool("write_document", {"document_id": file_id})
         unknown = await session.call_tool("read_document", {"document_id": 999_999})
 
@@ -494,15 +416,10 @@ async def test_read_and_write_document_mint_tickets_for_their_commands(reader: A
     assert unknown.is_error is True
 
 
-async def test_the_document_ticket_mint_rate_is_its_own(
-    make_client, sessionmaker, tmp_path
-) -> None:
-    client = await _with_api_key(
-        make_client(workspaces_dir=str(tmp_path / "ws"), document_ticket_rate_per_hour=1),
-        sessionmaker,
-    )
+async def test_the_document_ticket_mint_rate_is_its_own(make_client) -> None:
+    client = await api_key_client(make_client(document_ticket_rate_per_hour=1))
     draft = await _new_markdown(client, "Draft")
-    async with mcp_running(client), _mcp_session(client) as session:
+    async with mcp_running(client), mcp_session(client) as session:
         first = await session.call_tool("read_document", {"document_id": draft})
         second = await session.call_tool("read_document", {"document_id": draft})
         parse = await session.call_tool("parse", {})
@@ -522,10 +439,10 @@ async def test_every_name_a_command_writes_is_one_plain_shell_word(reader: Async
     sources.mkdir(parents=True, exist_ok=True)
     (sources / f"{paper}.$(touch x)").write_bytes(b"%PDF")
 
-    async with mcp_running(reader), _mcp_session(reader) as session:
-        read = _payload(await session.call_tool("read_document", {"document_id": paper}))
-        up = _payload(await session.call_tool("read_document", {"document_id": dots}))
-        option = _payload(await session.call_tool("write_document", {"document_id": dash}))
+    async with mcp_running(reader), mcp_session(reader) as session:
+        read = tool_payload(await session.call_tool("read_document", {"document_id": paper}))
+        up = tool_payload(await session.call_tool("read_document", {"document_id": dots}))
+        option = tool_payload(await session.call_tool("write_document", {"document_id": dash}))
 
     assert read["original"].endswith("""-o "$d"/'source.$(touch x)'""")
     assert up["download"].startswith("d=_...md; ")

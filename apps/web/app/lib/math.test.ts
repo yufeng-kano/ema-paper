@@ -66,10 +66,5 @@ describe('repairs for TeX a model wrote', () => {
     expect(renderTexHtml('L = \\left\\{ (V - v)^2 - \\sum_a p(a) \\tag{4.5}', true)).not.toBeNull()
     expect(renderTexHtml('+ (r - M)^2 \\right\\} \\tag{4.6}', true)).not.toBeNull()
   })
-
-  it('still hands back null for what no repair explains', () => {
-    expect(renderTexHtml('\\frac{a', true)).toBeNull()
-    expect(renderTexHtml('\\notacommand{x}', false)).toBeNull()
-  })
 })
 

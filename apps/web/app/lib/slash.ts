@@ -17,7 +17,7 @@ export interface SlashSkill {
  *  uploaded, only where the editor can insert one. */
 export type SlashConversion = BlockKindName | 'table' | 'image'
 
-export interface SlashItem {
+interface SlashItem {
   key: SlashConversion
   icon: IconName
   /** The markdown it stands for, drawn in mono where a shortcut sits; empty for a paragraph. */

@@ -19,7 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ..agents import CHAT
 from ..agents import memory as memory_defs
 from ..config import Settings
-from ..db.models import AgentSetting, Conversation, Memory, User, utcnow
+from ..db.models import AgentSetting, Conversation, Memory, utcnow
+from ..workspace.trash import lock_user
 from .chat_tools import ToolOutcome
 
 PAUSED = "Memory is paused: the user turned it off. Nothing was saved or changed; go on without it."
@@ -54,22 +55,21 @@ def first_turn_selection(rows: Sequence[Memory], settings: Settings) -> list[Mem
 
 
 async def snapshot_rows(
-    db: AsyncSession, user_id: int, document_id: int | None, ids: Sequence[object]
+    db: AsyncSession, user_id: int, document_id: int | None, ids: Sequence[int]
 ) -> list[Memory]:
     """The snapshot's memories as they are now, in its order: one the reader deleted is
     gone, and one whose scope no longer takes in this document is dropped."""
-    wanted = [value for value in ids if isinstance(value, int) and not isinstance(value, bool)]
-    if not wanted:
+    if not ids:
         return []
     rows = {
         row.id: row
         for row in (
-            await db.execute(select(Memory).where(Memory.user_id == user_id, Memory.id.in_(wanted)))
+            await db.execute(select(Memory).where(Memory.user_id == user_id, Memory.id.in_(ids)))
         ).scalars()
     }
     return [
         rows[memory_id]
-        for memory_id in wanted
+        for memory_id in ids
         if memory_id in rows and rows[memory_id].document_id in (None, document_id)
     ]
 
@@ -184,7 +184,7 @@ async def run_memory_tool(
     async with sessionmaker() as db:
         # The reader's row, held until the commit: the count below must not race another
         # conversation's save past the cap (docs/chat.md § Memory).
-        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+        await lock_user(db, user_id)
         paused = (
             await db.execute(
                 select(AgentSetting.memory_paused).where(

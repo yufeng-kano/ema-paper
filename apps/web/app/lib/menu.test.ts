@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { heightAbove, openSide, placeMenu, placeSubmenu } from './menu'
+import { heightAbove, openSide, placeCard, placeMenu, placeSubmenu } from './menu'
 
 const viewport = { width: 1000, height: 800 }
 const menu = { width: 200, height: 300 }
@@ -21,13 +21,13 @@ describe('placeMenu', () => {
 
   it('ends a menu asked for above at the point, even where it would fit below', () => {
     // A control at 500 with 300 to spare under it: the menu still ends at its top.
-    expect(placeMenu({ x: 120, y: 500 }, menu, viewport, { above: true })).toEqual({ x: 120, y: 200 })
+    expect(placeMenu({ x: 120, y: 500 }, menu, viewport, true)).toEqual({ x: 120, y: 200 })
   })
 
   it('opens a menu asked for above under the point when there is no room over it', () => {
-    expect(placeMenu({ x: 120, y: 200 }, menu, viewport, { above: true })).toEqual({ x: 120, y: 200 })
+    expect(placeMenu({ x: 120, y: 200 }, menu, viewport, true)).toEqual({ x: 120, y: 200 })
     // No room on either side: the near edge, as for any menu.
-    expect(placeMenu({ x: 5, y: 100 }, menu, { width: 150, height: 150 }, { above: true })).toEqual({ x: 8, y: 8 })
+    expect(placeMenu({ x: 5, y: 100 }, menu, { width: 150, height: 150 }, true)).toEqual({ x: 8, y: 8 })
   })
 
   it('holds a long menu asked for above to the room over the point, so it never covers it', () => {
@@ -35,7 +35,7 @@ describe('placeMenu', () => {
     const room = heightAbove({ x: 900, y: 761 })
     expect(room).toBe(753)
     const held = { width: 280, height: Math.min(784, room!) }
-    expect(placeMenu({ x: 900, y: 761 }, held, viewport, { above: true }).y + held.height).toBe(761)
+    expect(placeMenu({ x: 900, y: 761 }, held, viewport, true).y + held.height).toBe(761)
     // Too little room over the point: no cap, and the menu opens as any other.
     expect(heightAbove({ x: 900, y: 100 })).toBeNull()
   })
@@ -93,5 +93,47 @@ describe('placeSubmenu', () => {
 
   it('stays inside the viewport vertically', () => {
     expect(placeSubmenu({ ...row, top: 700, bottom: 730 }, parent, sub, viewport)).toEqual({ x: 304, y: 532 })
+  })
+})
+
+describe('placeCard', () => {
+  const card = { width: 300, height: 200 }
+  const above = { prefer: 'above' } as const
+  const below = { prefer: 'below' } as const
+
+  it('opens over a control where it prefers that side and fits', () => {
+    expect(placeCard({ left: 100, top: 500, bottom: 520 }, card, viewport, above)).toEqual({ x: 100, y: 294 })
+    // Exactly the room: 214 - 6 - 8 = 200.
+    expect(placeCard({ left: 100, top: 214, bottom: 234 }, card, viewport, above)).toEqual({ x: 100, y: 8 })
+  })
+
+  it('opens under a control it prefers to stand over when there is no room over it', () => {
+    expect(placeCard({ left: 100, top: 150, bottom: 170 }, card, viewport, above)).toEqual({ x: 100, y: 176 })
+  })
+
+  it('opens under a control where it prefers that side and fits', () => {
+    // Room over it too: the preferred side wins.
+    expect(placeCard({ left: 100, top: 400, bottom: 420 }, card, viewport, below)).toEqual({ x: 100, y: 426 })
+  })
+
+  it('opens over a control it prefers to hang under when only the room over it is enough', () => {
+    expect(placeCard({ left: 100, top: 700, bottom: 720 }, card, viewport, below)).toEqual({ x: 100, y: 494 })
+  })
+
+  it('opens under, moved up inside the window, when neither side has room', () => {
+    const short = { width: 1000, height: 300 }
+    // 300 - 8 - 200 = 92: up from 126, as far as the window's bottom margin needs.
+    expect(placeCard({ left: 100, top: 100, bottom: 120 }, card, short, above)).toEqual({ x: 100, y: 92 })
+    expect(placeCard({ left: 100, top: 100, bottom: 120 }, card, short, below)).toEqual({ x: 100, y: 92 })
+    // A window shorter than the card: the top margin wins.
+    expect(placeCard({ left: 100, top: 50, bottom: 70 }, card, { width: 1000, height: 150 }, below)).toEqual({
+      x: 100,
+      y: 8,
+    })
+  })
+
+  it('keeps its left edge inside the window', () => {
+    expect(placeCard({ left: 900, top: 500, bottom: 520 }, card, viewport, above)).toEqual({ x: 692, y: 294 })
+    expect(placeCard({ left: 2, top: 100, bottom: 120 }, card, viewport, below)).toEqual({ x: 8, y: 126 })
   })
 })

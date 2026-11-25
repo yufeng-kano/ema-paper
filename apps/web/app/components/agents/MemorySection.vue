@@ -11,6 +11,7 @@
  * an answer that comes back after *Clear all memories* is dropped rather than bringing back
  * a row the reader just cleared.
  */
+import { charLength } from '~/lib/agents'
 import {
   MEMORY_KINDS,
   clearMemories,
@@ -129,16 +130,15 @@ function meta(memory: Memory): string {
 
 /** The click being saved; the stored value otherwise. Put back when the save fails. */
 const autoChoice = ref<boolean | null>(null)
-const autoOn = computed(() => autoChoice.value ?? props.agent.settings.memory_auto ?? true)
-const paused = computed(() => props.agent.settings.memory_paused ?? false)
+const autoOn = computed(() => autoChoice.value ?? props.agent.settings.memory_auto)
+const paused = computed(() => props.agent.settings.memory_paused)
 const pausePending = ref(false)
 
-async function toggleAuto() {
+async function toggleAuto(next: boolean) {
   if (autoChoice.value !== null) {
     return
   }
   const name = props.agent.name
-  const next = !autoOn.value
   autoChoice.value = next
   actionError.value = null
   try {
@@ -207,7 +207,7 @@ interface Draft {
 
 const draft = ref<Draft | null>(null)
 const draftError = ref<string | null>(null)
-const draftLength = computed(() => [...(draft.value?.text ?? '').trim()].length)
+const draftLength = computed(() => charLength(draft.value?.text ?? ''))
 const draftOver = computed(() => maxChars.value !== null && draftLength.value > maxChars.value)
 
 async function startEdit(memory: Memory) {
@@ -355,20 +355,12 @@ async function confirmClear() {
 <template>
   <section class="section" :aria-labelledby="labelId">
     <div class="section-head">
-      <h3 :id="labelId" class="section-label">{{ t('agents.memory.label') }}</h3>
-      <button
-        type="button"
-        role="switch"
-        class="switch"
-        :aria-checked="autoOn"
-        :aria-busy="autoChoice !== null || undefined"
-        @click="toggleAuto"
-      >
+      <h3 :id="labelId" class="agents-label">{{ t('agents.memory.label') }}</h3>
+      <UiSwitch :model-value="autoOn" :busy="autoChoice !== null" @update:model-value="toggleAuto">
         {{ t('agents.memory.auto') }}
-        <span class="track" aria-hidden="true"><span class="knob" /></span>
-      </button>
+      </UiSwitch>
     </div>
-    <p class="note">{{ t('agents.memory.description') }}</p>
+    <p class="agents-note">{{ t('agents.memory.description') }}</p>
     <p v-if="paused" class="paused-line" role="status">
       <UiIcon name="pause" class="paused-glyph" />
       {{ t('agents.memory.paused') }}
@@ -465,14 +457,7 @@ async function confirmClear() {
                     </UiButton>
                   </div>
                 </div>
-                <p v-if="maxChars !== null" class="edit-count tabular" :class="{ over: draftOver }">
-                  {{
-                    t('agents.memory.count', {
-                      count: draftLength.toLocaleString(locale),
-                      max: maxChars.toLocaleString(locale),
-                    })
-                  }}
-                </p>
+                <AgentsCharCount v-if="maxChars !== null" class="edit-count" :count="draftLength" :max="maxChars" />
                 <UiBanner v-if="draftError" tone="error">{{ draftError }}</UiBanner>
               </div>
             </li>
@@ -592,79 +577,6 @@ async function confirmClear() {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-}
-
-/* The field label's treatment: a section of the panel, not a heading of the page. */
-.section-label {
-  margin: 0;
-  font-family: inherit;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
-}
-
-/* A switch is a labelled button: the words, then the system's capsule switch — a gray track
-   off, the accent on, the white knob sliding across. */
-.switch {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  height: var(--control-height-sm);
-  padding: 0 var(--space-1) 0 var(--space-3);
-  border: 0;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--ink);
-  font-size: var(--text-sm);
-  cursor: pointer;
-  transition: background var(--duration-fast) var(--ease);
-}
-
-.switch:hover {
-  background: var(--fill-weak);
-}
-
-/* Not disabled while it saves — a disabled button drops the keyboard's focus — only busy. */
-.switch[aria-busy='true'] {
-  cursor: progress;
-}
-
-.track {
-  position: relative;
-  display: inline-block;
-  flex-shrink: 0;
-  width: 36px;
-  height: 22px;
-  border-radius: var(--radius-full);
-  background: var(--fill-strong);
-  transition: background var(--duration-fast) var(--ease);
-}
-
-.knob {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 18px;
-  height: 18px;
-  border-radius: var(--radius-full);
-  background: var(--accent-fg);
-  box-shadow: var(--shadow-segment);
-  transition: left var(--duration-fast) var(--ease);
-}
-
-.switch[aria-checked='true'] .track {
-  background: var(--accent);
-}
-
-.switch[aria-checked='true'] .knob {
-  left: 16px;
-}
-
-.note {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-  line-height: 1.5;
 }
 
 .paused-line {
@@ -913,14 +825,7 @@ async function confirmClear() {
 }
 
 .edit-count {
-  margin: 0;
-  color: var(--faint);
-  font-size: var(--text-2xs);
   text-align: right;
-}
-
-.edit-count.over {
-  color: var(--danger);
 }
 
 .fine {

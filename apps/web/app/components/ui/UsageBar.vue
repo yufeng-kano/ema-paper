@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * A share as a bar: how much of a limit is used — the Usage section's credits and storage
- * (docs/web.md § Pages, `/settings/usage`) — or how far a parse has got.
+ * (docs/web.md § Pages, `?settings=usage`) and an account's storage in the console.
  *
  * The fill never escalates through amber to red: the figure is always printed beside it
  * (*N% used*, *9 of 32*), so the bar is emphasis and never the only signal — which is also why it
@@ -9,7 +9,7 @@
  * the few things allowed to be the accent colour.
  */
 const props = defineProps<{
-  /** 0..1, the used share of the limit, or the parse's pages done. */
+  /** 0..1, the used share of the limit. */
   share: number
   /** Accessible name — the row this bar belongs to. */
   label: string

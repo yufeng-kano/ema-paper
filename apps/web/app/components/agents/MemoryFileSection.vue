@@ -6,6 +6,7 @@
  * Save as the instructions have them. A save reaches new conversations and compacted ones;
  * one refused while a turn of the reader runs says so in a line under the box.
  */
+import { charLength } from '~/lib/agents'
 import { getMemoryFile, putMemoryFile } from '~/lib/api'
 
 const { t } = useI18n()
@@ -22,8 +23,7 @@ const loadError = ref<string | null>(null)
 const pending = ref(false)
 const error = ref<string | null>(null)
 
-/** Counted in code points, as the server counts. */
-const count = computed(() => [...draft.value].length)
+const count = computed(() => charLength(draft.value))
 const overCap = computed(() => maxChars.value !== null && count.value > maxChars.value)
 const dirty = computed(() => draft.value !== saved.value)
 
@@ -71,8 +71,8 @@ async function save() {
 
 <template>
   <section class="section" :aria-labelledby="labelId">
-    <h3 :id="labelId" class="section-label">{{ t('agents.memoryFile.label') }}</h3>
-    <p class="note">{{ t('agents.memoryFile.description') }}</p>
+    <h3 :id="labelId" class="agents-label">{{ t('agents.memoryFile.label') }}</h3>
+    <p class="agents-note">{{ t('agents.memoryFile.description') }}</p>
     <UiBanner v-if="loadError" tone="error">{{ loadError }}</UiBanner>
     <UiSkeleton v-else-if="loading" :rows="3" />
     <template v-else>
@@ -87,9 +87,7 @@ async function save() {
         :disabled="pending"
       />
       <div class="under">
-        <span class="count" :class="{ over: overCap }">
-          {{ maxChars !== null ? t('agents.memoryFile.count', { count, max: maxChars }) : count }}
-        </span>
+        <AgentsCharCount :count="count" :max="maxChars" />
         <div class="buttons">
           <UiButton variant="secondary" :disabled="!dirty || pending" @click="cancel">
             {{ t('common.cancel') }}
@@ -109,21 +107,6 @@ async function save() {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-}
-
-/* The field label's treatment: a section of the panel, not a heading of the page. */
-.section-label {
-  margin: 0;
-  font-family: inherit;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
-}
-
-.note {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
 }
 
 /* The file as it is: a plain box of its text, in the mono face, as tall as a few sections. */
@@ -156,16 +139,6 @@ async function save() {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2) var(--space-4);
-}
-
-.count {
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-
-/* Over the cap is the one state the count exists to show. */
-.count.over {
-  color: var(--danger);
 }
 
 .buttons {

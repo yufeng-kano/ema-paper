@@ -1,36 +1,133 @@
-"""The runner over the local backend: a bash process, no Docker, no network."""
+"""The runner over a local bash stand-in for its backend: no Docker, no network."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
+import shutil
+import subprocess
+import time
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from sightread_sandbox.backends import LocalBackend, adopted_user_ids
+from local_backend import GROUP_CLEANUP, LocalBackend
+from sightread_sandbox import backends
+from sightread_sandbox.backends import (
+    ADOPT_SWEEP,
+    CACHE_DIR,
+    DEFAULT_ENV,
+    KILL_TREE,
+    REAPER,
+    REAPER_PYTHON,
+    VM_SWEEP,
+    DockerBackend,
+    UserSandbox,
+    adopted_user_ids,
+)
 from sightread_sandbox.config import Settings
 from sightread_sandbox.main import create_app
+from sightread_sandbox.shell import SAFE_PATH, ShellSession, supervisor
 
 TOKEN = "runner-token-not-a-real-one"
+PROXY_URL = "http://10.250.250.2:3128"
 
 
-@pytest.fixture
-async def client(tmp_path):
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-        sandbox_output_max_bytes=400,
-        sandbox_idle_seconds=0,
+def local_settings(tmp_path: Path, **overrides: Any) -> Settings:
+    """The runner's settings for the tests, the workspaces under the test's own directory."""
+    return Settings(
+        **{
+            "app_env": "local",
+            "sandbox_token": TOKEN,
+            "sandbox_workspaces_dir": str(tmp_path / "ws"),
+            "sandbox_workspaces_mount": str(tmp_path / "ws"),
+            **overrides,
+        }
     )
-    app = create_app(settings, LocalBackend(settings))
+
+
+def docker_settings(tmp_path: Path, **overrides: Any) -> Settings:
+    """The Docker backend's settings on `runc`, a runtime only `APP_ENV=local` accepts."""
+    return local_settings(tmp_path, **{"sandbox_runtime": "runc", **overrides})
+
+
+@contextlib.asynccontextmanager
+async def runner(backend: backends.Backend) -> AsyncIterator[AsyncClient]:
+    """An authenticated client of the runner app over `backend` and its settings."""
+    app = create_app(backend.settings, backend)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
         http.headers["Authorization"] = f"Bearer {TOKEN}"
         yield http
+
+
+@pytest.fixture
+async def client(tmp_path) -> AsyncIterator[AsyncClient]:
+    backend = LocalBackend(local_settings(tmp_path, sandbox_output_max_bytes=400))
+    async with runner(backend) as http:
+        yield http
+        for user_id in list(backend._users):
+            await backend.stop(user_id)
+
+
+class FakeDocker:
+    """Stands in for `backends._docker`: records every call with its timeout, answers
+    `inspect` as Docker does for a VM that does not exist and every other call with
+    success, unless `answer` returns something for the call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], float]] = []
+        self.answer: Callable[[tuple[str, ...]], tuple[int, str] | None] = lambda args: None
+
+    async def __call__(self, *args: str, timeout: float) -> tuple[int, str]:
+        self.calls.append((args, timeout))
+        answered = self.answer(args)
+        if answered is not None:
+            return answered
+        if args[0] == "inspect":
+            return 1, "Error: No such object"
+        return 0, ""
+
+    def args(self, kind: str | None = None) -> list[tuple[str, ...]]:
+        """The arguments of every call, or of every `docker <kind>` call."""
+        return [args for args, _ in self.calls if kind is None or args[0] == kind]
+
+    def timeouts(self, kind: str) -> list[float]:
+        return [timeout for args, timeout in self.calls if args[0] == kind]
+
+
+@pytest.fixture
+def docker(monkeypatch) -> FakeDocker:
+    fake = FakeDocker()
+    monkeypatch.setattr(backends, "_docker", fake)
+    return fake
+
+
+def _proc_state(pid: int) -> str | None:
+    """The host process's state letter, or None once it is gone."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    # The name in parentheses may hold spaces or parentheses itself.
+    return stat.rsplit(")", 1)[1].split()[0]
+
+
+async def wait_ended(pid: int, within: float = 5.0) -> bool:
+    """Whether the host process `pid` ends within `within` seconds. The cleanup sends the
+    kill without waiting for it to land, and this host's init may be slow to reap: gone,
+    a zombie, or one being reaped all count as ended."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if _proc_state(pid) in (None, "Z", "X", "x"):
+            return True
+        await asyncio.sleep(0.05)
+    return False
 
 
 async def test_the_token_is_required(client) -> None:
@@ -110,34 +207,8 @@ async def test_restart_stop_and_reset(client, tmp_path) -> None:
     assert (tmp_path / "ws" / "4" / "files" / "keep.md").read_text() == "keep"
 
 
-async def test_a_newline_free_flood_is_cut_like_any_other(client) -> None:
-    flood = await client.post(
-        "/sandboxes/5/exec",
-        json={
-            "session": "s",
-            "command": "head -c 200000 /dev/zero | tr '\\0' 'a'; echo; echo done",
-        },
-    )
-    assert flood.status_code == 200, flood.text
-    body = flood.json()
-    assert body["truncated"] is True
-    assert body["exit_code"] == 0
-    assert body["output"].rstrip().endswith("done")
-    assert len(body["output"]) < 2000
-
-
 async def test_the_shell_cap_closes_the_longest_idle_shell(tmp_path) -> None:
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-        sandbox_max_shells=2,
-    )
-    app = create_app(settings, LocalBackend(settings))
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
-        http.headers["Authorization"] = f"Bearer {TOKEN}"
+    async with runner(LocalBackend(local_settings(tmp_path, sandbox_max_shells=2))) as http:
         await http.post("/sandboxes/6/exec", json={"session": "a", "command": "export A=1"})
         await http.post("/sandboxes/6/exec", json={"session": "b", "command": "export B=1"})
         assert (await http.get("/sandboxes/6")).json()["shells"] == 2
@@ -158,23 +229,106 @@ def test_running_sandboxes_are_recognised_by_name() -> None:
 
 
 async def test_the_idle_sweep_spares_a_running_command(tmp_path) -> None:
-    import asyncio
+    inspected: list[int] = []
 
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-        sandbox_idle_seconds=0,
-    )
-    backend = LocalBackend(settings)
+    class Counting(LocalBackend):
+        async def is_running(self, user_id: int) -> bool:
+            inspected.append(user_id)
+            return await super().is_running(user_id)
+
+    backend = Counting(local_settings(tmp_path, sandbox_idle_seconds=0))
     running = asyncio.create_task(backend.exec(8, "s", "sleep 1; echo done", timeout=10))
     await asyncio.sleep(0.2)
     assert await backend.stop_idle() == 0
     outcome = await running
     assert outcome.output == "done"
     assert await backend.stop_idle() == 1
+    # A VM the sweep removed is not asked about again until something starts it; one
+    # Docker merely reports not running is asked about on every sweep.
+    backend._user(9)
+    for _ in range(2):
+        inspected.clear()
+        assert await backend.stop_idle() == 0
+        assert inspected == [9]
+    await backend.exec(8, "s", "true", timeout=10)
+    inspected.clear()
+    assert await backend.stop_idle() == 1
+    assert inspected == [8, 9]
+
+
+async def test_a_vm_whose_start_timed_out_is_swept_once_it_comes_up(tmp_path, docker) -> None:
+    # The `docker run` CLI timed out, but the daemon goes on starting the VM: an
+    # inspection first finds it created and not running, later running.
+    vm = {"state": "absent"}
+
+    def answer(args: tuple[str, ...]) -> tuple[int, str] | None:
+        if args[0] == "run":
+            vm["state"] = "created"
+            return 1, "docker timed out"
+        if args[0] == "rm":
+            vm["state"] = "absent"
+        if args[0] == "inspect" and vm["state"] != "absent":
+            return 0, "true\n" if vm["state"] == "running" else "false\n"
+        return None
+
+    docker.answer = answer
+    backend = DockerBackend(docker_settings(tmp_path, sandbox_idle_seconds=0))
+    with pytest.raises(RuntimeError):
+        await backend.exec(5, "s", "true", timeout=5)
+    assert await backend.stop_idle() == 0
+    vm["state"] = "running"
+    assert await backend.stop_idle() == 1
+    assert vm["state"] == "absent"
+
+
+async def test_a_vm_whose_start_timed_out_is_checked_once_it_comes_up(tmp_path, docker) -> None:
+    # The `docker run` CLI timed out, and the daemon brought the VM up after it: the next
+    # command finds it running, a VM this runner neither finished starting nor adopted.
+    vms: dict[str, dict[str, Any]] = {}
+
+    def answer(args: tuple[str, ...]) -> tuple[int, str] | None:
+        if args[0] == "run":
+            vms[args[args.index("--name") + 1]]["state"] = "running"
+            return 1, "docker timed out"
+        name = args[-1] if args[0] in ("rm", "inspect") else args[1]
+        vm = vms[name]
+        if args[0] == "rm":
+            vm["state"] = "absent"
+        if args[0] == "inspect" and vm["state"] != "absent":
+            return 0, "true\n"
+        if args[0] == "exec" and args[-1] == backends.NO_IPV6 and vm["ipv6"]:
+            return 1, ""
+        return None
+
+    docker.answer = answer
+    backend = DockerBackend(
+        docker_settings(tmp_path, sandbox_network="ema-paper-sandbox", sandbox_proxy_url=PROXY_URL)
+    )
+
+    def scripts(name: str) -> list[str]:
+        return [args[-1] for args in docker.args("exec") if args[1] == name]
+
+    for user_id, ipv6 in ((85, False), (86, True)):
+        name = f"ema-paper-sandbox-{user_id}"
+        vms[name] = {"state": "absent", "ipv6": ipv6}
+        sandbox = backend._user(user_id)
+        with pytest.raises(RuntimeError, match="could not be started"):
+            await backend.ensure_running(sandbox)
+        assert vms[name]["state"] == "running"
+        if not ipv6:
+            await backend.ensure_running(sandbox)
+            assert scripts(name) == [backends.NO_IPV6, DEFAULT_ENV]
+            assert sandbox.started_at is not None
+            # Checked once: the next command takes the VM as started.
+            await backend.ensure_running(sandbox)
+            assert scripts(name) == [backends.NO_IPV6, DEFAULT_ENV]
+        else:
+            # One that holds an IPv6 address is removed, never taken as started.
+            with pytest.raises(RuntimeError, match="could not be started"):
+                await backend.ensure_running(sandbox)
+            assert scripts(name) == [backends.NO_IPV6]
+            assert vms[name]["state"] == "absent"
+            assert sandbox.started_at is None
 
 
 async def test_an_underscore_flood_is_bounded_too(client) -> None:
@@ -185,13 +339,12 @@ async def test_an_underscore_flood_is_bounded_too(client) -> None:
     assert flood.status_code == 200, flood.text
     body = flood.json()
     assert body["truncated"] is True
+    assert body["exit_code"] == 0
     assert body["output"].rstrip().endswith("end")
     assert len(body["output"]) < 2000
 
 
 async def test_a_timeout_runs_the_backends_kill_before_closing_the_shell() -> None:
-    from sightread_sandbox.shell import GROUP_CLEANUP, ShellSession, supervisor
-
     killed = []
 
     async def kill_inside(*, pid: int, locked: bool = False) -> None:
@@ -207,19 +360,15 @@ async def test_a_timeout_runs_the_backends_kill_before_closing_the_shell() -> No
 
 
 def test_production_accepts_only_a_vm_runtime(tmp_path) -> None:
-    base = {
-        "app_env": "production",
-        "sandbox_token": TOKEN,
-        "sandbox_backend": "docker",
-        "sandbox_workspaces_dir": str(tmp_path / "ws"),
-        "sandbox_workspaces_mount": str(tmp_path / "ws"),
-    }
-    assert Settings(**base, sandbox_runtime="kata").sandbox_runtime == "kata"
+    def production(**overrides: Any) -> Settings:
+        return docker_settings(tmp_path, app_env="production", **overrides)
+
+    assert production(sandbox_runtime="kata").sandbox_runtime == "kata"
     for runtime in ("runc", "crun", "kata2"):
         with pytest.raises(ValueError):
-            Settings(**base, sandbox_runtime=runtime)
+            production(sandbox_runtime=runtime)
     # The operator names their own VM runtime.
-    assert Settings(**base, sandbox_runtime="kata2", sandbox_vm_runtimes="kata2").sandbox_runtime
+    assert production(sandbox_runtime="kata2", sandbox_vm_runtimes="kata2").sandbox_runtime
 
 
 async def test_a_command_returns_only_once_its_background_jobs_are_done(client, tmp_path) -> None:
@@ -236,38 +385,7 @@ async def test_a_command_returns_only_once_its_background_jobs_are_done(client, 
     assert (tmp_path / "ws" / "3" / "late.txt").read_text().strip() == "late"
 
 
-async def test_nothing_a_command_started_outlives_it(client) -> None:
-    import time
-
-    started = time.monotonic()
-    disowned = await client.post(
-        "/sandboxes/10/exec",
-        json={
-            "session": "s",
-            "command": "nohup sleep 30 >/dev/null 2>&1 & disown; echo $!",
-            "timeout_seconds": 10,
-        },
-    )
-    assert disowned.status_code == 200, disowned.text
-    assert time.monotonic() - started < 5  # not waited for: killed
-    pid = int(disowned.json()["output"].strip())
-    after = await client.post(
-        "/sandboxes/10/exec",
-        json={
-            "session": "s",
-            # Dead, or killed and not yet reaped by this host's init: a zombie is not
-            # alive (in the VM, pid 1 reaps; here, the test host's init may not).
-            "command": f"grep -q 'State:.Z' /proc/{pid}/status 2>/dev/null && echo dead;"
-            f" [ -d /proc/{pid} ] && ! grep -q 'State:.Z' /proc/{pid}/status && echo alive;"
-            f" [ -d /proc/{pid} ] || echo dead",
-        },
-    )
-    assert after.json()["output"] == "dead"
-
-
 async def test_a_vm_that_cannot_be_removed_refuses_commands_and_keeps_its_cache(tmp_path) -> None:
-    from sightread_sandbox.backends import CACHE_DIR, UserSandbox
-
     class Stuck(LocalBackend):
         gone = False
 
@@ -277,18 +395,8 @@ async def test_a_vm_that_cannot_be_removed_refuses_commands_and_keeps_its_cache(
         async def is_gone(self, user_id: int) -> bool:
             return self.gone
 
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-        sandbox_idle_seconds=0,
-    )
-    backend = Stuck(settings)
-    app = create_app(settings, backend)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
-        http.headers["Authorization"] = f"Bearer {TOKEN}"
+    backend = Stuck(local_settings(tmp_path, sandbox_idle_seconds=0))
+    async with runner(backend) as http:
         assert (
             await http.post("/sandboxes/11/exec", json={"session": "s", "command": "true"})
         ).status_code == 200
@@ -310,18 +418,7 @@ async def test_a_vm_that_cannot_be_removed_refuses_commands_and_keeps_its_cache(
 
 
 async def test_a_restart_ends_the_command_the_shell_is_running(tmp_path) -> None:
-    import asyncio
-    import time
-
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-        sandbox_idle_seconds=0,
-    )
-    backend = LocalBackend(settings)
+    backend = LocalBackend(local_settings(tmp_path))
     running = asyncio.create_task(backend.exec(12, "s", "sleep 30; echo late", timeout=60))
     await asyncio.sleep(0.3)
     started = time.monotonic()
@@ -335,10 +432,6 @@ async def test_a_restart_ends_the_command_the_shell_is_running(tmp_path) -> None
 
 
 async def test_a_dropped_request_kills_its_command_where_it_runs() -> None:
-    import asyncio
-
-    from sightread_sandbox.shell import GROUP_CLEANUP, ShellSession, supervisor
-
     killed = []
 
     async def kill_inside(*, pid: int, locked: bool = False) -> None:
@@ -357,15 +450,11 @@ async def test_a_dropped_request_kills_its_command_where_it_runs() -> None:
 
 
 async def test_reset_removes_whatever_sits_at_the_cache(client, tmp_path) -> None:
-    from sightread_sandbox.backends import CACHE_DIR
-
     assert (
         await client.post("/sandboxes/13/exec", json={"session": "s", "command": "true"})
     ).status_code == 200
     assert (await client.post("/sandboxes/13/stop")).status_code == 204
     cache = tmp_path / "ws" / "13" / CACHE_DIR
-    import shutil
-
     shutil.rmtree(cache)
     cache.write_text("not a directory")  # what a command left in its place
     assert (await client.post("/sandboxes/13/reset")).status_code == 204
@@ -376,31 +465,17 @@ async def test_reset_removes_whatever_sits_at_the_cache(client, tmp_path) -> Non
     assert cache.is_dir()
 
 
-def test_the_vm_sweep_scripts_are_valid_sh_and_the_docker_backend_uses_them(tmp_path) -> None:
-    import subprocess
-
-    from sightread_sandbox.backends import ADOPT_SWEEP, KILL_TREE, VM_SWEEP, DockerBackend
-    from sightread_sandbox.shell import GROUP_CLEANUP
-
-    for script in (VM_SWEEP, KILL_TREE, ADOPT_SWEEP, GROUP_CLEANUP):
-        subprocess.run(["sh", "-n"], input=script, text=True, check=True)  # noqa: S603, S607
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="docker",
-        sandbox_runtime="runc",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    assert DockerBackend(settings).cleanup() == VM_SWEEP
-    assert LocalBackend(settings).cleanup() == GROUP_CLEANUP
+def test_the_vm_scripts_are_valid_sh_and_the_docker_backend_sweeps_the_vm(tmp_path) -> None:
+    for script in (KILL_TREE, ADOPT_SWEEP):
+        subprocess.run(["sh", "-n"], input=script, text=True, check=True)  # noqa: S607
+    # The supervisor a VM's shell runs ends every command with the VM-wide sweep.
+    argv, _cwd = DockerBackend(docker_settings(tmp_path)).shell_argv(1)
+    assert VM_SWEEP in argv[-1]
     # The timeout kill and the adoption both end with the sweep.
     assert VM_SWEEP.strip() in KILL_TREE and VM_SWEEP.strip() in ADOPT_SWEEP
 
 
 async def test_a_command_cannot_forge_its_own_status_line(client, tmp_path) -> None:
-    import time
-
     started = time.monotonic()
     # A command that reads what follows it on stdin and echoes the marker early would
     # end the framing with work still running: its stdin is /dev/null and the marker
@@ -429,58 +504,94 @@ async def test_a_command_cannot_forge_its_own_status_line(client, tmp_path) -> N
 
 
 def test_the_reaper_is_the_images_cmd() -> None:
-    from sightread_sandbox.backends import REAPER, REAPER_PYTHON
-
     compile(REAPER, "reaper", "exec")
     dockerfile = Path(__file__).resolve().parents[3] / "deploy" / "sandbox-image" / "Dockerfile"
     # The interpreter by its full path too: the VM's PATH starts in the workspace.
     assert f"CMD {json.dumps([REAPER_PYTHON, '-c', REAPER])}" in dockerfile.read_text()
 
 
-async def test_a_restart_whose_in_vm_kill_fails_does_not_deadlock(tmp_path) -> None:
-    import asyncio
+@pytest.fixture
+def kill_fails(tmp_path, monkeypatch) -> SimpleNamespace:
+    """The Docker backend's own kill inside the VM, over a fake `docker` whose KILL_TREE
+    always fails: the shells run on this host, everything else is answered as Docker
+    would. `vm.removable` says whether `docker rm -f` succeeds."""
+    calls: list[tuple[str, ...]] = []
+    vm = SimpleNamespace(running=False, removable=True)
 
-    from sightread_sandbox.backends import UserSandbox
+    async def fake_docker(*args, **_):
+        calls.append(args)
+        if args[0] == "inspect":
+            return (0, "true\n") if vm.running else (1, "Error: No such object")
+        if args[0] == "run":
+            vm.running = True
+        if args[0] == "rm":
+            if not vm.removable:
+                return 1, "Error: timed out"
+            vm.running = False
+        if args[0] == "exec" and KILL_TREE in args:
+            return 1, "kill failed"
+        return 0, ""
 
-    calls: list[bool] = []
+    class HostShells(DockerBackend):
+        def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
+            return ["sh", "-c", supervisor(GROUP_CLEANUP)], str(self.workspace(user_id))
 
-    class Stubborn(LocalBackend):
-        def on_timeout(self, user_id):
-            async def kill_inside(*, pid: int, locked: bool = False) -> None:
-                calls.append(locked)
-                sandbox = self._user(user_id)
-                # The fallback stop, under the lock the caller already holds.
-                async with sandbox.lock if not locked else _nothing():
-                    await self._stop_locked(sandbox)
+    monkeypatch.setattr(backends, "_docker", fake_docker)
+    settings = docker_settings(tmp_path, sandbox_docker_timeout_seconds=1)
 
-            return kill_inside
+    def count(kind: str) -> int:
+        """How many `docker <kind>` calls were made — `kill`: KILL_TREE execs."""
+        if kind == "kill":
+            return len([args for args in calls if args[0] == "exec" and KILL_TREE in args])
+        return len([args for args in calls if args[0] == kind])
 
-        async def _stop_locked(self, sandbox: UserSandbox) -> None:
-            sandbox.sessions.clear()
-            sandbox.session_used.clear()
-            self._running.discard(sandbox.user_id)
+    return SimpleNamespace(backend=HostShells(settings), vm=vm, calls=calls, count=count)
 
-    import contextlib
 
-    _nothing = contextlib.nullcontext
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-        sandbox_idle_seconds=0,
-    )
-    backend = Stubborn(settings)
+async def test_a_restart_whose_in_vm_kill_fails_removes_the_vm_under_its_own_lock(
+    kill_fails,
+) -> None:
+    backend = kill_fails.backend
     await backend.exec(15, "s", "true", timeout=10)
+    kill_fails.calls.clear()
+    # The fallback stop runs under the lock restart holds rather than waiting for it.
     await asyncio.wait_for(backend.restart(15, "s"), 5)
-    assert calls == [True]
+    assert kill_fails.count("kill") == 1
+    assert kill_fails.count("rm") == 1
+    assert not kill_fails.vm.running
     assert not backend._user(15).lock.locked()
+    assert backend._user(15).unstoppable is False
+
+
+async def test_a_stop_whose_in_vm_kill_fails_removes_the_vm_once(kill_fails) -> None:
+    backend = kill_fails.backend
+    running = asyncio.create_task(backend.exec(16, "busy", "sleep 30", timeout=60))
+    await asyncio.sleep(0.3)
+    kill_fails.calls.clear()
+    await asyncio.wait_for(backend.stop(16), 10)
+    # The kill saw the stop under way and left the removal to it.
+    assert kill_fails.count("kill") == 1
+    assert kill_fails.count("rm") == 1
+    outcome = await asyncio.wait_for(running, 10)
+    assert outcome.exit_code is None and not outcome.timed_out
+    assert backend._user(16).sessions == {}
+
+
+async def test_a_restart_whose_kill_and_removal_both_fail_leaves_the_vm_unstoppable(
+    kill_fails,
+) -> None:
+    backend = kill_fails.backend
+    await backend.exec(17, "s", "true", timeout=10)
+    kill_fails.vm.removable = False
+    with pytest.raises(RuntimeError, match="could not be stopped"):
+        await asyncio.wait_for(backend.restart(17, "s"), 10)
+    assert backend._user(17).unstoppable is True
+    assert not backend._user(17).lock.locked()
+    with pytest.raises(RuntimeError, match="no command runs there"):
+        await backend.exec(17, "s", "true", timeout=10)
 
 
 async def test_a_supervisor_killed_by_its_command_is_swept(tmp_path) -> None:
-    from sightread_sandbox.shell import ShellSession, supervisor
-
     swept: list[bool] = []
 
     async def kill_inside(*, pid: int, locked: bool = False) -> None:
@@ -507,15 +618,7 @@ async def test_an_evicted_shell_is_killed_inside_the_vm(tmp_path) -> None:
 
             return kill_inside
 
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-        sandbox_max_shells=1,
-    )
-    backend = Recording(settings)
+    backend = Recording(local_settings(tmp_path, sandbox_max_shells=1))
     await backend.exec(16, "a", "true", timeout=10)
     await backend.exec(16, "b", "true", timeout=10)
     # `a` made room for `b`: killed where it runs, under the lock exec holds.
@@ -524,8 +627,6 @@ async def test_an_evicted_shell_is_killed_inside_the_vm(tmp_path) -> None:
 
 
 async def test_the_supervisor_reports_its_pid_before_any_command(tmp_path) -> None:
-    from sightread_sandbox.shell import ShellSession, supervisor
-
     # The cleanup sees the keep line the runner sent with the command, never a file.
     shell = ShellSession(
         ["sh", "-c", supervisor('printf "KEEP=[%s]\\n" "$__sr_keep_in"')],
@@ -548,22 +649,13 @@ async def test_the_supervisor_reports_its_pid_before_any_command(tmp_path) -> No
 
 
 async def test_the_runner_names_the_other_live_shells_to_each_cleanup(tmp_path) -> None:
-    from sightread_sandbox.shell import supervisor
-
     class Recording(LocalBackend):
         def shell_argv(self, user_id):
             return ["sh", "-c", supervisor('printf "KEEP=[%s]\\n" "$__sr_keep_in"')], str(
                 self.workspace(user_id)
             )
 
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    backend = Recording(settings)
+    backend = Recording(local_settings(tmp_path))
     first = await backend.exec(21, "a", "true", timeout=10)
     pid_a = backend._user(21).sessions["a"].pid
     assert f"KEEP=[{pid_a}]" in first.output
@@ -587,18 +679,21 @@ async def test_the_runner_names_the_other_live_shells_to_each_cleanup(tmp_path) 
 
 
 def test_kill_tree_refuses_anything_but_a_pid() -> None:
-    import subprocess
-
-    from sightread_sandbox.backends import KILL_TREE
-
+    # The script runs on this host: should the pid check ever fail, the sweep after it
+    # would kill every process the account owns. Its kill is `true` here, so a broken
+    # check leaves every pid standing and fails the test with 5 instead.
+    env = {**os.environ, "__sr_kill": "true"}
     for bad in ("", "abc", "shell.pid", "12 13"):
-        done = subprocess.run(["sh", "-c", KILL_TREE, "sh", bad, ""], capture_output=True)  # noqa: S603, S607
+        done = subprocess.run(  # noqa: S603
+            ["sh", "-c", KILL_TREE, "sh", bad, ""],  # noqa: S607
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
         assert done.returncode == 3, bad
 
 
 async def test_a_stop_kills_a_running_command_inside_the_vm_first(tmp_path) -> None:
-    import asyncio
-
     calls: list[tuple[int, bool]] = []
 
     class Recording(LocalBackend):
@@ -608,14 +703,7 @@ async def test_a_stop_kills_a_running_command_inside_the_vm_first(tmp_path) -> N
 
             return kill_inside
 
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    backend = Recording(settings)
+    backend = Recording(local_settings(tmp_path))
     await backend.exec(31, "idle", "true", timeout=10)
     running = asyncio.create_task(backend.exec(31, "busy", "sleep 30", timeout=60))
     await asyncio.sleep(0.3)
@@ -630,30 +718,18 @@ async def test_a_stop_kills_a_running_command_inside_the_vm_first(tmp_path) -> N
 
 
 async def test_a_runner_that_cannot_list_sandboxes_does_not_start(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
-
-    async def daemon_away(*args, timeout=120.0):
+    async def daemon_away(*args, **_):
         return 1, "Cannot connect to the Docker daemon"
 
     monkeypatch.setattr(backends, "_docker", daemon_away)
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="docker",
-        sandbox_runtime="runc",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
     with pytest.raises(RuntimeError):
-        await backends.DockerBackend(settings).startup()
+        await DockerBackend(docker_settings(tmp_path)).startup()
 
 
 async def test_the_runner_starts_only_on_an_internal_network(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
-
     inspected = {"ema-paper-sandbox": "true true"}
 
-    async def fake_docker(*args, timeout=120.0):
+    async def fake_docker(*args, **_):
         if args[:2] == ("network", "inspect"):
             answer = inspected.get(args[-1])
             return (0, f"{answer}\n") if answer else (1, "not found")
@@ -662,23 +738,13 @@ async def test_the_runner_starts_only_on_an_internal_network(tmp_path, monkeypat
     monkeypatch.setattr(backends, "_docker", fake_docker)
 
     def settings(network: str) -> Settings:
-        return Settings(
-            app_env="local",
-            sandbox_token=TOKEN,
-            sandbox_backend="docker",
-            sandbox_runtime="runc",
-            sandbox_network=network,
-            sandbox_proxy_url="http://10.250.250.2:3128",
-            sandbox_workspaces_dir=str(tmp_path / "ws"),
-            sandbox_workspaces_mount=str(tmp_path / "ws"),
-        )
+        return docker_settings(tmp_path, sandbox_network=network, sandbox_proxy_url=PROXY_URL)
 
     # A network Docker routes off — `bridge`, or the sandbox's made without `internal` —
     # would hand the VMs the internet past the proxy; one where the host has an address,
     # whatever the host listens on; one Docker cannot find, nothing.
     for answer, network in (
         ("false <no value>", "bridge"),
-        ("false <no value>", "made-without-internal"),
         ("true <no value>", "host-has-an-address"),
         ("true false", "host-has-an-address-too"),
         (None, "missing"),
@@ -686,57 +752,31 @@ async def test_the_runner_starts_only_on_an_internal_network(tmp_path, monkeypat
         if answer:
             inspected[network] = answer
         with pytest.raises(RuntimeError, match="not an internal Docker network"):
-            await backends.DockerBackend(settings(network)).startup()
-    await backends.DockerBackend(settings("ema-paper-sandbox")).startup()
-    await backends.DockerBackend(settings("none")).startup()
+            await DockerBackend(settings(network)).startup()
+    await DockerBackend(settings("ema-paper-sandbox")).startup()
+    await DockerBackend(settings("none")).startup()
 
 
 def test_a_network_needs_the_proxy(tmp_path) -> None:
     with pytest.raises(ValueError, match="SANDBOX_PROXY_URL"):
-        Settings(
-            app_env="local",
-            sandbox_token=TOKEN,
-            sandbox_backend="docker",
-            sandbox_runtime="runc",
-            sandbox_network="ema-paper-sandbox",
-            sandbox_workspaces_dir=str(tmp_path / "ws"),
-            sandbox_workspaces_mount=str(tmp_path / "ws"),
-        )
+        docker_settings(tmp_path, sandbox_network="ema-paper-sandbox")
 
 
-async def test_a_vm_on_the_network_is_pointed_at_the_proxy(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
-
-    calls: list[tuple[str, ...]] = []
-
-    async def fake_docker(*args, timeout=120.0):
-        calls.append(args)
-        if args[0] == "inspect":
-            return 1, "Error: No such object"
-        return 0, ""
-
-    monkeypatch.setattr(backends, "_docker", fake_docker)
+async def test_a_vm_on_the_network_is_pointed_at_the_proxy(tmp_path, docker) -> None:
     for network, user_id in (("ema-paper-sandbox", 81), ("none", 82)):
-        settings = Settings(
-            app_env="local",
-            sandbox_token=TOKEN,
-            sandbox_backend="docker",
-            sandbox_runtime="runc",
-            sandbox_network=network,
-            sandbox_proxy_url="http://10.250.250.2:3128",
-            sandbox_workspaces_dir=str(tmp_path / "ws"),
-            sandbox_workspaces_mount=str(tmp_path / "ws"),
+        backend = DockerBackend(
+            docker_settings(tmp_path, sandbox_network=network, sandbox_proxy_url=PROXY_URL)
         )
-        backend = backends.DockerBackend(settings)
         await backend.ensure_running(backend._user(user_id))
-    on, off = [args for args in calls if args[0] == "run"]
+    on, off = docker.args("run")
     assert on[on.index("--network") + 1] == "ema-paper-sandbox"
+    execs = docker.args("exec")
     # The default environment is made in the VM just started, the network's as any other.
-    made = [args[1] for args in calls if args[0] == "exec" and args[-1] == backends.DEFAULT_ENV]
+    made = [args[1] for args in execs if args[-1] == DEFAULT_ENV]
     assert made == ["ema-paper-sandbox-81", "ema-paper-sandbox-82"]
     # Both spellings of both: uv, pip, git, curl and Python's clients each read one.
     for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
-        assert f"{name}=http://10.250.250.2:3128" in on
+        assert f"{name}={PROXY_URL}" in on
     assert off[off.index("--network") + 1] == "none"
     assert not [arg for arg in off if "PROXY" in arg.upper()]
     # IPv6 off, and checked off, on the network alone: its bridge keeps a link-local
@@ -744,53 +784,33 @@ async def test_a_vm_on_the_network_is_pointed_at_the_proxy(tmp_path, monkeypatch
     assert "net.ipv6.conf.all.disable_ipv6=1" in on
     assert "net.ipv6.conf.default.disable_ipv6=1" in on
     assert not [arg for arg in off if "ipv6" in arg]
-    checked = [args[1] for args in calls if args[0] == "exec" and args[-1] == backends.NO_IPV6]
-    assert checked == ["ema-paper-sandbox-81"]
+    assert [args[1] for args in execs if args[-1] == backends.NO_IPV6] == ["ema-paper-sandbox-81"]
 
 
-async def test_a_vm_on_the_network_that_keeps_ipv6_is_never_used(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
+async def test_a_vm_on_the_network_that_keeps_ipv6_is_never_used(tmp_path, docker) -> None:
+    def keeps_ipv6(args: tuple[str, ...]) -> tuple[int, str] | None:
+        return (1, "") if args[0] == "exec" and args[-1] == backends.NO_IPV6 else None
 
-    calls: list[tuple[str, ...]] = []
-
-    async def fake_docker(*args, timeout=120.0):
-        calls.append(args)
-        if args[0] == "inspect":
-            return 1, "Error: No such object"
-        if args[0] == "exec" and args[-1] == backends.NO_IPV6:
-            return 1, ""
-        return 0, ""
-
-    monkeypatch.setattr(backends, "_docker", fake_docker)
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="docker",
-        sandbox_runtime="runc",
-        sandbox_network="ema-paper-sandbox",
-        sandbox_proxy_url="http://10.250.250.2:3128",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    docker.answer = keeps_ipv6
+    backend = DockerBackend(
+        docker_settings(tmp_path, sandbox_network="ema-paper-sandbox", sandbox_proxy_url=PROXY_URL)
     )
-    backend = backends.DockerBackend(settings)
     sandbox = backend._user(83)
     with pytest.raises(RuntimeError, match="could not be started"):
         await backend.ensure_running(sandbox)
     # Removed before anything ran in it, and not counted as started.
-    assert calls[-1] == ("rm", "-f", "ema-paper-sandbox-83")
-    assert not [args for args in calls if args[0] == "exec" and args[-1] == backends.DEFAULT_ENV]
+    assert docker.args()[-1] == ("rm", "-f", "ema-paper-sandbox-83")
+    assert not [args for args in docker.args("exec") if args[-1] == DEFAULT_ENV]
     assert sandbox.started_at is None
 
 
 async def test_a_vm_with_ipv6_that_cannot_be_removed_takes_no_command(
     tmp_path, monkeypatch
 ) -> None:
-    from sightread_sandbox import backends
-
     calls: list[tuple[str, ...]] = []
     vm = {"running": False, "removable": False}
 
-    async def fake_docker(*args, timeout=120.0):
+    async def fake_docker(*args, **_):
         calls.append(args)
         if args[0] == "inspect":
             return (0, "true\n") if vm["running"] else (1, "Error: No such object")
@@ -805,17 +825,9 @@ async def test_a_vm_with_ipv6_that_cannot_be_removed_takes_no_command(
         return 0, ""
 
     monkeypatch.setattr(backends, "_docker", fake_docker)
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="docker",
-        sandbox_runtime="runc",
-        sandbox_network="ema-paper-sandbox",
-        sandbox_proxy_url="http://10.250.250.2:3128",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    backend = DockerBackend(
+        docker_settings(tmp_path, sandbox_network="ema-paper-sandbox", sandbox_proxy_url=PROXY_URL)
     )
-    backend = backends.DockerBackend(settings)
 
     def checks() -> int:
         return len([args for args in calls if args[0] == "exec" and args[-1] == backends.NO_IPV6])
@@ -847,10 +859,6 @@ IF_INET6_LINE = "00000000000000000000000000000001 01 80 10 80       lo\n"
     ids=["no-file", "empty", "an-address"],
 )
 def test_the_ipv6_check_reads_what_the_file_holds(tmp_path, content, passes) -> None:
-    import subprocess
-
-    from sightread_sandbox import backends
-
     path = tmp_path / "if_inet6"
     if content is not None:
         path.write_text(content)
@@ -860,10 +868,6 @@ def test_the_ipv6_check_reads_what_the_file_holds(tmp_path, content, passes) -> 
 
 
 def test_the_ipv6_check_does_not_trust_a_procfs_size() -> None:
-    import subprocess
-
-    from sightread_sandbox import backends
-
     # procfs gives a file that reads non-empty a size of 0, /proc/net/if_inet6 with
     # addresses in it included: a size test would pass every VM.
     status = Path("/proc/self/status")
@@ -873,17 +877,15 @@ def test_the_ipv6_check_does_not_trust_a_procfs_size() -> None:
 
 
 async def test_an_adopted_vm_on_the_network_with_ipv6_is_stopped(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
-
     calls: list[tuple[str, ...]] = []
 
-    async def fake_docker(*args, timeout=120.0):
+    async def fake_docker(*args, **_):
         calls.append(args)
         if args[:2] == ("network", "inspect"):
             return 0, "true true\n"
         if args[0] == "ps":
             return 0, "ema-paper-sandbox-91\nema-paper-sandbox-92\n"
-        # A runner before the IPv6 rule started 91; 92 has none.
+        # 91 holds an IPv6 address; 92 has none.
         if args[0] == "exec" and args[-1] == backends.NO_IPV6:
             return (1, "") if args[1] == "ema-paper-sandbox-91" else (0, "")
         return 0, ""
@@ -891,92 +893,54 @@ async def test_an_adopted_vm_on_the_network_with_ipv6_is_stopped(tmp_path, monke
     monkeypatch.setattr(backends, "_docker", fake_docker)
     for network in ("ema-paper-sandbox", "none"):
         calls.clear()
-        settings = Settings(
-            app_env="local",
-            sandbox_token=TOKEN,
-            sandbox_backend="docker",
-            sandbox_runtime="runc",
-            sandbox_network=network,
-            sandbox_proxy_url="http://10.250.250.2:3128",
-            sandbox_workspaces_dir=str(tmp_path / "ws"),
-            sandbox_workspaces_mount=str(tmp_path / "ws"),
-        )
-        await backends.DockerBackend(settings).startup()
+        settings = docker_settings(tmp_path, sandbox_network=network, sandbox_proxy_url=PROXY_URL)
+        await DockerBackend(settings).startup()
         removed = [args[-1] for args in calls if args[0] == "rm"]
         # Off the network an adopted VM's IPv6 reaches nothing, so it is not looked at.
         assert removed == (["ema-paper-sandbox-91"] if network != "none" else [])
 
 
-async def test_the_vm_scratch_size_comes_from_settings(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
-
-    calls: list[tuple[str, ...]] = []
-
-    async def fake_docker(*args, timeout=120.0):
-        calls.append(args)
-        if args[0] == "inspect":
-            return 1, "Error: No such object"
-        return 0, ""
-
-    monkeypatch.setattr(backends, "_docker", fake_docker)
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="docker",
-        sandbox_runtime="runc",
+async def test_a_vm_start_takes_its_limits_from_settings(tmp_path, docker) -> None:
+    settings = docker_settings(
+        tmp_path,
         sandbox_tmp_size="256m",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
+        sandbox_start_timeout_seconds=333,
+        sandbox_docker_timeout_seconds=444,
     )
-    backend = backends.DockerBackend(settings)
+    backend = DockerBackend(settings)
     await backend.ensure_running(backend._user(41))
-    run = next(args for args in calls if args[0] == "run")
+    (run,) = docker.args("run")
     assert "/tmp:rw,exec,size=256m" in run  # noqa: S108 - the VM scratch, not the host
     assert "size=1g" not in " ".join(run)
     # The parse baseline is a nested read-only mount over the workspace mount, its target
-    # made before the start (docs/sandbox.md § Backends).
+    # made before the start (docs/sandbox.md § The runner).
     host = tmp_path / "ws" / "41"
     baseline = f"{host}/.sightread:/workspace/.sightread:ro"
     assert baseline in run
     assert run.index(f"{host}:/workspace") < run.index(baseline)
     assert (host / ".sightread").is_dir()
+    # The start waits as long as configured; the stale VM before it is removed within
+    # Docker's own timeout.
+    assert docker.timeouts("run") == [333]
+    assert docker.timeouts("rm") == [444]
 
 
-async def test_the_default_environment_is_made_after_each_start(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
-
-    calls: list[tuple[str, ...]] = []
+async def test_the_default_environment_is_made_after_each_start(tmp_path, docker) -> None:
     env_code = 0
 
-    async def fake_docker(*args, timeout=120.0):
-        calls.append(args)
-        if args[0] == "inspect":
-            return 1, "Error: No such object"
-        if args[0] == "exec":
-            return env_code, "" if env_code == 0 else "error: no space left on device"
-        return 0, ""
+    def environment(args: tuple[str, ...]) -> tuple[int, str] | None:
+        if args[0] != "exec":
+            return None
+        return env_code, "" if env_code == 0 else "error: no space left on device"
 
-    monkeypatch.setattr(backends, "_docker", fake_docker)
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="docker",
-        sandbox_runtime="runc",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    backend = backends.DockerBackend(settings)
+    docker.answer = environment
+    backend = DockerBackend(docker_settings(tmp_path))
     await backend.ensure_running(backend._user(71))
+    calls = docker.args()
     run_at = next(index for index, args in enumerate(calls) if args[0] == "run")
     # Every program the runner starts in the VM by its full path, the reaper included.
-    assert calls[run_at][-3:] == (backends.REAPER_PYTHON, "-c", backends.REAPER)
-    assert calls[run_at + 1] == (
-        "exec",
-        "ema-paper-sandbox-71",
-        "/bin/sh",
-        "-c",
-        backends.DEFAULT_ENV,
-    )
+    assert calls[run_at][-3:] == (REAPER_PYTHON, "-c", REAPER)
+    assert calls[run_at + 1] == ("exec", "ema-paper-sandbox-71", "/bin/sh", "-c", DEFAULT_ENV)
     argv, _cwd = backend.shell_argv(71)
     assert argv[argv.index("ema-paper-sandbox-71") + 1 :][:4] == [
         "/usr/bin/setsid",
@@ -986,16 +950,11 @@ async def test_the_default_environment_is_made_after_each_start(tmp_path, monkey
     ]
     # A start whose environment could not be made still gives a shell.
     env_code = 1
-    calls.clear()
     await backend.ensure_running(backend._user(72))
     assert backend._user(72).started_at is not None
 
 
 def test_the_default_environment_check_only_looks(tmp_path) -> None:
-    import subprocess
-
-    from sightread_sandbox.backends import DEFAULT_ENV, SAFE_PATH
-
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
     fake_uv = tmp_path / "bin" / "uv"
@@ -1035,8 +994,6 @@ async def test_a_program_a_command_put_first_on_the_path_does_not_run_the_cleanu
     """The VM's PATH starts in the workspace (the default environment's bin): a `pgrep`
     a command writes there must not stand in for the system's in the cleanup that ends
     what the command left running, nor a `bash` run the next command."""
-    from sightread_sandbox.shell import GROUP_CLEANUP, ShellSession, supervisor
-
     planted = tmp_path / "venv" / "bin"
     planted.mkdir(parents=True)
     monkeypatch.setenv("PATH", f"{planted}:{os.environ['PATH']}")
@@ -1056,11 +1013,8 @@ echo $!""",
         assert outcome.exit_code == 0, outcome.output
         lines = outcome.output.split()
         assert lines[0] == "first"
-        pid = int(lines[-1])
-        # The real pgrep ran: the job was ended (dead, or a zombie this host's init
-        # has not reaped yet).
-        status = Path(f"/proc/{pid}/status")
-        assert not status.exists() or "State:\tZ" in status.read_text()
+        # The real pgrep ran: the job was ended.
+        assert await wait_ended(int(lines[-1]))
         after = await shell.run("echo ran; command -v pgrep", timeout=10)
         assert after.output.split()[0] == "ran"
         # The command itself still sees what it planted: the PATH is the VM's.
@@ -1072,11 +1026,6 @@ echo $!""",
 def test_the_vm_sweep_repeats_until_nothing_but_the_shells_is_left(tmp_path) -> None:
     """The sweep against a fake process table: `ps` and `kill` on PATH read and change a
     file, and killing the forker spawns a child the first snapshot never saw."""
-    import os
-    import subprocess
-
-    from sightread_sandbox.backends import VM_SWEEP
-
     state = tmp_path / "procs"
     # pid ppid stat: init, the exec root (ppid 0), the live supervisor, a leftover that
     # forks on death, a detached job, and a zombie waiting for pid 1.
@@ -1123,11 +1072,6 @@ def test_the_vm_sweep_does_not_count_its_own_ps_as_left_over(tmp_path) -> None:
     """Every snapshot holds the pipeline that took it, gone by the time its kill comes:
     those pids are not left over, or no sweep would ever finish. A process that refuses
     the kill and still stands is, and the sweep fails closed."""
-    import os
-    import subprocess
-
-    from sightread_sandbox.backends import VM_SWEEP
-
     state = tmp_path / "procs"
     state.write_text("1 0 S\n10 0 S\n20 10 S\n30 20 S\n")
     calls = tmp_path / "calls"
@@ -1184,10 +1128,6 @@ def test_the_vm_sweep_does_not_count_its_own_ps_as_left_over(tmp_path) -> None:
 async def test_a_reset_whose_cache_cannot_be_removed_reports_it(
     client, tmp_path, monkeypatch
 ) -> None:
-    import shutil
-
-    from sightread_sandbox import backends
-
     await client.post("/sandboxes/51/exec", json={"session": "s", "command": "true"})
     cache = tmp_path / "ws" / "51" / ".cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -1208,49 +1148,7 @@ async def test_a_reset_whose_cache_cannot_be_removed_reports_it(
 
 def test_the_runner_refuses_a_relative_workspace_host_path(tmp_path) -> None:
     with pytest.raises(ValueError, match="absolute"):
-        Settings(
-            app_env="local",
-            sandbox_token=TOKEN,
-            sandbox_backend="docker",
-            sandbox_runtime="runc",
-            sandbox_workspaces_dir="./workspaces",
-            sandbox_workspaces_mount=str(tmp_path / "ws"),
-        )
-    # The local backend runs no `docker run` and takes any path.
-    Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir="./workspaces",
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-
-
-async def test_the_vm_start_waits_as_long_as_configured(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
-
-    timeouts: list[float] = []
-
-    async def fake_docker(*args, timeout=120.0):
-        if args[0] == "run":
-            timeouts.append(timeout)
-        if args[0] == "inspect":
-            return 1, "Error: No such object"
-        return 0, ""
-
-    monkeypatch.setattr(backends, "_docker", fake_docker)
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="docker",
-        sandbox_runtime="runc",
-        sandbox_start_timeout_seconds=333,
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    backend = backends.DockerBackend(settings)
-    await backend.ensure_running(backend._user(61))
-    assert timeouts == [333]
+        docker_settings(tmp_path, sandbox_workspaces_dir="./workspaces")
 
 
 async def test_an_eviction_that_left_the_vm_unstoppable_starts_no_shell(tmp_path) -> None:
@@ -1261,75 +1159,30 @@ async def test_an_eviction_that_left_the_vm_unstoppable_starts_no_shell(tmp_path
             if evicting:
                 sandbox.unstoppable = True  # the evicted shell's command could not be ended
 
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_max_shells=1,
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    backend = Stuck(settings)
+    backend = Stuck(local_settings(tmp_path, sandbox_max_shells=1))
     await backend.exec(71, "a", "true", timeout=10)
     with pytest.raises(RuntimeError):
         await backend.exec(71, "b", "true", timeout=10)
     assert "b" not in backend._user(71).sessions
 
 
-async def test_a_stale_vm_is_removed_within_the_configured_timeout(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
-
-    timeouts: dict[str, float] = {}
-
-    async def fake_docker(*args, timeout=120.0):
-        timeouts[args[0]] = timeout
-        if args[0] == "inspect":
-            return 1, "Error: No such object"
-        return 0, ""
-
-    monkeypatch.setattr(backends, "_docker", fake_docker)
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="docker",
-        sandbox_runtime="runc",
-        sandbox_docker_timeout_seconds=444,
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    backend = backends.DockerBackend(settings)
-    await backend.ensure_running(backend._user(81))
-    assert timeouts["rm"] == 444
-
-
 async def test_a_vm_docker_cannot_inspect_is_unavailable_not_stopped(tmp_path, monkeypatch) -> None:
-    from sightread_sandbox import backends
-
     answer = {"out": (1, "Cannot connect to the Docker daemon")}
 
-    async def fake_docker(*args, timeout=120.0):
+    async def fake_docker(*args, **_):
         if args[0] == "inspect":
+            if isinstance(answer["out"], Exception):
+                raise answer["out"]
             return answer["out"]
         return 0, ""
 
     monkeypatch.setattr(backends, "_docker", fake_docker)
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="docker",
-        sandbox_runtime="runc",
-        sandbox_idle_seconds=0,
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    backend = backends.DockerBackend(settings)
+    backend = DockerBackend(docker_settings(tmp_path, sandbox_idle_seconds=0))
     # The daemon away, or an inspection that timed out: unknown, never a stopped VM the
     # dashboard would offer to start.
     with pytest.raises(RuntimeError):
         await backend.is_running(7)
-    app = create_app(settings, backend)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
-        http.headers["Authorization"] = f"Bearer {TOKEN}"
+    async with runner(backend) as http:
         assert (await http.get("/sandboxes/7")).status_code == 503
         # Docker's own "no such" is a positive absence: stopped.
         answer["out"] = (1, "Error: No such object: ema-paper-sandbox-7")
@@ -1338,6 +1191,13 @@ async def test_a_vm_docker_cannot_inspect_is_unavailable_not_stopped(tmp_path, m
     answer["out"] = (1, "docker timed out")
     backend._user(7).last_used = 0
     assert await backend.stop_idle() == 0
+    # Docker could not even be run (out of file descriptors): the sweep fails, and the
+    # next one asks again and stops the VM it then finds running.
+    answer["out"] = OSError(24, "Too many open files")
+    with pytest.raises(OSError):
+        await backend.stop_idle()
+    answer["out"] = (0, "true\n")
+    assert await backend.stop_idle() == 1
 
 
 async def test_a_command_whose_vm_became_unstoppable_is_not_reported_done(tmp_path) -> None:
@@ -1354,15 +1214,7 @@ async def test_a_command_whose_vm_became_unstoppable_is_not_reported_done(tmp_pa
         async def is_gone(self, user_id: int) -> bool:
             return self.gone
 
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_docker_timeout_seconds=1,
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    backend = Stuck(settings)
+    backend = Stuck(local_settings(tmp_path, sandbox_docker_timeout_seconds=1))
     # Not an outcome the worker may commit a tree over: 503, after the removal timeout
     # passed without Docker reporting the VM gone.
     with pytest.raises(RuntimeError):
@@ -1378,8 +1230,6 @@ async def test_a_command_whose_vm_became_unstoppable_is_not_reported_done(tmp_pa
 
 
 async def test_a_restart_that_cannot_confirm_the_kill_is_not_done(tmp_path) -> None:
-    import asyncio
-
     class Stuck(LocalBackend):
         gone = False
 
@@ -1392,15 +1242,7 @@ async def test_a_restart_that_cannot_confirm_the_kill_is_not_done(tmp_path) -> N
         async def is_gone(self, user_id: int) -> bool:
             return self.gone
 
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_docker_timeout_seconds=1,
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-    )
-    backend = Stuck(settings)
+    backend = Stuck(local_settings(tmp_path, sandbox_docker_timeout_seconds=1))
     running = asyncio.ensure_future(backend.exec(91, "s", "sleep 30", timeout=60))
     await asyncio.sleep(0.3)
     # The worker asks for the shell to be restarted to settle an unconfirmed command:
@@ -1411,9 +1253,7 @@ async def test_a_restart_that_cannot_confirm_the_kill_is_not_done(tmp_path) -> N
     with pytest.raises((asyncio.CancelledError, RuntimeError)):
         await running
     backend.gone = True
-    app = create_app(settings, backend)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
-        http.headers["Authorization"] = f"Bearer {TOKEN}"
+    async with runner(backend) as http:
         assert (await http.post("/sandboxes/91/restart", json={"session": "s"})).json() == {
             "ok": True
         }
@@ -1423,17 +1263,7 @@ async def test_a_restart_that_cannot_confirm_the_kill_is_not_done(tmp_path) -> N
 async def test_a_command_past_the_cap_is_refused(tmp_path) -> None:
     """The cap is the runner's setting, not a constant in the request model
     (docs/sandbox.md § The runner)."""
-    settings = Settings(
-        app_env="local",
-        sandbox_token=TOKEN,
-        sandbox_backend="local",
-        sandbox_workspaces_dir=str(tmp_path / "ws"),
-        sandbox_workspaces_mount=str(tmp_path / "ws"),
-        sandbox_command_max_chars=16,
-    )
-    app = create_app(settings, LocalBackend(settings))
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
-        http.headers["Authorization"] = f"Bearer {TOKEN}"
+    async with runner(LocalBackend(local_settings(tmp_path, sandbox_command_max_chars=16))) as http:
         refused = await http.post(
             "/sandboxes/9/exec", json={"session": "s", "command": "echo " + "x" * 20}
         )

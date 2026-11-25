@@ -6,9 +6,12 @@ The key is never logged and never appears in raised messages or responses.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -25,11 +28,11 @@ from ..parsing.images import image_size
 REQUEST_TIMEOUT_SECONDS = 20.0
 # A page of dense text can take a vision model a while; this is the whole-request ceiling.
 CHAT_TIMEOUT_SECONDS = 180.0
-# Fallback body cap when a caller has no Settings at hand; the deployed value is
-# UPSTREAM_RESPONSE_MAX_BYTES (config.py), threaded in by control routes and the worker.
-DEFAULT_RESPONSE_MAX_BYTES = 33_554_432
-# Likewise the answer's token cap; the deployed value is VISION_MAX_OUTPUT_TOKENS.
-DEFAULT_MAX_OUTPUT_TOKENS = 16_000
+
+# Retry policy for one upstream call, a page's and the format check's alike — 429s and
+# transient failures (docs/parsing.md § Upstream usage).
+VISION_MAX_ATTEMPTS = 4
+VISION_BACKOFF_BASE_SECONDS = 1.0
 
 DATA_URL_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
 
@@ -70,8 +73,8 @@ class ResponseTooLarge(Exception):
 
 
 async def _read_body_capped(response: httpx.Response, max_bytes: int) -> bytes:
-    """Read a streamed response body, aborting past `max_bytes` — a user-controlled
-    endpoint must not be able to exhaust memory with an unbounded reply."""
+    """Read a streamed response body, aborting past `max_bytes` — a broken upstream must
+    not be able to exhaust memory with an unbounded reply."""
     chunks: list[bytes] = []
     total = 0
     async for chunk in response.aiter_bytes():
@@ -110,23 +113,21 @@ async def agent_models(settings: Settings, agent: str) -> list[dict]:
     connection = kano_connection(settings)
     if connection is None:
         raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
-    catalog = await fetch_models(
-        connection.base_url, connection.api_key, max_bytes=settings.upstream_response_max_bytes
-    )
+    catalog = await fetch_models(connection, max_bytes=settings.upstream_response_max_bytes)
     names = {entry["id"]: entry["name"] for entry in catalog}
     return [{"id": model, "name": names[model]} for model in offered if model in names]
 
 
-async def fetch_models(
-    base_url: str, api_key: str, max_bytes: int = DEFAULT_RESPONSE_MAX_BYTES
-) -> list[dict]:
+async def fetch_models(connection: Connection, *, max_bytes: int) -> list[dict]:
     """The model catalog of an OpenAI-compatible endpoint, `GET {base_url}/models` —
     free on Kano Proxy's `/openai/v1`. Every failure is the upstream's, 502."""
     try:
         async with (
             httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client,
             client.stream(
-                "GET", f"{base_url}/models", headers={"Authorization": f"Bearer {api_key}"}
+                "GET",
+                f"{connection.base_url}/models",
+                headers={"Authorization": f"Bearer {connection.api_key}"},
             ) as response,
         ):
             if response.status_code in (401, 403):
@@ -170,6 +171,9 @@ class UpstreamError(Exception):
         super().__init__(message)
         self.fatal = fatal
         self.transient = transient
+        # What the call was billed when this failure was read from an answer; None when
+        # no answer came.
+        self.usage: Usage | None = None
 
 
 class RateLimited(UpstreamError):
@@ -220,15 +224,50 @@ class PaymentRequired(UpstreamError):
         super().__init__("The upstream reported exhausted credits")
 
 
+async def with_retries[T](
+    call: Callable[[], Awaitable[T]],
+    *,
+    slot: Callable[[], contextlib.AbstractAsyncContextManager] | None = None,
+    on_rate_limited: Callable[[], Awaitable[None]] | None = None,
+    on_retry: Callable[[UpstreamError], Awaitable[None]] | None = None,
+) -> T:
+    """Run one upstream call, backing off on 429 and on transient failures
+    (docs/parsing.md § Upstream usage): `VISION_MAX_ATTEMPTS` tries, read when called.
+
+    `slot` is held around each try only, so a backoff never holds up a call that could
+    run. `on_rate_limited` runs after a 429 that is retried, once the slot is left;
+    `on_retry` is awaited with every failure that is retried, before its backoff. The last
+    failure, and one that would repeat, is raised."""
+    for attempt in range(VISION_MAX_ATTEMPTS):
+        last = attempt == VISION_MAX_ATTEMPTS - 1
+        async with slot() if slot is not None else contextlib.nullcontext():
+            try:
+                return await call()
+            # A 429 first: RateLimited is an UpstreamError that is not transient.
+            except RateLimited as exc:
+                if last:
+                    raise
+                failure: UpstreamError = exc
+                delay = exc.retry_after or VISION_BACKOFF_BASE_SECONDS * (2**attempt)
+            except UpstreamError as exc:
+                if last or not exc.transient:
+                    raise
+                failure = exc
+                delay = VISION_BACKOFF_BASE_SECONDS * (2**attempt)
+        if on_retry is not None:
+            await on_retry(failure)
+        if isinstance(failure, RateLimited) and on_rate_limited is not None:
+            await on_rate_limited()
+        await asyncio.sleep(delay)
+
+
 @dataclass(frozen=True)
 class Connection:
     """The upstream to call: where, and the operator's key (docs/auth.md § 3). The key
-    lives in this value for the request it authorises and in no log line; `snapshot` is
-    what the job's dedup key stores for the upstream (docs/jobs.md § Dedup)."""
+    lives in this value for the request it authorises and in no log line."""
 
     api_key: str
     base_url: str
-    snapshot: str
 
     def __repr__(self) -> str:  # never let key material reach a log line
         return "Connection(...)"
@@ -258,7 +297,6 @@ def kano_connection(settings: Settings, *, anthropic: bool = False) -> Connectio
     return Connection(
         api_key=settings.kano_proxy_api_key,
         base_url=settings.kano_proxy_anthropic_base if anthropic else settings.kano_proxy_api_base,
-        snapshot=settings.kano_proxy_base_url,
     )
 
 
@@ -268,37 +306,36 @@ def image_data_url(path: Path) -> str:
     return f"data:{media_type};base64,{encoded}"
 
 
-def _int(value: object) -> int:
+def as_int(value: object) -> int:
+    """A reported count as an int: 0 when it is missing or not a number."""
     try:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0
 
 
-def _usage(payload: dict) -> Usage:
-    """Token counts, and the cost tagged with where it came from.
-
-    Kano Proxy's reported cost is recorded as an estimate (list prices). When it reports
-    none, or the value is not a usable number, the cost is unknown — never 0
-    (docs/parsing.md § Upstream usage).
-    """
-    raw = payload.get("usage") or {}
-    prompt_tokens = _int(raw.get("prompt_tokens"))
-    completion_tokens = _int(raw.get("completion_tokens"))
-
+def reported_cost(raw: dict) -> tuple[Decimal | None, str]:
+    """A call's cost from its `usage` object, tagged with where it came from: Kano Proxy's
+    reported `cost` is an estimate (list prices); none, or a value that is not a usable
+    number, is unknown — never 0 (docs/parsing.md § Upstream usage)."""
     reported = raw.get("cost")
-    # A JSON number only: `bool` is an `int` to Python, and a string is not what an
-    # OpenAI-compatible `usage.cost` is. `json` also parses NaN and Infinity.
+    # A JSON number only: `bool` is an `int` to Python, and a string is not what a
+    # reported `usage.cost` is. `json` also parses NaN and Infinity.
     if isinstance(reported, int | float) and not isinstance(reported, bool):
         cost = Decimal(str(reported))
         if cost.is_finite() and 0 <= cost <= MAX_REPORTED_COST:
-            return Usage(
-                prompt_tokens,
-                completion_tokens,
-                cost.quantize(COST_QUANTUM),
-                COST_SOURCE_ESTIMATED,
-            )
-    return Usage(prompt_tokens, completion_tokens, None, COST_SOURCE_UNKNOWN)
+            return cost.quantize(COST_QUANTUM), COST_SOURCE_ESTIMATED
+    return None, COST_SOURCE_UNKNOWN
+
+
+def _usage(payload: dict) -> Usage:
+    """A completion's token counts and its reported cost."""
+    raw = payload.get("usage") or {}
+    return Usage(
+        as_int(raw.get("prompt_tokens")),
+        as_int(raw.get("completion_tokens")),
+        *reported_cost(raw),
+    )
 
 
 def _message_text(payload: dict) -> str:
@@ -333,12 +370,30 @@ def _is_transient(status: int) -> bool:
     return status == 408 or status >= 500
 
 
+def raise_for_status(response: httpx.Response) -> None:
+    """An error status as the failure the callers' retry policy reads, the vision calls'
+    and the Messages API's alike: 429 rate-limited, 402 payment, 401/403 a key every call
+    will repeat, 408 and 5xx transient. A status below 400 raises nothing."""
+    if response.status_code == 429:
+        retry_after = response.headers.get("retry-after")
+        raise RateLimited(float(retry_after) if (retry_after or "").isdigit() else None)
+    if response.status_code == 402:
+        raise PaymentRequired()
+    if response.status_code in (401, 403):
+        raise UpstreamError("The upstream rejected the operator's key", fatal=True)
+    if response.status_code >= 400:
+        raise UpstreamError(
+            f"The upstream returned {response.status_code}",
+            transient=_is_transient(response.status_code),
+        )
+
+
 def _raise_for_error_payload(payload: dict) -> None:
     """Some OpenAI-compatible servers report a provider failure inside a 200 response."""
     error = payload.get("error")
     if not isinstance(error, dict):
         return
-    code = _int(error.get("code"))
+    code = as_int(error.get("code"))
     if code == 402:
         raise PaymentRequired()
     if code == 429:
@@ -356,6 +411,8 @@ async def _chat_with_image(
     max_bytes: int,
     max_output_tokens: int,
 ) -> tuple[str, Usage]:
+    # Read and encoded in a thread: a page image is megabytes of base64.
+    data_url = await asyncio.to_thread(image_data_url, image)
     body: dict = {
         "model": model,
         "messages": [
@@ -363,7 +420,7 @@ async def _chat_with_image(
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_data_url(image)}},
+                    {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
         ],
@@ -382,18 +439,7 @@ async def _chat_with_image(
                 json=body,
             ) as response,
         ):
-            if response.status_code == 429:
-                retry_after = response.headers.get("retry-after")
-                raise RateLimited(float(retry_after) if (retry_after or "").isdigit() else None)
-            if response.status_code == 402:
-                raise PaymentRequired()
-            if response.status_code in (401, 403):
-                raise UpstreamError("The upstream rejected the stored key", fatal=True)
-            if response.status_code >= 400:
-                raise UpstreamError(
-                    f"The upstream returned {response.status_code}",
-                    transient=_is_transient(response.status_code),
-                )
+            raise_for_status(response)
             raw = await _read_body_capped(response, max_bytes)
     except httpx.HTTPError as exc:
         raise UpstreamError("The upstream was unreachable", transient=True) from exc
@@ -411,7 +457,8 @@ async def _chat_with_image(
     _raise_for_error_payload(payload)
     try:
         text = _message_text(payload)
-    except (EmptyCompletion, IncompleteCompletion) as exc:
+    except UpstreamError as exc:
+        # An answered call, billed whatever its answer was.
         exc.usage = _usage(payload)
         raise
     return text, _usage(payload)
@@ -425,8 +472,8 @@ async def transcribe_page(
     page_no: int,
     *,
     convention: BboxConvention = bbox.DEFAULT,
-    max_response_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
-    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    max_response_bytes: int,
+    max_output_tokens: int,
 ) -> PageTranscription:
     """Transcribe one rendered page. The answer's figure placeholders come back in the
     stored contract, whatever convention the model was asked for (agents/bbox.py).
@@ -454,8 +501,8 @@ async def ask_about_page(
     prompt: str,
     image: Path,
     *,
-    max_response_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
-    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    max_response_bytes: int,
+    max_output_tokens: int,
 ) -> PageTranscription:
     """One more question about a page image, the figure check's (docs/parsing.md § Figure
     check), on the same wire as its transcription. The answer's text comes back as it is,

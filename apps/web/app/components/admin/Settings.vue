@@ -15,36 +15,10 @@ import { formatCount } from '~/lib/format'
 
 const { t, locale } = useI18n()
 const adminConsole = useAdminConsole()
-const { explain } = useAdminFailure()
 
 const canWrite = computed(() => adminConsole.can('settings', 'write'))
 
-const data = shallowRef<AdminSettingsResponse | null>(null)
-const pending = ref(false)
-const error = ref<string | null>(null)
-/** Only the newest read may write. */
-let seq = 0
-
-async function load(): Promise<void> {
-  const mine = ++seq
-  pending.value = true
-  try {
-    const loaded = await getAdminSettings()
-    if (mine === seq) {
-      data.value = loaded
-      error.value = null
-    }
-  } catch (failure) {
-    const message = await explain(failure)
-    if (mine === seq) {
-      error.value = message
-    }
-  } finally {
-    if (mine === seq) {
-      pending.value = false
-    }
-  }
-}
+const { data, pending, error, load, replace } = useAdminRead(getAdminSettings)
 
 onMounted(load)
 
@@ -74,10 +48,7 @@ const dialog = shallowRef<{ setting: AdminSetting; mode: 'edit' | 'restore' } | 
 
 function onSaved(settings: AdminSettingsResponse) {
   // A change made shows the settings it answered; a read still running is older.
-  seq += 1
-  pending.value = false
-  data.value = settings
-  error.value = null
+  replace(settings)
   dialog.value = null
 }
 </script>

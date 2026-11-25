@@ -25,7 +25,6 @@ import {
   type AdminGroupDetail,
   type AdminGroupsResponse,
   type AdminMember,
-  type AdminPerson,
 } from '~/lib/api'
 import {
   adminFailure,
@@ -35,6 +34,7 @@ import {
   canRenameGroup,
   canToggle,
   idOf,
+  nameOrEmail,
   toggledPermissions,
   type AdminLevel,
 } from '~/lib/admin'
@@ -46,6 +46,8 @@ const route = useRoute()
 const router = useRouter()
 const adminConsole = useAdminConsole()
 const { explain } = useAdminFailure()
+const { personName } = useAdminLabels()
+const hold = useHeldRequest()
 
 const held = adminConsole.permissions
 const canWrite = computed(() => can(held.value, 'groups', 'write'))
@@ -152,11 +154,6 @@ onMounted(loadList)
 
 // --- labels ----------------------------------------------------------------------------
 
-/** A person as the console names them: their name, else their account number. */
-function personName(person: AdminPerson): string {
-  return person.name?.trim() || t('admin.accountId', { id: person.id })
-}
-
 function areaLabel(key: string): string {
   return te(`admin.areas.${key}`) ? t(`admin.areas.${key}`) : key
 }
@@ -246,10 +243,6 @@ const memberColumns = computed<TableColumn<AdminMember>[]>(() => [
     : []),
 ])
 
-function memberName(member: AdminMember): string {
-  return member.name?.trim() || member.email
-}
-
 function addedLine(member: AdminMember): string {
   const date = formatDate(member.added_at, locale.value)
   return member.added_by
@@ -308,23 +301,14 @@ async function confirmRemove() {
   }
   removing.value = true
   removeError.value = null
-  // Back would leave the dialog while the request runs, and its answer would land unseen.
-  const release = router.beforeEach(() => false)
-  let failure: unknown = null
-  try {
-    await removeAdminGroupMember(group.id, member.user_id)
-  } catch (error) {
-    failure = error
-  } finally {
-    release()
-  }
-  if (failure && adminFailure(failure).kind !== 'notFound') {
-    removeError.value = await explain(failure)
+  const result = await hold(() => removeAdminGroupMember(group.id, member.user_id))
+  if ('failure' in result && adminFailure(result.failure).kind !== 'notFound') {
+    removeError.value = await explain(result.failure)
   } else {
     // Done — or a 404: the member already left, or the group itself is gone; either way
     // they are not in it.
     removeTarget.value = null
-    if (!(failure && (await gone(group.id)))) {
+    if (!('failure' in result && (await gone(group.id)))) {
       await refresh()
     }
   }
@@ -384,17 +368,9 @@ async function confirmDelete() {
   }
   deleting.value = true
   deleteError.value = null
-  const release = router.beforeEach(() => false)
-  let failure: unknown = null
-  try {
-    await deleteAdminGroup(group.id)
-  } catch (error) {
-    failure = error
-  } finally {
-    release()
-  }
-  if (failure && adminFailure(failure).kind !== 'notFound') {
-    deleteError.value = await explain(failure)
+  const result = await hold(() => deleteAdminGroup(group.id))
+  if ('failure' in result && adminFailure(result.failure).kind !== 'notFound') {
+    deleteError.value = await explain(result.failure)
   } else {
     // Done — or a 404: someone else deleted it first, which is what was asked.
     deleteOpen.value = false
@@ -535,7 +511,6 @@ async function confirmDelete() {
                     :id="id"
                     v-model="email"
                     type="email"
-                    autocomplete="off"
                     :placeholder="t('admin.groups.addByEmail')"
                     :described-by="describedBy"
                     :invalid="invalid"
@@ -564,16 +539,13 @@ async function confirmDelete() {
               :caption="t('admin.groups.membersCaption', { name: selected.name })"
             >
               <template #cell-member="{ row }">
-                <span class="person">
-                  <span class="person-name cell-block">{{ memberName(row) }}</span>
-                  <span v-if="row.name?.trim()" class="person-email cell-block">{{ row.email }}</span>
-                </span>
+                <AdminPersonCell :name="row.name" :email="row.email" />
               </template>
               <template #cell-added="{ row }">
                 <span class="added">{{ addedLine(row) }}</span>
               </template>
               <template #cell-remove="{ row }">
-                <UiButton size="xs" :label="t('admin.groups.removeNamed', { name: memberName(row) })" @click="askRemove(row)">
+                <UiButton size="xs" :label="t('admin.groups.removeNamed', { name: nameOrEmail(row) })" @click="askRemove(row)">
                   {{ t('admin.groups.remove') }}
                 </UiButton>
               </template>
@@ -600,10 +572,10 @@ async function confirmDelete() {
 
     <UiConfirmDialog
       v-if="removeTarget && selected"
-      :title="t('admin.groups.removeTitle', { name: memberName(removeTarget) })"
+      :title="t('admin.groups.removeTitle', { name: nameOrEmail(removeTarget) })"
       :message="
         t(selected.builtin ? 'admin.groups.removeOwnerBody' : 'admin.groups.removeBody', {
-          name: memberName(removeTarget),
+          name: nameOrEmail(removeTarget),
           group: selected.name,
         })
       "
@@ -798,22 +770,6 @@ async function confirmDelete() {
 .add-field {
   width: 260px;
   max-width: 100%;
-}
-
-.person {
-  display: grid;
-  min-width: 0;
-  padding: 6px 0;
-  line-height: 1.35;
-}
-
-.person-name {
-  font-weight: var(--weight-medium);
-}
-
-.person-email {
-  color: var(--muted);
-  font-size: var(--text-xs);
 }
 
 .added {

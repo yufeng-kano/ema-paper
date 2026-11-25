@@ -12,12 +12,11 @@ from datetime import timedelta
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
 from httpx import AsyncClient
 from sqlalchemy import func, select, update
 
-from sightread.agents import PARSE
+from sightread.agents.parse import PIPELINE_VERSION
 from sightread.auth.sessions import SESSION_COOKIE
 from sightread.db.models import (
     AgentSetting,
@@ -47,26 +46,26 @@ from sightread.workspace.layout import (
     git_dir,
     images_dir,
     sources_dir,
-    user_root,
+)
+from tests.billing_helpers import (
+    SUBSCRIPTIONS_URL,
+    canonical,
+    notify,
+    pay_version,
+    subscription_event,
 )
 from tests.conftest import (
     CSRF_HEADERS,
-    DATABASE_URL,
     PARSE_MODEL,
     PAY_SETTINGS,
     convert_on_upload,
     grant_plan,
+    postgres_only,
+    sign_in,
 )
-from tests.test_document_images import _image, _insert
-from tests.test_library_trash import _write
-from tests.test_markdown_documents import _upload_markdown
-from tests.test_pay import SUBSCRIPTIONS_URL, _event, _notify, _version, canonical
-from tests.test_retention import _stranger
-
-postgres_only = pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="the users row's cascades need PostgreSQL",
-)
+from tests.factories import job_row
+from tests.helpers import account_client
+from tests.library_helpers import image_bytes, insert_image, upload, write_content
 
 SANDBOX_URL = "http://sandbox.test"
 # Every table keyed by the user that the footprint below writes.
@@ -87,34 +86,16 @@ USER_TABLES = (
 )
 
 
-async def _account(make_client, tmp_path, **overrides) -> AsyncClient:
-    """Signed in, with a workspace of its own."""
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), **overrides)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
-
-
 async def _delete(client: AsyncClient) -> httpx.Response:
     return await client.delete("/api/account", headers=CSRF_HEADERS)
 
 
 async def _job(db, user_id: int, status: str = "succeeded") -> uuid.UUID:
-    job = Job(
-        id=uuid.uuid4(),
-        user_id=user_id,
-        agent="parse",
-        kind="pdf",
-        filename="paper.pdf",
-        media_type="application/pdf",
+    job = job_row(
+        user_id,
         size_bytes=8,
-        sha256=uuid.uuid4().hex * 2,
-        model=PARSE_MODEL,
-        pipeline_version=PARSE.pipeline_version,
-        bbox_format="yxyx_norm1000",
+        pipeline_version=PIPELINE_VERSION,
         status=status,
-        page_count=1,
         finished_at=utcnow() if status in ("succeeded", "failed") else None,
     )
     db.add(job)
@@ -130,9 +111,9 @@ async def _footprint(client: AsyncClient) -> dict:
     assert (
         await client.post("/api/keys", json={"name": "laptop"}, headers=CSRF_HEADERS)
     ).status_code == 201
-    note = (await _upload_markdown(client, b"# Note\n", name="note.md")).json()
-    await _write(client, note["id"], "# Note, edited\n")
-    assert (await _insert(client, note["id"], _image("PNG"))).status_code == 201
+    note = (await upload(client, "note.md", b"# Note\n")).json()
+    await write_content(client, note["id"], "# Note, edited\n")
+    assert (await insert_image(client, note["id"], image_bytes("PNG"))).status_code == 201
     period_start = utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     async with client.app.state.sessionmaker() as db:
         parsed = await _job(db, uid)
@@ -201,7 +182,7 @@ async def _footprint(client: AsyncClient) -> dict:
                 period_end=utcnow() - timedelta(days=10),
             )
         )
-        db.add(PayEvent(id=f"evt_{uid}", type="subscription.canceled", user_id=uid))
+        db.add(PayEvent(id=f"evt_{uid}", user_id=uid))
         await db.commit()
         attachment_id = attachment.id
     figures, uploads = Path(settings.figures_dir), Path(settings.upload_dir)
@@ -250,11 +231,11 @@ async def _owned_rows(client: AsyncClient, user_id: int) -> dict[str, int]:
 
 
 @postgres_only
-async def test_deleting_the_account_removes_every_row_and_file_of_it(make_client, tmp_path) -> None:
-    account = await _account(make_client, tmp_path)
-    stranger = await _stranger(make_client, tmp_path)
-    theirs = (await _upload_markdown(stranger, b"# Theirs\n", name="theirs.md")).json()
-    await _write(stranger, theirs["id"], "# Theirs, edited\n")
+async def test_deleting_the_account_removes_every_row_and_file_of_it(make_client) -> None:
+    account = await sign_in(make_client())
+    stranger = await account_client(make_client)
+    theirs = (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
+    await write_content(stranger, theirs["id"], "# Theirs, edited\n")
     owned = await _footprint(account)
     token = account.cookies.get(SESSION_COOKIE)
     assert all((await _owned_rows(account, account.user_id)).values())
@@ -292,10 +273,8 @@ async def test_deleting_the_account_removes_every_row_and_file_of_it(make_client
 
 
 @respx.mock
-async def test_a_subscription_that_still_renews_refuses_until_it_is_set_to_end(
-    make_client, tmp_path
-) -> None:
-    account = await _account(make_client, tmp_path, **PAY_SETTINGS)
+async def test_a_subscription_that_still_renews_refuses_until_it_is_set_to_end(make_client) -> None:
+    account = await sign_in(make_client(**PAY_SETTINGS))
     uid = account.user_id
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{uid}").mock(
         return_value=httpx.Response(200, json=canonical(uid))
@@ -322,17 +301,17 @@ async def test_a_subscription_that_still_renews_refuses_until_it_is_set_to_end(
     assert fetch.call_count == 2
 
     # The subscription's ending events still come: acknowledged, nothing fetched.
-    notified = await _notify(account, _event(uid, "evt_after"))
+    notified = await notify(account, subscription_event(uid, "evt_after"))
     assert (notified.status_code, notified.json()) == (200, {})
     assert fetch.call_count == 2
 
 
 @respx.mock
 async def test_pay_unreachable_refuses_only_an_account_with_a_subscription_on_record(
-    make_client, tmp_path
+    make_client,
 ) -> None:
-    account = await _account(make_client, tmp_path, **PAY_SETTINGS)
-    stranger = await _stranger(make_client, tmp_path, **PAY_SETTINGS)
+    account = await sign_in(make_client(**PAY_SETTINGS))
+    stranger = await account_client(make_client, **PAY_SETTINGS)
     await grant_plan(account.app.state.sessionmaker, account.user_id)
     respx.get(url__startswith=SUBSCRIPTIONS_URL).mock(side_effect=httpx.ConnectError("down"))
 
@@ -345,14 +324,12 @@ async def test_pay_unreachable_refuses_only_an_account_with_a_subscription_on_re
 
 
 @respx.mock
-async def test_a_renewal_written_while_the_request_waited_still_refuses(
-    make_client, tmp_path
-) -> None:
-    account = await _account(make_client, tmp_path, **PAY_SETTINGS)
+async def test_a_renewal_written_while_the_request_waited_still_refuses(make_client) -> None:
+    account = await sign_in(make_client(**PAY_SETTINGS))
     uid = account.user_id
     # Pay answered before the locks were taken; a notification wrote a newer version
     # since. The write keeps the newer one, and the newer one decides.
-    await grant_plan(account.app.state.sessionmaker, uid, version=_version(5))
+    await grant_plan(account.app.state.sessionmaker, uid, version=pay_version(5))
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{uid}").mock(
         return_value=httpx.Response(200, json=canonical(uid, version=2, cancel=True))
     )
@@ -370,11 +347,9 @@ async def test_a_renewal_written_while_the_request_waited_still_refuses(
 
 
 @respx.mock
-async def test_a_checkout_that_can_still_be_paid_refuses_until_it_cannot(
-    make_client, tmp_path
-) -> None:
-    account = await _account(make_client, tmp_path, **PAY_SETTINGS)
-    lapsed = await _stranger(make_client, tmp_path, **PAY_SETTINGS)
+async def test_a_checkout_that_can_still_be_paid_refuses_until_it_cannot(make_client) -> None:
+    account = await sign_in(make_client(**PAY_SETTINGS))
+    lapsed = await account_client(make_client, **PAY_SETTINGS)
     lifetime = account.app.state.settings.kano_pay_checkout_lifetime_seconds
     fetch = respx.get(url__startswith=SUBSCRIPTIONS_URL).mock(
         return_value=httpx.Response(200, json={"subscription": None})
@@ -407,8 +382,8 @@ async def test_a_checkout_that_can_still_be_paid_refuses_until_it_cannot(
     assert (await _delete(account)).status_code == 204
 
 
-async def test_without_pay_the_stored_subscription_decides(make_client, tmp_path) -> None:
-    account = await _account(make_client, tmp_path)
+async def test_without_pay_the_stored_subscription_decides(make_client) -> None:
+    account = await sign_in(make_client())
     await grant_plan(account.app.state.sessionmaker, account.user_id)
 
     refused = await _delete(account)
@@ -425,12 +400,10 @@ async def test_without_pay_the_stored_subscription_decides(make_client, tmp_path
 
 
 @postgres_only
-async def test_running_work_refuses_and_queued_work_goes_with_the_account(
-    make_client, tmp_path
-) -> None:
-    account = await _account(make_client, tmp_path)
+async def test_running_work_refuses_and_queued_work_goes_with_the_account(make_client) -> None:
+    account = await sign_in(make_client())
     uid = account.user_id
-    note = (await _upload_markdown(account, b"# Note\n", name="note.md")).json()
+    note = (await upload(account, "note.md", b"# Note\n")).json()
     async with account.app.state.sessionmaker() as db:
         running = await _job(db, uid, status="running")
         conversation = Conversation(user_id=uid, document_id=note["id"], session="s")
@@ -483,10 +456,8 @@ async def test_running_work_refuses_and_queued_work_goes_with_the_account(
 
 
 @postgres_only
-async def test_a_queued_parse_takes_its_upload_with_the_account(
-    make_client, tmp_path, documents
-) -> None:
-    account = await _account(make_client, tmp_path)
+async def test_a_queued_parse_takes_its_upload_with_the_account(make_client, documents) -> None:
+    account = await sign_in(make_client())
     await convert_on_upload(account)
     uploaded = await account.post(
         "/api/library/documents",
@@ -506,10 +477,8 @@ async def test_a_queued_parse_takes_its_upload_with_the_account(
 
 
 @respx.mock
-async def test_a_sandbox_that_cannot_be_stopped_does_not_hold_the_deletion_up(
-    make_client, tmp_path
-) -> None:
-    account = await _account(make_client, tmp_path, sandbox_url=SANDBOX_URL, sandbox_token="t")
+async def test_a_sandbox_that_cannot_be_stopped_does_not_hold_the_deletion_up(make_client) -> None:
+    account = await sign_in(make_client(sandbox_url=SANDBOX_URL, sandbox_token="t"))
     stop = respx.post(f"{SANDBOX_URL}/sandboxes/{account.user_id}/stop").mock(
         side_effect=httpx.ConnectError("down")
     )
@@ -518,15 +487,15 @@ async def test_a_sandbox_that_cannot_be_stopped_does_not_hold_the_deletion_up(
 
 
 async def test_the_sweep_finishes_a_deletion_whose_files_the_request_left(
-    make_client, tmp_path, monkeypatch
+    make_client, monkeypatch
 ) -> None:
     from sightread.routes import control
 
-    account = await _account(make_client, tmp_path)
+    account = await sign_in(make_client())
     owned = await _footprint(account)
     settings = account.app.state.settings
-    stranger = await _stranger(make_client, tmp_path)
-    (await _upload_markdown(stranger, b"# Theirs\n", name="theirs.md")).json()
+    stranger = await account_client(make_client)
+    (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
 
     async def failing(*args, **kwargs):
         raise OSError("disk unwell")
@@ -557,12 +526,12 @@ async def test_the_sweep_finishes_a_deletion_whose_files_the_request_left(
 
 
 async def test_an_unreadable_marker_still_finishes_the_directories(
-    make_client, tmp_path, monkeypatch
+    make_client, monkeypatch
 ) -> None:
     from sightread.routes import control
 
-    account = await _account(make_client, tmp_path)
-    await _upload_markdown(account, b"# Note\n", name="note.md")
+    account = await sign_in(make_client())
+    await upload(account, "note.md", b"# Note\n")
     settings = account.app.state.settings
 
     async def failing(*args, **kwargs):

@@ -6,7 +6,9 @@
  * cursor; **Restore default** puts the default back. A text equal to the default is saved
  * as no prompt, so a later default reaches it.
  */
+import { charLength } from '~/lib/agents'
 import { putAgentSettings, type AgentEntry, type SavedAgentSettings } from '~/lib/api'
+import { insertAtCaret } from '~/lib/caret'
 
 const props = defineProps<{
   agent: AgentEntry
@@ -22,21 +24,15 @@ const { t } = useI18n()
 const { resolve } = useApiError()
 
 const initial = props.agent.settings.prompt ?? props.agent.default_prompt
-/** A preset selected before agents had a prompt of their own still runs after the default
- *  (docs/agents.md § Per-agent settings). Saving anything, the default included, replaces it. */
-const legacyPreset = props.agent.settings.prompt === null && props.agent.settings.prompt_preset_id !== null
 const text = ref(initial)
 const textarea = ref<HTMLTextAreaElement | null>(null)
 const pending = ref(false)
 const error = ref<string | null>(null)
 
 const isDefault = computed(() => text.value.trim() === props.agent.default_prompt.trim())
-/** Counted as the server counts: the trimmed text, in code points rather than UTF-16 units. */
-const length = computed(() => [...text.value.trim()].length)
+const length = computed(() => charLength(text.value))
 const overCap = computed(() => props.maxChars !== null && length.value > props.maxChars)
-const saveDisabled = computed(
-  () => (text.value === initial && !legacyPreset) || !text.value.trim() || overCap.value,
-)
+const saveDisabled = computed(() => text.value === initial || !text.value.trim() || overCap.value)
 
 /** A chip inserts its token at the caret, replacing a selection, and hands focus back. */
 async function insertToken(token: string) {
@@ -45,12 +41,11 @@ async function insertToken(token: string) {
     text.value += token
     return
   }
-  const start = el.selectionStart
-  const end = el.selectionEnd
-  text.value = text.value.slice(0, start) + token + text.value.slice(end)
+  const inserted = insertAtCaret(text.value, el.selectionStart, el.selectionEnd, token)
+  text.value = inserted.text
   await nextTick()
   el.focus()
-  el.setSelectionRange(start + token.length, start + token.length)
+  el.setSelectionRange(inserted.caret, inserted.caret)
 }
 
 async function save() {
@@ -70,24 +65,22 @@ async function save() {
 </script>
 
 <template>
-  <UiModal
-    size="wide"
-    :title="t('agents.promptDialogTitle', { agent: title })"
-    :busy="pending"
+  <AgentsDefinitionDialog
+    :heading="t('agents.promptDialogTitle', { agent: title })"
+    :item="{ builtin: true, modified: !isDefault }"
+    :state="isDefault ? t('agents.promptDefault') : t('agents.promptEdited')"
+    :form-id="`prompt-form-${agent.name}`"
+    :is-default="isDefault"
+    :pending="pending"
+    :error="error"
+    :save-disabled="saveDisabled"
     @close="emit('close')"
+    @save="save"
+    @restore="text = agent.default_prompt"
+    @clear-error="error = null"
   >
-    <template #title>
-      <div class="heading">
-        <h2 class="heading-title">{{ t('agents.promptDialogTitle', { agent: title }) }}</h2>
-        <span class="heading-state" role="status">
-          {{ isDefault && !legacyPreset ? t('agents.promptDefault') : t('agents.promptEdited') }}
-        </span>
-      </div>
-    </template>
-
-    <form :id="`prompt-form-${agent.name}`" class="form" @submit.prevent="save">
-      <UiBanner v-if="legacyPreset">{{ t('agents.promptLegacyPreset') }}</UiBanner>
-      <div v-if="agent.prompt_tokens?.length" class="tokens">
+    <div class="prompt-field">
+      <div v-if="agent.prompt_tokens.length" class="tokens">
         <button
           v-for="token in agent.prompt_tokens"
           :key="token"
@@ -106,62 +99,19 @@ async function save() {
         :id="`prompt-text-${agent.name}`"
         ref="textarea"
         v-model="text"
-        class="text"
+        class="area mono-area prompt-text"
         rows="18"
         spellcheck="false"
         :disabled="pending"
       />
-      <p v-if="maxChars !== null" class="count mono tabular" :class="{ over: overCap }">
-        {{ t('agents.promptCount', { count: length.toLocaleString(), max: maxChars.toLocaleString() }) }}
-      </p>
-      <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
-    </form>
-
-    <template #footer>
-      <UiButton variant="ghost" class="foot-start" :disabled="pending || isDefault" @click="text = agent.default_prompt">
-        <template #icon><UiIcon name="rotate-ccw" /></template>
-        {{ t('agents.promptRestore') }}
-      </UiButton>
-      <UiButton variant="secondary" :disabled="pending" @click="emit('close')">
-        {{ t('common.cancel') }}
-      </UiButton>
-      <UiButton
-        variant="primary"
-        type="submit"
-        :form="`prompt-form-${agent.name}`"
-        :loading="pending"
-        :disabled="saveDisabled"
-      >
-        {{ t('common.save') }}
-      </UiButton>
-    </template>
-  </UiModal>
+      <AgentsCharCount v-if="maxChars !== null" class="end-count mono" :count="length" :max="maxChars" />
+    </div>
+  </AgentsDefinitionDialog>
 </template>
 
 <style scoped>
-.heading {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-  min-width: 0;
-}
-
-.heading-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--display-sm);
-  letter-spacing: normal;
-}
-
-.heading-state {
-  flex-shrink: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
-.form {
+/* The tokens, the prompt and its count sit closer together than the shell's fields do. */
+.prompt-field {
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -173,74 +123,7 @@ async function save() {
   gap: 6px;
 }
 
-/* A chip is a button that types for you: a hairline and the mono of the text it goes into. */
-.token {
-  height: var(--control-height-xs);
-  padding: 0 var(--space-2);
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--ink-soft);
-  font-size: var(--text-2xs);
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
-}
-
-.token:hover {
-  background: var(--rail);
-  color: var(--ink);
-}
-
-.token:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-
-/* Same skin as UiTextInput's `.control`, sized for a prompt instead of one line. */
-.text {
-  width: 100%;
-  min-width: 0;
+.prompt-text {
   min-height: 16rem;
-  padding: var(--space-3) 14px;
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: var(--paper);
-  color: var(--ink);
-  font-family: var(--mono);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-  resize: vertical;
-  transition: border-color var(--duration-fast) var(--ease);
-}
-
-.text:disabled {
-  background: var(--paper-sunken);
-  color: var(--muted);
-  cursor: not-allowed;
-}
-
-@media (pointer: coarse) {
-  .text {
-    font-size: 16px;
-  }
-}
-
-.count {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-2xs);
-  text-align: right;
-}
-
-/* Over the cap is the one state the count exists to show. */
-.count.over {
-  color: var(--danger);
-}
-
-/* The footer's left action stands apart from Cancel and Save. */
-.foot-start {
-  margin-right: auto;
 }
 </style>

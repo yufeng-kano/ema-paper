@@ -24,7 +24,7 @@ http://localhost:8080 {
 	}
 	@rest not path /api/library/documents
 	request_body @rest {
-		max_size 128MB
+		max_size 180MB
 	}
 
 	@api path /healthz /v1/* /api/* /oauth/* /mcp /mcp/* /.well-known/*

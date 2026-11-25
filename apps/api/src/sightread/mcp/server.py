@@ -4,7 +4,7 @@ A shell and nothing more. `parse` mints a single-use upload ticket (docs/auth.md
 formats the `curl` commands that carry it; the document bytes go out-of-band through
 `/v1/parse`, because base64 in tool arguments would burn the file size over again in model
 tokens. The library tools list the Files library inline and, for one document, mint a
-document ticket (docs/auth.md § 7) and format the commands that land it on disk or save its
+document ticket (docs/auth.md § 6) and format the commands that land it on disk or save its
 text back over `/v1/library/documents/{id}` (docs/mcp.md § The library tools). No parsing
 decision, no model choice, no queue knowledge and no workspace write lives here, so an MCP
 spec change touches this file alone (docs/project-structure.md § Boundaries). What makes a
@@ -35,14 +35,13 @@ from starlette.types import Receive, Scope, Send
 
 from ..agents import PARSE
 from ..auth import document_tickets, upload_tickets
-from ..auth.deps import LIBRARY_SCOPE_MESSAGE, bearer_credential, resolve_bearer_identity
-from ..db.models import FILE_KIND, Document, Job, User
+from ..auth.deps import bearer_credential, resolve_bearer_identity
+from ..db.models import FILE_KIND, User
 from ..errors import ApiError, error_response
 from ..routes.v1 import FOLDER_PATH_MAX, document_entry, library_index
 from ..upstream.client import offered_models
-from ..workspace import documents as workspace_documents
 from ..workspace import filing
-from ..workspace.layout import path_segment, user_root
+from ..workspace.layout import path_segment
 
 MCP_PATH = "/mcp"
 PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
@@ -117,7 +116,7 @@ FILED_NOTES = (
     "document where it is. The .md you land is a copy: to change the document in Ema "
     "Paper, find its id with list_library and use read_document and write_document."
 )
-# An unfiled ticket's way into Files, for a caller that reaches the library.
+# An unfiled ticket's way into Files.
 UNFILED_NOTES = (
     " An `upload` on this ticket adds nothing to the reader's Files library. To keep a "
     "paper in Ema Paper, call `parse` with `folder` and run `upload` again with the same "
@@ -201,9 +200,6 @@ def _stamp(moment: datetime) -> str:
 # by the tool; the streamable-HTTP transport runs each request's handler in a task spawned
 # from that request, so the value a tool sees is the one its own caller presented.
 _current_user_id: ContextVar[int | None] = ContextVar("sightread_mcp_user_id", default=None)
-# Whether that caller's credential reaches the library: an API key, or an OAuth grant holding
-# the `library` scope (docs/auth.md § 4).
-_current_library: ContextVar[bool] = ContextVar("sightread_mcp_library", default=False)
 
 
 async def _current_user(db: AsyncSession) -> User:
@@ -215,13 +211,6 @@ async def _current_user(db: AsyncSession) -> User:
     )
     if user is None:
         raise PermissionError("This MCP session is not authenticated")
-    return user
-
-
-async def _library_user(db: AsyncSession) -> User:
-    user = await _current_user(db)
-    if not _current_library.get():
-        raise PermissionError(LIBRARY_SCOPE_MESSAGE)
     return user
 
 
@@ -294,11 +283,8 @@ def build_server(app: FastAPI) -> MCPServer:
             settings = await app.state.runtime_settings.current(db)
             user = await _current_user(db)
             user_id = user.id
-            library_access = _current_library.get()
             destination = None
             if folder is not None:
-                if not library_access:
-                    raise PermissionError(LIBRARY_SCOPE_MESSAGE)
                 if not folder.strip():
                     raise ValueError(
                         "`folder` is empty: give a folder path from list_library, or / for "
@@ -314,7 +300,6 @@ def build_server(app: FastAPI) -> MCPServer:
                 db,
                 settings,
                 user,
-                library_access=library_access,
                 into_library=destination is not None,
                 folder_id=None if destination is None else destination["id"],
             )
@@ -349,13 +334,11 @@ def build_server(app: FastAPI) -> MCPServer:
                 f"{settings.parse_retention_days} days after it finishes and then deleted: "
                 "the .md you landed is the copy that lasts."
             )
-            if library_access:
-                notes += UNFILED_NOTES.format(
-                    age=never
-                    or ("" if retention == 0 else f", within {retention - 1} days of its end")
-                )
+            notes += UNFILED_NOTES.format(
+                age=never or ("" if retention == 0 else f", within {retention - 1} days of its end")
+            )
 
-        base = settings.app_url.rstrip("/")
+        base = settings.app_url
         auth = f"-H 'Authorization: Bearer {token}'"
         # The upload lands whatever the server answers in a progress file of its own,
         # removed first so it is always this run's; the read after it fails loudly with
@@ -430,7 +413,7 @@ def build_server(app: FastAPI) -> MCPServer:
     ) -> dict[str, Any]:
         async with app.state.sessionmaker() as db:
             settings = await app.state.runtime_settings.current(db)
-            user = await _library_user(db)
+            user = await _current_user(db)
             index = await library_index(db, user.id)
         folders, documents = index["folders"], index["documents"]
         if folder and folder.strip("/"):
@@ -475,21 +458,14 @@ def build_server(app: FastAPI) -> MCPServer:
     ) -> dict[str, Any]:
         async with app.state.sessionmaker() as db:
             settings = await app.state.runtime_settings.current(db)
-            user = await _library_user(db)
-            document = await document_entry(db, settings, user.id, document_id)
+            user = await _current_user(db)
             # The suffix of what `…/original` answers with — the kept original, or the
             # upload until it is filed — names the file the `original` command lands.
-            source = None
-            if document["original"]:
-                row = await db.get(Document, document_id)
-                job = await db.get(Job, row.job_id)
-                source = await workspace_documents.answering_original(
-                    db, user_root(settings.workspaces_dir, user.id), document_id, job
-                )
+            document, source = await document_entry(db, settings, user.id, document_id)
             ticket, token = await document_tickets.mint(
                 db, settings, user, document_id, document_tickets.READ
             )
-        base = f"{settings.app_url.rstrip('/')}/v1/library/documents/{document_id}"
+        base = f"{settings.app_url}/v1/library/documents/{document_id}"
         auth = f"-H 'Authorization: Bearer {token}'"
         local = _local_name(document["name"])
         answer: dict[str, Any] = {
@@ -545,8 +521,8 @@ def build_server(app: FastAPI) -> MCPServer:
     ) -> dict[str, Any]:
         async with app.state.sessionmaker() as db:
             settings = await app.state.runtime_settings.current(db)
-            user = await _library_user(db)
-            document = await document_entry(db, settings, user.id, document_id)
+            user = await _current_user(db)
+            document, _ = await document_entry(db, settings, user.id, document_id)
             if document["kind"] == FILE_KIND:
                 raise ApiError(
                     400,
@@ -556,7 +532,7 @@ def build_server(app: FastAPI) -> MCPServer:
             ticket, token = await document_tickets.mint(
                 db, settings, user, document_id, document_tickets.WRITE
             )
-        base = f"{settings.app_url.rstrip('/')}/v1/library/documents/{document_id}"
+        base = f"{settings.app_url}/v1/library/documents/{document_id}"
         auth = f"-H 'Authorization: Bearer {token}'"
         local = _local_name(document["name"])
         return {
@@ -597,7 +573,7 @@ class BearerGuard:
         self._transport = transport
 
     def _challenge(self, invalid: bool) -> dict[str, str]:
-        issuer = self._app.state.settings.app_url.rstrip("/")
+        issuer = self._app.state.settings.app_url
         parts = [f'resource_metadata="{issuer}{PROTECTED_RESOURCE_PATH}"']
         if invalid:
             parts.insert(0, 'error="invalid_token"')
@@ -605,11 +581,11 @@ class BearerGuard:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         credential = bearer_credential(Request(scope))
-        identity = None
+        user = None
         if credential is not None:
             async with self._app.state.sessionmaker() as db:
-                identity = await resolve_bearer_identity(db, credential)
-        if identity is None:
+                user = await resolve_bearer_identity(db, credential)
+        if user is None:
             response = error_response(
                 401,
                 "auth",
@@ -619,12 +595,10 @@ class BearerGuard:
             await response(scope, receive, send)
             return
 
-        user_token = _current_user_id.set(identity.user.id)
-        library_token = _current_library.set(identity.library)
+        user_token = _current_user_id.set(user.id)
         try:
             await self._transport(scope, receive, send)
         finally:
-            _current_library.reset(library_token)
             _current_user_id.reset(user_token)
 
 

@@ -1,13 +1,15 @@
 """Where things live inside a user's workspace (docs/workspace.md § Layout).
 
-Pure path arithmetic: nothing here reads or writes a file. The names the library keeps
-are labels in a tree; this module is what turns a label into a path segment that cannot
-escape the tree or collide with the names the workspace reserves for itself.
+Path arithmetic, and the listings of WORKSPACES_DIR that say which users have an entry
+there: nothing here reads or writes a file. The names the library keeps are labels in a tree;
+this module is what turns a label into a path segment that cannot escape the tree or
+collide with the names the workspace reserves for itself.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import unicodedata
 from pathlib import Path
@@ -37,18 +39,17 @@ IMAGES_SUFFIX = ".images"
 # A deleted account's marker, standing until the account's files are gone
 # (docs/auth.md § Deleting the account).
 DELETED_SUFFIX = ".deleted"
-LOCK_FILE = "lock"
 
-# What a document directory may not be called: the workspace's own names, git's, and
-# the names history excludes wherever they appear (`figures`, `source.*`) — a document
-# or folder so named would be a directory git ignores whole, its revisions never made.
-RESERVED_SEGMENTS = frozenset(
-    {SIGHTREAD_DIR, META_FILE, CACHE_DIR, FIGURES_DIR, ".git", ".gitignore"}
-)
+# What a document directory may not be called besides a dot name: the names history
+# excludes wherever they appear (`figures`, `source.*`) — a document or folder so named
+# would be a directory git ignores whole, its revisions never made. The workspace's own
+# names and git's all start with a dot, which `path_segment` prefixes already.
+RESERVED_SEGMENTS = frozenset({FIGURES_DIR})
 
-# Separators and control characters never reach a path; the library already strips the
-# separators (routes/library.py), this is the belt to that brace.
-_UNSAFE = re.compile(r"[\x00-\x1f\x7f/\\]")
+# Separators and control characters: never in a library name (`filing.clean_name`) nor in
+# a path segment — a separator would make a breadcrumb lie about where a file is, and a
+# control character would make two different names look identical.
+UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f/\\]")
 
 # The repository's `info/exclude`: kept in the git directory, out of the shell's reach.
 EXCLUDE_RULES = "\n".join(
@@ -68,6 +69,34 @@ EXCLUDE_RULES = "\n".join(
 def user_root(workspaces_dir: str | Path, user_id: int) -> Path:
     """`{WORKSPACES_DIR}/{user_id}` — what the user's VM mounts as /workspace."""
     return Path(workspaces_dir) / str(user_id)
+
+
+def _is_user_id(name: str) -> bool:
+    """Whether a name is what `str(user_id)` writes: ASCII digits only, so `int()` reads it
+    back as the id it names (`'²'` is a digit `int()` refuses, `'١'` one it reads as 1)."""
+    return name.isascii() and name.isdecimal()
+
+
+def workspace_roots(workspaces_dir: str | Path) -> list[Path]:
+    """Every user's workspace root under `workspaces_dir`, by user id; none when it cannot
+    be listed."""
+    base = Path(workspaces_dir)
+    try:
+        names = sorted((name for name in os.listdir(base) if _is_user_id(name)), key=int)
+    except OSError:
+        return []
+    return [base / name for name in names]
+
+
+def users_with_suffix(workspaces_dir: str | Path, suffix: str) -> list[int]:
+    """The users with an entry `{WORKSPACES_DIR}/.repos/{user_id}{suffix}` — a marker
+    beside their git directory — by id."""
+    try:
+        names = os.listdir(Path(workspaces_dir) / REPOS_DIR)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    stems = (name.removesuffix(suffix) for name in names if name.endswith(suffix))
+    return sorted(int(stem) for stem in stems if _is_user_id(stem))
 
 
 def git_dir(root: Path) -> Path:
@@ -107,21 +136,6 @@ def is_canonical_segment(segment: str) -> bool:
     return path_segment(segment_name(segment)) == segment
 
 
-def no_symlinks(root: Path, path: Path) -> bool:
-    """Whether no component of `path` below `root` is a symlink — the check every fixed
-    workspace file passes before the host reads or writes it (docs/workspace.md)."""
-    try:
-        relative = path.relative_to(root)
-    except ValueError:
-        return False
-    cursor = root
-    for part in relative.parts:
-        cursor = cursor / part
-        if cursor.is_symlink():
-            return False
-    return True
-
-
 def path_segment(name: str) -> str:
     """A library name as one path component.
 
@@ -133,7 +147,7 @@ def path_segment(name: str) -> str:
     `report` are `_.report` and `report`, never both `report`).
     """
     segment = unicodedata.normalize("NFC", name)
-    segment = _UNSAFE.sub(" ", segment).strip()
+    segment = UNSAFE_CHARS.sub(" ", segment).strip()
     if (
         not segment
         or segment.startswith((".", "_", f"{SOURCE_STEM}."))

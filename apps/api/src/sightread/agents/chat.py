@@ -1,8 +1,8 @@
 """The `chat` agent: a tool-using conversation about one parsed document — or, from the
 Files page, about the reader's whole library (docs/chat.md § Library conversations).
 
-What defines it lives here — the system prompt, the tool list in its fixed order, the beta
-headers the request needs, and which models can run it. The loop is `jobs/chat_runner.py`.
+What defines it lives here — the system prompt, the tool list in its fixed order and the
+beta headers the request needs. The loop is `jobs/chat_runner.py`.
 """
 
 from __future__ import annotations
@@ -11,16 +11,6 @@ import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-
-from .parse import BBOX_FORMAT_YXYX
-
-# Bumped when the prompt or the tool contract changes what a conversation does. Chat has
-# no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
-# 10: convert_file, figure links; 11: fewer strict tools, thinking binding; 12: search
-# before guessing an address; 13: uv's default environment, the fonts; 14: the sites the
-# sandbox reaches; 15: insert_image; 16: the editor's view shows images; 17: convert_file
-# retries a failed conversion; 18: library conversations, their prompt and tools.
-PIPELINE_VERSION = 18
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. A custom tool whose input has structure is
@@ -482,7 +472,8 @@ def web_tools(*, enabled: bool, brave: bool, openalex: bool) -> tuple[dict, ...]
     )
 
 
-# `memory` came last, so every tool before it kept its place in the cached prefix.
+# The order is part of the cached prefix: a tool is added at the end, never in between
+# (docs/chat.md § Upstream).
 TOOLS: tuple[dict, ...] = (
     BASH_TOOL,
     EDITOR_TOOL,
@@ -492,7 +483,6 @@ TOOLS: tuple[dict, ...] = (
     SUBAGENT_TOOL,
     MEMORY_TOOL,
 )
-TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in TOOLS)
 # A subagent's editor and shell: the agent's own, by name and input, declared with a schema.
 # A subagent may run on a model Kano Proxy reaches through a conversion, and the conversion
 # drops every tool without one — the Anthropic-defined editor and bash among them, which
@@ -545,7 +535,7 @@ SUBAGENT_BASH_TOOL = {
 }
 # What a subagent may be given (docs/chat.md § Subagents). The editor answers `view` only
 # to one that may not change files, and `bash` is given only to one that may. `bash` comes
-# last, so the tools of a subagent without it are the prefix they always were.
+# last, so a subagent without it declares a prefix of the full list.
 SUBAGENT_TOOLS: tuple[dict, ...] = (
     VIEW_PAGE_TOOL,
     VIEW_FIGURE_TOOL,
@@ -569,11 +559,8 @@ CACHE_TTL = "1h"
 CACHE_TTL_DELTA = timedelta(hours=1)
 
 
-# `{...}` tokens are replaced by `render_system_prompt`, never by str.format: the text
-# carries literal braces of its own.
-DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Ema Paper, working for one signed-in user on documents they parsed from PDFs and images, or wrote or uploaded as markdown. You run in that user's own sandbox VM. Nothing you do leaves it except the text you send back.
-
-# Workspace
+# The workspace tree, the same in the document and the library prompt.
+_WORKSPACE = """# Workspace
 
 /workspace/files/                   the user's library, the same tree as their Files page
   AGENTS.md                         the user's standing instructions for every document (the AGENTS.md section below)
@@ -588,7 +575,18 @@ DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Ema Paper, working 
 /workspace/memory.md                your own notes across conversations (the Memory file section below)
 /workspace/.sightread/results/<job_id>/result.md   the untouched parse output, read-only
 /workspace/.sightread/trash/        what the user moved to the Trash on the Files page, read-only and outside the library
+"""
 
+
+# `{...}` tokens are replaced by `render_system_prompt`, never by str.format: the text
+# carries literal braces of its own.
+DEFAULT_SYSTEM_PROMPT = "".join(
+    (
+        """You are the document agent inside Ema Paper, working for one signed-in user on documents they parsed from PDFs and images, or wrote or uploaded as markdown. You run in that user's own sandbox VM. Nothing you do leaves it except the text you send back.
+
+""",
+        _WORKSPACE,
+        """
 A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Ema Paper, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it.
 
 A file of the library is any plain file directly in a folder, outside the document directories: the user's own bytes, the only copy there is. Read it with your tools (pandoc for a Word file, Python for a spreadsheet) and change it when the user asks. A binary or a large file has no revision to undo a change, so rewrite one only when the user asks for exactly that, and never delete one. In your replies it is "your file <name>", never a path.
@@ -654,31 +652,22 @@ When you point the user to a section, write its heading as a link: the heading's
 Whenever you use a figure of the document — you opened its crop with view_figure, or your answer or the notes you write rest on it — link it the same way: the caption's first words as the text, linked to the figure's block anchor — the GitHub-style anchor of the section heading it sits under, then `~`, then the caption's first words — as in [Figure 3: Overview of the method](#3-method~Figure 3: Overview of the method). Their view turns it into a button that scrolls to the figure. A figure with no caption is linked by its section alone. Link nothing else that way. A web address is an ordinary markdown link, [title](https://…), which their view draws as a link.
 
 Each message ends with a context block naming the document's current revision, the reader's locale and any language the user chose, with its rule. Answer in the reader's locale unless the block names an answer language. A revision that changed since your last look at the file means it was edited meanwhile; read it again before you rely on what you saw.
-"""
+""",
+    )
+)
 
 # A library conversation's prompt (docs/chat.md § Library conversations): the reader's whole
 # library from the Files page, no document open. Always this one there — a reader's own
 # prompt is written for a document and its tokens — with the same blocks after it. It
 # shares the default's workspace, tools and talking sections where they hold; `{network}`
 # is its one token.
-LIBRARY_SYSTEM_PROMPT = """You are the library agent inside Ema Paper, working for one signed-in user on their whole library — the documents they parsed from PDFs and images or wrote or uploaded as markdown, the files they keep, and the folders that hold them — from their Files page. No document is open. You run in that user's own sandbox VM. Nothing you do leaves it except the text you send back.
+LIBRARY_SYSTEM_PROMPT = "".join(
+    (
+        """You are the library agent inside Ema Paper, working for one signed-in user on their whole library — the documents they parsed from PDFs and images or wrote or uploaded as markdown, the files they keep, and the folders that hold them — from their Files page. No document is open. You run in that user's own sandbox VM. Nothing you do leaves it except the text you send back.
 
-# Workspace
-
-/workspace/files/                   the user's library, the same tree as their Files page
-  AGENTS.md                         the user's standing instructions for every document (the AGENTS.md section below)
-  <folder>/AGENTS.md                the same for that folder and the folders inside it; the nearer file wins
-  <folder>/<document>/
-    doc.md                          the editable transcription (markdown)
-    notes.md                        the user's notes on this document
-    source.pdf                      the original upload, when it was kept (or source.<image ext>)
-    figures/                        figure crops, p<page>_<y1>_<x1>_<y2>_<x2>.png, and inserted images, img-<hash>.png or .jpg
-    .meta.json                      document id, job id, model, bbox format, page count
-  <folder>/<file name>              a file the user keeps as it is: any kind, the one copy there is, read-write
-/workspace/memory.md                your own notes across conversations (the Memory file section below)
-/workspace/.sightread/results/<job_id>/result.md   the untouched parse output, read-only
-/workspace/.sightread/trash/        what the user moved to the Trash on the Files page, read-only and outside the library
-
+""",
+        _WORKSPACE,
+        """
 A document's text is its doc.md, whose path list_files gives. A PDF or an image kept as a file has no text until it is converted: convert_file converts it, which costs the user credits. A file of the library is the user's own bytes, the only copy there is: read it with your tools (pandoc for a Word file, Python for a spreadsheet), change it only when the user asks, and never delete one. A figure of a document is a crop under its figures/; the editor's view shows it.
 
 # The Files page
@@ -722,7 +711,9 @@ Link each folder, document and file you name: a folder as [name](/files?folder=<
 Before the first tool call of a turn, state in one line what you are about to do. When you finish, summarize in plain language what you changed and where, and anything you could not do; the user sees each change as a step they can undo, so do not repeat every step. Ask a question only when two readings of the request would lead to different changes, and ask it in the user's terms.
 
 Each message ends with a context block naming the reader's locale and any language the user chose, with its rule. Answer in the reader's locale unless the block names an answer language.
-"""
+""",
+    )
+)
 
 PROMPT_TOKENS: tuple[str, ...] = (
     "{document_path}",
@@ -862,16 +853,23 @@ The user's standing instructions for every document of the library, as this conv
 AGENTS_FILE_CUT = "\n\n[The files go on past what fits here; ask the user to shorten them, or shorten them when asked.]"
 
 
-def render_agents_file(text: str | None, max_chars: int, *, library: bool = False) -> str | None:
-    """The AGENTS.md system block (docs/chat.md § AGENTS.md): the rendered chain after its
-    rules of use — a library conversation's, which has the root's file and no document —
-    cut at `max_chars` with a line saying so. None when there is no file."""
+def _capped_block(text: str | None, max_chars: int, intro: str, cut: str) -> str | None:
+    """`text` stripped after `intro`, cut at `max_chars` with the `cut` line saying so.
+    None for a missing or blank text."""
     if text is None or not text.strip():
         return None
     body = text.strip()
     if len(body) > max_chars:
-        body = body[:max_chars].rstrip() + AGENTS_FILE_CUT
-    return (LIBRARY_AGENTS_FILE_INTRO if library else AGENTS_FILE_INTRO) + body
+        body = body[:max_chars].rstrip() + cut
+    return intro + body
+
+
+def render_agents_file(text: str | None, max_chars: int, *, library: bool = False) -> str | None:
+    """The AGENTS.md system block (docs/chat.md § AGENTS.md): the rendered chain after its
+    rules of use — a library conversation's, which has the root's file and no document —
+    cut at `max_chars` with a line saying so. None when there is no file."""
+    intro = LIBRARY_AGENTS_FILE_INTRO if library else AGENTS_FILE_INTRO
+    return _capped_block(text, max_chars, intro, AGENTS_FILE_CUT)
 
 
 MEMORY_FILE_INTRO = """# Memory file
@@ -886,12 +884,7 @@ def render_memory_file(text: str | None, max_chars: int) -> str | None:
     """The memory-file system block (docs/chat.md § Memory, *The memory file*): the file's
     text after one line saying whose it is, cut at `max_chars` with a line saying so. None
     for an empty or missing file."""
-    if text is None or not text.strip():
-        return None
-    body = text.strip()
-    if len(body) > max_chars:
-        body = body[:max_chars].rstrip() + MEMORY_FILE_CUT
-    return MEMORY_FILE_INTRO + body
+    return _capped_block(text, max_chars, MEMORY_FILE_INTRO, MEMORY_FILE_CUT)
 
 
 # The per-turn context block (docs/chat.md § Prompt caching): what the model must know
@@ -914,7 +907,7 @@ def turn_note(
 ) -> str:
     """The turn block: the document's revision, the reader's locale and the languages the
     reader chose on the Agent page, each line only when chosen and stating its own rule, so
-    it holds under a replaced or migrated prompt and an edited `translate` (docs/chat.md
+    it holds under a replaced prompt and an edited `translate` (docs/chat.md
     § Instructions). A library conversation (`document` False) has no revision line
     (docs/chat.md § Library conversations)."""
     lines = ["Context for this message:"]
@@ -990,7 +983,7 @@ def render_summary(summary: str) -> str:
 
 @dataclass(frozen=True)
 class SystemPart:
-    """One system block and what it is: `prompt`, `preset`, `instructions`, `catalogue`,
+    """One system block and what it is: `prompt`, `instructions`, `catalogue`,
     `agents_file`, `memory_file` or `memory` — what the runner sends and the Agent page's
     drawer lists."""
 
@@ -1001,7 +994,6 @@ class SystemPart:
 def system_parts(
     prompt: str,
     *,
-    preset: str | None,
     instructions: str | None,
     catalogue: str | None,
     memory: str | None,
@@ -1009,13 +1001,11 @@ def system_parts(
     agents_file: str | None = None,
 ) -> list[SystemPart]:
     """The system blocks in the order a turn sends them (docs/chat.md § Upstream): the
-    rendered prompt, a legacy preset verbatim, the reader's instructions (raw; rendered
-    here), the rendered catalogue, the rendered AGENTS.md block, the rendered memory-file
-    block, the rendered memory block — each only when it has something to say. The last
-    three are the conversation's own snapshots."""
+    rendered prompt, the reader's instructions (raw; rendered here), the rendered
+    catalogue, the rendered AGENTS.md block, the rendered memory-file block, the rendered
+    memory block — each only when it has something to say. The last three are the
+    conversation's own snapshots."""
     parts = [SystemPart("prompt", prompt)]
-    if preset is not None and preset.strip():
-        parts.append(SystemPart("preset", preset))
     rendered_instructions = render_instructions(instructions)
     if rendered_instructions is not None:
         parts.append(SystemPart("instructions", rendered_instructions))
@@ -1037,6 +1027,3 @@ def system_blocks(parts: Iterable[SystemPart]) -> list[dict]:
     if blocks:
         blocks[-1]["cache_control"] = {"type": "ephemeral", "ttl": CACHE_TTL}
     return blocks
-
-
-BBOX_FORMAT = BBOX_FORMAT_YXYX

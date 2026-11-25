@@ -10,22 +10,17 @@
  */
 import type { CardState, EditCard, StepItem, ToolStep, UndoState } from '~/lib/thread'
 
-const props = withDefaults(
-  defineProps<{
-    steps: StepItem[]
-    live: boolean
-    open: boolean
-    openSteps: ReadonlySet<string>
-    cardState: (card: EditCard) => CardState
-    /** A turn is unfinished: the revisions route refuses a revert under one. */
-    locked: boolean
-    /** A diff card offers *Revert* (not in the Files page's card). */
-    revertable?: boolean
-    /** A library step's Undo state; null for a step without one. */
-    undoState?: (step: ToolStep) => UndoState | null
-  }>(),
-  { revertable: true, undoState: () => null },
-)
+const props = defineProps<{
+  steps: StepItem[]
+  live: boolean
+  open: boolean
+  openSteps: ReadonlySet<string>
+  cardState: (card: EditCard) => CardState
+  /** A turn is unfinished: the revisions route refuses a revert under one. */
+  locked: boolean
+  /** A library step's Undo state; null for a step without one. */
+  undoState: (step: ToolStep) => UndoState | null
+}>()
 
 const emit = defineEmits<{
   toggle: []
@@ -40,9 +35,7 @@ const labels = useStepLabels()
 const label = computed(() => {
   const counted = props.steps.filter((step) => step.type !== 'note').length
   if (props.live) {
-    const last = props.steps[props.steps.length - 1]
-    const action =
-      last?.type === 'tool' && last.status === 'pending' ? labels.doing(last.step) : t('chat.thinkingNow')
+    const action = labels.inFlight(props.steps)
     return counted ? t('chat.liveStep', { action, n: counted }) : action
   }
   // A group of notes alone is the model thinking before it answered.
@@ -72,7 +65,6 @@ const label = computed(() => {
           :open="openSteps.has(step.key)"
           :card-state="cardState"
           :locked="locked"
-          :revertable="revertable"
           :undo="undoState(step)"
           @toggle="emit('toggle-step', step.key)"
           @toggle-edit="emit('toggle-edit', $event)"

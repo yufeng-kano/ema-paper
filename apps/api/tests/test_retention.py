@@ -12,14 +12,12 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 
-import pytest
 import respx
 from httpx import AsyncClient
 from sqlalchemy import delete, select, update
 
-from sightread.agents import PARSE
+from sightread.agents.parse import PIPELINE_VERSION
 from sightread.auth.api_keys import create_api_key
-from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import (
     ChatTurn,
     Conversation,
@@ -36,51 +34,32 @@ from sightread.db.models import (
 from sightread.jobs.queue import find_cached_job
 from sightread.jobs.sweeper import expire_trash, purge_parses
 from sightread.workspace.documents import original_of
-from sightread.workspace.layout import images_dir, results_root, trash_root, user_root
+from sightread.workspace.layout import images_dir, results_root, trash_root
 from tests.conftest import (
     CSRF_HEADERS,
-    DATABASE_URL,
     KANO_BASE,
     KANO_CHAT_URL,
     PARSE_MODEL,
     convert_on_upload,
+    postgres_only,
 )
-from tests.test_document_images import _image, _insert
-from tests.test_library_trash import _document, _folder, _read, _trash, _write
-from tests.test_markdown_documents import _upload_markdown
-from tests.test_parse_end_to_end import _drain_queue, _vision_stub
-
-postgres_only = pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="the job's foreign-key actions need PostgreSQL",
+from tests.factories import job_row, user_row
+from tests.helpers import (
+    account_client,
+    drain_queue,
+    post_folder,
+    read_library,
+    staged_uploads,
+    vision_stub,
 )
-
-
-@pytest.fixture
-async def writer(make_client, tmp_path) -> AsyncClient:
-    """Signed in, with a workspace of its own and no upstream connected."""
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
-
-
-async def _stranger(
-    make_client, tmp_path, email: str = "stranger@example.com", **overrides
-) -> AsyncClient:
-    """A second account on the same deployment, signed in."""
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), **overrides)
-    async with client.app.state.sessionmaker() as db:
-        user = User(google_sub=email, email=email)
-        db.add(user)
-        await db.flush()
-        token = await create_session(db, user)
-        await db.commit()
-        client.user_id = user.id
-    client.cookies.set(SESSION_COOKIE, token)
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
+from tests.library_helpers import (
+    image_bytes,
+    insert_image,
+    trash,
+    upload,
+    write_content,
+    written_document,
+)
 
 
 async def _age(client: AsyncClient, model: type, row_id: int, *, days: float) -> None:
@@ -103,20 +82,18 @@ async def _expire(client: AsyncClient) -> int:
 
 async def test_the_trash_deletes_for_good_what_it_kept_past_its_time(writer) -> None:
     # Uploads keep originals; the edits give each a directory, so a Trash entry.
-    old = (await _upload_markdown(writer, b"# Old\n", name="old.md")).json()
-    await _write(writer, old["id"], "# Old, edited\n")
-    assert (await _insert(writer, old["id"], _image("PNG"))).status_code == 201
-    box = await _folder(writer, "Box")
-    inner = await _folder(writer, "Inner", box["id"])
-    boxed = (
-        await _upload_markdown(writer, b"# Boxed\n", name="boxed.md", folder_id=inner["id"])
-    ).json()
-    await _write(writer, boxed["id"], "# Boxed, edited\n")
-    young = (await _upload_markdown(writer, b"# Young\n", name="young.md")).json()
-    await _write(writer, young["id"], "# Young, edited\n")
-    stays = await _document(writer, "stays.md", None, "# Stays\n")
+    old = (await upload(writer, "old.md", b"# Old\n")).json()
+    await write_content(writer, old["id"], "# Old, edited\n")
+    assert (await insert_image(writer, old["id"], image_bytes("PNG"))).status_code == 201
+    box = await post_folder(writer, "Box")
+    inner = await post_folder(writer, "Inner", box["id"])
+    boxed = (await upload(writer, "boxed.md", b"# Boxed\n", folder_id=inner["id"])).json()
+    await write_content(writer, boxed["id"], "# Boxed, edited\n")
+    young = (await upload(writer, "young.md", b"# Young\n")).json()
+    await write_content(writer, young["id"], "# Young, edited\n")
+    stays = await written_document(writer, "stays.md", None, "# Stays\n")
     for kind, row in (("documents", old), ("folders", box), ("documents", young)):
-        assert (await _trash(writer, kind, row["id"])).status_code == 200
+        assert (await trash(writer, kind, row["id"])).status_code == 200
     assert sorted(path.name for path in trash_root(writer.root).iterdir()) == [
         f"document-{old['id']}",
         f"document-{young['id']}",
@@ -146,7 +123,7 @@ async def test_the_trash_deletes_for_good_what_it_kept_past_its_time(writer) -> 
         assert original_of(writer.root, row["id"]) is None
     assert not (images_dir(writer.root) / str(old["id"])).exists()
     # The younger item waits in the Trash, whole; the live file is untouched.
-    library = await _read(writer)
+    library = await read_library(writer)
     assert [row["id"] for row in library["trash"]["documents"]] == [young["id"]]
     assert library["trash"]["folders"] == []
     assert [row["id"] for row in library["documents"]] == [stays["id"]]
@@ -156,13 +133,13 @@ async def test_the_trash_deletes_for_good_what_it_kept_past_its_time(writer) -> 
 
 
 async def test_a_trash_with_a_conversation_still_answering_waits_while_the_others_empty(
-    writer, make_client, tmp_path
+    writer, make_client
 ) -> None:
-    stranger = await _stranger(make_client, tmp_path)
-    mine = (await _upload_markdown(writer, b"# Mine\n", name="mine.md")).json()
-    theirs = (await _upload_markdown(stranger, b"# Theirs\n", name="theirs.md")).json()
+    stranger = await account_client(make_client)
+    mine = (await upload(writer, "mine.md", b"# Mine\n")).json()
+    theirs = (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
     for client, row in ((writer, mine), (stranger, theirs)):
-        assert (await _trash(client, "documents", row["id"])).status_code == 200
+        assert (await trash(client, "documents", row["id"])).status_code == 200
         await _age(client, Document, row["id"], days=40)
     # A turn about the trashed file still running: deleting it now would pull the rows
     # and the directory from under the worker.
@@ -181,8 +158,8 @@ async def test_a_trash_with_a_conversation_still_answering_waits_while_the_other
         turn_id = turn.id
 
     assert await _expire(writer) == 1
-    assert [row["id"] for row in (await _read(writer))["trash"]["documents"]] == [mine["id"]]
-    assert (await _read(stranger))["trash"]["documents"] == []
+    assert [row["id"] for row in (await read_library(writer))["trash"]["documents"]] == [mine["id"]]
+    assert (await read_library(stranger))["trash"]["documents"] == []
     assert not (trash_root(stranger.root) / f"document-{theirs['id']}").exists()
 
     # Once the turn is done, the next sweep takes it.
@@ -194,17 +171,17 @@ async def test_a_trash_with_a_conversation_still_answering_waits_while_the_other
         )
         await db.commit()
     assert await _expire(writer) == 1
-    assert (await _read(writer))["trash"]["documents"] == []
+    assert (await read_library(writer))["trash"]["documents"] == []
 
 
 async def test_a_trash_retention_of_zero_never_empties_the_trash(writer) -> None:
     writer.app.state.settings.trash_retention_days = 0
-    kept = (await _upload_markdown(writer, b"# Kept\n", name="kept.md")).json()
-    assert (await _trash(writer, "documents", kept["id"])).status_code == 200
+    kept = (await upload(writer, "kept.md", b"# Kept\n")).json()
+    assert (await trash(writer, "documents", kept["id"])).status_code == 200
     await _age(writer, Document, kept["id"], days=3650)
 
     assert await _expire(writer) == 0
-    assert [row["id"] for row in (await _read(writer))["trash"]["documents"]] == [kept["id"]]
+    assert [row["id"] for row in (await read_library(writer))["trash"]["documents"]] == [kept["id"]]
     assert original_of(writer.root, kept["id"]) is not None
 
 
@@ -221,21 +198,13 @@ async def _parse(
 ) -> uuid.UUID:
     """A parse row as the worker leaves it, finished `finished_days` ago (None: not
     finished), with its result when it succeeded."""
-    job = Job(
-        id=uuid.uuid4(),
-        user_id=user_id,
-        agent="parse",
-        kind="pdf",
-        filename="paper.pdf",
-        media_type="application/pdf",
+    job = job_row(
+        user_id,
         size_bytes=8,
         sha256=sha256 or uuid.uuid4().hex * 2,
-        model=PARSE_MODEL,
         connection_base_url=KANO_BASE,
-        pipeline_version=PARSE.pipeline_version,
-        bbox_format="yxyx_norm1000",
+        pipeline_version=PIPELINE_VERSION,
         status=status,
-        page_count=1,
         pages_done=0 if finished_days is None else 1,
         created_at=utcnow() - timedelta(days=41),
         finished_at=None if finished_days is None else utcnow() - timedelta(days=finished_days),
@@ -273,7 +242,7 @@ async def test_a_parse_no_file_keeps_is_deleted_after_its_retention(
     writer, make_client, tmp_path
 ) -> None:
     settings = writer.app.state.settings
-    stranger = await _stranger(make_client, tmp_path)
+    stranger = await account_client(make_client)
     period_start = utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     async with writer.app.state.sessionmaker() as db:
         uid = writer.user_id
@@ -296,8 +265,6 @@ async def test_a_parse_no_file_keeps_is_deleted_after_its_retention(
         # account's file holds — the rule never looks across accounts.
         orphan = await _parse(db, uid)
         failed = await _parse(db, uid, status="failed")
-        # A row from before `finished_at` was always written counts from its creation.
-        unstamped = await _parse(db, uid, finished_days=None)
         foreign = await _parse(db, uid, sha256="e" * 64)
         theirs = await _parse(db, stranger.user_id, sha256="e" * 64)
         db.add(Document(user_id=stranger.user_id, job_id=theirs, name="c.pdf"))
@@ -346,11 +313,11 @@ async def test_a_parse_no_file_keeps_is_deleted_after_its_retention(
 
     purged = await purge_parses(writer.app.state.sessionmaker, settings)
 
-    assert purged == 4
+    assert purged == 3
     async with writer.app.state.sessionmaker() as db:
         left = set((await db.execute(select(Job.id))).scalars())
         assert left == {filed, trashed, reconverted, earlier, young, queued, running, theirs}
-        assert not left & {orphan, failed, unstamped, foreign}
+        assert not left & {orphan, failed, foreign}
         assert (await db.execute(select(Result.job_id).where(Result.job_id == orphan))).all() == []
         # The cost stays where it was counted: the entry without its job, the period's
         # spent unchanged, the usage row too.
@@ -391,7 +358,6 @@ def _key(user_id: int, sha256: str) -> dict:
         "agent": "parse",
         "sha256": sha256,
         "model": PARSE_MODEL,
-        "connection_id": None,
         "connection_base_url": KANO_BASE,
         "pages_spec": "",
         "prompt_sha256": "",
@@ -402,7 +368,7 @@ async def test_the_dedup_cache_never_answers_with_a_parse_about_to_be_deleted(
     sessionmaker,
 ) -> None:
     async with sessionmaker() as db:
-        user = User(google_sub="dedup", email="dedup@example.com")
+        user = user_row("dedup@example.com")
         db.add(user)
         await db.flush()
         # In the last day of its 30: the next sweep may delete it under the new file.
@@ -430,7 +396,7 @@ async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
 ) -> None:
     from sightread.routes import library
 
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
     settings = writer.app.state.settings
     sessionmaker = writer.app.state.sessionmaker
     body = documents["text_pdf"].read_bytes()
@@ -444,7 +410,7 @@ async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
         )
 
     assert (await upload()).status_code == 201
-    await _drain_queue(writer, sessionmaker)
+    await drain_queue(writer, sessionmaker)
     async with sessionmaker() as db:
         await db.execute(
             update(Job).values(
@@ -474,13 +440,12 @@ async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
     )
     async with sessionmaker() as db:
         assert (await db.execute(select(Document))).all() == []
-    assert [path.name for path in Path(settings.upload_dir).iterdir()] == []
+    assert staged_uploads(writer) == []
     # Uploaded again, it parses afresh.
     monkeypatch.undo()
     assert (await upload()).status_code == 201
 
 
-@postgres_only
 async def test_a_parse_whose_crops_will_not_go_stays_for_the_next_sweep(
     writer, monkeypatch
 ) -> None:

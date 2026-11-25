@@ -11,14 +11,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
-from httpx import AsyncClient
-from sqlalchemy import Text, cast, func, select, update
+from sqlalchemy import Text, cast, select, update
 
 from sightread.agents import chat as chat_agent
 from sightread.agents import skills as skill_defs
-from sightread.billing.credits import parse_model_prices
 from sightread.db.models import (
     COMPACT_TURN,
     IDLE_COMPACT_TURN,
@@ -33,78 +30,29 @@ from sightread.jobs import chat_compact, chat_runner
 from sightread.jobs.queue import history_bytes
 from sightread.upstream.anthropic import ChatUsage
 from sightread.workspace import git
-from sightread.workspace.layout import user_root
 from sightread.workspace.locks import mark_writing, workspace_lock
 from sightread.workspace.memory_file import memory_file_text
-from tests.conftest import CSRF_HEADERS
-from tests.test_chat import MESSAGES_URL, _run_queued_turn, sse
-from tests.test_chat_extensions import (
+from tests.chat_helpers import (
+    DONE,
+    MESSAGES_URL,
+    SUMMARY,
     chatting_client,
+    conversation_row,
+    detail,
     new_conversation,
     replayed_events,
+    run_queued_turn,
     send,
+    set_clock,
+    streamed,
     stub_messages,
+    texts,
+    turns_of,
 )
+from tests.conftest import CSRF_HEADERS
 
-DONE = ([{"type": "text", "text": "Done."}], "end_turn")
-SUMMARY = ([{"type": "text", "text": "## Requests\n\nThe reader asked for tables."}], "end_turn")
 MODEL = "claude-code/claude-opus-5-5"
 OTHER_MODEL = "codex/gpt-5.5"
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
-
-
-async def conversation_row(client: AsyncClient, conversation_id: int) -> Conversation:
-    async with client.app.state.sessionmaker() as db:
-        row = await db.get(Conversation, conversation_id)
-        db.expunge(row)
-        return row
-
-
-async def detail(client: AsyncClient, conversation_id: int) -> dict:
-    response = await client.get(f"/api/conversations/{conversation_id}")
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-async def turns_of(client: AsyncClient, conversation_id: int) -> list[ChatTurn]:
-    async with client.app.state.sessionmaker() as db:
-        rows = (
-            (
-                await db.execute(
-                    select(ChatTurn)
-                    .where(ChatTurn.conversation_id == conversation_id)
-                    .order_by(ChatTurn.created_at)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for row in rows:
-            db.expunge(row)
-        return rows
-
-
-async def set_clock(client: AsyncClient, conversation_id: int, *, warm_for: float, tokens: int):
-    async with client.app.state.sessionmaker() as db:
-        await db.execute(
-            update(Conversation)
-            .where(Conversation.id == conversation_id)
-            .values(
-                cache_warm_until=datetime.now(UTC) + timedelta(seconds=warm_for),
-                context_tokens=tokens,
-                # As a turn's own writes leave it: the test reads it back unmoved.
-                updated_at=Conversation.updated_at,
-            )
-        )
-        await db.commit()
-
-
-def texts(content: list[dict]) -> list[str]:
-    return [block["text"] for block in content if block.get("type") == "text"]
 
 
 # --- /compact ------------------------------------------------------------------------------
@@ -132,10 +80,9 @@ async def test_a_compaction_replaces_the_history_with_its_summary(chat_client) -
     main, _ = stub_messages([DONE, SUMMARY, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello there")
-    await _run_queued_turn(client)
-    before = (await detail(client, conversation_id))["conversation"]
-    assert before["compactable"]
-    assert before["compacted_message_id"] is None
+    await run_queued_turn(client)
+    assert (await detail(client, conversation_id))["conversation"]["compactable"]
+    assert (await conversation_row(client, conversation_id)).compacted_message_id is None
 
     sent = await send(client, conversation_id, text="keep the table", command="compact")
     assert sent.status_code == 202, sent.text
@@ -143,7 +90,7 @@ async def test_a_compaction_replaces_the_history_with_its_summary(chat_client) -
     assert [turn["kind"] for turn in turns] == [MESSAGE_TURN, COMPACT_TURN]
     shown = (await detail(client, conversation_id))["messages"][-1]["content"]
     assert shown == [{"type": "text", "text": "/compact keep the table"}]
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     request = main[1]["messages"][-1]
     assert request["role"] == "user"
@@ -166,8 +113,8 @@ async def test_a_compaction_replaces_the_history_with_its_summary(chat_client) -
     assert row.memory_ids is None
     assert row.context_tokens is None
     assert row.cache_warm_until is None
+    assert row.compacted_message_id is not None
     after = await detail(client, conversation_id)
-    assert after["conversation"]["compacted_message_id"] == row.compacted_message_id
     assert not after["conversation"]["compactable"]
     assert after["turns"][1]["status"] == "succeeded"
     assert after["messages"][-1]["content"] == [
@@ -179,7 +126,7 @@ async def test_a_compaction_replaces_the_history_with_its_summary(chat_client) -
     ]
 
     await send(client, conversation_id, text="and now?")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     replay = main[2]["messages"]
     assert [message["role"] for message in replay] == ["user", "user"]
     assert texts(replay[0]["content"]) == [chat_agent.SUMMARY_PREFIX + SUMMARY[0][0]["text"]]
@@ -197,9 +144,9 @@ async def test_a_compaction_that_answers_nothing_fails_and_is_not_replayed(chat_
     main, _ = stub_messages([DONE, ([], "end_turn"), DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello there")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     turns = (await detail(client, conversation_id))["turns"]
     assert (turns[1]["kind"], turns[1]["status"], turns[1]["error"]) == (
         COMPACT_TURN,
@@ -211,7 +158,7 @@ async def test_a_compaction_that_answers_nothing_fails_and_is_not_replayed(chat_
     assert (await detail(client, conversation_id))["conversation"]["compactable"]
 
     await send(client, conversation_id, text="still here")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     replay = main[2]["messages"]
     assert [message["role"] for message in replay] == ["user", "assistant", "user"]
     assert texts(replay[0]["content"])[0] == "hello there"
@@ -228,13 +175,13 @@ async def test_an_abandoned_compaction_fills_no_history_cap(chat_client) -> None
     stub_messages([DONE, ([], "end_turn"), SUMMARY, DONE, ([], "end_turn")])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello there")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     async with client.app.state.sessionmaker() as db:
         before = await history_bytes(db, conversation_id)
     assert before > 0
 
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     failed = (await turns_of(client, conversation_id))[1]
     assert failed.status == "failed"
     async with client.app.state.sessionmaker() as db:
@@ -243,27 +190,28 @@ async def test_an_abandoned_compaction_fills_no_history_cap(chat_client) -> None
         assert await history_bytes(db, conversation_id, turn_id=failed.id) > before
 
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     boundary = (await conversation_row(client, conversation_id)).compacted_message_id
     assert boundary is not None
     async with client.app.state.sessionmaker() as db:
         summary_alone = await history_bytes(db, conversation_id, since=boundary)
         # The summary row's own bytes: the compaction's other rows come before the boundary.
-        summary_row = (
-            await db.execute(
-                select(func.octet_length(cast(Message.content, Text))).where(Message.id == boundary)
-            )
-        ).scalar_one()
+        # Its stored text measured in UTF-8, as the cap measures it on either database.
+        summary_row = len(
+            (await db.execute(select(cast(Message.content, Text)).where(Message.id == boundary)))
+            .scalar_one()
+            .encode()
+        )
     assert summary_alone == summary_row > 0
 
     await send(client, conversation_id, text="go on")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     async with client.app.state.sessionmaker() as db:
         continued = await history_bytes(db, conversation_id, since=boundary)
     assert continued > summary_alone
 
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     turns = await turns_of(client, conversation_id)
     assert [turn.status for turn in turns] == [
         "succeeded",
@@ -283,10 +231,11 @@ async def test_an_abandoned_compaction_fills_no_history_cap(chat_client) -> None
 
 
 async def test_the_composers_commands_are_no_skill_names(chat_client) -> None:
-    """`new` and `compact` are the composer's own: a skill is neither created under them nor
-    renamed to them, so `/compact` never runs a skill in the runner's place (docs/chat.md
-    § Skills)."""
+    """The composer's commands (`/new`, `/compact`, `/rename`, `/init`) are no skill names:
+    a skill is neither created under them nor renamed to them, so `/compact` or `/init`
+    never runs a skill in the runner's place (docs/chat.md § Skills)."""
     assert chat_agent.COMPACT_COMMAND in skill_defs.COMPOSER_COMMANDS
+    assert chat_agent.INIT_COMMAND in skill_defs.COMPOSER_COMMANDS
     for name in sorted(skill_defs.COMPOSER_COMMANDS):
         refused = await chat_client.post(
             "/api/skills",
@@ -295,6 +244,8 @@ async def test_the_composers_commands_are_no_skill_names(chat_client) -> None:
         )
         assert refused.status_code == 400, refused.text
         assert "composer" in refused.text
+        # The refusal names every reserved command, so the reader knows what else to avoid.
+        assert all(f"/{command}" in refused.text for command in skill_defs.COMPOSER_COMMANDS)
     created = await chat_client.post(
         "/api/skills",
         json={"name": "squash", "description": "x", "body": "x"},
@@ -312,18 +263,14 @@ async def test_the_composers_commands_are_no_skill_names(chat_client) -> None:
 
 
 @respx.mock
-async def test_a_compaction_updates_the_memory_file_within_its_own_allowance(
-    make_client, tmp_path
-) -> None:
+async def test_a_compaction_updates_the_memory_file_within_its_own_allowance(make_client) -> None:
     """The compaction may call tools up to `CHAT_COMPACT_MAX_TOOL_CALLS`, counted across
     its rounds: a round that asks for more runs the first of them and answers the rest
     with an error, and the call after the cap takes no tool — its text is the summary. A
     file the agent wrote to `/workspace/memory.md` is the snapshot the compacted
     conversation goes on with, and the next turn's system prompt carries it (docs/chat.md
     § Compaction, § Memory)."""
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_compact_max_tool_calls=1)
-    )
+    client = await chatting_client(make_client(chat_compact_max_tool_calls=1))
     main, _ = stub_messages(
         [
             DONE,
@@ -359,11 +306,11 @@ async def test_a_compaction_updates_the_memory_file_within_its_own_allowance(
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="use tables")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert all(part["text"] != chat_agent.MEMORY_FILE_INTRO for part in main[0]["system"])
 
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert "tool_choice" not in main[1]
     assert main[2]["tool_choice"] == {"type": "none"}
     results = main[2]["messages"][-1]["content"]
@@ -372,7 +319,7 @@ async def test_a_compaction_updates_the_memory_file_within_its_own_allowance(
         ("e2", True),
     ]
     assert results[1]["content"] == chat_runner.NOT_RUN_COMPACT_ALLOWANCE
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    root = client.root
     assert (root / "memory.md").read_text() == "## Conventions\n\n- Tables, never lists\n"
     assert not (root / "notes.md").exists()
     assert [revision.message for revision in git.log(root, Path("memory.md"))] == [
@@ -388,7 +335,7 @@ async def test_a_compaction_updates_the_memory_file_within_its_own_allowance(
     ]
 
     await send(client, conversation_id, text="go on")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     kinds = [part["text"].split("\n", 1)[0] for part in main[3]["system"]]
     memory_file = next(
         part["text"] for part in main[3]["system"] if part["text"].startswith("# Memory file")
@@ -407,7 +354,7 @@ async def test_a_cancel_after_the_summary_is_stored_sets_no_boundary(
     main, _ = stub_messages([DONE, SUMMARY, DONE])
     conversation_id = await new_conversation(chat_client)
     await send(chat_client, conversation_id, text="use tables")
-    await _run_queued_turn(chat_client)
+    await run_queued_turn(chat_client)
 
     store = chat_runner._store_summary
 
@@ -420,7 +367,7 @@ async def test_a_cancel_after_the_summary_is_stored_sets_no_boundary(
 
     monkeypatch.setattr(chat_runner, "_store_summary", store_then_cancel)
     await send(chat_client, conversation_id, text="", command="compact")
-    await _run_queued_turn(chat_client)
+    await run_queued_turn(chat_client)
     row = await conversation_row(chat_client, conversation_id)
     assert row.compacted_message_id is None
     turns = (await detail(chat_client, conversation_id))["turns"]
@@ -440,11 +387,11 @@ async def test_a_cancel_after_the_summary_is_stored_sets_no_boundary(
             .scalars()
             .all()
         )
-    assert chat_compact.is_summary(stored[-1])
+    assert stored[-1][0]["context"] == chat_compact.SUMMARY_CONTEXT
 
     monkeypatch.setattr(chat_runner, "_store_summary", store)
     await send(chat_client, conversation_id, text="go on")
-    await _run_queued_turn(chat_client)
+    await run_queued_turn(chat_client)
     # The first turn's exchange and the new message: nothing of the cancelled compaction.
     assert [message["role"] for message in main[2]["messages"]] == ["user", "assistant", "user"]
     assert "## Requests" not in json.dumps(main[2]["messages"])
@@ -456,7 +403,7 @@ async def test_the_memory_file_is_read_under_the_workspace_lock(chat_client) -> 
     writing marker is no writer in flight and refuses no read (docs/chat.md § Memory,
     *The memory file*)."""
     settings = chat_client.app.state.settings
-    root = user_root(settings.workspaces_dir, chat_client.user_id)
+    root = chat_client.root
     root.mkdir(parents=True, exist_ok=True)
     (root / "memory.md").write_text("notes\n")
     async with workspace_lock(root):
@@ -471,36 +418,6 @@ async def test_the_memory_file_is_read_under_the_workspace_lock(chat_client) -> 
 # --- the cache clock ------------------------------------------------------------------------
 
 
-def cached_stream(blocks: list[dict], stop_reason: str, usage: dict) -> bytes:
-    """A stream whose `message_start` reports the usage given, as the Anthropic API does."""
-    events: list[dict] = [
-        {"type": "message_start", "message": {"model": MODEL, "usage": usage}},
-    ]
-    for index, block in enumerate(blocks):
-        events += [
-            {
-                "type": "content_block_start",
-                "index": index,
-                "content_block": {"type": "text", "text": ""},
-            },
-            {
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "text_delta", "text": block["text"]},
-            },
-            {"type": "content_block_stop", "index": index},
-        ]
-    events += [
-        {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason},
-            "usage": {"output_tokens": 5},
-        },
-        {"type": "message_stop"},
-    ]
-    return sse(*events)
-
-
 def stub_usages(usages: list[dict]) -> list[dict]:
     """Answer each call with `Done.` and the next usage; the requests are kept."""
     answers = iter(usages)
@@ -508,7 +425,9 @@ def stub_usages(usages: list[dict]) -> list[dict]:
 
     def answer(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
-        return httpx.Response(200, content=cached_stream(DONE[0], "end_turn", next(answers)))
+        return httpx.Response(
+            200, content=streamed(DONE[0], "end_turn", model=MODEL, usage=next(answers))
+        )
 
     respx.post(MESSAGES_URL).mock(side_effect=answer)
     return requests
@@ -541,7 +460,7 @@ async def test_the_cache_clock_runs_on_the_native_usage_alone(chat_client) -> No
     conversation_id = await new_conversation(client)
     started = datetime.now(UTC)
     await send(client, conversation_id, text="one")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     row = await conversation_row(client, conversation_id)
     assert row.context_tokens == 10 + 90 + 0 + 5
     assert row.cache_warm_until is not None
@@ -557,13 +476,13 @@ async def test_the_cache_clock_runs_on_the_native_usage_alone(chat_client) -> No
     assert listed["conversations"][0]["compactable"]
 
     await send(client, conversation_id, text="two")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     row = await conversation_row(client, conversation_id)
     assert row.context_tokens == 10 + 90 + 20 + 5
     assert row.cache_warm_until is None
 
     await send(client, conversation_id, text="three")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     row = await conversation_row(client, conversation_id)
     assert row.context_tokens == 105
     assert row.cache_warm_until is None
@@ -588,40 +507,6 @@ def test_the_usage_knows_whether_the_api_cached() -> None:
     assert not usage(native=False, read=5, write=5).cached
 
 
-def test_a_price_may_carry_the_models_context_window() -> None:
-    prices = parse_model_prices(
-        json.dumps(
-            {
-                "m": {
-                    "input": 1,
-                    "cache_read": 1,
-                    "cache_write": 1,
-                    "output": 1,
-                    "context": 1000000,
-                },
-                "n": {"input": 1, "cache_read": 1, "cache_write": 1, "output": 1},
-            }
-        )
-    )
-    assert prices["m"].context == 1_000_000
-    assert prices["n"].context is None
-    for context in (0, -1, "big", 1.5, True):
-        with pytest.raises(ValueError, match="context"):
-            parse_model_prices(
-                json.dumps(
-                    {
-                        "m": {
-                            "input": 1,
-                            "cache_read": 1,
-                            "cache_write": 1,
-                            "output": 1,
-                            "context": context,
-                        }
-                    }
-                )
-            )
-
-
 # --- the model between turns ----------------------------------------------------------------
 
 
@@ -634,7 +519,6 @@ async def test_a_conversation_moves_to_another_model_between_turns(chat_client) 
     main, _ = stub_messages([DONE, DONE])
     conversation_id = await new_conversation(client)
     url = f"/api/conversations/{conversation_id}"
-    assert (await client.put(url, json={}, headers=CSRF_HEADERS)).status_code == 400
     unknown = await client.put(url, json={"model": "vendor/unknown"}, headers=CSRF_HEADERS)
     assert unknown.status_code == 400, unknown.text
 
@@ -643,7 +527,7 @@ async def test_a_conversation_moves_to_another_model_between_turns(chat_client) 
     assert queued.status_code == 409, queued.text
     renamed = await client.put(url, json={"title": "Kept"}, headers=CSRF_HEADERS)
     assert renamed.status_code == 200, renamed.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert main[0]["model"] == MODEL
     await set_clock(client, conversation_id, warm_for=3000, tokens=50)
 
@@ -660,14 +544,8 @@ async def test_a_conversation_moves_to_another_model_between_turns(chat_client) 
     assert same.json()["cache_warm_until"] is not None
 
     await send(client, conversation_id, text="two")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert main[1]["model"] == OTHER_MODEL
-    starts = [
-        data
-        for name, data in await replayed_events(client, conversation_id)
-        if name == "turn_start"
-    ]
-    assert [start["model"] for start in starts] == [MODEL, OTHER_MODEL]
 
 
 # --- the idle pass --------------------------------------------------------------------------
@@ -687,7 +565,7 @@ async def test_the_idle_pass_compacts_a_long_conversation_before_its_cache_expir
     main, _ = stub_messages([DONE, SUMMARY])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello", locale="zh-TW")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     listed_before = (await detail(client, conversation_id))["conversation"]["updated_at"]
     await set_clock(
         client,
@@ -720,7 +598,7 @@ async def test_the_idle_pass_compacts_a_long_conversation_before_its_cache_expir
     # The next pass finds nothing: the clock is cleared, and a turn is queued anyway.
     assert await chat_compact.idle_compact_once(client.app.state.sessionmaker, settings) == 0
 
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert main[1]["messages"][-1]["content"][0]["text"] == chat_agent.compact_instruction("")
     after = await detail(client, conversation_id)
     assert after["turns"][1] == {
@@ -729,7 +607,7 @@ async def test_the_idle_pass_compacts_a_long_conversation_before_its_cache_expir
         "status": "succeeded",
         "error": None,
     }
-    assert after["conversation"]["compacted_message_id"] is not None
+    assert (await conversation_row(client, conversation_id)).compacted_message_id is not None
     assert after["conversation"]["updated_at"] == listed_before
     assert after["messages"][-1]["content"][0]["context"] == chat_compact.SUMMARY_CONTEXT
 
@@ -739,13 +617,14 @@ async def test_the_idle_pass_leaves_what_is_not_due_and_what_it_may_not_touch(
     chat_client,
 ) -> None:
     """Not due: a cache with more than the lead left, a context under the minimum. Not
-    touched, though due: the reader's switch off, a turn still unfinished, a balance under
-    the send's minimum — each with the clock cleared and nothing enqueued, not even the
-    message of a refused reservation (docs/chat.md § Compaction, *Idle compaction*)."""
+    touched, though due: the reader's switch off, a turn still unfinished, the reader at the
+    turn cap, a balance under the send's minimum — each with the clock cleared and nothing
+    enqueued, not even the message of a refused reservation (docs/chat.md § Compaction,
+    *Idle compaction*)."""
     client = chat_client
     settings = client.app.state.settings
     sessionmaker = client.app.state.sessionmaker
-    stub_messages([DONE, DONE, DONE])
+    stub_messages([DONE] * 5)
     lead = settings.chat_idle_compact_lead_seconds
     minimum = settings.chat_idle_compact_min_tokens
 
@@ -754,11 +633,11 @@ async def test_the_idle_pass_leaves_what_is_not_due_and_what_it_may_not_touch(
 
     later = await new_conversation(client)
     await send(client, later, text="hello")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     await set_clock(client, later, warm_for=lead + 600, tokens=minimum)
     short = await new_conversation(client)
     await send(client, short, text="hello")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     await set_clock(client, short, warm_for=lead - 10, tokens=minimum - 1)
     assert await chat_compact.idle_compact_once(sessionmaker, settings) == 0
     assert (await conversation_row(client, later)).cache_warm_until is not None
@@ -766,7 +645,7 @@ async def test_the_idle_pass_leaves_what_is_not_due_and_what_it_may_not_touch(
 
     due = await new_conversation(client)
     await send(client, due, text="hello")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     count = await message_count(due)
 
     switched_off = await client.put(
@@ -778,6 +657,7 @@ async def test_the_idle_pass_leaves_what_is_not_due_and_what_it_may_not_touch(
     assert await chat_compact.idle_compact_once(sessionmaker, settings) == 0
     assert (await conversation_row(client, due)).cache_warm_until is None
     assert len(await turns_of(client, due)) == 1
+    assert await message_count(due) == count
     await client.put("/api/agents/chat/settings", json={"idle_compact": True}, headers=CSRF_HEADERS)
 
     await send(client, due, text="still thinking")  # queued, never run
@@ -785,8 +665,18 @@ async def test_the_idle_pass_leaves_what_is_not_due_and_what_it_may_not_touch(
     assert await chat_compact.idle_compact_once(sessionmaker, settings) == 0
     assert (await conversation_row(client, due)).cache_warm_until is None
     assert [turn.kind for turn in await turns_of(client, due)] == [MESSAGE_TURN, MESSAGE_TURN]
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     count = await message_count(due)
+
+    # The reader at the turn cap, by a turn queued in another of their conversations.
+    await send(client, later, text="meanwhile")  # queued, run after the pass
+    await set_clock(client, due, warm_for=lead - 10, tokens=minimum)
+    capped = settings.model_copy(update={"max_chat_turns_per_user": 1})
+    assert await chat_compact.idle_compact_once(sessionmaker, capped) == 0
+    assert (await conversation_row(client, due)).cache_warm_until is None
+    assert len(await turns_of(client, due)) == 2
+    assert await message_count(due) == count
+    await run_queued_turn(client)
 
     async with sessionmaker() as db:
         await db.execute(
@@ -819,10 +709,10 @@ async def test_a_failed_compaction_leaves_no_clock(chat_client) -> None:
     }
     answers = iter(
         [
-            cached_stream(DONE[0], "end_turn", native),
+            streamed(DONE[0], "end_turn", model=MODEL, usage=native),
             # The compactions answer nothing, with the cache read: `compact_empty`.
-            cached_stream([], "end_turn", native),
-            cached_stream([], "end_turn", native),
+            streamed([], "end_turn", model=MODEL, usage=native),
+            streamed([], "end_turn", model=MODEL, usage=native),
         ]
     )
     respx.post(MESSAGES_URL).mock(
@@ -830,7 +720,7 @@ async def test_a_failed_compaction_leaves_no_clock(chat_client) -> None:
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert (await conversation_row(client, conversation_id)).cache_warm_until is not None
 
     await set_clock(
@@ -840,7 +730,7 @@ async def test_a_failed_compaction_leaves_no_clock(chat_client) -> None:
         tokens=settings.chat_idle_compact_min_tokens,
     )
     assert await chat_compact.idle_compact_once(sessionmaker, settings) == 1
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     turns = await turns_of(client, conversation_id)
     assert (turns[1].kind, turns[1].status, turns[1].error) == (
         IDLE_COMPACT_TURN,
@@ -852,7 +742,7 @@ async def test_a_failed_compaction_leaves_no_clock(chat_client) -> None:
     assert row.compacted_message_id is None
 
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     turns = await turns_of(client, conversation_id)
     assert (turns[2].kind, turns[2].status) == (COMPACT_TURN, "failed")
     assert (await conversation_row(client, conversation_id)).cache_warm_until is None
@@ -871,7 +761,7 @@ async def test_the_idle_pass_reads_the_conversation_again_under_its_lock(chat_cl
     stub_messages([DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     await set_clock(
         client,
         conversation_id,
@@ -896,31 +786,21 @@ async def test_the_idle_pass_reads_the_conversation_again_under_its_lock(chat_cl
 
 
 @respx.mock
-async def test_the_memory_file_is_read_and_written_on_the_agent_page(make_client, tmp_path) -> None:
+async def test_the_memory_file_is_read_and_written_on_the_agent_page(make_client) -> None:
     """`memory.md` at the workspace root: read as is, saved as a revision of the reader's
     own with one trailing newline, capped, and refused while a turn of theirs is unfinished
     (docs/api.md, docs/chat.md § Memory *The memory file*)."""
-    client = await chatting_client(
-        make_client(
-            workspaces_dir=str(tmp_path / "workspaces"),
-            chat_memory_file_max_chars=40,
-            chat_idle_compact_lead_seconds=123,
-        )
-    )
+    client = await chatting_client(make_client(chat_memory_file_max_chars=40))
     url = "/api/agents/chat/memory-file"
     empty = await client.get(url)
     assert empty.status_code == 200, empty.text
     assert empty.json() == {"text": "", "max_chars": 40}
-    limits = (await client.get("/api/me")).json()["limits"]
-    assert limits["memory_file_max_chars"] == 40
-    # The panel reads the open conversation again as the worker's window opens (docs/web.md).
-    assert limits["idle_compact_lead_seconds"] == 123
 
     saved = await client.put(url, json={"text": "## Style\n\n- Tables​ "}, headers=CSRF_HEADERS)
     assert saved.status_code == 200, saved.text
     assert saved.json() == {"text": "## Style\n\n- Tables\n"}
     assert (await client.get(url)).json()["text"] == "## Style\n\n- Tables\n"
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    root = client.root
     assert (root / "memory.md").read_text() == "## Style\n\n- Tables\n"
     revisions = git.log(root, Path("memory.md"))
     assert [revision.message for revision in revisions] == ["memory memory.md"]
@@ -949,7 +829,7 @@ async def test_the_memory_file_is_read_and_written_on_the_agent_page(make_client
     busy = await client.put(url, json={"text": "Later."}, headers=CSRF_HEADERS)
     assert busy.status_code == 409, busy.text
     assert (await client.get(url)).json()["text"] == "Short.\n"
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert (await client.put(url, json={"text": "Later."}, headers=CSRF_HEADERS)).status_code == 200
 
 
@@ -964,7 +844,7 @@ async def test_a_conversation_keeps_the_memory_file_it_started_with(chat_client)
     main, _ = stub_messages([DONE, DONE, SUMMARY, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="one")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     def memory_file_part(request: dict) -> str | None:
         return next(
@@ -987,15 +867,15 @@ async def test_a_conversation_keeps_the_memory_file_it_started_with(chat_client)
 
     await client.put(url, json={"text": "Second notes."}, headers=CSRF_HEADERS)
     await send(client, conversation_id, text="two")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert memory_file_part(main[1]) == chat_agent.MEMORY_FILE_INTRO + "First notes."
 
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert memory_file_part(main[2]) == chat_agent.MEMORY_FILE_INTRO + "First notes."
     assert (await conversation_row(client, conversation_id)).memory_file == "Second notes.\n"
     await send(client, conversation_id, text="three")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert memory_file_part(main[3]) == chat_agent.MEMORY_FILE_INTRO + "Second notes."
 
 
@@ -1025,6 +905,3 @@ def test_the_compaction_message_is_the_instruction_and_the_note() -> None:
         chat_compact.COMPACT_CONTEXT,
         chat_agent.TURN_CONTEXT,
     ]
-    assert chat_compact.is_summary([{"type": "text", "text": "s", "context": "summary"}])
-    assert not chat_compact.is_summary([{"type": "text", "text": "s"}])
-    assert not chat_compact.is_summary("text")

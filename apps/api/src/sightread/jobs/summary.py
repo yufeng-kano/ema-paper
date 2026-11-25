@@ -29,12 +29,12 @@ from ..db.models import (
     Document,
     Message,
     UsageLog,
-    User,
     utcnow,
 )
 from ..errors import ApiError
 from ..upstream.anthropic import CompletedMessage, StreamProgress, stream_messages
 from ..upstream.client import Connection, UpstreamError, kano_connection
+from ..workspace.trash import lock_user
 from . import chat_versions
 from .intake import insufficient_credits
 
@@ -68,10 +68,10 @@ async def call(
 
 async def write_title(
     db: AsyncSession, settings: Settings, conversation: Conversation, *, locale: str
-) -> str:
+) -> None:
     """Ask the summary model for the conversation's title, bill the call and write the
-    title, `updated_at` kept as it was. Returns the title; raises `ApiError` for every
-    refusal and failure of docs/api.md, the title then unchanged."""
+    title, `updated_at` kept as it was. Raises `ApiError` for every refusal and failure of
+    docs/api.md, the title then unchanged."""
     connection = kano_connection(settings, anthropic=True)
     if connection is None:
         raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
@@ -138,7 +138,7 @@ async def write_title(
     # The entry first, under the user's row lock, as a send takes it: the call needs the
     # balance a send needs (docs/billing.md § A chat turn). Committed before the call, so
     # no lock is held while the model writes.
-    await db.execute(select(User.id).where(User.id == conversation.user_id).with_for_update())
+    await lock_user(db, conversation.user_id)
     # One title in flight per reader: each reserves nothing, so calls made side by side
     # would all pass the balance check and together run past it. An entry still reserved
     # after twice the call's bound is one a crash left, and no longer counts.
@@ -170,7 +170,6 @@ async def write_title(
             user_id=conversation.user_id,
             kind=ledger.CHAT,
             amount=0,
-            model=model,
             minimum=settings.chat_min_credits,
         )
     except ledger.InsufficientCredits as exc:
@@ -194,12 +193,7 @@ async def write_title(
                 user_id=conversation.user_id,
                 agent=CHAT.name,
                 model=model,
-                prompt_tokens=usage.input_tokens,
-                completion_tokens=usage.output_tokens,
-                cache_read_tokens=usage.cache_read_tokens,
-                cache_write_tokens=usage.cache_write_tokens,
-                cost=usage.cost,
-                cost_source=usage.cost_source,
+                **usage.log_fields(),
             )
         )
         amount = credits_for_usd(
@@ -240,4 +234,3 @@ async def write_title(
         raise ApiError(502, "upstream", "The model could not be reached; try again")
     if not title:
         raise ApiError(502, "upstream", "The model wrote no title; try again")
-    return title

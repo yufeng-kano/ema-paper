@@ -16,7 +16,7 @@ export interface ChartBox {
   bottom: number
 }
 
-export interface ChartPoint {
+interface ChartPoint {
   x: number
   y: number
 }

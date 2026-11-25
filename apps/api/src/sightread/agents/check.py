@@ -8,14 +8,6 @@ parse's own run.
 
 from __future__ import annotations
 
-from .parse import BBOX_FORMAT_YXYX
-
-# Bookkeeping for the registry: the check has no dedup cache of its own (docs/agents.md).
-PIPELINE_VERSION = 1
-
-# The markdown it reads declares the parse's coordinate contract, and it never moves a box.
-BBOX_FORMAT = BBOX_FORMAT_YXYX
-
 # Custom tools with schemas: the agent may run on a model Kano Proxy reaches through a
 # conversion, which drops a tool without one (docs/chat.md § Subagents).
 READ_PAGE_TOOL = {

@@ -169,7 +169,81 @@ describe('an edited document', () => {
   })
 })
 
-describe('review fixes', () => {
+describe('what is typed stays as typed', () => {
+  const para = (...content: JSONContent[]): JSONContent => ({ type: 'doc', content: [{ type: 'paragraph', content }] })
+  const line = (text: string) => para({ type: 'text', text })
+
+  it('keeps a formula a formula right before a digit', () => {
+    const markdown = serializeInline([
+      { type: 'inlineMath', attrs: { latex: 'x' } },
+      { type: 'text', text: '2 apples' },
+    ])
+    expect(load(markdown).content![0]!.content!.map((node) => node.type)).toEqual(['inlineMath', 'text'])
+  })
+
+  it('keeps a literal dollar before a formula a dollar', () => {
+    const markdown = docToMarkdown(para({ type: 'text', text: 'price $' }, { type: 'inlineMath', attrs: { latex: 'x' } }))
+    expect(markdown).toBe('price \\$$x$')
+    expect(load(markdown).content![0]!.content!.map((node) => node.type)).toEqual(['text', 'inlineMath'])
+  })
+
+  it('keeps a typed dot leader a sentence', () => {
+    const markdown = docToMarkdown(para({ type: 'text', text: 'Wait.... 5' }))
+    expect(reading(markdown)).toEqual([{ kind: 'p', text: markdown }])
+  })
+
+  it('keeps a fence line inside code from closing it', () => {
+    const doc: JSONContent = { type: 'doc', content: [{ type: 'codeBlock', content: [{ type: 'text', text: 'a\n```\nb' }] }] }
+    expect(reading(docToMarkdown(doc)).map((block) => block.kind)).toEqual(['code'])
+  })
+
+  it.each(['$a\\$', 'cost $a`b$ x', 'Wait.....5', 'Loading........12'])('keeps %s plain text', (text) => {
+    const markdown = docToMarkdown(line(text))
+    expect(reading(markdown)).toEqual([{ kind: 'p', text: markdown }])
+    expect(load(markdown).content![0]!.content).toEqual([{ type: 'text', text }])
+  })
+})
+
+describe('page markers and spacing', () => {
+  it('keeps the page markers of a notes file', () => {
+    const notes = '<!-- page: 1 -->\nA\n\n<!-- page: 2 -->\nB'
+    const doc = load(notes)
+    expect(docToMarkdown(doc)).toBe(notes)
+    doc.content![1]!.content = [{ type: 'text', text: 'A2' }]
+    expect(docToMarkdown(doc)).toBe('<!-- page: 1 -->\nA2\n\n<!-- page: 2 -->\nB')
+  })
+
+  it('adds no page marker a notes file did not have, and keeps its spacing', () => {
+    const notes = 'intro\n\n\n<!--page:3-->\nfoo\n\n\nbar'
+    const doc = load(notes)
+    expect(docToMarkdown(doc)).toBe(notes)
+    doc.content![2]!.content = [{ type: 'text', text: 'foo2' }]
+    expect(docToMarkdown(doc, '\n')).toBe('intro\n\n\n<!--page:3-->\nfoo2\n\n\nbar\n')
+  })
+
+  it('leaves an untouched table with its own spacing alone', () => {
+    const notes = '|A|B|\n|---|---|\n|1|2|\n\nedit me'
+    const doc = load(notes)
+    doc.content![1]!.content = [{ type: 'text', text: 'edited' }]
+    expect(docToMarkdown(doc)).toBe('|A|B|\n|---|---|\n|1|2|\n\nedited')
+  })
+
+  it('keeps a page marker line inside code', () => {
+    const doc: JSONContent = { type: 'doc', content: [{ type: 'codeBlock', content: [{ type: 'text', text: 'a\n<!-- page: 9 -->\nb' }] }] }
+    const pages = parseResultMarkdown(docToMarkdown(doc))
+    expect(pages.map((page) => page.blocks.map((block) => block.kind))).toEqual([['code']])
+  })
+
+  it('keeps content before the first page marker before it', () => {
+    const notes = 'intro\n\n<!-- page: 1 -->\nmore'
+    const doc = load(notes)
+    expect(docToMarkdown(doc)).toBe(notes)
+    doc.content![2]!.content = [{ type: 'text', text: 'more2' }]
+    expect(docToMarkdown(doc)).toBe('intro\n\n<!-- page: 1 -->\nmore2')
+  })
+})
+
+describe('list items and table cells', () => {
   const p = (text: string) => ({ type: 'paragraph', content: [{ type: 'text', text }] })
 
   it('keeps a formula and code made inside a list item', () => {
@@ -194,17 +268,6 @@ describe('review fixes', () => {
     expect(docToMarkdown(doc)).toBe('- item $E=mc^2$ `print(1)`')
   })
 
-  it('keeps a formula a formula right before a digit', () => {
-    const markdown = serializeInline([
-      { type: 'inlineMath', attrs: { latex: 'x' } },
-      { type: 'text', text: '2 apples' },
-    ])
-    expect(reading(markdown)).toEqual([{ kind: 'p', text: markdown }])
-    expect(parseResultMarkdown(markdown)[0]!.blocks[0]).toMatchObject({ kind: 'p' })
-    const segments = (reading(markdown)[0] as { text: string }).text
-    expect(segments.startsWith('$x$')).toBe(true)
-  })
-
   it('writes code with a pipe in a table cell, and code holding a backtick as text', () => {
     const doc = load('| a | b |\n| --- | --- |\n| 1 | 2 |')
     doc.content![0]!.content![0]!.content![0]!.content = [
@@ -213,59 +276,6 @@ describe('review fixes', () => {
     const markdown = docToMarkdown(doc)
     expect(reading(markdown)).toEqual([{ kind: 'table', header: ['`a|b`', 'b'], rows: [['1', '2']] }])
     expect(serializeInline([{ type: 'text', text: 'a`b', marks: [{ type: 'code' }] }])).toBe('a\\`b')
-  })
-
-  it('keeps the page markers of a notes file', () => {
-    const notes = '<!-- page: 1 -->\nA\n\n<!-- page: 2 -->\nB'
-    const doc = load(notes)
-    expect(docToMarkdown(doc)).toBe(notes)
-    doc.content![1]!.content = [{ type: 'text', text: 'A2' }]
-    expect(docToMarkdown(doc)).toBe('<!-- page: 1 -->\nA2\n\n<!-- page: 2 -->\nB')
-  })
-})
-
-describe('second review', () => {
-  const para = (...content: JSONContent[]): JSONContent => ({ type: 'doc', content: [{ type: 'paragraph', content }] })
-
-  it('keeps a literal dollar before a formula a dollar', () => {
-    const markdown = docToMarkdown(para({ type: 'text', text: 'price $' }, { type: 'inlineMath', attrs: { latex: 'x' } }))
-    expect(markdown).toBe('price \\$$x$')
-    expect(load(markdown).content![0]!.content!.map((node) => node.type)).toEqual(['text', 'inlineMath'])
-  })
-
-  it('keeps a typed dot leader a sentence', () => {
-    const markdown = docToMarkdown(para({ type: 'text', text: 'Wait.... 5' }))
-    expect(reading(markdown)).toEqual([{ kind: 'p', text: markdown }])
-  })
-
-  it('keeps a fence line inside code from closing it', () => {
-    const doc: JSONContent = { type: 'doc', content: [{ type: 'codeBlock', content: [{ type: 'text', text: 'a\n```\nb' }] }] }
-    expect(reading(docToMarkdown(doc)).map((block) => block.kind)).toEqual(['code'])
-  })
-
-  it('adds no page marker a notes file did not have, and keeps its spacing', () => {
-    const notes = 'intro\n\n\n<!--page:3-->\nfoo\n\n\nbar'
-    const doc = load(notes)
-    expect(docToMarkdown(doc)).toBe(notes)
-    doc.content![2]!.content = [{ type: 'text', text: 'foo2' }]
-    expect(docToMarkdown(doc, '\n')).toBe('intro\n\n\n<!--page:3-->\nfoo2\n\n\nbar\n')
-  })
-})
-
-describe('third review', () => {
-  const para = (text: string): JSONContent => ({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] })
-
-  it('leaves an untouched table with its own spacing alone', () => {
-    const notes = '|A|B|\n|---|---|\n|1|2|\n\nedit me'
-    const doc = load(notes)
-    doc.content![1]!.content = [{ type: 'text', text: 'edited' }]
-    expect(docToMarkdown(doc)).toBe('|A|B|\n|---|---|\n|1|2|\n\nedited')
-  })
-
-  it.each(['$a\\$', 'cost $a`b$ x', 'Wait.....5', 'Loading........12'])('keeps %s plain text', (text) => {
-    const markdown = docToMarkdown(para(text))
-    expect(reading(markdown)).toEqual([{ kind: 'p', text: markdown }])
-    expect(load(markdown).content![0]!.content).toEqual([{ type: 'text', text }])
   })
 
   it('writes a multi-line formula in a list item on one line', () => {
@@ -278,23 +288,9 @@ describe('third review', () => {
     }
     expect(reading(docToMarkdown(doc)).map((block) => block.kind)).toEqual(['list'])
   })
-
-  it('keeps a page marker line inside code', () => {
-    const doc: JSONContent = { type: 'doc', content: [{ type: 'codeBlock', content: [{ type: 'text', text: 'a\n<!-- page: 9 -->\nb' }] }] }
-    const pages = parseResultMarkdown(docToMarkdown(doc))
-    expect(pages.map((page) => page.blocks.map((block) => block.kind))).toEqual([['code']])
-  })
-
-  it('keeps content before the first page marker before it', () => {
-    const notes = 'intro\n\n<!-- page: 1 -->\nmore'
-    const doc = load(notes)
-    expect(docToMarkdown(doc)).toBe(notes)
-    doc.content![2]!.content = [{ type: 'text', text: 'more2' }]
-    expect(docToMarkdown(doc)).toBe('intro\n\n<!-- page: 1 -->\nmore2')
-  })
 })
 
-describe('pull request review', () => {
+describe('marks read back as written', () => {
   const doc = (...content: JSONContent[]): JSONContent => ({ type: 'doc', content: [{ type: 'paragraph', content }] })
   const text = (value: string, ...marks: string[]): JSONContent =>
     marks.length ? { type: 'text', text: value, marks: marks.map((type) => ({ type })) } : { type: 'text', text: value }
@@ -313,7 +309,9 @@ describe('pull request review', () => {
     expect(back.map((node) => [node.text?.replace(/\u200b/g, ''), (node.marks ?? []).map((mark) => mark.type).sort()]))
       .toEqual(content.map((node) => [node.text, (node.marks ?? []).map((mark) => mark.type).sort()]))
   })
+})
 
+describe('captionLine', () => {
   it('keeps a caption one line that starts no block', () => {
     expect(captionLine('# Figure 2\n\nmore')).toBe('Figure 2 more')
     expect(captionLine('- 1. a')).toBe('1\\. a')
@@ -435,6 +433,13 @@ describe('blockIndexAt', () => {
   it('counts an offset into a file with carriage returns as the editor reads it', () => {
     const crlf = 'One\r\n\r\nTwo'
     expect(blockIndexAt(crlf, crlf.indexOf('Two'))).toBe(1)
+  })
+
+  it('never finds a block inside a page marker', () => {
+    const marked = '<!-- page: 1 -->\n1\n\nNext'
+    expect(blockIndexAt(marked, marked.indexOf('\n1') + 1)).toBe(1)
+    expect(blockIndexAt(marked, marked.indexOf('Next'))).toBe(2)
+    expect(markdownToDoc(marked).content?.map((node) => node.attrs?.lead)).toEqual(['', '\n', '\n\n'])
   })
 })
 

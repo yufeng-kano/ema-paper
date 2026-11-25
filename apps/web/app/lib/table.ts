@@ -1,9 +1,6 @@
 /**
  * The column contract `UiDataTable` renders (see the component for what it does with each
- * field). It lives here rather than in the SFC because a Vue component that both exports a
- * type and uses `<script setup>` needs a second, plain `<script>` block for the export —
- * and importing a type out of an auto-imported component is a seam nothing else in this app
- * has.
+ * field).
  */
 export interface TableColumn<Row> {
   key: string

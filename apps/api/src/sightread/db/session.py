@@ -9,12 +9,15 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 from fastapi import Request
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+
+from ..errors import ApiError
 
 
 def create_engine(database_url: str) -> AsyncEngine:
@@ -40,3 +43,12 @@ async def db_session(request: Request) -> AsyncIterator[AsyncSession]:
     """FastAPI dependency yielding a session bound to the app's sessionmaker."""
     async with request.app.state.sessionmaker() as session:
         yield session
+
+
+async def commit_or_conflict(db: AsyncSession, message: str) -> None:
+    """Commit; when a constraint refuses it, roll back and answer 409 with `message`."""
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise ApiError(409, "invalid_request", message) from exc

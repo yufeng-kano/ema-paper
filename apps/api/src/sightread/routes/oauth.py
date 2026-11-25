@@ -37,6 +37,7 @@ from ..auth.oidc import POST_LOGIN_KEY
 from ..auth.sessions import SESSION_COOKIE, resolve_session
 from ..config import Settings
 from ..db.models import OAuthClient, User
+from ..mcp.server import MCP_PATH
 
 router = APIRouter(tags=["oauth"])
 
@@ -44,7 +45,6 @@ router = APIRouter(tags=["oauth"])
 # in flight, the authorize request to come back to.
 CONSENT_STATE_KEY = "oauth_consent"
 
-MCP_PATH = "/mcp"
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
 
@@ -173,7 +173,7 @@ def _page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
 @router.get("/.well-known/oauth-authorization-server")
 async def authorization_server_metadata(settings: AppSettings) -> JSONResponse:
     """RFC 8414 metadata; the issuer is this API's public origin."""
-    issuer = settings.app_url.rstrip("/")
+    issuer = settings.app_url
     return JSONResponse(
         {
             "issuer": issuer,
@@ -198,7 +198,7 @@ async def protected_resource_metadata(settings: AppSettings) -> JSONResponse:
     Also served under the path-suffixed form, which is where a client that starts from
     `<origin>/mcp` looks first.
     """
-    issuer = settings.app_url.rstrip("/")
+    issuer = settings.app_url
     return JSONResponse(
         {
             "resource": f"{issuer}{MCP_PATH}",
@@ -273,8 +273,9 @@ async def _validated_request(
     return client
 
 
-def _redirect_with_error(redirect_uri: str, state: str, error: str) -> RedirectResponse:
-    query = {"error": error, **({"state": state} if state else {})}
+def _redirect(redirect_uri: str, state: str, **params: str) -> RedirectResponse:
+    """Back to the client with `params` (an `error` or the `code`) and its `state`, if any."""
+    query = {**params, **({"state": state} if state else {})}
     separator = "&" if "?" in redirect_uri else "?"
     return RedirectResponse(f"{redirect_uri}{separator}{urlencode(query)}", status_code=302)
 
@@ -311,19 +312,19 @@ async def authorize(
     code_challenge: str = "",
     code_challenge_method: str = "",
     state: str = "",
-    scope: str = "",
 ):
     """Consent screen for a signed-in user; anything else is a redirect or an error page.
 
     `resource` (RFC 8707) is accepted and ignored: this AS protects exactly one resource.
+    So is `scope`: a grant always holds both scopes (docs/auth.md § 4).
     """
     client = await _validated_request(db, client_id, redirect_uri)
     if isinstance(client, HTMLResponse):
         return client
     if response_type != "code":
-        return _redirect_with_error(redirect_uri, state, "unsupported_response_type")
+        return _redirect(redirect_uri, state, error="unsupported_response_type")
     if not code_challenge or code_challenge_method != CODE_CHALLENGE_METHOD:
-        return _redirect_with_error(redirect_uri, state, "invalid_request")
+        return _redirect(redirect_uri, state, error="invalid_request")
 
     user = await _session_user(request, db)
     if user is None:
@@ -336,7 +337,6 @@ async def authorize(
         "redirect_uri": redirect_uri,
         "state": state,
         "code_challenge": code_challenge,
-        "scope": scope or GRANTED_SCOPE,
         "consent_token": consent_token,
     }
     hidden = "".join(
@@ -383,15 +383,13 @@ async def authorize_decision(
     if user is None:
         return _page("Sign in required", "<p>Your session expired. Sign in and retry.</p>", 401)
     if decision != "approve":
-        return _redirect_with_error(redirect_uri, state, "access_denied")
+        return _redirect(redirect_uri, state, error="access_denied")
 
     code = await issue_code(
         db, client=client, user=user, redirect_uri=redirect_uri, code_challenge=code_challenge
     )
     await db.commit()
-    query = {"code": code, **({"state": state} if state else {})}
-    separator = "&" if "?" in redirect_uri else "?"
-    return RedirectResponse(f"{redirect_uri}{separator}{urlencode(query)}", status_code=302)
+    return _redirect(redirect_uri, state, code=code)
 
 
 # --- token -----------------------------------------------------------------------------

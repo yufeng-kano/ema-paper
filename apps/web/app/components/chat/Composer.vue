@@ -16,13 +16,13 @@
  * next draft.
  */
 import { deleteAttachment, listSkills, uploadAttachment, type AttachmentUpload, type UploadLimits } from '~/lib/api'
+import { blockKey } from '~/lib/blocks'
 import {
   acceptList,
   builtinCommands,
   commandQuery,
   COMPACT_COMMAND,
   extensionOf,
-  formatBytes,
   isImageFile,
   matchCommands,
   NEW_COMMAND,
@@ -39,16 +39,17 @@ import {
   type ComposerPayload,
   type SentSection,
 } from '~/lib/composer'
+import { formatBytes } from '~/lib/format'
 import { libraryMessage, type LibraryPlace } from '~/lib/library'
 import { inlinePlain, type OutlineEntry } from '~/lib/markdown'
-import type { MenuItem, Point } from '~/lib/menu'
+import type { MenuItem } from '~/lib/menu'
 
 const props = defineProps<{
   /** A turn is in flight: the composer waits, and Stop is the one control. */
   running: boolean
   stopping: boolean
   /** A send would be refused (no credits, a full workspace): the draft waits, Send is off. */
-  blocked?: boolean
+  blocked: boolean
   limits: UploadLimits | null
   /** The document pane's selection, read as the reader comes to the composer. */
   documentSelection: () => string | null
@@ -71,7 +72,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{ stop: []; 'new-conversation': [] }>()
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const { resolve } = useApiError()
 /** Two panels can be mounted at once — the Files page's under a viewer's — so the ids the
  *  field and its menu refer to each other by are this composer's own. */
@@ -173,10 +174,6 @@ interface AddedSection extends SentSection {
 
 const addedSections = ref<AddedSection[]>([])
 
-function entryKey(entry: OutlineEntry): string {
-  return `${entry.page}-${entry.index}`
-}
-
 /** `limits.sections_per_message` reached: no further section is offered. */
 const sectionsFull = computed(() => {
   const cap = props.limits?.sections_per_message
@@ -198,7 +195,7 @@ function addEntry(entry: OutlineEntry) {
     return
   }
   addSection({
-    key: entryKey(entry),
+    key: blockKey(entry),
     heading: entry.text,
     plain: entry.plain,
     text: sectionText(source, props.limits?.selection_max_chars),
@@ -266,49 +263,27 @@ function showPicked() {
 // --- *Add context*: the current section, then every heading --------------------------------
 
 const addButton = ref<HTMLButtonElement | null>(null)
-const addMenu = ref<Point | null>(null)
-const addMenuFromKey = ref(false)
 /** The section the document was at when the menu opened: scrolling with the menu open
  *  closes it, so this is the one the menu offers. */
 const menuCurrent = ref<OutlineEntry | null>(null)
-/** The event that last closed the menu, if one did. */
-let addMenuClosedBy: Event | null = null
-/** The press now on **+** is the one that closed the menu (a press outside it, caught
- *  first): that press's click must not open it again. A pick, Escape or a press elsewhere
- *  leaves the next press free. */
-let addPressClosedMenu = false
+const {
+  at: addMenu,
+  fromKey: addMenuFromKey,
+  onPointerdown: onAddPointerdown,
+  toggle: toggleAddMenu,
+  close: closeAddMenu,
+} = useMenuButton(addButton, {
+  onOpen: () => {
+    menuCurrent.value = props.currentSection()
+  },
+  // The menu gives focus back to what had it, inside the field.
+  onClose: expectFocusReturn,
+})
 
 /** A subsection is set in by a space as wide as the type, so the outline reads as one. A
  *  heading longer than the menu is cut by the menu, with an ellipsis; the row's title and
  *  the chip it adds say it whole. */
 const SUBSECTION_INDENT = ' '
-
-function onAddPointerdown(event: PointerEvent) {
-  addPressClosedMenu = addMenuClosedBy === event
-}
-
-function toggleAddMenu(event: MouseEvent) {
-  // A click the keyboard made carries no pointer detail, and no press came before it.
-  const fromKey = event.detail === 0
-  if (addMenu.value || (addPressClosedMenu && !fromKey)) {
-    addPressClosedMenu = false
-    addMenu.value = null
-    return
-  }
-  const box = addButton.value?.getBoundingClientRect()
-  addMenuFromKey.value = fromKey
-  menuCurrent.value = props.currentSection()
-  // Over the button, ending just above it: the composer sits at the foot of the column, and
-  // a menu opened down would cover the control and the draft.
-  addMenu.value = box ? { x: box.left, y: box.top - 4 } : { x: 0, y: 0 }
-}
-
-function closeAddMenu(cause?: Event) {
-  addMenu.value = null
-  addMenuClosedBy = cause ?? null
-  // The menu gives focus back to what had it, inside the field.
-  expectFocusReturn()
-}
 
 const addMenuItems = computed<MenuItem[]>(() => {
   const added = new Set(addedSections.value.map((section) => section.key))
@@ -318,20 +293,20 @@ const addMenuItems = computed<MenuItem[]>(() => {
       key: 'current',
       label: current ? t('chat.context.currentSectionNamed', { heading: current.plain }) : t('chat.context.currentSection'),
       icon: 'locate' as const,
-      disabled: !current || (sectionsFull.value && !added.has(entryKey(current))),
+      disabled: !current || (sectionsFull.value && !added.has(blockKey(current))),
     },
     ...props.outline.map((entry, index) => ({
-      key: entryKey(entry),
+      key: blockKey(entry),
       label: `${entry.level >= 3 ? SUBSECTION_INDENT : ''}${entry.plain}`,
-      checked: added.has(entryKey(entry)),
-      disabled: sectionsFull.value && !added.has(entryKey(entry)),
+      checked: added.has(blockKey(entry)),
+      disabled: sectionsFull.value && !added.has(blockKey(entry)),
       separated: index === 0,
     })),
   ]
 })
 
 function onAddSelect(key: string) {
-  const entry = key === 'current' ? menuCurrent.value : props.outline.find((candidate) => entryKey(candidate) === key)
+  const entry = key === 'current' ? menuCurrent.value : props.outline.find((candidate) => blockKey(candidate) === key)
   if (entry) {
     addEntry(entry)
   }
@@ -577,7 +552,7 @@ function refusalText(refusal: AttachmentRefusal): string {
     case 'type':
       return t('chat.attachmentUnsupported')
     case 'size':
-      return t('chat.attachmentTooLarge', { size: formatBytes(refusal.max) })
+      return t('chat.attachmentTooLarge', { size: formatBytes(refusal.max, locale.value, { limit: true }) })
     case 'count':
       return t('chat.attachmentTooMany', { count: refusal.max })
   }
@@ -688,7 +663,9 @@ function fileMeta(item: PendingAttachment): string {
   const extension = extensionOf(item.name).toUpperCase()
   const kind = extension.length <= 4 ? extension : ''
   const detail =
-    item.state === 'uploading' ? t('chat.attachmentUploading', { percent: item.progress }) : formatBytes(item.size)
+    item.state === 'uploading'
+      ? t('chat.attachmentUploading', { percent: item.progress })
+      : formatBytes(item.size, locale.value)
   return kind ? `${kind} · ${detail}` : detail
 }
 
@@ -874,7 +851,7 @@ async function ask(request: AskRequest): Promise<AskOutcome> {
   if (request.section) {
     const { heading, text } = request.section
     const entry = props.outline.find((candidate) => candidate.text === heading)
-    const key = entry ? entryKey(entry) : `heading:${heading}`
+    const key = entry ? blockKey(entry) : `heading:${heading}`
     if (!addedSections.value.some((added) => added.key === key)) {
       if (sectionsFull.value) {
         return 'full'

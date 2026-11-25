@@ -1,10 +1,5 @@
 import { CHAT_EVENT_NAMES, conversationEventsUrl, type ChatEvent } from '~/lib/api'
-
-/** One frame of the stream with the sequence number its `id:` line carried. */
-export interface StreamedEvent {
-  seq: number
-  event: ChatEvent
-}
+import { TURN_END_EVENTS } from '~/lib/thread'
 
 /** Consecutive drops with no event between them before the stream gives up on a turn. */
 const MAX_SILENT_RETRIES = 6
@@ -33,13 +28,12 @@ const RETRY_CAP_MS = 10000
  * between them gives up.
  */
 export function useConversationStream(
-  onEvent: (frame: StreamedEvent) => void,
+  onEvent: (event: ChatEvent) => void,
   /** The stream gave up on a turn it never heard from again: the record decides now. */
-  onGaveUp?: () => void,
+  onGaveUp: () => void,
 ) {
-  /** The last sequence seen — the `after` of the next open. */
-  const lastSeq = ref(0)
-  const connected = ref(false)
+  /** The last sequence seen — the `after` of the next connect. */
+  let lastSeq = 0
   /** A turn is in flight as far as the stream knows. */
   const active = ref(false)
   /** Which one: the id `turn_start` or `expectTurn` named, so a replayed older turn's
@@ -64,25 +58,18 @@ export function useConversationStream(
       source.close()
       source = null
     }
-    connected.value = false
   }
 
   function connect() {
-    if (conversationId === null || typeof EventSource === 'undefined') {
+    if (conversationId === null) {
       return
     }
     disconnect()
     const id = conversationId
-    const stream = new EventSource(conversationEventsUrl(id, lastSeq.value), {
+    const stream = new EventSource(conversationEventsUrl(id, lastSeq), {
       withCredentials: true,
     })
     source = stream
-
-    stream.onopen = () => {
-      if (source === stream) {
-        connected.value = true
-      }
-    }
 
     for (const name of CHAT_EVENT_NAMES) {
       stream.addEventListener(name, (raw) => {
@@ -97,8 +84,8 @@ export function useConversationStream(
           return
         }
         const seq = Number.parseInt(message.lastEventId, 10)
-        if (Number.isFinite(seq) && seq > lastSeq.value) {
-          lastSeq.value = seq
+        if (Number.isFinite(seq) && seq > lastSeq) {
+          lastSeq = seq
         }
         silentRetries = 0
         const turnId = typeof data.turn_id === 'string' ? data.turn_id : null
@@ -109,11 +96,11 @@ export function useConversationStream(
           if (expected === null) {
             expected = turnId
           }
-        } else if ((name === 'turn_done' || name === 'turn_error') && (expected === null || turnId === expected)) {
+        } else if (TURN_END_EVENTS.has(name) && (expected === null || turnId === expected)) {
           active.value = false
           expected = null
         }
-        onEvent({ seq: lastSeq.value, event: { ...data, event: name } as ChatEvent })
+        onEvent({ ...data, event: name } as ChatEvent)
       })
     }
 
@@ -128,7 +115,7 @@ export function useConversationStream(
       }
       if (silentRetries >= MAX_SILENT_RETRIES) {
         active.value = false
-        onGaveUp?.()
+        onGaveUp()
         return
       }
       const delay = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** silentRetries)
@@ -138,22 +125,22 @@ export function useConversationStream(
   }
 
   /**
-   * Starts following `id` from `after` — 0 replays the whole log, which is how the panel
-   * recovers the commits of earlier edits. Switching conversations forgets the previous
+   * Starts following `id` from its first event: the whole log is replayed, which is how the
+   * panel recovers the commits of earlier edits. Switching conversations forgets the previous
    * one's cursor.
    */
-  function open(id: number, after = 0) {
+  function open(id: number) {
     disconnect()
     conversationId = id
-    lastSeq.value = after
+    lastSeq = 0
     active.value = false
     expected = null
     silentRetries = 0
     connect()
   }
 
-  /** Come back from the last seen sequence after the stream gave up and the record said
-   *  the turn is still going: the retry budget starts over. */
+  /** Come back from the last seen sequence after the stream gave up and the record could
+   *  not be read, while the last one read lists a live turn: the retry budget starts over. */
   function resume() {
     if (conversationId === null) {
       return
@@ -183,5 +170,5 @@ export function useConversationStream(
 
   onBeforeUnmount(close)
 
-  return { lastSeq, connected, active, open, expectTurn, resume, close }
+  return { active, open, expectTurn, resume, close }
 }

@@ -1,5 +1,16 @@
-import { getAdminMe, type AdminMe } from '~/lib/api'
-import { adminFailure, can as holds, conflictKey, type AdminArea, type AdminLevel } from '~/lib/admin'
+import type { Ref } from 'vue'
+import { getAdminMe, type AdminMe, type AdminPerson, type AuditEntry, type PeriodSource } from '~/lib/api'
+import {
+  adminFailure,
+  can as holds,
+  conflictKey,
+  nameOrEmail,
+  pastLastPage,
+  planLabel,
+  type AdminArea,
+  type AdminLevel,
+} from '~/lib/admin'
+import { formatCount } from '~/lib/format'
 
 /**
  * Only ever assigned on the client (the `admin` middleware and the pages are client-only), so
@@ -36,19 +47,14 @@ export function useAdminConsole() {
   const reauthRequired = computed(() => me.value?.reauth_required === true)
   const reauthHours = computed(() => me.value?.reauth_hours ?? 0)
 
-  async function load(): Promise<void> {
-    state.value = await getAdminMe()
-    failed.value = false
-  }
-
   /** Reads `GET /api/admin/me` unless the signed-in account's answer is here; concurrent
    *  callers share one request. Its failure — a 404 when the console is off — is the
    *  caller's to handle. */
   function ensureLoaded(): Promise<void> {
-    if (import.meta.server || me.value) {
+    if (me.value) {
       return Promise.resolve()
     }
-    inFlight ??= load().finally(() => {
+    inFlight ??= reload().finally(() => {
       inFlight = null
     })
     return inFlight
@@ -56,8 +62,9 @@ export function useAdminConsole() {
 
   /** Re-reads it: after a 403 `permission_denied`, so the nav and the buttons follow what
    *  the account holds now, and after signing in again. */
-  function reload(): Promise<void> {
-    return load()
+  async function reload(): Promise<void> {
+    state.value = await getAdminMe()
+    failed.value = false
   }
 
   /** A route answered 403 `reauth_required`: the page turns into *Sign in again*. */
@@ -143,4 +150,226 @@ export function useAdminFailure() {
   }
 
   return { explain }
+}
+
+/** What a redeem code, or a batch of them, grants: credits and how long they last, or days of
+ *  a plan. */
+interface CodeGrant {
+  kind: 'credits' | 'plan'
+  credits: number | null
+  valid_days: number | null
+  plan_id: string | null
+  days: number | null
+}
+
+/**
+ * The console's words for accounts, audit records, grants and plans, the same on every page
+ * that shows them. Called in setup. A caller whose account can be missing says what that
+ * shows itself.
+ */
+export function useAdminLabels() {
+  const { t, te, locale } = useI18n()
+
+  /** An account the console names without its address — who added, changed or disabled
+   *  something: its name, else its account number. */
+  function personName(person: AdminPerson): string {
+    return person.name?.trim() || t('admin.accountId', { id: person.id })
+  }
+
+  /** Who made an audit record; null once that account is deleted. */
+  function actorName(row: AuditEntry): string | null {
+    return row.actor ? nameOrEmail(row.actor) : null
+  }
+
+  /** The catalog's words for an action; one it does not know prints as its key. */
+  function actionLabel(action: string): string {
+    return te(`admin.audit.actions.${action}`) ? t(`admin.audit.actions.${action}`) : action
+  }
+
+  /** What an audit record's target is called now; a job, or one gone, by its type and id. */
+  function targetLabel(row: AuditEntry): string {
+    if (row.target_label) {
+      return row.target_label
+    }
+    const type = te(`admin.audit.targets.${row.target_type}`) ? t(`admin.audit.targets.${row.target_type}`) : row.target_type
+    return `${type} ${row.target_id}`
+  }
+
+  function grantLabel(grant: CodeGrant): string {
+    if (grant.kind === 'credits') {
+      const days = grant.valid_days ?? 0
+      return t(
+        'admin.codes.grantCredits',
+        { credits: formatCount(grant.credits ?? 0, locale.value), n: formatCount(days, locale.value) },
+        days,
+      )
+    }
+    const days = grant.days ?? 0
+    return t('admin.codes.grantPlan', { n: formatCount(days, locale.value), plan: planLabel(grant.plan_id ?? '') }, days)
+  }
+
+  /** An account's plan, and what pays for its period: *Free*, or *Pro · Subscription*. */
+  function planLine(plan: { id: string; source: PeriodSource }): string {
+    return plan.source === 'free' ? t('admin.users.free') : `${planLabel(plan.id)} · ${t(`admin.users.paidBy.${plan.source}`)}`
+  }
+
+  return { personName, actorName, actionLabel, targetLabel, grantLabel, planLine }
+}
+
+/**
+ * A console list's place in the route query (docs/admin.md § Pages): every page keeps its
+ * filters there, so Back and a reload return to them. Each page reads its own filters.
+ */
+export function useAdminQuery() {
+  const route = useRoute()
+  const router = useRouter()
+
+  /** Moves the query, a `null` dropping its key; a filter or a search passes `page: null`,
+   *  so it starts again at the first page. */
+  function setQuery(patch: Record<string, string | null>, replace = false): void {
+    const query = Object.fromEntries(Object.entries({ ...route.query, ...patch }).filter(([, value]) => value !== null))
+    void (replace ? router.replace({ query }) : router.push({ query }))
+  }
+
+  function goToPage(next: number): void {
+    setQuery({ page: next > 1 ? String(next) : null })
+  }
+
+  /** Whether a list read for `page` is one to show. A page past the end — a link from a
+   *  longer list — is not: the query moves to its last page instead, which the query's
+   *  change reads. */
+  function withinPages(list: Parameters<typeof pastLastPage>[0], page: number): boolean {
+    const last = pastLastPage(list, page)
+    if (last === null) {
+      return true
+    }
+    setQuery({ page: last > 1 ? String(last) : null }, true)
+    return false
+  }
+
+  return { setQuery, goToPage, withinPages }
+}
+
+/** How long typing rests before a list's search runs. */
+const SEARCH_DELAY_MS = 300
+
+/**
+ * A list's search field, typed ahead of the query: what is typed reaches `?q=` once typing
+ * rests, replacing the entry and starting again at the first page, and Back and Forward,
+ * which move the query under the field, move the field with it.
+ */
+export function useQuerySearch(
+  q: Readonly<Ref<string>>,
+  setQuery: ReturnType<typeof useAdminQuery>['setQuery'],
+): Ref<string> {
+  const search = ref(q.value)
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  watch(search, (value) => {
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      const next = value.trim()
+      if (next !== q.value) {
+        setQuery({ q: next || null, page: null }, true)
+      }
+    }, SEARCH_DELAY_MS)
+  })
+
+  watch(q, (value) => {
+    if (value !== search.value.trim()) {
+      search.value = value
+    }
+  })
+
+  onBeforeUnmount(() => clearTimeout(timer))
+
+  return search
+}
+
+interface AdminReadOptions<T> {
+  /** False keeps an answer off the page: the read leads elsewhere (`withinPages`). */
+  accept?: (loaded: T) => boolean
+  /** Takes the newest read's failure over: true when it did, and the page says nothing. */
+  onError?: (failure: unknown) => boolean
+  /** A failure also clears what the last read showed. */
+  clearOnError?: boolean
+  onLoaded?: (loaded: T) => void
+}
+
+/**
+ * One console read and its state. Reads can overlap — a filter changed while the last one
+ * runs, *Refresh* — and only the newest may write. A failure is said through
+ * `useAdminFailure`, so a reauth, a denial and a console turned off take the page over as
+ * everywhere in the console; the last answer stays on screen under it unless
+ * `clearOnError`.
+ */
+export function useAdminRead<T>(fetch: () => Promise<T>, options: AdminReadOptions<T> = {}) {
+  const { explain } = useAdminFailure()
+  const data = shallowRef<T | null>(null)
+  const pending = ref(false)
+  const error = ref<string | null>(null)
+  let seq = 0
+
+  async function load(): Promise<void> {
+    const mine = ++seq
+    pending.value = true
+    try {
+      const loaded = await fetch()
+      if (mine !== seq || options.accept?.(loaded) === false) {
+        return
+      }
+      data.value = loaded
+      error.value = null
+      options.onLoaded?.(loaded)
+    } catch (failure) {
+      if (mine === seq && options.onError?.(failure)) {
+        return
+      }
+      const message = await explain(failure)
+      if (mine === seq) {
+        if (options.clearOnError) {
+          data.value = null
+        }
+        error.value = message
+      }
+    } finally {
+      if (mine === seq) {
+        pending.value = false
+      }
+    }
+  }
+
+  /** Shows an answer newer than any read still running — a change's own — which then
+   *  writes nothing. */
+  function replace(value: T): void {
+    seq += 1
+    pending.value = false
+    data.value = value
+    error.value = null
+  }
+
+  return { data, pending, error, load, replace }
+}
+
+type HeldResult<T> = { value: T } | { failure: unknown }
+
+/**
+ * A dialog's request with Back held while it runs: a navigation would close the dialog, and
+ * the answer would land unseen (docs/admin.md § Pages, *Errors*). The hold is released
+ * before the result is returned, so a 401's way back to the landing page — taken while the
+ * failure is explained — is never the navigation it refuses. Called in setup, where the
+ * router is in reach.
+ */
+export function useHeldRequest() {
+  const router = useRouter()
+  return async function held<T>(call: () => Promise<T>): Promise<HeldResult<T>> {
+    const release = router.beforeEach(() => false)
+    try {
+      return { value: await call() }
+    } catch (failure) {
+      return { failure }
+    } finally {
+      release()
+    }
+  }
 }

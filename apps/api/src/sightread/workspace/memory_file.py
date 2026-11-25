@@ -26,8 +26,6 @@ def read_memory_file(root: Path, max_bytes: int) -> str:
     larger than the API opens."""
     try:
         return safe_io.read_text(root, root / MEMORY_FILE, max_bytes) or ""
-    except FileNotFoundError:
-        return ""
     except (safe_io.EntryTooLarge, safe_io.UnsafeEntry, UnicodeDecodeError, OSError) as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
 

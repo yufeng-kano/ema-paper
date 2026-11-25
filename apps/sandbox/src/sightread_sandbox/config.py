@@ -15,8 +15,6 @@ class Settings(BaseSettings):
     app_env: Literal["local", "production"] = "local"
     # What api and worker present; empty refuses every request.
     sandbox_token: str = ""
-    # `docker` (production) or `local` (tests and nothing else: a bash process, no VM).
-    sandbox_backend: Literal["docker", "local"] = "docker"
     # The Docker runtime: `kata` is a VM per container; `runc` is for local development.
     sandbox_runtime: str = "kata"
     sandbox_image: str = "ema-paper-sandbox"
@@ -56,7 +54,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check(self) -> Settings:
-        if self.sandbox_backend == "docker" and not self.sandbox_workspaces_dir.startswith("/"):
+        if not self.sandbox_workspaces_dir.startswith("/"):
             # `docker run -v` takes the host path as the daemon sees it: relative to
             # nothing this runner knows (docs/sandbox.md § Operations).
             raise ValueError("SANDBOX_WORKSPACES_DIR must be an absolute host path")
@@ -67,10 +65,10 @@ class Settings(BaseSettings):
             if not self.sandbox_token:
                 raise ValueError("SANDBOX_TOKEN is required in production")
             allowed = {name.strip() for name in self.sandbox_vm_runtimes.split(",") if name.strip()}
-            if self.sandbox_backend != "docker" or self.sandbox_runtime not in allowed:
+            if self.sandbox_runtime not in allowed:
                 # No VM boundary is no sandbox (docs/sandbox.md § Isolation).
                 raise ValueError(
-                    "production needs the docker backend with a VM runtime "
+                    "production needs a VM runtime "
                     f"(SANDBOX_RUNTIME must be one of SANDBOX_VM_RUNTIMES: {sorted(allowed)})"
                 )
         return self

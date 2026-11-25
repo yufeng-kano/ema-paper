@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * Preferences (docs/web.md § Pages, `/settings/<section>`): what a PDF or an image becomes,
+ * Preferences (docs/web.md § Pages, `?settings=<section>`): what a PDF or an image becomes,
  * and how it opens. *Convert on upload* is the parse agent's `auto_convert`, read with the
  * agents and saved on change (docs/agents.md) — off, an upload is kept as it is and
  * converted when the reader asks for Markdown in its viewer. *Open on* is the reader's
@@ -9,7 +9,7 @@
  * § Result viewer, *Original and Markdown*). The session carries both (`GET /api/me`), so
  * the Files page and the viewer follow a save at once.
  */
-import { listAgents, putAgentSettings, putPreferences, type AgentEntry, type DocumentView } from '~/lib/api'
+import { listAgents, PARSE_AGENT, putAgentSettings, putPreferences, type AgentEntry, type DocumentView } from '~/lib/api'
 
 const { t } = useI18n()
 const { resolve } = useApiError()
@@ -19,7 +19,6 @@ const VIEWS: readonly DocumentView[] = ['original', 'markdown']
 
 // --- convert on upload ------------------------------------------------------------------
 
-const PARSE_AGENT = 'parse'
 const { data: agentsData, errorMessage: agentsError } = useAuthedData(() => listAgents())
 /** The parse agent's entry, as read, then as each save answers it. */
 const parseAgent = ref<AgentEntry | null>(null)
@@ -45,7 +44,7 @@ async function toggleConvert(next: boolean) {
     parseAgent.value = { ...agent, settings, bbox }
     // The Files page reads the switch from the session (`GET /api/me`), so it follows at once.
     if (auth.me.value) {
-      auth.me.value = { ...auth.me.value, auto_convert: settings.auto_convert ?? next }
+      auth.me.value = { ...auth.me.value, auto_convert: settings.auto_convert }
     }
   } catch (failure) {
     convertError.value = await resolve(failure)

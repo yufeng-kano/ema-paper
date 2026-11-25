@@ -1,12 +1,12 @@
 <script setup lang="ts">
 /**
- * The frame of every public page (docs/web.md § Pages, `/`, `/pricing` and the policy pages):
- * the public bar — the mark and name at the left; at the right the page's name, and *Sign in*
- * (*Back to Files* once `GET /api/me` says someone is signed in) as the bar's one accent
- * capsule — the page's own content on the desk between, and the public footer at the bottom.
- * The sign-in page passes no title: the bar offers *Pricing* there instead, and no sign-in,
- * the page being the sign-in. Full-bleed: a visitor lands here signed out, and a signed-in
- * reader is not sent away.
+ * The frame of every public page (docs/web.md § Pages: `/`, `/pricing`, `/rates`, the policy
+ * pages and Nuxt's error page): the public bar — the mark and name at the left; at the right the
+ * page's name, and *Sign in* (*Back to Files* once `GET /api/me` says someone is signed in) as
+ * the bar's one accent capsule — the page's own content on the desk between, and the public
+ * footer at the bottom. The sign-in page and the error page pass no title: the bar offers
+ * *Pricing* there instead, and no sign-in. Full-bleed: a visitor lands here signed out, and a
+ * signed-in reader is not sent away.
  */
 defineProps<{
   /** The page's name, marked current in the bar. */

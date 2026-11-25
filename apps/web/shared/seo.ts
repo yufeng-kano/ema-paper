@@ -7,8 +7,8 @@
 
 /**
  * The public pages, as paths under a locale's prefix: the sign-in page (the SEO surface),
- * pricing, the rates, and the policy pages Dodo's site review reads (docs/billing.md
- * § Transition, step 6).
+ * pricing, the rates, and the policy pages. The public footer links every one but the
+ * sign-in page, named by its `footer.<page>` key, so each needs that key in en and zh-TW.
  */
 export const PUBLIC_PAGES = ['/', '/pricing', '/rates', '/terms', '/privacy', '/refund'] as const
 
@@ -36,14 +36,14 @@ export const PUBLIC_PATHS = PUBLIC_PAGES.flatMap((page) => PAGE_LOCALES.map(({ p
  * The authed pages, client-rendered shells that send a signed-out visitor to sign in — the
  * operator console's among them. Under every locale: nothing is served without one.
  */
-const AUTHED_PAGES = ['/files', '/settings', '/admin'] as const
+const AUTHED_PAGES = ['/files', '/admin'] as const
 
 /**
  * Kept off every crawler: the authed pages in each locale, the sign-in redirect, the data
  * plane, the authorization server and the MCP endpoint. The rest of `/api/` stays open: the
  * pricing and policy pages render from `/api/billing/catalog` and `/api/site`.
  */
-export const DISALLOWED_PATHS = [
+const DISALLOWED_PATHS = [
   ...PAGE_LOCALES.flatMap(({ prefix }) => AUTHED_PAGES.map((page) => prefix + page)),
   '/api/auth/',
   '/v1/',

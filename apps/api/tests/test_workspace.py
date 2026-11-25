@@ -1,21 +1,24 @@
 """The per-user workspace: materialization, revisions, the tree (docs/workspace.md).
 
-Real git in a temporary directory; no database beyond the SQLite fallback.
+Real git in a temporary directory; the SQLite fallback, except the finished-parse row-lock
+test, which needs PostgreSQL.
 """
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import json
 import os
 import shutil
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
-from sightread.config import Settings
-from sightread.db.models import Document, Folder, Job, Result, User
+from sightread.db.models import Document, Folder, Job, User
 from sightread.errors import ApiError
 from sightread.jobs import sweeper
 from sightread.workspace import documents, git, reconcile, safe_io
@@ -30,47 +33,24 @@ from sightread.workspace.layout import (
     sources_dir,
     user_root,
 )
-from tests.conftest import KANO_BASE, TEST_SECRET_KEY
-
-
-def _settings(tmp_path: Path) -> Settings:
-    return Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-    )
+from sightread.workspace.locks import _backup_lock_path
+from tests.conftest import path_settings, postgres_only
+from tests.factories import filed_parse, user_row
 
 
 async def _seed(db, *, markdown: str = "# Title\n\nBody\n") -> tuple[User, Document]:
-    user = User(google_sub="ws", email="ws@example.com")
+    """An account with one two-page parse filed as `Papers/paper.pdf`."""
+    user = user_row("ws@example.com")
     db.add(user)
     await db.flush()
-    folder = Folder(user_id=user.id, parent_id=None, name="Papers")
-    db.add(folder)
-    await db.flush()
-    job = Job(
-        id=uuid.uuid4(),
-        user_id=user.id,
-        agent="parse",
-        kind="pdf",
-        filename="paper.pdf",
-        media_type="application/pdf",
-        size_bytes=10,
-        sha256="a" * 64,
-        model="claude-x",
-        bbox_format="yxyx_norm1000",
-        status="succeeded",
-        page_count=2,
-    )
-    db.add(job)
-    await db.flush()
-    db.add(Result(job_id=job.id, markdown=markdown, pages=[], figures=[], errors=[], meta={}))
-    document = Document(user_id=user.id, folder_id=folder.id, job_id=job.id, name="paper.pdf")
-    db.add(document)
+    document = await filed_parse(db, user.id, markdown=markdown, page_count=2)
     await db.commit()
     return user, document
+
+
+def _nothing_aside(root: Path) -> bool:
+    """No directory a delete or a move set aside is left in the workspace root."""
+    return not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
 
 
 def test_path_segments_cannot_escape_or_shadow_the_workspace() -> None:
@@ -95,7 +75,7 @@ def test_path_segments_cannot_escape_or_shadow_the_workspace() -> None:
 
 
 async def test_materialize_writes_once_and_edits_commit_revisions(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         content = await documents.read_content(db, settings, document)
@@ -127,7 +107,7 @@ async def test_materialize_writes_once_and_edits_commit_revisions(sessionmaker, 
         await documents.materialize_document(db, settings, document)
         assert paths.doc.read_text() == "# Title\n\nEdited\n"
 
-        history = await documents.revisions(db, settings, document)
+        history = git.log(paths.root, paths.relative)
         assert [entry.message for entry in history][:2] == [
             "edit files/Papers/paper.pdf/doc.md",
             "materialize files/Papers/paper.pdf",
@@ -137,11 +117,11 @@ async def test_materialize_writes_once_and_edits_commit_revisions(sessionmaker, 
         restored = (await documents.revert(db, settings, document, history[0].commit)).revision
         assert restored == content.revision
         assert paths.doc.read_text() == "# Title\n\nBody\n"
-        assert (await documents.revisions(db, settings, document))[0].message.startswith("revert")
+        assert git.log(paths.root, paths.relative)[0].message.startswith("revert")
 
 
 async def test_reconcile_follows_a_directory_the_shell_moved(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -170,7 +150,7 @@ async def test_keep_source_moves_the_upload_into_the_document_directory(tmp_path
     root = tmp_path / "ws" / "7"
     upload = tmp_path / "upload.pdf"
     upload.write_bytes(b"%PDF-1.4")
-    kept = documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31)
+    kept = documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31, kind="pdf")
     # The original named by the document; no directory made in the tree for the copy.
     assert kept == tmp_path / "ws" / ".repos" / "7.sources" / "31.pdf"
     assert kept.read_bytes() == b"%PDF-1.4"
@@ -182,22 +162,23 @@ async def test_keep_source_moves_the_upload_into_the_document_directory(tmp_path
     (root / "files" / "paper.pdf").mkdir(parents=True)
     (root / "files" / "paper.pdf" / META_FILE).write_text("{}")
     upload.write_bytes(b"%PDF-1.4")
-    documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31)
+    documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31, kind="pdf")
     assert (root / "files" / "paper.pdf" / "source.pdf").read_bytes() == b"%PDF-1.4"
     # Ignored by git: the binary never enters history.
-    assert git.commit_all(root, "user", "x") is None or "source" not in git.log(root)[0].files
+    assert git.commit_all(root, "user", "x") is not None
+    assert git.log(root)[0].files == ("files/paper.pdf/.meta.json",)
 
 
 async def test_revert_follows_a_rename(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         content = await documents.read_content(db, settings, document)
         await documents.write_content(
             db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
         )
-        edit = (await documents.revisions(db, settings, document))[0]
         before = await documents.document_paths(db, settings, document)
+        edit = git.log(before.root, before.relative)[0]
         document.name = "renamed.pdf"
         await db.commit()
         after = await documents.document_paths(db, settings, document)
@@ -210,7 +191,7 @@ async def test_revert_follows_a_rename(sessionmaker, tmp_path) -> None:
 
 
 async def test_materialize_refuses_a_full_workspace(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     settings.workspace_quota_bytes = 1
     async with sessionmaker() as db:
         _, document = await _seed(db)
@@ -225,7 +206,7 @@ async def test_materialize_refuses_a_full_workspace(sessionmaker, tmp_path) -> N
 async def test_the_git_directory_is_outside_the_tree_and_a_planted_hook_never_runs(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -250,7 +231,7 @@ async def test_the_git_directory_is_outside_the_tree_and_a_planted_hook_never_ru
 
 
 async def test_a_symlinked_document_file_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     outside = tmp_path / "secret.txt"
     outside.write_text("not yours")
     async with sessionmaker() as db:
@@ -289,7 +270,7 @@ def test_segments_decode_and_know_whether_they_are_canonical() -> None:
 
 
 async def test_reconcile_canonicalizes_a_directory_the_shell_named(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -324,7 +305,7 @@ def test_long_names_become_bounded_distinct_segments() -> None:
 
 
 async def test_an_inflated_document_file_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     settings.content_max_bytes = 64
     async with sessionmaker() as db:
         _, document = await _seed(db)
@@ -341,7 +322,7 @@ async def test_an_inflated_document_file_is_refused(sessionmaker, tmp_path) -> N
 
 
 async def test_a_fifo_or_oversized_save_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     settings.content_max_bytes = 64
     async with sessionmaker() as db:
         _, document = await _seed(db)
@@ -361,7 +342,7 @@ async def test_a_fifo_or_oversized_save_is_refused(sessionmaker, tmp_path) -> No
 
 
 async def test_a_move_puts_the_document_where_the_row_says(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -395,12 +376,12 @@ def test_shell_diffs_and_revisions_are_read_within_a_bound(tmp_path) -> None:
     diff = git.show_commit(root, commit, 2_000)
     assert len(diff) < 2_100 and diff.rstrip().endswith("[... diff cut by the workspace ...]")
     with pytest.raises(git.GitError):
-        git.show(root, commit, Path("files/big.txt"), 1_000)
-    assert git.show(root, commit, Path("files/big.txt"), 1_000_000) == "line\n" * 20_000
+        git.show_bytes(root, commit, Path("files/big.txt"), 1_000)
+    assert git.show_bytes(root, commit, Path("files/big.txt"), 1_000_000) == b"line\n" * 20_000
 
 
 async def test_reconcile_ignores_oversized_metadata(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -413,7 +394,7 @@ async def test_reconcile_ignores_oversized_metadata(sessionmaker, tmp_path) -> N
 
 
 async def test_a_directory_where_a_file_belongs_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -427,7 +408,7 @@ async def test_a_directory_where_a_file_belongs_is_refused(sessionmaker, tmp_pat
 async def test_the_lock_lives_outside_the_mount_and_saves_commit_only_their_file(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -448,7 +429,7 @@ async def test_the_lock_lives_outside_the_mount_and_saves_commit_only_their_file
 
 
 async def test_revert_undoes_every_path_of_a_shell_commit(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -467,7 +448,7 @@ async def test_revert_undoes_every_path_of_a_shell_commit(sessionmaker, tmp_path
 async def test_reconcile_leaves_a_row_alone_when_its_id_is_in_two_places(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -478,7 +459,7 @@ async def test_reconcile_leaves_a_row_alone_when_its_id_is_in_two_places(
 
 
 async def test_a_late_library_row_adopts_the_finished_upload(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one()
@@ -510,7 +491,7 @@ async def test_a_tree_a_dead_workers_command_may_write_takes_no_host_write(
 ) -> None:
     from sightread.workspace.locks import clear_writing, mark_writing, workspace_lock
 
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -537,7 +518,7 @@ async def test_a_tree_a_dead_workers_command_may_write_takes_no_host_write(
 async def test_a_document_named_like_an_excluded_artifact_keeps_its_revisions(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         document.name = "source.pdf"
@@ -572,10 +553,67 @@ def test_path_scoped_commits_name_their_paths_literally(tmp_path) -> None:
     assert git.commit_paths(root, "user", "nothing", [Path("files/zzz")]) is None
 
 
+def test_a_path_scoped_commit_stages_paths_past_one_argv_chunk(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "ws" / "1"
+    for name in ("a", "b", "c"):
+        (root / "files" / name).mkdir(parents=True)
+        (root / "files" / name / "doc.md").write_text(f"{name}\n")
+    git.ensure_repo(root)
+    # One pathspec per `ls-files` call, one of them matching nothing.
+    monkeypatch.setattr(git, "_PATHSPEC_CHUNK_BYTES", 24)
+    paths = [Path("files/a"), Path("files/zzz"), Path("files/b"), Path("files/c")]
+    assert git.commit_paths(root, "user", "three", paths) is not None
+    assert sorted(git.log(root)[0].files) == ["files/a/doc.md", "files/b/doc.md", "files/c/doc.md"]
+
+
+def test_missing_at_head_reads_a_name_as_a_name(tmp_path) -> None:
+    """A shell can begin a top-level name with `:`, which git would otherwise read as
+    pathspec magic: an exclusion, a glob, or nothing at all."""
+    root = tmp_path / "ws" / "1"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    held = [Path(":!x"), Path(":(glob)y"), Path("x")]
+    for name in held:
+        (root / name).write_text(f"{name}\n")
+    git.commit_all(root, "user", "names")
+    assert git.missing_at_head(root, held) == []
+    assert git.missing_at_head(root, [Path(":x"), Path("x")]) == [Path(":x")]
+
+
+def test_renames_since_follows_chains_and_paths_that_meet(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    for name in ("a", "c", "e"):
+        (root / name).write_text(f"{name} line\n" * 50)
+    base = git.commit_all(root, "user", "base")
+    assert base is not None
+
+    def move(source: str, target: str) -> None:
+        (root / source).rename(root / target)
+        assert git.commit_all(root, "user", f"{source} -> {target}") is not None
+
+    move("a", "b")
+    (root / "b").unlink()
+    git.commit_all(root, "user", "remove b")
+    # `c` takes the name `a` once moved to, and both move on together.
+    move("c", "b")
+    move("b", "d")
+    # A rename back to the origin's name, then on.
+    move("e", "f")
+    move("f", "e")
+    move("e", "g")
+    assert git.renames_since(root, base) == {
+        Path("a"): Path("d"),
+        Path("c"): Path("d"),
+        Path("e"): Path("g"),
+    }
+
+
 async def test_a_folder_set_aside_by_a_crashed_delete_comes_back_whole(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -593,14 +631,14 @@ async def test_a_folder_set_aside_by_a_crashed_delete_comes_back_whole(
         assert paths.doc.read_text() == "# Title\n\nBody\n"
         assert (root / "files" / "Papers" / "scratch.txt").read_text() == "notes\n"
         assert (root / "files" / "Papers" / "drafts").is_dir()
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
         assert git.log(root)[0].message == "restore files/Papers"
 
 
 async def test_an_aside_holding_a_deleted_document_does_not_come_back_whole(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         other = Document(
@@ -623,13 +661,13 @@ async def test_an_aside_holding_a_deleted_document_does_not_come_back_whole(
         assert paths.doc.read_text() == "# Title\n\nBody\n"
         assert not other_paths.directory.exists()
         assert not (root / "files" / "Papers" / "scratch.txt").exists()
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
 
 
 async def test_a_failed_library_parse_keeps_its_original(sessionmaker, tmp_path) -> None:
     from sightread.jobs import runner
 
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one()
@@ -653,12 +691,88 @@ async def test_a_failed_library_parse_keeps_its_original(sessionmaker, tmp_path)
         assert job.status == "failed" and job.source_deleted_at is not None
 
 
+async def _running_library_parse(sessionmaker, settings) -> SimpleNamespace:
+    """A document's parse still running with its upload staged: the document, its job, the
+    upload, the user's workspace, and where the finished parse keeps the upload in the
+    document's directory."""
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        job = await db.get(Job, document.job_id)
+        upload = Path(settings.upload_dir) / f"{job.id}.pdf"
+        upload.parent.mkdir(parents=True, exist_ok=True)
+        upload.write_bytes(b"%PDF-1.4 test")
+        job.source_path = str(upload)
+        job.status = "running"
+        await db.commit()
+    root = user_root(settings.workspaces_dir, user.id)
+    return SimpleNamespace(
+        document_id=document.id,
+        job_id=job.id,
+        upload=upload,
+        root=root,
+        kept=root / "files" / "Papers" / "paper.pdf" / "source.pdf",
+    )
+
+
+@postgres_only
+async def test_a_finished_library_parse_waits_for_the_filing_row_lock(
+    sessionmaker, tmp_path
+) -> None:
+    """Filing takes the job's row lock before it inserts: a finish that waits for it reads
+    the row it filed as a recipient rather than deleting the upload under it (docs/jobs.md
+    § Retention). PostgreSQL only: SQLite takes no row lock."""
+    from sightread.jobs import runner
+
+    settings = path_settings(tmp_path)
+    parse = await _running_library_parse(sessionmaker, settings)
+    async with sessionmaker() as holder:
+        await holder.execute(select(Job.id).where(Job.id == parse.job_id).with_for_update())
+        held = asyncio.create_task(
+            runner._finish(sessionmaker, parse.job_id, status="succeeded", settings=settings)
+        )
+        await asyncio.sleep(0.3)
+        assert not held.done()
+        await holder.rollback()
+    await asyncio.wait_for(held, 10)
+    assert parse.kept.read_bytes() == b"%PDF-1.4 test"
+
+
+async def test_a_finished_library_parse_keeps_its_source_in_one_backup_snapshot(
+    sessionmaker, tmp_path
+) -> None:
+    """The retention exception (docs/jobs.md): the upload moves into the document dir. The
+    terminal rows and the kept original land in one backup snapshot: a backup holding the
+    lock keeps the finish — commit included — out until it is done."""
+    from sightread.jobs import runner
+
+    settings = path_settings(tmp_path)
+    parse = await _running_library_parse(sessionmaker, settings)
+    backup_path = _backup_lock_path(parse.root)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    backup = backup_path.open("a+")
+    fcntl.flock(backup, fcntl.LOCK_EX)
+    finishing = asyncio.create_task(
+        runner._finish(sessionmaker, parse.job_id, status="succeeded", settings=settings)
+    )
+    await asyncio.sleep(0.3)
+    assert not finishing.done()
+    async with sessionmaker() as db:
+        assert (await db.get(Job, parse.job_id)).status == "running"
+    fcntl.flock(backup, fcntl.LOCK_UN)
+    backup.close()
+    await asyncio.wait_for(finishing, 10)
+    assert parse.kept.read_bytes() == b"%PDF-1.4 test"
+    assert not parse.upload.exists()
+    original = documents.original_of(parse.root, parse.document_id)
+    assert original is not None and original.read_bytes() == b"%PDF-1.4 test"
+
+
 async def test_retention_copies_for_its_recipients_when_a_late_row_took_the_upload(
     sessionmaker, tmp_path
 ) -> None:
     from sightread.jobs import runner
 
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, first = await _seed(db)
         job = (await db.execute(select(Job).where(Job.id == first.job_id))).scalar_one()
@@ -692,7 +806,7 @@ async def test_retention_copies_for_its_recipients_when_a_late_row_took_the_uplo
 async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -700,10 +814,15 @@ async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
         await documents.write_content(
             db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
         )
+        # The original and a crop: in the directory, outside history.
+        (before.directory / "source.pdf").write_bytes(b"%PDF-1.4 original")
+        (before.directory / "figures").mkdir()
+        (before.directory / "figures" / "p1_0_0_10_10.png").write_bytes(b"png")
         document.name = "renamed.pdf"
         await db.commit()
         after = await documents.document_paths(db, settings, document)
         await documents.move_path(settings, user.id, before.relative, after.relative)
+        assert (after.directory / "source.pdf").exists()
         rename = git.log(after.root)[0]
         assert rename.message.startswith("move ")
 
@@ -711,13 +830,15 @@ async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
         row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
         assert row.name == "paper.pdf"
         assert before.doc.read_text() == "# Title\n\nEdited\n"
+        assert (before.directory / "source.pdf").read_bytes() == b"%PDF-1.4 original"
+        assert (before.directory / "figures" / "p1_0_0_10_10.png").exists()
         assert not after.directory.exists()
         assert reverted.revision == documents.revision_of("# Title\n\nEdited\n")
         assert git.log(after.root)[0].commit == reverted.commit
 
 
 async def test_non_utf8_content_is_refused_not_a_crash(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -728,7 +849,7 @@ async def test_non_utf8_content_is_refused_not_a_crash(sessionmaker, tmp_path) -
 
 
 async def test_a_cached_library_upload_keeps_its_fresh_file(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one()
@@ -744,7 +865,7 @@ async def test_a_cached_library_upload_keeps_its_fresh_file(sessionmaker, tmp_pa
 
 
 async def test_a_revert_that_cannot_complete_touches_nothing(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -766,7 +887,7 @@ async def test_a_revert_that_cannot_complete_touches_nothing(sessionmaker, tmp_p
 
 
 async def test_deleting_through_a_linked_ancestor_is_refused(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -835,7 +956,7 @@ def test_a_failed_write_leaves_the_file_as_it_was(tmp_path) -> None:
 async def test_figure_crops_are_copied_file_by_file_and_never_through_a_link(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         crops = tmp_path / "figures" / str(document.job_id)
@@ -862,29 +983,6 @@ async def test_figure_crops_are_copied_file_by_file_and_never_through_a_link(
         assert not list(elsewhere.iterdir())
 
 
-async def test_the_history_follows_a_rename(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
-    async with sessionmaker() as db:
-        user, document = await _seed(db)
-        content = await documents.read_content(db, settings, document)
-        await documents.write_content(
-            db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
-        )
-        edit = (await documents.revisions(db, settings, document))[0]
-        before = await documents.document_paths(db, settings, document)
-        document.name = "renamed.pdf"
-        await db.commit()
-        after = await documents.document_paths(db, settings, document)
-        await documents.move_path(settings, user.id, before.relative, after.relative)
-        history = await documents.revisions(db, settings, document)
-        # The move is the newest; the edit made under the old name is still listed.
-        assert history[0].commit != edit.commit
-        assert edit.commit in {revision.commit for revision in history}
-        assert "doc.md" in "".join(
-            next(revision for revision in history if revision.commit == edit.commit).files
-        )
-
-
 def test_missing_parents_are_made_through_descriptors(tmp_path) -> None:
     root = tmp_path / "ws" / "2"
     root.mkdir(parents=True)
@@ -907,7 +1005,7 @@ def test_missing_parents_are_made_through_descriptors(tmp_path) -> None:
 async def test_a_revert_never_writes_over_what_sits_at_the_old_place(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -915,7 +1013,7 @@ async def test_a_revert_never_writes_over_what_sits_at_the_old_place(
         await db.commit()
         after = await documents.document_paths(db, settings, document)
         await documents.move_path(settings, user.id, before.relative, after.relative)
-        rename = (await documents.revisions(db, settings, document))[0]
+        rename = git.log(after.root, after.relative)[0]
         # The shell wrote a new file where the document's used to be.
         before.directory.mkdir()
         before.doc.write_text("newer")
@@ -927,7 +1025,7 @@ async def test_a_revert_never_writes_over_what_sits_at_the_old_place(
 
 
 async def test_missing_crops_are_copied_on_a_later_materialization(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         crops = tmp_path / "figures" / str(document.job_id)
@@ -942,7 +1040,7 @@ async def test_missing_crops_are_copied_on_a_later_materialization(sessionmaker,
 
 
 async def test_reconcile_records_no_folder_under_a_documents_name(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -964,10 +1062,39 @@ async def test_reconcile_records_no_folder_under_a_documents_name(sessionmaker, 
         assert row.folder_id == document.folder_id
 
 
+async def test_reconcile_follows_a_document_into_a_directory_that_replaced_a_file(
+    sessionmaker, tmp_path
+) -> None:
+    settings = path_settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        (root / "files" / "Notes").write_bytes(b"kept")
+        git.commit_all(root, "agent:1", "a file from the shell")
+        assert await reconcile.reconcile_user(db, settings, user.id) == 1
+        # The shell replaced the file with a directory of its name and moved the document
+        # into it: one reconciliation removes the file's row, records the folder and
+        # follows the document there.
+        (root / "files" / "Notes").unlink()
+        target = root / "files" / "Notes" / "paper.pdf"
+        target.parent.mkdir()
+        paths.directory.rename(target)
+        git.commit_all(root, "agent:1", "mv from the shell")
+        assert await reconcile.reconcile_user(db, settings, user.id) == 3
+        row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
+        folder = await db.get(Folder, row.folder_id)
+        assert (folder.name, folder.parent_id) == ("Notes", None)
+        names = set(
+            (await db.execute(select(Document.name).where(Document.user_id == user.id))).scalars()
+        )
+        assert names == {"paper.pdf"}
+
+
 async def test_a_revert_of_a_rename_that_also_edited_restores_the_bytes(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     # Long enough that git still sees the edited file as the renamed one (R, not D + A).
     original = "# Title\n\n" + "".join(f"Paragraph {index}.\n\n" for index in range(30))
     async with sessionmaker() as db:
@@ -979,7 +1106,7 @@ async def test_a_revert_of_a_rename_that_also_edited_restores_the_bytes(
         (after_dir / "doc.md").write_text(original + "And a line the shell added\n")
         git.commit_all(before.root, "agent:1", "mv and edit from the shell")
         await reconcile.reconcile_user(db, settings, user.id)
-        shell = (await documents.revisions(db, settings, document))[0]
+        shell = git.log(before.root, after_dir.relative_to(before.root))[0]
         assert any(status == "R" for status, _, _ in git.changed_paths(before.root, shell.commit))
         await documents.revert(db, settings, document, shell.commit)
         # Back at the old path, with the bytes from before the commit.
@@ -993,9 +1120,7 @@ def test_a_staging_failure_is_an_error_not_a_silent_save(tmp_path) -> None:
     git.ensure_repo(root)
     safe_io.write_text(root, root / "files" / "doc.md", "one")
     assert git.commit_paths(root, "user", "first", [Path("files/doc.md")]) is not None
-    # A pathspec that matches nothing is skipped...
-    assert git.commit_paths(root, "user", "none", [Path("files/gone")]) is None
-    # ...a stale index lock is not.
+    # A stale index lock is an error, never a skipped save.
     (git_dir(root) / "index.lock").write_text("")
     safe_io.write_text(root, root / "files" / "doc.md", "two")
     with pytest.raises(git.GitError):
@@ -1005,7 +1130,7 @@ def test_a_staging_failure_is_an_error_not_a_silent_save(tmp_path) -> None:
 async def test_reconcile_never_walks_through_a_linked_files_directory(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1035,19 +1160,6 @@ def test_tree_sizes_never_follow_a_link(tmp_path) -> None:
     assert safe_io.tree_size(root, root / "link-dir") == 0
 
 
-def test_the_revision_log_is_bounded(tmp_path) -> None:
-    root = tmp_path / "ws" / "5"
-    root.mkdir(parents=True)
-    git.ensure_repo(root)
-    for index in range(git._log_files_max() + 50):
-        safe_io.write_text(root, root / "files" / f"f{index:04d}.txt", "x")
-    git.commit_all(root, "agent:1", "a flood of files")
-    (revision,) = git.log(root)
-    # The first LOG_FILES_MAX paths and a count of the rest, never the whole list.
-    assert len(revision.files) == git._log_files_max() + 1
-    assert revision.files[-1] == "... and 50 more"
-
-
 def test_a_revert_past_the_total_bound_is_refused_before_anything_moves(tmp_path) -> None:
     root = tmp_path / "ws" / "6"
     root.mkdir(parents=True)
@@ -1058,7 +1170,7 @@ def test_a_revert_past_the_total_bound_is_refused_before_anything_moves(tmp_path
     git.commit_all(root, "user", "four files")
     for index in range(4):
         safe_io.write_text(root, root / "files" / "d" / f"f{index}.txt", "y" * 1000)
-    (shell,) = [git.commit_all(root, "agent:1", "edit all four")]
+    shell = git.commit_all(root, "agent:1", "edit all four")
     paths = documents.DocumentPaths(root=root, relative=Path("files/d"))
     with pytest.raises(ApiError) as refused:
         documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=2_500, max_paths=100)
@@ -1067,20 +1179,6 @@ def test_a_revert_past_the_total_bound_is_refused_before_anything_moves(tmp_path
     # Within the bound, the same revert goes through.
     documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=10_000, max_paths=100)
     assert (root / "files" / "d" / "f0.txt").read_text() == "x" * 1000
-
-
-def test_a_revision_whose_list_reaches_the_bound_is_still_listed(tmp_path, monkeypatch) -> None:
-    root = tmp_path / "ws" / "7"
-    root.mkdir(parents=True)
-    git.ensure_repo(root)
-    for index in range(60):
-        safe_io.write_text(root, root / "files" / f"a-rather-long-file-name-{index:04d}.txt", "x")
-    git.commit_all(root, "agent:1", "many names")
-    monkeypatch.setattr(git, "_log_max_bytes", lambda: 600)
-    (revision,) = git.log(root)
-    assert revision.message == "many names"
-    assert revision.files[-1] == "... (list cut)"
-    assert 0 < len(revision.files) < 60
 
 
 def test_tree_sizes_survive_a_very_deep_tree(tmp_path) -> None:
@@ -1197,7 +1295,7 @@ def test_the_backup_hold_waits_for_the_backup_lock(tmp_path) -> None:
     entered = threading.Event()
 
     def writer() -> None:
-        shared = locks._acquire_shared(backup)
+        shared = locks._flock(backup, fcntl.LOCK_SH)
         # The workspace lock inside the hold takes the backup lock shared again.
         handle, inner = locks._acquire(locks._lock_path(root, locks.WORKSPACE_SUFFIX), backup)
         entered.set()
@@ -1254,7 +1352,7 @@ def test_reaches_beyond_tells_a_documents_own_revision_from_a_shells(tmp_path) -
     assert documents.reaches_beyond(paths, own) is False
     assert documents.reaches_beyond(paths, both) is True
     # The document moved since: its own older revision is still its own.
-    git.move(root, root / "files" / "a", root / "files" / "moved")
+    safe_io.rename(root, root / "files" / "a", root / "files" / "moved")
     git.commit_paths(root, "user", "rename a", [Path("files/a"), Path("files/moved")])
     moved = documents.DocumentPaths(root=root, relative=Path("files/moved"))
     assert documents.reaches_beyond(moved, own) is False
@@ -1262,7 +1360,7 @@ def test_reaches_beyond_tells_a_documents_own_revision_from_a_shells(tmp_path) -
 
 
 async def test_a_removal_whose_rows_stay_is_put_back(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1275,71 +1373,6 @@ async def test_a_removal_whose_rows_stay_is_put_back(sessionmaker, tmp_path) -> 
     assert paths.doc.read_text() == "# Title\n\nEdited\n"
     (newest,) = git.log(root, paths.relative, 1)
     assert newest.message == f"restore {paths.relative}"
-
-
-def test_the_name_migration_brings_legacy_names_into_one_namespace() -> None:
-    import importlib.util
-
-    from alembic.migration import MigrationContext
-    from alembic.operations import Operations
-    from sqlalchemy import create_engine, insert, text
-
-    from sightread.db.models import Base
-
-    spec = importlib.util.spec_from_file_location(
-        "normalize_library_names",
-        Path(__file__).resolve().parents[1]
-        / "migrations"
-        / "versions"
-        / "c8f28f7cd45e_normalize_library_names.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-
-    engine = create_engine("sqlite://")
-    # The two tables the migration reads; SQLite enforces no foreign key here, and the
-    # core inserts fill the timestamps the models default.
-    Base.metadata.create_all(engine, tables=[Folder.__table__, Document.__table__])
-    with engine.begin() as connection:
-        connection.execute(
-            insert(Folder.__table__).values(id=1, user_id=1, parent_id=None, name="Report")
-        )
-        for row_id, name in ((1, "Report"), (2, "e\u0301.pdf"), (3, "\u00e9.pdf"), (4, "a/b")):
-            connection.execute(
-                insert(Document.__table__).values(
-                    id=row_id, user_id=1, folder_id=None, job_id=uuid.uuid4(), name=name
-                )
-            )
-        with Operations.context(MigrationContext.configure(connection)):
-            module.upgrade()
-        names = connection.execute(text("SELECT id, name FROM documents ORDER BY id")).all()
-    # The folder keeps `Report`; the document that shared it is suffixed; the decomposed
-    # spelling becomes the composed one, and the second of the two is suffixed; a
-    # separator is cleaned as a fresh name would be.
-    assert names == [(1, "Report (2)"), (2, "\u00e9.pdf"), (3, "\u00e9 (2).pdf"), (4, "a b")]
-
-
-async def test_a_reverted_rename_takes_the_untracked_assets_along(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
-    async with sessionmaker() as db:
-        user, document = await _seed(db)
-        before = await documents.materialize_document(db, settings, document)
-        # The original and a crop: in the directory, outside history.
-        (before.directory / "source.pdf").write_bytes(b"%PDF-1.4 original")
-        (before.directory / "figures").mkdir()
-        (before.directory / "figures" / "p1_0_0_10_10.png").write_bytes(b"png")
-        document.name = "renamed.pdf"
-        await db.commit()
-        after = await documents.document_paths(db, settings, document)
-        await documents.move_path(settings, user.id, before.relative, after.relative)
-        assert (after.directory / "source.pdf").exists()
-        rename = git.log(after.root)[0]
-
-        await documents.revert(db, settings, document, rename.commit)
-        assert (before.directory / "source.pdf").read_bytes() == b"%PDF-1.4 original"
-        assert (before.directory / "figures" / "p1_0_0_10_10.png").exists()
-        assert not after.directory.exists()
 
 
 def test_a_git_that_stalls_is_ended_at_the_deadline(tmp_path, monkeypatch) -> None:
@@ -1362,7 +1395,7 @@ def test_a_git_that_stalls_is_ended_at_the_deadline(tmp_path, monkeypatch) -> No
 async def test_a_revert_whose_revision_cannot_be_recorded_is_rolled_back(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         _, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1457,13 +1490,11 @@ def test_a_removal_whose_revision_cannot_be_recorded_moves_back(tmp_path, monkey
         documents._remove_tree(root, Path("files/d"), "delete files/d")
     assert refused.value.status_code == 409
     assert (root / "files" / "d" / "source.pdf").read_bytes() == b"%PDF"
-    assert not [
-        name for name, _ in safe_io.list_dir(root, root) if name.startswith(safe_io.TEMP_PREFIX)
-    ]
+    assert _nothing_aside(root)
 
 
 async def test_a_move_whose_commit_fails_is_undone(sessionmaker, tmp_path, monkeypatch) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -1494,7 +1525,7 @@ async def test_a_move_whose_commit_fails_is_undone(sessionmaker, tmp_path, monke
 async def test_reconcile_leaves_what_a_command_made_inside_a_document(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1520,7 +1551,7 @@ async def test_reconcile_leaves_what_a_command_made_inside_a_document(
 
 
 async def test_reconcile_follows_two_documents_that_traded_places(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, first = await _seed(db, markdown="# First\n")
         second = Document(
@@ -1557,7 +1588,7 @@ async def test_reconcile_follows_two_documents_that_traded_places(sessionmaker, 
 async def test_reconcile_refuses_a_document_that_took_a_folders_name(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1578,7 +1609,7 @@ async def test_reconcile_refuses_a_document_that_took_a_folders_name(
 async def test_a_save_whose_commit_fails_leaves_the_file_as_it_was(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1604,7 +1635,7 @@ async def test_a_save_whose_commit_fails_leaves_the_file_as_it_was(
 async def test_a_materialization_whose_commit_fails_is_written_again(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         real = git.commit_paths
@@ -1626,7 +1657,7 @@ async def test_a_materialization_whose_commit_fails_is_written_again(
 
 
 async def test_reconcile_records_an_empty_folder_the_shell_made(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1649,7 +1680,7 @@ async def test_reconcile_records_an_empty_folder_the_shell_made(sessionmaker, tm
 async def test_a_canonicalization_whose_commit_fails_is_undone(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1671,10 +1702,32 @@ async def test_a_canonicalization_whose_commit_fails_is_undone(
         assert shell_named.with_name("_.report").is_dir()
 
 
+def test_a_directory_the_disk_refuses_to_move_stays_and_the_others_are_recorded(
+    tmp_path, monkeypatch
+) -> None:
+    root = user_root(tmp_path / "workspaces", 1)
+    git.ensure_repo(root)
+    for name in (".a", ".b"):
+        (root / "files" / name).mkdir(parents=True)
+        (root / "files" / name / "note.txt").write_text(name)
+    real = safe_io.rename
+
+    def refusing(root_: Path, source: Path, target: Path) -> None:
+        if source.name == ".b":
+            raise PermissionError("read-only parent")
+        real(root_, source, target)
+
+    monkeypatch.setattr(safe_io, "rename", refusing)
+    assert reconcile._canonicalize(root) == 1
+    assert (root / "files" / "_.a" / "note.txt").is_file()
+    assert (root / "files" / ".b" / "note.txt").is_file()
+    assert git.log(root)[0].message.startswith("canonicalize")
+
+
 async def test_the_documents_own_rename_revision_does_not_reach_beyond_it(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -1706,7 +1759,7 @@ async def test_the_documents_own_rename_revision_does_not_reach_beyond_it(
 async def test_a_delete_the_process_died_in_is_restored_by_reconciliation(
     sessionmaker, tmp_path
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1719,27 +1772,13 @@ async def test_a_delete_the_process_died_in_is_restored_by_reconciliation(
         assert await reconcile.reconcile_user(db, settings, user.id) == 1
         assert paths.doc.read_text() == "# Edited\n"
         assert git.log(paths.root)[0].message.startswith("restore ")
-        assert not [name for name in os.listdir(paths.root) if name.startswith(".sr-tmp-")]
-        # An aside whose rows are gone for good is swept, as before.
-        other = Document(
-            user_id=user.id, folder_id=document.folder_id, job_id=document.job_id, name="gone.pdf"
-        )
-        db.add(other)
-        await db.commit()
-        other_paths = await documents.materialize_document(db, settings, other)
-        gone = await documents.remove_path(settings, user.id, other_paths.relative)
-        assert gone is not None
-        await db.delete(other)
-        await db.commit()
-        await reconcile.reconcile_user(db, settings, user.id)
-        assert not [name for name in os.listdir(paths.root) if name.startswith(".sr-tmp-")]
-        assert not other_paths.directory.exists()
+        assert _nothing_aside(paths.root)
 
 
 async def test_a_move_that_fails_after_displacing_a_squatter_puts_it_back(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -1747,7 +1786,7 @@ async def test_a_move_that_fails_after_displacing_a_squatter_puts_it_back(
         target = before.relative.with_name("renamed.pdf")
         (root / target).mkdir()
         (root / target / "scratch.txt").write_text("the shell's")
-        real = git.move
+        real = safe_io.rename
         calls = {"n": 0}
 
         def flaky(root_, source, dest):
@@ -1756,7 +1795,7 @@ async def test_a_move_that_fails_after_displacing_a_squatter_puts_it_back(
                 raise OSError(5, "Input/output error")
             return real(root_, source, dest)
 
-        monkeypatch.setattr(git, "move", flaky)
+        monkeypatch.setattr(safe_io, "rename", flaky)
         with pytest.raises(ApiError) as refused:
             await documents.move_path(settings, user.id, before.relative, target)
         assert refused.value.status_code == 409
@@ -1808,7 +1847,7 @@ async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
     a document whose `.meta.json` a command removed: nothing inside names a row, so the
     origin written beside the aside is what brings it back while a row still names that
     path (docs/workspace.md § Revisions)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         drafts = Folder(user_id=user.id, parent_id=None, name="Drafts")
@@ -1825,7 +1864,7 @@ async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
         assert await reconcile.reconcile_user(db, settings, user.id) >= 1
         assert (root / "files" / "Drafts" / "notes.txt").read_text() == "from bash\n"
         assert git.log(root)[0].message == "restore files/Drafts"
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
         # A document stripped of its metadata by a command comes back the same way.
         paths.meta.unlink()
         paths.doc.write_text("# Edited\n")
@@ -1834,7 +1873,7 @@ async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
         assert removal is not None
         assert await reconcile.reconcile_user(db, settings, user.id) >= 1
         assert paths.doc.read_text() == "# Edited\n"
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
         # Once the rows are gone for good, an aside and its origin are swept together.
         await db.delete(drafts)
         await db.commit()
@@ -1842,7 +1881,7 @@ async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
         assert removal is not None
         await reconcile.reconcile_user(db, settings, user.id)
         assert not (root / "files" / "Drafts").exists()
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
 
 
 def test_a_git_that_times_out_is_a_git_error_and_leaves_no_lock(tmp_path, monkeypatch) -> None:
@@ -1871,7 +1910,7 @@ async def test_a_removal_whose_origin_cannot_be_written_is_refused_whole(
 ) -> None:
     """A full disk at the origin marker must not leave the directory aside with nothing
     to bring it back: it goes back where it was, and the delete is refused."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1890,14 +1929,14 @@ async def test_a_removal_whose_origin_cannot_be_written_is_refused_whole(
         await documents.remove_path(settings, user.id, Path("files/Drafts"))
     assert refused.value.status_code == 409
     assert (root / "files" / "Drafts" / "notes.txt").read_text() == "from bash\n"
-    assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+    assert _nothing_aside(root)
 
 
 async def test_undoing_a_move_puts_the_displaced_squatter_back_too(sessionmaker, tmp_path) -> None:
     """A move whose row did not commit is undone whole: the document back where it was,
     and the directory the move displaced back under the name it had (docs/workspace.md
     § Layout)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -1920,7 +1959,7 @@ async def test_a_file_moved_in_from_another_document_reaches_beyond(sessionmaker
     """The exemption for the old side of a rename is the document's own rename only: a
     shell revision that moved a file in from another document is that document's too,
     so its revert waits for every turn of the user (docs/workspace.md § Revisions)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         other = Document(
@@ -1931,24 +1970,19 @@ async def test_a_file_moved_in_from_another_document_reaches_beyond(sessionmaker
         paths = await documents.materialize_document(db, settings, document)
         other_paths = await documents.materialize_document(db, settings, other)
     root = paths.root
-    git.move(root, other_paths.notes, paths.directory / "extra.md")
+    safe_io.rename(root, other_paths.notes, paths.directory / "extra.md")
     moved_in = git.commit_all(root, "agent:1", "bash: mv")
     assert moved_in is not None
     assert documents.reaches_beyond(paths, moved_in) is True
-    # The document's own rename, by contrast, stays its own.
-    renamed = paths.relative.with_name("renamed.pdf")
-    own = await documents.move_path(settings, user.id, paths.relative, renamed)
-    assert own is not None and own.commit is not None
-    renamed_paths = documents.DocumentPaths(root=root, relative=renamed)
-    assert documents.reaches_beyond(renamed_paths, own.commit) is False
 
 
 async def test_reconciliation_removes_the_originals_of_rows_that_are_gone(
     sessionmaker, tmp_path
 ) -> None:
     """A delete the process died in after its rows' commit leaves the originals beside the
-    git directory; the next reconciliation takes them, and only them."""
-    settings = _settings(tmp_path)
+    git directory, a writer that died between its copy and its rename a staging copy; the
+    next reconciliation takes them, and only them."""
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -1961,7 +1995,7 @@ async def test_reconciliation_removes_the_originals_of_rows_that_are_gone(
         await reconcile.reconcile_user(db, settings, user.id)
     assert (originals / f"{document.id}.pdf").is_file()
     assert not (originals / "999.pdf").exists()
-    assert (originals / ".tmp-1000.pdf").is_file()
+    assert not (originals / ".tmp-1000.pdf").exists()
 
 
 async def test_materialized_files_left_uncommitted_are_committed_next_time(
@@ -1970,7 +2004,7 @@ async def test_materialized_files_left_uncommitted_are_committed_next_time(
     """The process died between the write and the commit: the files are in place and
     untracked, and the next materialization — which writes nothing — commits them, so
     the first edit is a change against the parse baseline (docs/workspace.md § Layout)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         real = git.commit_paths
@@ -1979,10 +2013,10 @@ async def test_materialized_files_left_uncommitted_are_committed_next_time(
         paths = await documents.materialize_document(db, settings, document)
         monkeypatch.setattr(git, "commit_paths", real)
         assert paths.doc.is_file()
-        assert not git.tracked_at_head(paths.root, paths.relative / "doc.md")
+        doc, meta = paths.relative / "doc.md", paths.relative / ".meta.json"
+        assert git.missing_at_head(paths.root, [doc]) == [doc]
         await documents.materialize_document(db, settings, document)
-        assert git.tracked_at_head(paths.root, paths.relative / "doc.md")
-        assert git.tracked_at_head(paths.root, paths.relative / ".meta.json")
+        assert git.missing_at_head(paths.root, [doc, meta]) == []
         head = git.log(paths.root)[0]
         assert head.message == f"materialize {paths.relative}"
         # Committed, nothing is asked of the next one.
@@ -1997,7 +2031,7 @@ async def test_the_origin_is_written_before_the_directory_moves_aside(
     two leaves a marker beside no aside — swept, the directory where it was — and never
     an aside no marker names; a rename that is refused takes its marker with it
     (docs/workspace.md § Revisions)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -2017,7 +2051,7 @@ async def test_the_origin_is_written_before_the_directory_moves_aside(
         monkeypatch.setattr(safe_io, "rename", real)
         assert refused.value.status_code == 409
         assert len(markers_at_rename[0]) == 1
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
         assert paths.doc.is_file()
         # A marker whose rename never came: the next reconciliation sweeps the marker and
         # leaves the directory, which still stands where the marker says.
@@ -2035,7 +2069,7 @@ async def test_a_revert_whose_reconciliation_fails_is_reported_as_reverted_and_f
     after its commit is reported as such, and the next read of the document brings the
     row in line rather than writing a fresh copy at the path it still names
     (docs/workspace.md § Revisions)."""
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         before = await documents.materialize_document(db, settings, document)
@@ -2139,7 +2173,7 @@ def test_packing_keeps_every_revision_and_drops_what_none_names(tmp_path) -> Non
     for text in ("one", "two", "three"):
         safe_io.write_text(root, root / "files" / "doc.md", text)
         git.commit_all(root, "user", text)
-    # What staging used to leave behind: a blob no revision names.
+    # A blob no revision names.
     garbage = git._git_raw(root, "hash-object", "-w", "--stdin", stdin=b"an original").strip()
     assert git.loose_objects(root) > 0
     git.pack(root)
@@ -2259,7 +2293,7 @@ def test_a_file_with_several_names_counts_once(tmp_path) -> None:
 async def test_a_workspace_too_deep_to_measure_is_refused_not_undercounted(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path)
+    settings = path_settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
         paths = await documents.materialize_document(db, settings, document)
@@ -2268,3 +2302,25 @@ async def test_a_workspace_too_deep_to_measure_is_refused_not_undercounted(
         with pytest.raises(ApiError) as refused:
             await documents.measure_storage(db, settings, user.id, paths.root)
         assert refused.value.status_code == 409
+
+
+def test_discarding_an_adoption_never_removes_a_directory_through_a_swapped_link(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "ws" / "25"
+    directory = root / "files" / "Papers" / "paper.pdf"
+    directory.mkdir(parents=True)
+    (directory / "source.pdf").write_bytes(b"%PDF-1.4\n")
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "paper.pdf").mkdir(parents=True)
+    real_remove = safe_io.remove_file
+
+    def remove_then_swap(at_root: Path, path: Path) -> None:
+        real_remove(at_root, path)
+        # The shell swaps the folder for a link between the copy's unlink and the rmdir.
+        shutil.rmtree(root / "files" / "Papers")
+        (root / "files" / "Papers").symlink_to(elsewhere)
+
+    monkeypatch.setattr(safe_io, "remove_file", remove_then_swap)
+    documents._discard_adopted(root, 7, directory)
+    assert (elsewhere / "paper.pdf").is_dir()

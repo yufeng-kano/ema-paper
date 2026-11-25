@@ -19,9 +19,10 @@ import os
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import IO
 
 from ..errors import ApiError
-from .layout import git_dir
+from .layout import git_dir, users_with_suffix
 
 _process_locks: dict[Path, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -75,6 +76,11 @@ def clear_writing(root: Path) -> None:
     writing_marker(root).unlink(missing_ok=True)
 
 
+def writing_users(workspaces_dir: str | Path) -> list[int]:
+    """The users whose writing marker stands, by id (a staged `.writing.tmp` is none)."""
+    return users_with_suffix(workspaces_dir, WRITING_SUFFIX)
+
+
 def _lock_path(root: Path, suffix: str) -> Path:
     repo = git_dir(root)
     repo.parent.mkdir(parents=True, exist_ok=True)
@@ -88,20 +94,35 @@ def _backup_lock_path(root: Path) -> Path:
     return git_dir(root).parent / BACKUP_LOCK
 
 
-def _acquire(path: Path, backup: Path) -> tuple[object, object]:
+def _flock(path: Path, operation: int) -> IO[str]:
+    """`path` opened and locked with `operation`; the handle is closed when the lock fails."""
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle, operation)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
+def _release(*handles: IO[str]) -> None:
+    for handle in handles:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _acquire(path: Path, backup: Path) -> tuple[IO[str], IO[str]]:
     """The backup lock shared first, then the user's lock exclusive: the backup holds the
     former exclusively while it captures the rows and the tree, so no write lands between
     the two (docs/workspace.md § Backups)."""
-    shared = backup.open("a+")
-    fcntl.flock(shared, fcntl.LOCK_SH)
+    shared = _flock(backup, fcntl.LOCK_SH)
     try:
-        fd = path.open("a+")
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        return _flock(path, fcntl.LOCK_EX), shared
     except BaseException:
-        fcntl.flock(shared, fcntl.LOCK_UN)
-        shared.close()
+        _release(shared)
         raise
-    return fd, shared
 
 
 @contextlib.asynccontextmanager
@@ -112,17 +133,7 @@ async def _hold(root: Path, suffix: str) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            for held in (handle, shared):
-                try:
-                    fcntl.flock(held, fcntl.LOCK_UN)  # type: ignore[arg-type]
-                finally:
-                    held.close()  # type: ignore[attr-defined]
-
-
-def _acquire_shared(backup: Path) -> object:
-    shared = backup.open("a+")
-    fcntl.flock(shared, fcntl.LOCK_SH)
-    return shared
+            _release(handle, shared)
 
 
 @contextlib.asynccontextmanager
@@ -133,14 +144,11 @@ async def backup_shared(root: Path) -> AsyncIterator[None]:
     taken inside takes the backup lock shared again, which a shared hold never refuses."""
     path = _backup_lock_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    shared = await asyncio.to_thread(_acquire_shared, path)
+    shared = await asyncio.to_thread(_flock, path, fcntl.LOCK_SH)
     try:
         yield
     finally:
-        try:
-            fcntl.flock(shared, fcntl.LOCK_UN)  # type: ignore[arg-type]
-        finally:
-            shared.close()  # type: ignore[attr-defined]
+        _release(shared)
 
 
 @contextlib.asynccontextmanager

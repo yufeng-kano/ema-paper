@@ -13,9 +13,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import unicodedata
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -30,6 +30,7 @@ from ..errors import ApiError
 from . import documents as workspace_documents
 from . import safe_io
 from .documents import (
+    STORAGE_FULL,
     live_document,
     live_folder,
     markdown_name,
@@ -41,6 +42,7 @@ from .documents import (
 )
 from .layout import (
     FILES_DIR,
+    UNSAFE_CHARS,
     document_relative_dir,
     path_segment,
     segment_name,
@@ -61,16 +63,11 @@ DOCUMENT_NAME_MAX = 512
 NAME_ATTEMPTS = 500
 # An insert can lose a name race with another tab; the retry re-reads the folder's names.
 INSERT_ATTEMPTS = 3
-STORAGE_FULL = "The workspace is at its quota; free some space first"
 # A copy of an item whose files the Trash's repair rule could not bring back is refused,
 # not made from the baseline as if the item had never been read (docs/workspace.md § Copies).
 STRANDED = "The item's files could not be brought back from the Trash; nothing was copied"
 FILE_CLASH = "A file with this name already exists here"
 FOLDER_CLASH = "A folder with this name already exists here"
-
-# A name is a label in a tree, never a path. Separators would make a breadcrumb lie about
-# where a file is, and control characters would make two different names look identical.
-UNSAFE_IN_NAME = re.compile(r"[\x00-\x1f\x7f/\\]")
 
 
 # --- names and places -------------------------------------------------------------------
@@ -80,7 +77,7 @@ def clean_name(raw: str, limit: int) -> str:
     """A display name: NFC, no separators, no control characters, trimmed and capped.
     Normalized here, before uniqueness is decided, so two spellings of one name are one
     name in the library as they are one directory in the workspace (docs/workspace.md)."""
-    name = UNSAFE_IN_NAME.sub(" ", unicodedata.normalize("NFC", raw)).strip()
+    name = UNSAFE_CHARS.sub(" ", unicodedata.normalize("NFC", raw)).strip()
     if not name:
         raise ApiError(400, "invalid_request", "A name is required")
     return name[:limit].strip()
@@ -94,8 +91,8 @@ def free_name(taken: set[str], name: str, limit: int) -> str:
 
     The stem gives up whatever room the suffix needs. A name already at the column's limit
     would otherwise grow past it, and PostgreSQL answers that with a truncation error — on
-    an upload, after `submit_parse` has committed, so the parse would run and bill the
-    user's key while their request failed.
+    an upload, after `submit_parse` has committed, with the parse queued and its credits
+    reserved, so the parse would run on the user's credits while their request failed.
     """
     if name not in taken:
         return name
@@ -106,9 +103,9 @@ def free_name(taken: set[str], name: str, limit: int) -> str:
     for index in range(2, NAME_ATTEMPTS):
         suffix = f" ({index}){dot}{extension}"
         room = limit - len(suffix)
-        # `room <= 0` needs an extension longer than the whole column, which `clean_name`
-        # already makes impossible; should it happen, the extension gives way and the
-        # counter stays, so every try is a new candidate (as the name migration does).
+        # `room <= 0` when the extension is nearly as long as the column, which
+        # `clean_name` allows (`a.` and 510 characters): the extension gives way and the
+        # counter stays, so every try is a new candidate.
         candidate = f"{stem[:room]}{suffix}" if room > 0 else suffix[:limit]
         if candidate not in taken:
             return candidate
@@ -233,6 +230,45 @@ async def insert_named[RowT: (Folder, Document)](
                 raise ApiError(409, "invalid_request", message) from exc
 
 
+async def commit_verified(
+    db: AsyncSession,
+    landed: tuple[type, int],
+    *,
+    held: Callable[[object | None], bool],
+    subject: str,
+    refused: str,
+    unconfirmed: str,
+    undo: Callable[[], Awaitable[None]] | None = None,
+) -> object | None:
+    """Commit, and verify a commit that raises on a connection of its own: PostgreSQL may
+    have made it durable before the connection dropped. None on a clean commit. When it
+    raised, the request's session is rolled back and the row `landed` names is read: one
+    `held` says is as the commit left it is returned, the change standing; one that is not
+    means nothing changed — `undo` takes back what was done on disk for it, and the
+    answer is a 409 `refused`; a read that fails says nothing either way, and the answer
+    is a 409 `unconfirmed` rather than a change that did not happen. `subject` names the
+    change in the log (docs/workspace.md § Revisions)."""
+    try:
+        await db.commit()
+        return None
+    except Exception as exc:  # verified below, whatever raised
+        readable, row = await read_row(db, *landed)
+        with contextlib.suppress(Exception):
+            await db.rollback()
+        if readable and held(row):
+            logger.warning("%s was committed despite the error", subject)
+            return row
+        if readable:
+            logger.exception("%s did not commit", subject)
+            if undo is not None:
+                try:
+                    await undo()
+                except Exception:  # the refusal stands; the leftovers are logged
+                    logger.exception("could not take back %s", subject)
+            raise ApiError(409, "invalid_request", refused) from exc
+        raise ApiError(409, "invalid_request", unconfirmed) from exc
+
+
 async def commit_filing(
     db: AsyncSession,
     row: Document,
@@ -249,32 +285,17 @@ async def commit_filing(
     file stands for a row that is gone; a read that fails says nothing either way, and
     is answered as unconfirmed rather than as a filing that did not happen
     (docs/workspace.md § Revisions)."""
-    try:
-        await db.commit()
-        return row
-    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
-        readable, landed = await read_row(db, Document, row.id)
-        if readable and isinstance(landed, Document):
-            logger.warning("the filing of document %d was committed despite the error", row.id)
-            return landed
-        with contextlib.suppress(Exception):
-            await db.rollback()
-        if readable:
-            logger.exception("the filing of document %d did not commit", row.id)
-            if undo is not None:
-                try:
-                    await undo()
-                except Exception:  # noqa: BLE001 - the refusal stands; the leftovers are logged
-                    logger.exception("could not take back the files of document %d", row.id)
-            raise ApiError(
-                409, "invalid_request", f"{what} could not be filed; nothing was filed"
-            ) from exc
-        raise ApiError(
-            409,
-            "invalid_request",
-            f"{what} may have been filed, but the database could not confirm it; "
-            "reload the library before trying again",
-        ) from exc
+    landed = await commit_verified(
+        db,
+        (Document, row.id),
+        held=lambda found: isinstance(found, Document),
+        subject=f"the filing of document {row.id}",
+        refused=f"{what} could not be filed; nothing was filed",
+        unconfirmed=f"{what} may have been filed, but the database could not confirm it; "
+        "reload the library before trying again",
+        undo=undo,
+    )
+    return landed or row
 
 
 # --- folders and files ------------------------------------------------------------------
@@ -287,25 +308,16 @@ async def make_folder(
     it. The caller holds the workspace lock, so the shell sees the folder as soon as the
     row exists and a workspace that takes no host write refused it up front
     (docs/workspace.md § Layout); `parent_id` is the caller's checked, live folder."""
-    try:
-        row = await insert_named(
-            db,
-            user_id=user_id,
-            into=parent_id,
-            build=lambda name: Folder(user_id=user_id, parent_id=parent_id, name=name),
-            taken=lambda: sibling_names(db, user_id, parent_id),
-            wanted=clean_name(name, FOLDER_NAME_MAX),
-            limit=FOLDER_NAME_MAX,
-            message="A folder with this name already exists here",
-        )
-    except ApiError:
-        # A parent deleted between the caller's check and the insert fails the foreign
-        # key, which arrives as the same IntegrityError a taken name does — and retrying
-        # with a destination that no longer exists only ever produces a 409 about the
-        # wrong thing.
-        if parent_id is None or await folder_exists(db, user_id, parent_id):
-            raise
-        raise ApiError(404, "invalid_request", "No such folder") from None
+    row = await insert_named(
+        db,
+        user_id=user_id,
+        into=parent_id,
+        build=lambda name: Folder(user_id=user_id, parent_id=parent_id, name=name),
+        taken=lambda: sibling_names(db, user_id, parent_id),
+        wanted=clean_name(name, FOLDER_NAME_MAX),
+        limit=FOLDER_NAME_MAX,
+        message=FOLDER_CLASH,
+    )
     relative = await folder_relative_dir(db, user_id, row.id)
     try:
         await workspace_documents.make_folder_dir(settings, user_id, relative)
@@ -331,7 +343,12 @@ def live_child(folders: dict[int, Folder], parent_id: int | None, name: str) -> 
 
 
 async def ensure_folders(
-    db: AsyncSession, settings: Settings, user_id: int, names: list[str]
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    names: list[str],
+    *,
+    made: list[int] | None = None,
 ) -> int | None:
     """The folder at the end of a path of names — `Papers`, then `2024` inside it — each
     found among the user's live folders by its cleaned name or made where it is missing
@@ -339,16 +356,21 @@ async def ensure_folders(
     empty path: the top level. A name a live document holds where a folder would be made
     is refused (409): made under a suffixed name, the folder would be made again at every
     call that names it. Every name is checked before the first is made, and a path past
-    `FOLDER_PATH_DEPTH_MAX` names is refused (400). The caller holds the workspace lock."""
+    `FOLDER_PATH_DEPTH_MAX` names is refused (400). The ids of the folders it makes are
+    appended to `made`. The caller holds the workspace lock."""
     if len(names) > FOLDER_PATH_DEPTH_MAX:
         raise ApiError(
             400, "invalid_request", f"A folder path is at most {FOLDER_PATH_DEPTH_MAX} folders deep"
         )
     cleaned = [clean_name(raw, FOLDER_NAME_MAX) for raw in names]
+    # Read once: under the workspace lock no other request makes a folder meanwhile. Once
+    # one is made, the rest of the path is new and is made whole — and `folders` is not read
+    # again, since the insert's retry may have rolled back and expired its rows.
+    folders = await workspace_documents.user_folders(db, user_id)
+    making = False
     parent_id: int | None = None
     for wanted in cleaned:
-        folders = await workspace_documents.user_folders(db, user_id)
-        found = live_child(folders, parent_id, wanted)
+        found = None if making else live_child(folders, parent_id, wanted)
         if found is None:
             # No live folder holds the name here, so a name still taken is a document's.
             if wanted in await sibling_names(db, user_id, parent_id):
@@ -358,6 +380,9 @@ async def ensure_folders(
                     f"'{wanted}' is a document here, not a folder; name another folder",
                 )
             found = await make_folder(db, settings, user_id, parent_id, wanted)
+            making = True
+            if made is not None:
+                made.append(found.id)
         parent_id = found.id
     return parent_id
 
@@ -383,21 +408,18 @@ async def find_or_make_folder_path(
         if found is None:
             break
     folder_id = None if found is None else found.id
-    made: list[Folder] = []
+    made: list[int] = []
     if found is None and names:
         async with workspace_lock(user_root(settings.workspaces_dir, user_id)):
-            before = set(await workspace_documents.user_folders(db, user_id))
-            folder_id = await ensure_folders(db, settings, user_id, names)
+            folder_id = await ensure_folders(db, settings, user_id, names, made=made)
+            # Read again under the lock: what a concurrent call made of the path is in it,
+            # and the rows a retried insert expired are fresh.
             folders = await workspace_documents.user_folders(db, user_id)
-        made = [folder for key, folder in folders.items() if key not in before]
-
-    def shown(folder_id: int) -> str:
-        return "/".join(row.name for row in workspace_documents.folder_chain(folders, folder_id))
 
     return {
         "id": folder_id,
-        "path": "/" if folder_id is None else shown(folder_id),
-        "created": sorted(shown(row.id) for row in made),
+        "path": "/" if folder_id is None else workspace_documents.folder_path(folders, folder_id),
+        "created": sorted(workspace_documents.folder_path(folders, made_id) for made_id in made),
     }
 
 
@@ -446,30 +468,25 @@ async def keep_file(
             return names
         return names | {segment_name(name) for name, _is_dir in entries}
 
-    try:
-        row = await insert_named(
-            db,
+    row = await insert_named(
+        db,
+        user_id=user_id,
+        into=folder_id,
+        build=lambda name: Document(
             user_id=user_id,
-            into=folder_id,
-            build=lambda name: Document(
-                user_id=user_id,
-                folder_id=folder_id,
-                job_id=None,
-                kind=FILE_KIND,
-                name=name,
-                media_type=media_type,
-                size_bytes=size,
-            ),
-            taken=taken,
-            wanted=wanted,
-            limit=DOCUMENT_NAME_MAX,
-            message="A file with this name already exists here",
-            commit=False,
-        )
-    except ApiError:
-        if folder_id is None or await folder_exists(db, user_id, folder_id):
-            raise
-        raise ApiError(404, "invalid_request", "No such folder") from None
+            folder_id=folder_id,
+            job_id=None,
+            kind=FILE_KIND,
+            name=name,
+            media_type=media_type,
+            size_bytes=size,
+        ),
+        taken=taken,
+        wanted=wanted,
+        limit=DOCUMENT_NAME_MAX,
+        message=FILE_CLASH,
+        commit=False,
+    )
     row_id = row.id
     relative = await document_relative(db, row)
     try:
@@ -579,7 +596,7 @@ async def move_then_commit(
                     await workspace_documents.undo_move(
                         settings, user_id, before, after, moved.displaced, author=author
                     )
-                except Exception:  # noqa: BLE001 - the move revision stays revertible
+                except Exception:  # the move revision stays revertible
                     logger.exception("could not move %s back after a failed commit", after)
         raise
 
@@ -604,24 +621,19 @@ async def new_document(
     if folder_id is not None:
         await live_folder(db, user_id, folder_id)
     wanted = markdown_name(clean_name(name, DOCUMENT_NAME_MAX), DOCUMENT_NAME_MAX)
-    try:
-        row = await insert_named(
-            db,
-            user_id=user_id,
-            into=folder_id,
-            build=lambda name: Document(
-                user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
-            ),
-            taken=lambda: sibling_names(db, user_id, folder_id),
-            wanted=wanted,
-            limit=DOCUMENT_NAME_MAX,
-            message=FILE_CLASH,
-            commit=text is None,
-        )
-    except ApiError:
-        if folder_id is None or await folder_exists(db, user_id, folder_id):
-            raise
-        raise ApiError(404, "invalid_request", "No such folder") from None
+    row = await insert_named(
+        db,
+        user_id=user_id,
+        into=folder_id,
+        build=lambda name: Document(
+            user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
+        ),
+        taken=lambda: sibling_names(db, user_id, folder_id),
+        wanted=wanted,
+        limit=DOCUMENT_NAME_MAX,
+        message=FILE_CLASH,
+        commit=text is None,
+    )
     if text is None:
         return row
     row_id = row.id
@@ -794,7 +806,7 @@ async def stash_then_commit(
                     await workspace_documents.unstash_path(
                         settings, user_id, entry, relative, f"restore {relative}", author=author
                     )
-                except Exception:  # noqa: BLE001 - the repair rule returns it
+                except Exception:  # the repair rule returns it
                     logger.exception("could not bring %s back from the Trash", relative)
         raise
 
@@ -817,32 +829,20 @@ async def put_back_then_move(
     document or the next reconciliation (docs/workspace.md § The Trash). Returns the row
     as committed when the commit raised and landed (the request's session rolled back),
     else None."""
-    answer = None
-    try:
-        await db.commit()
-    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
-        readable, row = await read_row(db, *landed)
-        with contextlib.suppress(Exception):
-            await db.rollback()
-        if readable and row is not None and row.trashed_at is None:
-            logger.warning("the put back of %s was committed despite the error", relative)
-            answer = row
-        elif readable:
-            raise ApiError(
-                409, "invalid_request", f"{what} could not be put back; nothing was changed"
-            ) from exc
-        else:
-            raise ApiError(
-                409,
-                "invalid_request",
-                f"{what} may have been put back, but the database could not confirm it; "
-                "reload the library before trying again",
-            ) from exc
+    answer = await commit_verified(
+        db,
+        landed,
+        held=lambda row: row is not None and row.trashed_at is None,
+        subject=f"the put back of {relative}",
+        refused=f"{what} could not be put back; nothing was changed",
+        unconfirmed=f"{what} may have been put back, but the database could not confirm it; "
+        "reload the library before trying again",
+    )
     try:
         await workspace_documents.unstash_path(
             settings, user_id, entry, relative, f"put back {relative}", author=author
         )
-    except Exception:  # noqa: BLE001 - the rows stand; the repair rule brings the files
+    except Exception:  # the rows stand; the repair rule brings the files
         logger.exception("the files of %s stay in the Trash for now", relative)
     return answer
 
@@ -907,59 +907,55 @@ async def put_back_document(
 ) -> Document:
     """Put Back: to the folder it was trashed from, or the nearest live one above it, a
     taken name suffixed as a move's is (docs/api.md)."""
-    await workspace_documents.recover_trash(db, settings, user_id)
-    for attempt in range(INSERT_ATTEMPTS):
-        await lock_user(db, user_id)
-        row = await owned_document(db, user_id, document_id)
-        if row.trashed_at is None:
-            raise ApiError(404, "invalid_request", "No such document in the Trash")
-        place = nearest_live(await workspace_documents.user_folders(db, user_id), row.folder_id)
-        taken = await sibling_names(db, user_id, place)
-        row.folder_id = place
-        row.name = free_name(taken, row.name, DOCUMENT_NAME_MAX)
-        row.trashed_at = None
-        if await flush_or_retry(db, INSERT_ATTEMPTS - 1 - attempt, FILE_CLASH):
-            break
-    relative = await document_relative(db, row)
-    landed = await put_back_then_move(
-        db,
-        settings,
-        user_id,
-        trash_entry("document", row.id),
-        relative,
-        landed=(Document, row.id),
-        what="The file",
-        author=author,
-    )
-    return landed or row
+    return await _put_back(db, settings, user_id, document_id, folder=False, author=author)
 
 
 async def put_back_folder(
     db: AsyncSession, settings: Settings, user_id: int, folder_id: int, *, author: str
 ) -> Folder:
     """Put Back a folder, with everything that went to the Trash with it (docs/api.md)."""
+    return await _put_back(db, settings, user_id, folder_id, folder=True, author=author)
+
+
+async def _put_back(
+    db: AsyncSession, settings: Settings, user_id: int, item_id: int, *, folder: bool, author: str
+):
+    """Put Back a folder (`folder`) or a document: the row live again at the nearest live
+    folder at or above the one it was trashed from, its name suffixed where that is taken,
+    and then its directory out of the Trash."""
+    model, kind, parent, limit, clash, what = (
+        (Folder, "folder", "parent_id", FOLDER_NAME_MAX, FOLDER_CLASH, "The folder")
+        if folder
+        else (Document, "document", "folder_id", DOCUMENT_NAME_MAX, FILE_CLASH, "The file")
+    )
     await workspace_documents.recover_trash(db, settings, user_id)
     for attempt in range(INSERT_ATTEMPTS):
         await lock_user(db, user_id)
-        row = await owned_folder(db, user_id, folder_id)
+        row = await (owned_folder if folder else owned_document)(db, user_id, item_id)
         if row.trashed_at is None:
-            raise ApiError(404, "invalid_request", "No such folder in the Trash")
-        place = nearest_live(await workspace_documents.user_folders(db, user_id), row.parent_id)
+            raise ApiError(404, "invalid_request", f"No such {kind} in the Trash")
+        place = nearest_live(
+            await workspace_documents.user_folders(db, user_id), getattr(row, parent)
+        )
         taken = await sibling_names(db, user_id, place)
-        row.parent_id = place
-        row.name = free_name(taken, row.name, FOLDER_NAME_MAX)
+        setattr(row, parent, place)
+        row.name = free_name(taken, row.name, limit)
         row.trashed_at = None
-        if await flush_or_retry(db, INSERT_ATTEMPTS - 1 - attempt, FOLDER_CLASH):
+        if await flush_or_retry(db, INSERT_ATTEMPTS - 1 - attempt, clash):
             break
-    relative = await folder_relative_dir(db, user_id, row.id)
+    relative = (
+        await folder_relative_dir(db, user_id, row.id)
+        if folder
+        else await document_relative(db, row)
+    )
     landed = await put_back_then_move(
         db,
         settings,
         user_id,
-        trash_entry("folder", row.id),
+        trash_entry(kind, row.id),
         relative,
-        landed=(Folder, row.id),
-        what="The folder",
+        landed=(model, row.id),
+        what=what,
         author=author,
     )
     return landed or row
@@ -1035,37 +1031,23 @@ async def copy_then_commit(
     except BaseException:
         await db.rollback()
         raise
-    try:
-        await db.commit()
-    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
-        readable, row = await read_row(db, *landed)
-        with contextlib.suppress(Exception):
-            await db.rollback()
-        if readable and row is not None:
-            logger.warning("the copy to %s was committed despite the error", target)
-            return row
-        if readable:
-            try:
-                await workspace_documents.remove_copy(
-                    settings,
-                    user_id,
-                    target,
-                    made,
-                    [document.target_id for document in documents],
-                    author=author,
-                )
-            except Exception:  # noqa: BLE001 - the refusal stands; the leftovers are logged
-                logger.exception("could not take back the copy at %s", target)
-            raise ApiError(
-                409, "invalid_request", "The copy could not be made; nothing was copied"
-            ) from exc
-        raise ApiError(
-            409,
-            "invalid_request",
-            "The copy may have been made, but the database could not confirm it; "
-            "reload the library before trying again",
-        ) from exc
-    return None
+    return await commit_verified(
+        db,
+        landed,
+        held=lambda row: row is not None,
+        subject=f"the copy to {target}",
+        refused="The copy could not be made; nothing was copied",
+        unconfirmed="The copy may have been made, but the database could not confirm it; "
+        "reload the library before trying again",
+        undo=lambda: workspace_documents.remove_copy(
+            settings,
+            user_id,
+            target,
+            made,
+            [document.target_id for document in documents],
+            author=author,
+        ),
+    )
 
 
 async def copy_document(
@@ -1190,12 +1172,16 @@ async def copy_folder(
     await flush_or_retry(db, 0, FOLDER_CLASH)
     # The folders under it parent by parent, so each new row has its new parent's id;
     # their names were unique where they were, and are where they land.
+    children: dict[int | None, list[Folder]] = {}
+    for child in sorted(folders.values(), key=lambda row: row.id):
+        if child.id in inside:
+            children.setdefault(child.parent_id, []).append(child)
     mapping = {source.id: top.id}
-    pending = [source.id]
+    pending = deque([source.id])
     while pending:
-        parent = pending.pop(0)
-        for child in sorted(folders.values(), key=lambda row: row.id):
-            if child.parent_id == parent and child.id in inside and child.id not in mapping:
+        parent = pending.popleft()
+        for child in children.get(parent, []):
+            if child.id not in mapping:
                 made = Folder(user_id=user_id, parent_id=mapping[parent], name=child.name)
                 db.add(made)
                 await db.flush()

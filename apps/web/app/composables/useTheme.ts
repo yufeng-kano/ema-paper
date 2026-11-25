@@ -9,7 +9,7 @@
  */
 export type Theme = 'system' | 'light' | 'dark'
 
-export const THEME_KEY = 'sightread.theme'
+const THEME_KEY = 'sightread.theme'
 export const THEMES: readonly Theme[] = ['system', 'light', 'dark']
 
 function readStored(): Theme {

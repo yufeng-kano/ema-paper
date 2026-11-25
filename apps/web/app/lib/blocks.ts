@@ -10,7 +10,10 @@ import {
   blockPlain,
   firstWords,
   inlinePlain,
+  isHeading,
+  locateSources,
   sectionExtent,
+  type BlockAt,
   type InlineOptions,
   type OutlineEntry,
   type PlacedBlock,
@@ -20,6 +23,12 @@ import {
 /** A block's place as the rendered document addresses it: `page-index`. */
 export function blockKey(at: { page: number; index: number }): string {
   return `${at.page}-${at.index}`
+}
+
+/** The place a key names; null for a string `blockKey` never makes. */
+export function parseBlockKey(key: string): BlockAt | null {
+  const match = /^(\d+)-(\d+)$/.exec(key)
+  return match ? { page: Number(match[1]), index: Number(match[2]) } : null
 }
 
 // --- names ------------------------------------------------------------------------------------
@@ -78,10 +87,22 @@ export function blockName(block: ResultBlock, text: NameText, options?: InlineOp
     return caption ? text.image(cutWords(firstWords(caption), NAME_CHARS)) : text.imageBare
   }
   const words = blockPlain(block, options)
-  if (block.kind === 'h2' || block.kind === 'h3') {
+  if (isHeading(block)) {
     return text.quoted(cutWords(words, HEADING_NAME_CHARS))
   }
   return text.quoted(cutWords(firstWords(words), NAME_CHARS))
+}
+
+/** What *Ask* and *Translate* say they ask about when they act on one block: a paragraph, a
+ *  heading's section, a formula, or any other block. */
+export function askKind(block: ResultBlock): 'paragraph' | 'section' | 'formula' | 'block' {
+  if (block.kind === 'p') {
+    return 'paragraph'
+  }
+  if (isHeading(block)) {
+    return 'section'
+  }
+  return block.kind === 'math' ? 'formula' : 'block'
 }
 
 /**
@@ -108,7 +129,7 @@ export function translatable(block: ResultBlock): boolean {
 
 // --- collapsed sections -------------------------------------------------------------------------
 
-export interface Folds {
+interface Folds {
   /** Blocks a collapsed section hides, by `blockKey`. */
   hidden: Set<string>
   /** Each drawn fold's hidden blocks, comments not counted, by its heading's `blockKey`. */
@@ -144,10 +165,6 @@ export function foldsOf(placed: readonly PlacedBlock[], outline: readonly Outlin
     index = end
   }
   return folds
-}
-
-function isHeading(entry: PlacedBlock): boolean {
-  return entry.block.kind === 'h2' || entry.block.kind === 'h3'
 }
 
 /** How many shared blocks a move's rotation may take back from either side. */
@@ -210,13 +227,13 @@ export function followBlocks(before: readonly PlacedBlock[], after: readonly Pla
   }
   const went: number[] = []
   for (let index = head; index < fromEnd; index += 1) {
-    if (isHeading(before[index]!)) {
+    if (isHeading(before[index]!.block)) {
       went.push(index)
     }
   }
   const came: number[] = []
   for (let index = head; index < toEnd; index += 1) {
-    if (isHeading(after[index]!)) {
+    if (isHeading(after[index]!.block)) {
       came.push(index)
     }
   }
@@ -333,7 +350,7 @@ export function changedBlocks(before: readonly PlacedBlock[], after: readonly Pl
 }
 
 /** The most documents whose folds the browser keeps: `localStorage` is small, and shared. */
-export const FOLD_MEMORY_LIMIT = 100
+const FOLD_MEMORY_LIMIT = 100
 
 /** The folds remembered per document — `doc:<id>` — with when each was last set, so the
  *  oldest are the ones let go. */
@@ -377,7 +394,7 @@ export function rememberFolds(memory: FoldMemory, id: string, slugs: Iterable<st
  * heading is one row reaching to its section's last hidden block — what a move carries.
  * `first` and `last` index `placedBlocks`.
  */
-export interface Row {
+interface Row {
   key: string
   first: number
   last: number
@@ -422,7 +439,7 @@ const TICK = 2
 const GAP_MAX = 8
 const GAP_MIN = 2
 
-export interface TickFit {
+interface TickFit {
   gap: number
   /** The headings drawn, by outline index, and whether each is a long (`#`/`##`) tick. */
   ticks: { index: number; long: boolean }[]
@@ -503,7 +520,7 @@ export function dockOutlinePanel(
 // --- undo ---------------------------------------------------------------------------------------
 
 /** One change to a file: at `at`, `removed` was replaced by `inserted`. */
-export interface Span {
+interface Span {
   at: number
   removed: string
   inserted: string
@@ -513,7 +530,7 @@ export type UndoFile = 'document' | 'notes'
 
 /** A block action as the stack keeps it: the spans it changed, and hashes of the text before
  *  and after — which is what *exactly what the action left* is checked against. */
-export interface UndoStep {
+interface UndoStep {
   file: UndoFile
   spans: Span[]
   before: string
@@ -641,24 +658,11 @@ export function blocksInRanges(
   ranges: readonly { start: number; end: number }[],
 ): number[] {
   const found = new Set<number>()
-  // A block's source is whole lines, found only where whole lines are: a paragraph that is only
-  // `1` is not the `1` in `<!-- page: 1 -->`.
-  const wholeLines = (start: number, length: number) =>
-    (start === 0 || markdown[start - 1] === '\n') && (start + length === markdown.length || markdown[start + length] === '\n')
-  let cursor = 0
-  const spans = placed.map((entry) => {
-    const { src } = entry.block
-    let start = markdown.indexOf(src, cursor)
-    while (start !== -1 && !wholeLines(start, src.length)) {
-      start = markdown.indexOf(src, start + 1)
-    }
-    if (start === -1) {
-      return null
-    }
-    // A comment is stepped over, so no later block is found inside it, but never selected.
-    cursor = start + src.length
-    return entry.block.kind === 'comment' ? null : { start, end: cursor }
-  })
+  // A comment is stepped over, so no later block is found inside it, but never selected.
+  const spans = locateSources(
+    markdown,
+    placed.map((entry) => entry.block),
+  ).map((span, index) => (placed[index]!.block.kind === 'comment' ? null : span))
   for (const range of ranges) {
     const held = spans.flatMap((span, index) => {
       if (!span) {
@@ -677,7 +681,7 @@ export function blocksInRanges(
 }
 
 /** What undo or redo hands back: the file, its text as it now is, and what was put back. */
-export interface UndoResult {
+interface UndoResult {
   file: UndoFile
   text: string
   ranges: { start: number; end: number }[]
@@ -694,14 +698,6 @@ export class UndoHistory {
   private undone: UndoStep[] = []
 
   constructor(private readonly limit = 50) {}
-
-  get canUndo(): boolean {
-    return this.done.length > 0
-  }
-
-  get canRedo(): boolean {
-    return this.undone.length > 0
-  }
 
   /** A block action: `before` became `after`. A new action ends every redo. */
   record(file: UndoFile, before: string, after: string): void {

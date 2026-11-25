@@ -1382,7 +1382,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.121.2" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
-    { name = "mcp", specifier = ">=1.0" },
+    { name = "mcp", specifier = ">=2.0" },
     { name = "pillow", specifier = ">=11" },
     { name = "pillow-heif", specifier = ">=0.21" },
     { name = "pydantic-settings", specifier = ">=2.13.1" },

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * A redeem code, typed and redeemed (docs/web.md § Pages, `/settings/usage`; the contract
+ * A redeem code, typed and redeemed (docs/web.md § Pages, `?settings=usage`; the contract
  * is docs/billing.md § Redeem codes): one field, one line on what a code gives, *Redeem*.
  * A refusal is worded under the field from the error's type, in the reader's language; a
  * success turns the dialog into a receipt — the credits added and their expiry, or the days
@@ -8,9 +8,9 @@
  */
 import { redeemCode, type RedeemResult } from '~/lib/api'
 import { formatCount, formatDate } from '~/lib/format'
-import { presentCode, redeemErrorKey } from '~/lib/redeem'
+import { redeemErrorKey } from '~/lib/redeem'
 
-const emit = defineEmits<{ close: []; redeemed: [RedeemResult] }>()
+const emit = defineEmits<{ close: []; redeemed: [] }>()
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
@@ -28,7 +28,7 @@ async function submit() {
   error.value = null
   try {
     result.value = await redeemCode(code.value)
-    emit('redeemed', result.value)
+    emit('redeemed')
   } catch (failure) {
     const key = redeemErrorKey(failure)
     error.value = key ? t(key) : await resolve(failure)
@@ -76,6 +76,7 @@ const note = computed(() => {
     </div>
     <form v-else id="redeem-form" class="form" @submit.prevent="submit">
       <UiField v-slot="{ id, describedBy, invalid }" :label="t('redeem.label')" :error="error ?? undefined">
+        <!-- Uppercase as typed, so the code reads as printed; the server does the real reading. -->
         <UiTextInput
           :id="id"
           :model-value="code"
@@ -85,7 +86,7 @@ const note = computed(() => {
           :maxlength="64"
           mono
           required
-          @update:model-value="code = presentCode($event)"
+          @update:model-value="code = $event.toUpperCase()"
         />
       </UiField>
       <p class="help">{{ t('redeem.help') }}</p>

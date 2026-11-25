@@ -36,6 +36,11 @@ class Operator:
     permissions: tuple[str, ...]
     ip: str | None
 
+    def can(self, permission: str) -> bool:
+        """Whether the operator's groups give `permission`: what a route asks before it
+        puts a field of another area into its payload."""
+        return permission in self.permissions
+
 
 async def require_console_session(request: Request, db: DbSession) -> Operator:
     # An API key, an OAuth access token or an upload ticket arrives as `Authorization`;
@@ -73,7 +78,7 @@ def require_permission(permission: str):
         raise ValueError(f"Unknown permission: {permission}")
 
     async def dependency(operator: ConsoleSession, settings: AppSettings) -> Operator:
-        if permission not in operator.permissions:
+        if not operator.can(permission):
             raise ApiError(403, "permission_denied", f"This needs the {permission} permission")
         if reauth_due(operator, settings):
             raise ApiError(403, "reauth_required", "Sign in again to use the console")

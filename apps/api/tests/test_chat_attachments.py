@@ -9,7 +9,6 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 
-import httpx
 import respx
 from httpx import AsyncClient
 from PIL import Image
@@ -17,20 +16,20 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from sqlalchemy import select
 
-from sightread.db.models import ChatAttachment, User, utcnow
+from sightread.db.models import ChatAttachment, utcnow
 from sightread.parsing import attachments as attachment_prep
 from sightread.parsing import poppler
-from tests.conftest import CSRF_HEADERS
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_extensions import chatting_client, new_conversation, send, stub_messages
-
-
-async def attach(
-    client: AsyncClient, name: str, data: bytes, media_type: str = "application/octet-stream"
-) -> httpx.Response:
-    return await client.post(
-        "/api/attachments", files={"file": (name, data, media_type)}, headers=CSRF_HEADERS
-    )
+from tests.chat_helpers import (
+    attach,
+    chatting_client,
+    new_conversation,
+    run_queued_turn,
+    send,
+    stub_messages,
+)
+from tests.conftest import CSRF_HEADERS, sign_in
+from tests.factories import user_row
+from tests.helpers import staged_uploads
 
 
 def waiting(client: AsyncClient) -> list[Path]:
@@ -40,11 +39,9 @@ def waiting(client: AsyncClient) -> list[Path]:
 
 @respx.mock
 async def test_attachments_are_prepared_embedded_and_shown_without_their_bytes(
-    make_client, tmp_path, documents
+    make_client, documents
 ) -> None:
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_attachment_cache_seconds=600)
-    )
+    client = await chatting_client(make_client(chat_attachment_cache_seconds=600))
     image = await attach(client, "wide.png", documents["wide_png"].read_bytes(), "image/png")
     assert image.status_code == 201, image.text
     image = image.json()
@@ -79,7 +76,7 @@ async def test_attachments_are_prepared_embedded_and_shown_without_their_bytes(
     assert waiting(client) == []
     async with client.app.state.sessionmaker() as db:
         assert (await db.execute(select(ChatAttachment))).scalars().all() == []
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     again = await send(client, conversation_id, text="Again", attachments=[image["id"]])
     assert again.status_code == 409
 
@@ -126,7 +123,7 @@ async def test_attachments_are_prepared_embedded_and_shown_without_their_bytes(
 
 async def test_an_attachment_is_refused_by_size_type_and_content(make_client, documents) -> None:
     client = make_client(chat_attachment_max_bytes=1024 * 1024)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     big = await attach(client, "big.txt", b"x" * (1024 * 1024 + 1), "text/plain")
     assert big.status_code == 413
     assert "CHAT_ATTACHMENT_MAX_BYTES" in big.json()["error"]["message"]
@@ -159,7 +156,7 @@ async def test_an_attachment_is_refused_by_size_type_and_content(make_client, do
 
 async def test_a_long_text_keeps_its_head_and_tail(make_client, tmp_path) -> None:
     client = make_client(chat_attachment_text_max_chars=200)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     text = "HEAD " + "x" * 5000 + " TAIL"
     created = await attach(client, "long.txt", text.encode(), "text/plain")
     assert created.status_code == 201, created.text
@@ -170,7 +167,7 @@ async def test_a_long_text_keeps_its_head_and_tail(make_client, tmp_path) -> Non
     # The bound holds at a chunk's edge too, and NULs never reach a JSONB column.
     source = tmp_path / "chunked.txt"
     source.write_bytes(b"\x00" + "é".encode() * attachment_prep.READ_CHUNK_BYTES)
-    bounded = attachment_prep._read_bounded(source, 100, strict=True)
+    bounded = attachment_prep._read_bounded(source, 100)
     assert "\x00" not in bounded and len(bounded) <= 100 and bounded.startswith("é")
 
 
@@ -193,7 +190,7 @@ async def test_a_pdf_is_read_only_to_its_text_cap(make_client, tmp_path) -> None
     assert not goes_on and len(whole) > source.stat().st_size
 
     client = make_client(chat_attachment_text_max_chars=300)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     created = await attach(client, "long.pdf", source.read_bytes(), "application/pdf")
     assert created.status_code == 201, created.text
     prepared = waiting(client)[0].read_text(encoding="utf-8")
@@ -202,25 +199,19 @@ async def test_a_pdf_is_read_only_to_its_text_cap(make_client, tmp_path) -> None
     assert len(prepared) == 300 + len(attachment_prep.PDF_TEXT_CUT) == created.json()["chars"]
     # The prepared text is all that is left: nothing was staged beside it.
     assert len(waiting(client)) == 1
-    assert [entry.name for entry in Path(client.app.state.settings.upload_dir).iterdir()] == [
-        waiting(client)[0].name
-    ]
+    assert staged_uploads(client) == [waiting(client)[0].name]
 
 
 async def test_the_attachment_route_streams_past_the_json_body_cap(make_client) -> None:
     """The general body cap is for JSON; an attachment streams under its own (docs/api.md)."""
     client = make_client(content_max_bytes=1024)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     created = await attach(client, "large.txt", b"line\n" * 100_000, "text/plain")
     assert created.status_code == 201, created.text
 
 
-async def test_an_attachment_is_removed_expires_or_is_another_readers(
-    make_client, tmp_path
-) -> None:
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_attachments_per_message=2)
-    )
+async def test_an_attachment_is_removed_expires_or_is_another_readers(make_client) -> None:
+    client = await chatting_client(make_client(chat_attachments_per_message=2))
     removed = (await attach(client, "a.txt", b"alpha", "text/plain")).json()
     deleted = await client.delete(f"/api/attachments/{removed['id']}", headers=CSRF_HEADERS)
     assert deleted.status_code == 204
@@ -244,7 +235,7 @@ async def test_an_attachment_is_removed_expires_or_is_another_readers(
     # Another reader's attachment is not the caller's to send or to remove.
     stranger_id = uuid.uuid4()
     async with client.app.state.sessionmaker() as db:
-        stranger = User(google_sub="stranger", email="stranger@example.com")
+        stranger = user_row("stranger@example.com")
         db.add(stranger)
         await db.flush()
         db.add(
@@ -269,7 +260,7 @@ async def test_an_attachment_is_removed_expires_or_is_another_readers(
 
 async def test_a_new_upload_drops_the_rows_the_sweeper_has_taken(make_client) -> None:
     client = make_client()
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     stale = (await attach(client, "old.txt", b"old", "text/plain")).json()
     async with client.app.state.sessionmaker() as db:
         row = await db.get(ChatAttachment, uuid.UUID(stale["id"]))
@@ -285,7 +276,7 @@ async def test_the_attachments_waiting_for_a_message_are_capped(make_client) -> 
     """Each upload is bounded and so is their number: uploads never sent would otherwise fill
     the upload directory for a day (docs/api.md)."""
     client = make_client(chat_attachments_pending_max=2)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     first = await attach(client, "a.txt", b"one", "text/plain")
     second = await attach(client, "b.txt", b"two", "text/plain")
     assert (first.status_code, second.status_code) == (201, 201)
@@ -302,14 +293,12 @@ async def test_the_attachments_waiting_for_a_message_are_capped(make_client) -> 
 
 @respx.mock
 async def test_attachments_that_would_fill_the_history_stay_for_another_conversation(
-    make_client, tmp_path, documents
+    make_client, documents
 ) -> None:
     """The cap counts the message being sent: an image that would carry the history past it
     is refused before it is spent, rather than embedded into a turn that then cannot run
     (docs/chat.md § History is append-only)."""
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_history_max_bytes=2000)
-    )
+    client = await chatting_client(make_client(chat_history_max_bytes=2000))
     image = (
         await attach(client, "wide.png", documents["wide_png"].read_bytes(), "image/png")
     ).json()
@@ -334,14 +323,4 @@ def test_an_attachment_is_classified_by_extension_then_by_media_type() -> None:
     assert attachment_prep.classify("clipboard", "image/png") == "image"
     assert attachment_prep.classify("notes", "text/plain; charset=utf-8") == "text"
     assert attachment_prep.classify("archive.zip", "application/zip") is None
-    assert ".heic" in attachment_prep.ATTACHMENT_EXTENSIONS
-
-
-async def test_the_composer_learns_the_attachment_limits(make_client) -> None:
-    client = make_client(chat_attachment_max_bytes=5_000_000, chat_attachments_per_message=3)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    limits = (await client.get("/api/me")).json()["limits"]
-    assert limits["attachment_max_bytes"] == 5_000_000
-    assert limits["attachments_per_message"] == 3
-    assert limits["attachment_extensions"] == list(attachment_prep.ATTACHMENT_EXTENSIONS)
-    assert {".png", ".pdf", ".md", ".txt"} <= set(limits["attachment_extensions"])
+    assert {".heic", ".png", ".pdf", ".md", ".txt"} <= set(attachment_prep.ATTACHMENT_EXTENSIONS)

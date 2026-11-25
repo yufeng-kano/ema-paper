@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   UndoHistory,
   applySpans,
+  askKind,
+  blockKey,
   blockName,
   blocksInRanges,
   changedBlocks,
@@ -15,6 +17,7 @@ import {
   followFolds,
   hashText,
   moveTarget,
+  parseBlockKey,
   readFoldMemory,
   rememberFolds,
   restoredRanges,
@@ -23,7 +26,7 @@ import {
   translatable,
   type NameText,
 } from './blocks'
-import { blockPlain, documentOutline, moveBlocks, parseResultMarkdown, placedBlocks } from './markdown'
+import { blockPlain, documentOutline, moveBlocks, parseBlocks, parseResultMarkdown, placedBlocks } from './markdown'
 
 const en: NameText = {
   formula: 'Formula',
@@ -35,13 +38,9 @@ const en: NameText = {
   imageBare: 'Image',
 }
 
-function blocks(markdown: string) {
-  return parseResultMarkdown(markdown).flatMap((page) => page.blocks)
-}
-
 describe('blockName', () => {
   it('names a formula by its tag, anything else by its words in quotation marks', () => {
-    const [tagged, plain, heading, prose, figure, bare] = blocks(
+    const [tagged, plain, heading, prose, figure, bare] = parseBlocks(
       [
         '$$x = 1 \\tag{1.6}$$',
         '',
@@ -66,7 +65,7 @@ describe('blockName', () => {
   })
 
   it('names an inserted image by its caption, after Image', () => {
-    const [captioned, bare] = blocks(
+    const [captioned, bare] = parseBlocks(
       ['![shot](figures/img-0123456789abcdef.png)', 'The login screen', '', '![shot](figures/img-0123456789abcdef.jpg)'].join('\n'),
     )
     expect(blockName(captioned!, en)).toBe('Image “The login screen”')
@@ -75,7 +74,7 @@ describe('blockName', () => {
   })
 
   it('names a section link by its label where the caller reads section links, as the notes do', () => {
-    const [lone, inText, quote] = blocks(
+    const [lone, inText, quote] = parseBlocks(
       [
         '[3.1 Problem Setup](#31-problem-setup)',
         '',
@@ -92,14 +91,21 @@ describe('blockName', () => {
   })
 
   it('cuts words without spaces by length', () => {
-    const [block] = blocks('注意力函數可以描述為將一個查詢和一組鍵值對映射到輸出')
+    const [block] = parseBlocks('注意力函數可以描述為將一個查詢和一組鍵值對映射到輸出')
     expect(blockName(block!, { ...en, quoted: (words) => `「${words}」` })).toBe('「注意力函數可以描述為將一個查詢和一組鍵值對映射到…」')
+  })
+})
+
+describe('askKind', () => {
+  it('asks about a paragraph, a section, a formula, or a block', () => {
+    const kinds = parseBlocks(['Prose.', '', '## Two', '', '### Three', '', '$$x$$', '', '- item'].join('\n')).map(askKind)
+    expect(kinds).toEqual(['paragraph', 'section', 'section', 'formula', 'block'])
   })
 })
 
 describe('translatable', () => {
   it('is prose and captions, never formulas, code, tables, contents or bare figures', () => {
-    const kinds = blocks(
+    const kinds = parseBlocks(
       ['Prose.', '', '- item', '', '> quoted', '', '$$x$$', '', '```\ncode\n```', '', '| a |\n| --- |\n| 1 |', '', '![f](sightread://p1/0,0,1,1)'].join('\n'),
     ).map(translatable)
     expect(kinds).toEqual([true, true, true, false, false, false, false])
@@ -209,10 +215,23 @@ describe('followFolds', () => {
   })
 })
 
+describe('parseBlockKey', () => {
+  it('reads back the place blockKey wrote', () => {
+    expect(parseBlockKey(blockKey({ page: 3, index: 12 }))).toEqual({ page: 3, index: 12 })
+    expect(parseBlockKey(blockKey({ page: 0, index: 0 }))).toEqual({ page: 0, index: 0 })
+  })
+
+  it('is null for a string blockKey never makes', () => {
+    for (const key of ['', 'a-b', '1', '1-2-3', '-1-2', '1.5-2', '1-']) {
+      expect(parseBlockKey(key)).toBeNull()
+    }
+  })
+})
+
 describe('foldsOver', () => {
   it('names every collapsed section holding a block, not the heading’s own', () => {
     const collapsed = new Set(['1-intro', '11-sub'])
-    const at = (key: string) => placed.findIndex((entry) => `${entry.page}-${entry.index}` === key)
+    const at = (key: string) => placed.findIndex((entry) => blockKey(entry) === key)
     expect(foldsOver(placed, outline, collapsed, [at('0-4')])).toEqual(['1-intro', '11-sub'])
     expect(foldsOver(placed, outline, collapsed, [at('0-3')])).toEqual(['1-intro'])
     expect(foldsOver(placed, outline, collapsed, [at('1-1'), at('0-0')])).toEqual([])
@@ -389,6 +408,14 @@ describe('undo', () => {
     // The `1` deleted and taken back is the `1` selected, not the page marker's.
     const spans = diffSpans(markdown, markdown.replace('\n1\n\n', '\n'))
     expect(blocksInRanges(markdown, all, restoredRanges(spans, 'undo'))).toEqual([1])
+  })
+
+  it('finds a one-line block in CRLF text by its raw offsets', () => {
+    const markdown = 'One.\r\n\r\nTwo.\r\n'
+    const all = placedBlocks(parseResultMarkdown(markdown))
+    const two = markdown.indexOf('Two.')
+    expect(blocksInRanges(markdown, all, [{ start: two, end: two + 'Two.'.length }])).toEqual([1])
+    expect(blocksInRanges(markdown, all, [{ start: 0, end: 2 }])).toEqual([0])
   })
 
   it('hashes by content and length', () => {

@@ -6,7 +6,6 @@ leak cannot be replayed. Sessions expire after 30 days and are revocable server-
 
 from __future__ import annotations
 
-import hmac
 import secrets
 from datetime import timedelta
 
@@ -41,7 +40,7 @@ async def resolve_session_row(db: AsyncSession, token: str) -> tuple[UserSession
     row = (
         await db.execute(select(UserSession).where(UserSession.token_hash == token_hash))
     ).scalar_one_or_none()
-    if row is None or not hmac.compare_digest(row.token_hash, token_hash):
+    if row is None:
         return None
     if row.expires_at <= utcnow():
         await db.delete(row)

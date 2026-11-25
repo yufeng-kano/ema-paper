@@ -1,11 +1,11 @@
 """A persistent shell session (docs/sandbox.md § The runner).
 
-The bash tool's contract is a shell whose working directory, environment and background
-processes carry from one command to the next, with `restart` as the only reset. One
-`ShellSession` is one such shell: a long-lived `bash` child whose stdin we write commands
-to and whose combined output we read back up to a sentinel line that carries the exit
-code. The backend decides what the child is — `bash` in a directory, or `docker exec` into
-the user's VM — and nothing else differs.
+The bash tool's contract is a shell whose working directory and exported environment
+carry from one command to the next, with `restart` as the only reset. `ShellSession` is
+one such shell: a long-lived POSIX-sh supervisor whose stdin we write commands to. It runs
+each one in a fresh `bash` and ends the command's combined output with a sentinel line
+that carries the exit code. The backend decides where the supervisor runs (`docker exec`
+into the user's VM) and the cleanup that runs after each command.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import asyncio
 import contextlib
 import os
 import secrets
-from asyncio import LimitOverrunError
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
@@ -70,14 +69,6 @@ class BoundedOutput:
             return head + tail, False
         return f"{head}\n[... {self.omitted} bytes omitted by the sandbox ...]\n{tail}", True
 
-
-# The default end-of-command cleanup: everything in the shell's process group but the
-# shell. What the local backend uses — on a host, nothing wider would be safe. The VM
-# backend sweeps the whole VM instead (backends.VM_SWEEP).
-GROUP_CLEANUP = (
-    "for __sr_pid in $(pgrep -g $$); do"
-    ' [ "$__sr_pid" != "$$" ] && kill -KILL "$__sr_pid" 2>/dev/null; done'
-)
 
 # What the child bash runs for each command: the session's saved working directory and
 # exported variables restored, the command sourced (so its `cd` and `export` land in
@@ -181,7 +172,8 @@ class ShellSession:
             if not text.startswith(PID_PREFIX):
                 raise ValueError(text)
             self.pid = int(text[len(PID_PREFIX) :])
-        except (TimeoutError, ValueError, LimitOverrunError) as exc:
+        # `readline` reports a line past the stream's limit as a ValueError too.
+        except (TimeoutError, ValueError) as exc:
             await self.close()
             raise RuntimeError("the shell did not report its pid") from exc
 
@@ -223,7 +215,7 @@ class ShellSession:
             # command's own stdin is /dev/null, and the marker is read before the command
             # starts — so the status line that follows is the supervisor's, never the
             # command's (docs/sandbox.md § The runner). A marker that happens to appear
-            # in the command (it cannot, at this length, but still) is drawn again.
+            # in the command is drawn again.
             while True:
                 marker = f"__SR_DONE_{secrets.token_hex(8)}__"
                 if marker not in command:
@@ -272,10 +264,9 @@ class ShellSession:
                             collected.add(line)
                         if found:
                             break
-                        # A partial line past the cap is output too; keep only the tail
-                        # where a marker could still begin. The marker always starts a
-                        # line, and a line this long is not the marker's, whatever its
-                        # first byte — so the head goes, every time.
+                        # A partial line past the cap is output too: the marker always
+                        # starts a line, and a line this long cannot be the marker's, so
+                        # all but the tail goes.
                         if len(pending) > self._max_bytes:
                             collected.add(pending[: -len(marker_bytes)])
                             pending = pending[-len(marker_bytes) :]

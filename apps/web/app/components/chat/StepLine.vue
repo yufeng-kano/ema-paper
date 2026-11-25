@@ -3,8 +3,8 @@
  * One step's line (docs/web.md § The agent panel): a glyph for its kind, a verb, its target
  * (in mono, unless it is one of the document's own files) and a detail, the lines an edit added, then its mark — a check, a cross, a
  * spinner while it runs. The reading of the call is `lib/steps.ts`; the words are the
- * catalog's. The row around it (a button, or a plain line in a subagent card) is the
- * caller's.
+ * catalog's. The row around it (a step row's button, or the plain line of a group's *Use
+ * skill* step) is the caller's.
  */
 import type { Step } from '~/lib/steps'
 import type { CardState, SkillRunStep, StepStatus, ToolStep } from '~/lib/thread'

@@ -11,7 +11,7 @@
 import type { Node as ProseNode } from '@tiptap/pm/model'
 import { Selection, type Transaction } from '@tiptap/pm/state'
 import type { Mappable } from '@tiptap/pm/transform'
-import { parseResultMarkdown, type InlineOptions, type ResultBlock } from './markdown'
+import { isHeading, parseBlocks, sectionExtent, type InlineOptions, type ResultBlock } from './markdown'
 import { convertBlock, docToMarkdown, markdownToDoc, type BlockKindName } from './richdoc'
 
 export interface NoteUnit {
@@ -50,7 +50,7 @@ function isBare(node: ProseNode): boolean {
   if (node.type.name !== 'rawBlock') {
     return false
   }
-  const blocks = parseResultMarkdown(String(node.attrs.source)).flatMap((page) => page.blocks)
+  const blocks = parseBlocks(String(node.attrs.source))
   return !blocks.length || blocks[0]!.kind === 'comment'
 }
 
@@ -90,11 +90,7 @@ export function unitMarkdown(doc: ProseNode, unit: NoteUnit): string {
 /** The unit as the viewer's parser reads it, for its kind and its name: an excerpt's quote, any
  *  other unit's one block; null for an empty line. */
 export function unitBlock(doc: ProseNode, unit: NoteUnit): ResultBlock | null {
-  return parseResultMarkdown(unitMarkdown(doc, unit)).flatMap((page) => page.blocks)[0] ?? null
-}
-
-function isHeading(block: ResultBlock | null): block is Extract<ResultBlock, { kind: 'h2' | 'h3' }> {
-  return block?.kind === 'h2' || block?.kind === 'h3'
+  return parseBlocks(unitMarkdown(doc, unit))[0] ?? null
 }
 
 /**
@@ -107,13 +103,7 @@ export function sectionMarkdown(doc: ProseNode, units: readonly NoteUnit[], inde
   const head = unitBlock(doc, units[index]!)
   let end = index + 1
   if (isHeading(head)) {
-    while (end < units.length) {
-      const block = unitBlock(doc, units[end]!)
-      if (isHeading(block) && block.level <= head.level) {
-        break
-      }
-      end += 1
-    }
+    end = index + sectionExtent(units.slice(index).map((unit) => ({ block: unitBlock(doc, unit) })), 0).end
     while (end > index + 1 && units[end - 1]!.bare) {
       end -= 1
     }

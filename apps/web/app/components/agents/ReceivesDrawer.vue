@@ -69,8 +69,6 @@ function partLabel(part: AgentContextPart): string {
   switch (part.kind) {
     case 'prompt':
       return part.own ? t('agents.receives.ownPrompt') : t('agents.receives.defaultPrompt')
-    case 'preset':
-      return t('agents.receives.preset')
     case 'instructions':
       return t('agents.receives.instructions')
     case 'catalogue':
@@ -83,8 +81,6 @@ function partLabel(part: AgentContextPart): string {
     case 'memory':
       return part.paused ? t('agents.receives.memoryPaused') : t('agents.receives.memory', { count: part.count ?? 0 })
   }
-  // A block a newer API sends that this page does not know yet: listed by its kind.
-  return String((part as { kind: string }).kind)
 }
 
 const rows = computed(() =>
@@ -190,7 +186,7 @@ onBeforeUnmount(() => {
                   <dd class="mono">{{ fact.value }}</dd>
                 </div>
               </dl>
-              <p v-if="!context?.facts" class="facts-note">{{ t('agents.receives.factsNote') }}</p>
+              <p class="facts-note">{{ t('agents.receives.factsNote') }}</p>
             </template>
             <pre v-else class="text mono">{{ row.text }}</pre>
           </div>

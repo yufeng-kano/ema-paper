@@ -8,11 +8,9 @@
  * request runs.
  */
 import { createAdminCodes, type AdminCodesCreated, type AdminCodesList } from '~/lib/api'
-import { formatRedeemBy, planLabel } from '~/lib/admin'
+import { INT32_MAX, formatRedeemBy, formatUsd, planLabel, utcDay, wholeNumberOf } from '~/lib/admin'
 import { formatCount } from '~/lib/format'
 
-/** The largest number a code's fields hold: the database's integer. */
-const INT_MAX = 2 ** 31 - 1
 /** The longest label: the column's 255 characters. */
 const LABEL_MAX = 255
 
@@ -21,8 +19,8 @@ const props = defineProps<{ options: AdminCodesList['create'] }>()
 const emit = defineEmits<{ close: []; created: [created: AdminCodesCreated] }>()
 
 const { t, locale } = useI18n()
-const router = useRouter()
 const { explain } = useAdminFailure()
+const hold = useHeldRequest()
 
 const kind = ref<'credits' | 'plan'>('credits')
 const credits = ref('')
@@ -40,22 +38,16 @@ const error = ref<string | null>(null)
 useBuildHold(pending)
 
 /** Today, UTC, as the date field writes it: the first day a new code can count to. */
-const today = new Date().toISOString().slice(0, 10)
+const today = utcDay(new Date())
 /** A date before it: the picker starts at today, but typing is not held to that, and the
  *  server refuses a code born expired. Dates as `YYYY-MM-DD` compare as strings. */
 const pastDate = computed(() => !!redeemBy.value && redeemBy.value < today)
 
-/** A field's whole number from 1 to `max`, else null. */
-function wholeNumber(value: string, max: number): number | null {
-  const n = /^\d+$/.test(value.trim()) ? Number(value.trim()) : Number.NaN
-  return n >= 1 && n <= max ? n : null
-}
-
-const creditsN = computed(() => wholeNumber(credits.value, INT_MAX))
-const validDaysN = computed(() => wholeNumber(validDays.value, props.options.max_days))
-const daysN = computed(() => wholeNumber(days.value, props.options.max_days))
-const maxUsesN = computed(() => wholeNumber(maxUses.value, INT_MAX))
-const countN = computed(() => wholeNumber(count.value, props.options.max_count))
+const creditsN = computed(() => wholeNumberOf(credits.value, INT32_MAX))
+const validDaysN = computed(() => wholeNumberOf(validDays.value, props.options.max_days))
+const daysN = computed(() => wholeNumberOf(days.value, props.options.max_days))
+const maxUsesN = computed(() => wholeNumberOf(maxUses.value, INT32_MAX))
+const countN = computed(() => wholeNumberOf(count.value, props.options.max_count))
 
 /** Said under a field once something is typed in it that is not a number it takes. */
 function numberError(value: string, n: number | null, max: number): string | undefined {
@@ -82,9 +74,7 @@ const batch = computed(() => {
   if (kind.value === 'credits') {
     const each = creditsN.value!
     const total = n * uses * each
-    const usd = new Intl.NumberFormat(locale.value, { style: 'currency', currency: 'USD' }).format(
-      total * Number(props.options.credit_usd),
-    )
+    const usd = formatUsd(total * Number(props.options.credit_usd), locale.value)
     return t('admin.codes.batchCredits', {
       count: codesText,
       uses: usesText,
@@ -116,39 +106,31 @@ async function submit() {
     label: label.value.trim(),
   }
   // Back would close the dialog while the request runs, and the codes would land unseen.
-  const release = router.beforeEach(() => false)
-  let created: AdminCodesCreated | null = null
-  let failure: unknown = null
-  try {
-    created = await createAdminCodes(
+  const result = await hold(() =>
+    createAdminCodes(
       kind.value === 'credits'
         ? { kind: 'credits', credits: creditsN.value!, valid_days: validDaysN.value!, ...fields }
         : { kind: 'plan', plan_id: planId.value, days: daysN.value!, ...fields },
-    )
-  } catch (caught) {
-    failure = caught
-  } finally {
-    release()
-  }
-  if (created) {
+    ),
+  )
+  if ('value' in result) {
     pending.value = false
-    emit('created', created)
+    emit('created', result.value)
     return
   }
-  error.value = await explain(failure)
+  error.value = await explain(result.failure)
   pending.value = false
 }
 </script>
 
 <template>
-  <UiModal :title="t('admin.codes.createTitle')" size="md" :busy="pending" @close="emit('close')">
-    <template #title>
-      <div class="heading">
-        <h2 class="heading-title">{{ t('admin.codes.createTitle') }}</h2>
-        <p class="heading-sub">{{ t('admin.codes.createSubtitle') }}</p>
-      </div>
-    </template>
-
+  <UiModal
+    :title="t('admin.codes.createTitle')"
+    :subtitle="t('admin.codes.createSubtitle')"
+    size="md"
+    :busy="pending"
+    @close="emit('close')"
+  >
     <form id="admin-codes-form" class="form" novalidate @submit.prevent="submit">
       <div v-if="options.plans.length" class="wide kind">
         <span id="admin-codes-kind" class="group-label">{{ t('admin.codes.kindField') }}</span>
@@ -179,7 +161,7 @@ async function submit() {
       </div>
 
       <template v-if="kind === 'credits'">
-        <UiField v-slot="{ id, describedBy, invalid }" :label="t('admin.codes.credits')" :error="numberError(credits, creditsN, INT_MAX)">
+        <UiField v-slot="{ id, describedBy, invalid }" :label="t('admin.codes.credits')" :error="numberError(credits, creditsN, INT32_MAX)">
           <UiTextInput
             :id="id"
             v-model="credits"
@@ -225,7 +207,7 @@ async function submit() {
         </UiField>
       </template>
 
-      <UiField v-slot="{ id, describedBy, invalid }" :label="t('admin.codes.maxUses')" :error="numberError(maxUses, maxUsesN, INT_MAX)">
+      <UiField v-slot="{ id, describedBy, invalid }" :label="t('admin.codes.maxUses')" :error="numberError(maxUses, maxUsesN, INT32_MAX)">
         <UiTextInput
           :id="id"
           v-model="maxUses"
@@ -300,27 +282,6 @@ async function submit() {
 </template>
 
 <style scoped>
-.heading {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.heading-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--display-xs);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-heading);
-}
-
-.heading-sub {
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
 /* Two fields a row, the pairs the CLI's flags make; one on a phone. */
 .form {
   display: grid;

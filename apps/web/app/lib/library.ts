@@ -13,6 +13,7 @@
 import type { DocumentView, LibraryBody, LibraryBodyItem, LibraryDocument, LibraryFolder, UploadLimits } from '~/lib/api'
 import type { IconName } from '~/lib/icons'
 import type { LibraryItem } from '~/lib/steps'
+import { extensionOf } from './composer'
 
 export type FolderId = number | null
 
@@ -76,21 +77,6 @@ export function subtreeIds(folders: LibraryFolder[], root: number): Set<number> 
   return found
 }
 
-/**
- * Whether dropping `moving` into `target` is a move at all — refused in the client for the
- * same reasons the server refuses it, so a drag that cannot land never highlights.
- */
-export function canMoveFolder(
-  folders: LibraryFolder[],
-  moving: LibraryFolder,
-  target: FolderId,
-): boolean {
-  if (target === moving.parent_id) {
-    return false
-  }
-  return target === null || !subtreeIds(folders, moving.id).has(target)
-}
-
 /** A parse still in flight: the two states a file's row keeps polling for. */
 export function isPending(document: LibraryDocument): boolean {
   return document.status === 'queued' || document.status === 'running'
@@ -149,20 +135,18 @@ export function acceptsUpload(
   if (file.type && limits.accepted_media_types.includes(file.type)) {
     return true
   }
-  const dot = file.name.lastIndexOf('.')
-  const extension = dot === -1 ? '' : file.name.slice(dot).toLowerCase()
-  return extension !== '' && limits.accepted_extensions.includes(extension)
+  const extension = extensionOf(file.name)
+  return extension !== '' && limits.accepted_extensions.includes(`.${extension}`)
 }
 
 /** Whether the upload endpoint would file this as a markdown document rather than parse it —
  *  by type or by extension, as the server decides (docs/workspace.md § Markdown documents). */
-export function isMarkdownUpload(file: { name: string; type: string }, limits: UploadLimits | null): boolean {
-  if (file.type && limits?.markdown_media_types?.includes(file.type)) {
+export function isMarkdownUpload(file: { name: string; type: string }, limits: UploadLimits): boolean {
+  if (file.type && limits.markdown_media_types.includes(file.type)) {
     return true
   }
-  const dot = file.name.lastIndexOf('.')
-  const extension = dot === -1 ? '' : file.name.slice(dot).toLowerCase()
-  return extension !== '' && (limits?.markdown_extensions?.includes(extension) ?? false)
+  const extension = extensionOf(file.name)
+  return extension !== '' && limits.markdown_extensions.includes(`.${extension}`)
 }
 
 /**
@@ -200,38 +184,33 @@ export function typeAheadMatch(rows: { key: string; name: string }[], typed: str
 
 /**
  * The cap intake applies to this file, from the server's own numbers (`GET /api/me`
- * § limits): a markdown document's, a parse's for a PDF or an image while the parse agent
- * converts them (`autoConvert`, its switch), a file's for anything else — the PDF or image
- * kept as a file included. Which cap, never whether it is taken, since every kind is
- * (docs/web.md § Files). Null while the limits have not arrived, or where an older API
- * names none.
+ * § limits), and `as` names which it is: a markdown document's, a parse's for a PDF or an
+ * image while the parse agent converts them (`autoConvert`, its switch), a file's for
+ * anything else — the PDF or image kept as a file included. Which cap, never whether it is
+ * taken, since every kind is (docs/web.md § Files). Null while the limits have not arrived.
  */
 export function uploadCap(
   file: { name: string; type: string },
   limits: UploadLimits | null,
   autoConvert = false,
-): number | null {
+): { bytes: number; as: 'markdown' | 'parse' | 'file' } | null {
   if (!limits) {
     return null
   }
-  if (isMarkdownUpload(file, limits)) {
-    return limits.markdown_max_bytes ?? null
-  }
-  if (autoConvert && acceptsUpload(file, limits)) {
-    return limits.upload_max_bytes
-  }
-  return limits.file_max_bytes ?? null
+  const as = isMarkdownUpload(file, limits) ? 'markdown' : autoConvert && acceptsUpload(file, limits) ? 'parse' : 'file'
+  const bytes = { markdown: limits.markdown_max_bytes, parse: limits.upload_max_bytes, file: limits.file_max_bytes }[as]
+  return { bytes, as }
 }
 
 /** The glyph before a file's name, by its type (docs/web.md § Files, *Four columns*). */
-export type FileGlyph = 'file' | 'file-text' | 'image' | 'film' | 'music' | 'sheet' | 'presentation' | 'archive'
+type FileGlyph = 'file' | 'file-text' | 'image' | 'film' | 'music' | 'sheet' | 'presentation' | 'archive'
 
 /**
  * What a file is, in the terms the Kind column and the glyph use: the catalog key that
  * names its kind (`files.kinds.<key>`) and the format's name for the key's `{format}` —
  * *JPEG image*, *Excel spreadsheet*, *ZIP archive*, else *<EXT> file*.
  */
-export interface FileKind {
+interface FileKind {
   key: 'pdf' | 'image' | 'video' | 'audio' | 'spreadsheet' | 'presentation' | 'word' | 'archive' | 'file' | 'plain'
   format: string
   glyph: FileGlyph
@@ -345,12 +324,6 @@ const GLYPHS: Readonly<Record<FileKind['key'], FileGlyph>> = {
   plain: 'file',
 }
 
-/** The extension, lower-cased and without its dot; a leading dot is a name, not an extension. */
-function extensionOf(name: string): string {
-  const dot = name.lastIndexOf('.')
-  return dot <= 0 ? '' : name.slice(dot + 1).toLowerCase()
-}
-
 /**
  * What a file kept as it is is — by its media type first, as intake stored it, then by its
  * extension, since a browser types what it has no association for as nothing at all.
@@ -446,10 +419,11 @@ export function initialView(
   return document.view ?? defaultView
 }
 
-/** What the file viewer shows of a file by itself: what a browser renders safely on its own
- *  and the file route serves inline (docs/api.md § `GET /api/library/documents/{id}/file`).
- *  An SVG is served as a download, so it has none. */
-export type FilePreview = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'none'
+/** What a browser renders of a file safely on its own, as the file route serves it inline
+ *  (docs/api.md § `GET /api/library/documents/{id}/file`); an SVG is served as a download, so
+ *  it has none. The file viewer shows 'video', 'audio' and 'text'; 'pdf' and 'image' send the
+ *  file to the result viewer's Original view (`originalKind`). */
+type FilePreview = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'none'
 
 export function filePreview(mediaType: string | null | undefined): FilePreview {
   const type = (mediaType ?? '').toLowerCase()
@@ -485,7 +459,7 @@ export interface LibraryPlace {
 }
 
 /** A selected row: the item, as the page's undo names it, and its Files path. */
-export interface LibraryRow extends LibraryItem {
+interface LibraryRow extends LibraryItem {
   path: string
 }
 

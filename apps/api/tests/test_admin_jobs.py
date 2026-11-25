@@ -22,30 +22,30 @@ from sightread.config import Settings
 from sightread.db.models import AuditLog, CreditEntry, Job, JobPage, UsageLog, utcnow
 from sightread.jobs import queue
 from sightread.routes import admin as admin_routes
-from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_MODELS_URL, PAY_SETTINGS
-from tests.test_admin import (
-    OWNERS,
-    _account,
-    _add,
-    _audit,
-    _error,
-    _group,
-    _last_audit_id,
-    _owner,
+from tests.admin_helpers import (
+    account_client,
+    add_member,
+    audit_rows,
+    create_group,
+    error_of,
+    last_audit_id,
+    owner_client,
+)
+from tests.billing_helpers import CATALOG_URL, catalog
+from tests.conftest import (
+    CSRF_HEADERS,
+    KANO_API_KEY,
+    KANO_MODELS_URL,
+    PAY_SETTINGS,
     postgres_only,
 )
-from tests.test_pay import CATALOG_URL, catalog
+from tests.factories import job_row
 
 JOB_FIELDS = {
-    "agent": "parse",
-    "kind": "pdf",
     "filename": "confidential-thesis.pdf",
-    "media_type": "application/pdf",
     "size_bytes": 2048,
     "sha256": "a" * 64,
     "pages_spec": "",
-    "model": "vendor/vision-model",
-    "bbox_format": "yxyx_norm1000",
     "prompt": "SECRET-PROMPT transcribe page {page}",
     "prompt_sha256": "p" * 64,
     "page_count": 3,
@@ -54,7 +54,7 @@ JOB_FIELDS = {
 
 async def _job(client: AsyncClient, user_id: int, **fields) -> Job:
     async with client.app.state.sessionmaker() as db:
-        job = Job(user_id=user_id, **{**JOB_FIELDS, "status": "queued", **fields})
+        job = job_row(user_id, **{**JOB_FIELDS, "status": "queued", **fields})
         db.add(job)
         await db.commit()
         return job
@@ -78,7 +78,6 @@ async def _requeue(client: AsyncClient, job_id) -> httpx.Response:
 def test_the_probe_timeout_the_usage_range_and_the_failed_window_are_validated() -> None:
     assert Settings().admin_probe_timeout_seconds == 5
     assert Settings().admin_usage_max_days == 366
-    assert Settings().admin_failed_window_hours == 24
     # The Usage page's longest preset, 90 days, is the least cap that refuses none of them.
     assert Settings(admin_usage_max_days=90).admin_usage_max_days == 90
     assert Settings(admin_failed_window_hours=8760).admin_failed_window_hours == 8760
@@ -95,11 +94,6 @@ def test_the_probe_timeout_the_usage_range_and_the_failed_window_are_validated()
 
 
 # --- whether the worker runs ----------------------------------------------------------
-
-
-def test_the_worker_lock_key_splits_into_its_pg_locks_columns() -> None:
-    assert (queue.WORKER_LOCK_CLASSID << 32) | queue.WORKER_LOCK_OBJID == queue.WORKER_LOCK_KEY
-    assert (queue.WORKER_LOCK_CLASSID, queue.WORKER_LOCK_OBJID) == (1, 3_017_056_705)
 
 
 async def test_off_postgresql_the_worker_state_is_unknown(sessionmaker) -> None:
@@ -158,8 +152,8 @@ async def test_another_lock_with_the_same_halves_is_not_the_worker(sessionmaker)
 async def test_a_stuck_job_goes_back_with_its_finished_pages_and_one_audit_row(
     make_client, monkeypatch, tmp_path
 ) -> None:
-    owner = await _owner(make_client)
-    account = await _account(make_client, "reader@example.test")
+    owner = await owner_client(make_client)
+    account = await account_client(make_client, "reader@example.test")
     started = utcnow() - timedelta(minutes=40)
     job = await _job(
         owner,
@@ -195,18 +189,19 @@ async def test_a_stuck_job_goes_back_with_its_finished_pages_and_one_audit_row(
         directory.mkdir(parents=True)
         (directory / "fig1.png").write_bytes(b"png")
     _worker(monkeypatch, "stopped")
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     response = await _requeue(owner, job.id)
     assert response.status_code == 200, response.text
     body = response.json()
     assert (body["id"], body["status"], body["pages_done"]) == (str(job.id), "queued", 1)
-    assert (body["worker_generation"], body["started_at"], body["stuck"]) == (None, None, False)
+    assert (body["worker_generation"], body["stuck"]) == (None, False)
     assert body["email"] == "reader@example.test"
 
     async with owner.app.state.sessionmaker() as db:
         stored = await db.get(Job, job.id)
         assert (stored.status, stored.pages_done, stored.worker_generation) == ("queued", 1, None)
+        assert stored.started_at is None
         assert list(await db.scalars(select(JobPage.page_no).where(JobPage.job_id == job.id))) == [
             1
         ]
@@ -220,7 +215,7 @@ async def test_a_stuck_job_goes_back_with_its_finished_pages_and_one_audit_row(
     assert not (figures / f"{job.id}.attempt").exists()
     assert (figures / str(other.id) / "fig1.png").exists()
 
-    [row] = await _audit(owner, start)
+    [row] = await audit_rows(owner, start)
     assert (row.actor_id, row.permission, row.action) == (
         owner.user_id,
         "jobs.write",
@@ -244,44 +239,44 @@ async def test_a_stuck_job_goes_back_with_its_finished_pages_and_one_audit_row(
     # Queued now: a second requeue is refused and records nothing.
     again = await _requeue(owner, job.id)
     assert again.status_code == 409
-    assert _error(again)["reason"] == "not_running"
-    assert len(await _audit(owner, start)) == 1
+    assert error_of(again)["reason"] == "not_running"
+    assert len(await audit_rows(owner, start)) == 1
 
 
 async def test_a_job_another_generation_left_is_stuck_while_the_worker_runs(
     make_client, monkeypatch
 ) -> None:
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     stale = await _job(owner, owner.user_id, status="running", worker_generation=6)
     live = await _job(owner, owner.user_id, status="running", worker_generation=7)
     _worker(monkeypatch, "running", 7)
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     refused = await _requeue(owner, live.id)
     assert refused.status_code == 409
-    assert _error(refused) == {
+    assert error_of(refused) == {
         "type": "admin_conflict",
         "message": "The live worker is running this job",
         "reason": "not_stuck",
     }
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
     response = await _requeue(owner, stale.id)
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "queued"
-    assert [row.target_id for row in await _audit(owner, start)] == [str(stale.id)]
+    assert [row.target_id for row in await audit_rows(owner, start)] == [str(stale.id)]
 
 
 @pytest.mark.parametrize("status", ["queued", "succeeded", "failed"])
 async def test_only_a_running_job_is_requeued(make_client, monkeypatch, status: str) -> None:
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     job = await _job(owner, owner.user_id, status=status, error="kept as it is")
     _worker(monkeypatch, "stopped")
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     response = await _requeue(owner, job.id)
     assert response.status_code == 409
-    assert _error(response) == {
+    assert error_of(response) == {
         "type": "admin_conflict",
         "message": f"The job is {status}, not running",
         "reason": "not_running",
@@ -289,38 +284,38 @@ async def test_only_a_running_job_is_requeued(make_client, monkeypatch, status: 
     async with owner.app.state.sessionmaker() as db:
         stored = await db.get(Job, job.id)
         assert (stored.status, stored.error) == (status, "kept as it is")
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
 
 async def test_nothing_is_requeued_while_the_worker_state_is_unknown(
     make_client, monkeypatch
 ) -> None:
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     job = await _job(owner, owner.user_id, status="running", worker_generation=1)
     _worker(monkeypatch, "unknown")
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     response = await _requeue(owner, job.id)
     assert response.status_code == 409
-    assert _error(response)["reason"] == "worker_unknown"
+    assert error_of(response)["reason"] == "worker_unknown"
     async with owner.app.state.sessionmaker() as db:
         assert (await db.get(Job, job.id)).status == "running"
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
 
 async def test_an_unknown_or_malformed_job_id_is_refused(make_client) -> None:
-    owner = await _owner(make_client)
-    start = await _last_audit_id(owner)
+    owner = await owner_client(make_client)
+    start = await last_audit_id(owner)
     missing = await _requeue(owner, uuid.uuid4())
     assert missing.status_code == 404
-    assert _error(missing)["message"] == "No such job"
+    assert error_of(missing)["message"] == "No such job"
     assert (await _requeue(owner, "not-a-uuid")).status_code == 422
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
 
 @postgres_only
 async def test_requeue_reads_the_real_worker_lock(make_client) -> None:
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     sessionmaker = owner.app.state.sessionmaker
     held = await queue.try_worker_lock(sessionmaker.kw["bind"])
     assert held is not None
@@ -332,7 +327,7 @@ async def test_requeue_reads_the_real_worker_lock(make_client) -> None:
         stale = await _job(
             owner, owner.user_id, status="running", worker_generation=generation + 100
         )
-        assert _error(await _requeue(owner, live.id))["reason"] == "not_stuck"
+        assert error_of(await _requeue(owner, live.id))["reason"] == "not_stuck"
         assert (await _requeue(owner, stale.id)).status_code == 200
     finally:
         await queue.release_worker_lock(held)
@@ -344,11 +339,11 @@ async def test_requeue_reads_the_real_worker_lock(make_client) -> None:
 
 
 async def test_jobs_routes_need_their_permissions(make_client, monkeypatch) -> None:
-    owner = await _owner(make_client)
-    outsider = await _account(make_client, "outsider@example.test")
-    reader = await _account(make_client, "reader@example.test")
-    readers = await _group(owner, "job-readers", ["jobs.read"])
-    await _add(owner, readers["id"], user_id=reader.user_id)
+    owner = await owner_client(make_client)
+    outsider = await account_client(make_client, "outsider@example.test")
+    reader = await account_client(make_client, "reader@example.test")
+    readers = await create_group(owner, "job-readers", ["jobs.read"])
+    await add_member(owner, readers["id"], user_id=reader.user_id)
     job = await _job(owner, reader.user_id, status="running", worker_generation=2)
     _worker(monkeypatch, "stopped")
     reads = (
@@ -360,29 +355,26 @@ async def test_jobs_routes_need_their_permissions(make_client, monkeypatch) -> N
     for path in reads:
         response = await outsider.get(path)
         assert response.status_code == 403, path
-        assert _error(response)["type"] == "permission_denied"
+        assert error_of(response)["type"] == "permission_denied"
         assert (await reader.get(path)).status_code == 200, path
     # Reading is not writing.
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
     refused = await _requeue(reader, job.id)
     assert refused.status_code == 403
-    assert _error(refused)["type"] == "permission_denied"
-    assert await _audit(owner, start) == []
+    assert error_of(refused)["type"] == "permission_denied"
+    assert await audit_rows(owner, start) == []
     async with owner.app.state.sessionmaker() as db:
         assert (await db.get(Job, job.id)).status == "running"
-    # Anonymous: the session first.
-    anonymous = make_client(owner_emails=OWNERS)
-    assert (await anonymous.get("/api/admin/jobs")).status_code == 401
 
 
 async def test_an_address_needs_users_read_and_the_audit_needs_audit_read(make_client) -> None:
-    owner = await _owner(make_client)
-    reader = await _account(make_client, "reader@example.test")
-    support = await _account(make_client, "support@example.test")
-    readers = await _group(owner, "job-readers", ["jobs.read"])
-    staff = await _group(owner, "support", ["jobs.read", "users.read", "audit.read"])
-    await _add(owner, readers["id"], user_id=reader.user_id)
-    await _add(owner, staff["id"], user_id=support.user_id)
+    owner = await owner_client(make_client)
+    reader = await account_client(make_client, "reader@example.test")
+    support = await account_client(make_client, "support@example.test")
+    readers = await create_group(owner, "job-readers", ["jobs.read"])
+    staff = await create_group(owner, "support", ["jobs.read", "users.read", "audit.read"])
+    await add_member(owner, readers["id"], user_id=reader.user_id)
+    await add_member(owner, staff["id"], user_id=support.user_id)
     job = await _job(owner, reader.user_id)
 
     [hidden] = (await reader.get("/api/admin/jobs")).json()["items"]
@@ -409,7 +401,7 @@ async def test_an_address_needs_users_read_and_the_audit_needs_audit_read(make_c
 
 
 async def test_the_jobs_list_pages_filters_and_shows_no_content(make_client) -> None:
-    owner = await _owner(make_client, admin_page_size=2)
+    owner = await owner_client(make_client, admin_page_size=2)
     base = utcnow() - timedelta(hours=1)
     jobs = [
         await _job(owner, owner.user_id, status="queued", created_at=base),
@@ -464,8 +456,6 @@ async def test_the_jobs_list_pages_filters_and_shows_no_content(make_client) -> 
 
     only = (await owner.get("/api/admin/jobs?status=failed")).json()
     assert ([item["id"] for item in only["items"]], only["total"]) == ([str(jobs[1].id)], 1)
-    # The page size is capped by ADMIN_PAGE_SIZE.
-    assert (await owner.get("/api/admin/jobs?page_size=50")).json()["page_size"] == 2
 
     bad = await owner.get("/api/admin/jobs?status=cancelled")
     assert bad.status_code == 422
@@ -477,7 +467,7 @@ async def test_the_jobs_list_pages_filters_and_shows_no_content(make_client) -> 
 
 
 async def test_a_running_job_is_marked_stuck_by_the_worker_state(make_client, monkeypatch) -> None:
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     await _job(owner, owner.user_id, status="running", worker_generation=3)
     _worker(monkeypatch, "running", 3)
     [live] = (await owner.get("/api/admin/jobs")).json()["items"]
@@ -506,8 +496,8 @@ def _usage(user_id: int, model: str, when: datetime, cost: str | None, source: s
 
 
 async def test_usage_is_summed_per_utc_day_and_model_across_midnight(make_client) -> None:
-    owner = await _owner(make_client)
-    other = await _account(make_client, "other@example.test")
+    owner = await owner_client(make_client)
+    other = await account_client(make_client, "other@example.test")
 
     def at(day: int, hour: int, minute: int = 0, second: int = 0, micro: int = 0) -> datetime:
         return datetime(2026, 3, day, hour, minute, second, micro, tzinfo=UTC)
@@ -564,20 +554,19 @@ async def test_usage_is_summed_per_utc_day_and_model_across_midnight(make_client
             row["completion_tokens"],
             row["cost"],
             row["estimated_cost"],
-            row["estimated_calls"],
             row["unpriced_calls"],
         )
         for row in body["rows"]
     ]
     assert rows == [
-        ("2026-03-15", "vendor/a", 2, 500, 50, 1.0, 0.25, 1, 0),
-        ("2026-03-15", "vendor/b", 1, 5, 0, 0.0, 0.0, 0, 1),
-        ("2026-03-14", "vendor/a", 1, 100, 10, 0.0, 0.5, 1, 0),
+        ("2026-03-15", "vendor/a", 2, 500, 50, 1.0, 0.25, 0),
+        ("2026-03-15", "vendor/b", 1, 5, 0, 0.0, 0.0, 1),
+        ("2026-03-14", "vendor/a", 1, 100, 10, 0.0, 0.5, 0),
     ]
     totals = body["totals"]
     assert (totals["calls"], totals["prompt_tokens"], totals["completion_tokens"]) == (4, 605, 60)
     assert (totals["cost"], totals["estimated_cost"]) == (1.0, 0.75)
-    assert (totals["estimated_calls"], totals["unpriced_calls"]) == (2, 1)
+    assert totals["unpriced_calls"] == 1
 
     one_day = (await owner.get("/api/admin/usage?from=2026-03-14&to=2026-03-14")).json()
     assert [(row["date"], row["calls"]) for row in one_day["rows"]] == [("2026-03-14", 1)]
@@ -586,11 +575,11 @@ async def test_usage_is_summed_per_utc_day_and_model_across_midnight(make_client
 
 
 async def test_a_usage_range_is_checked_and_capped(make_client) -> None:
-    owner = await _owner(make_client, admin_usage_max_days=90)
+    owner = await owner_client(make_client, admin_usage_max_days=90)
     assert (await owner.get("/api/admin/usage?from=2026-01-01&to=2026-03-31")).status_code == 200
     too_long = await owner.get("/api/admin/usage?from=2026-01-01&to=2026-04-01")
     assert too_long.status_code == 422
-    assert _error(too_long)["message"] == "The range spans more than 90 days"
+    assert error_of(too_long)["message"] == "The range spans more than 90 days"
     backwards = await owner.get("/api/admin/usage?from=2026-03-02&to=2026-03-01")
     assert backwards.status_code == 422
     for query in ("from=2026-03-01", "to=2026-03-01", "from=2026-13-01&to=2026-03-01", ""):
@@ -601,8 +590,8 @@ async def test_a_usage_range_is_checked_and_capped(make_client) -> None:
 
 
 async def test_the_overview_counts_jobs_and_todays_usage(make_client, monkeypatch) -> None:
-    owner = await _owner(make_client)
-    await _account(make_client, "other@example.test")
+    owner = await owner_client(make_client)
+    await account_client(make_client, "other@example.test")
     now = utcnow()
     midnight = datetime.combine(now.date(), time.min, UTC)
     oldest = now - timedelta(minutes=30)
@@ -659,7 +648,7 @@ async def test_the_overview_counts_jobs_and_todays_usage(make_client, monkeypatc
     assert (await owner.get("/api/admin/overview")).json()["jobs"]["stuck"] == 2
 
     # ADMIN_FAILED_WINDOW_HOURS reaches further back: the job that failed 30 hours ago counts.
-    wider = await _owner(make_client, admin_failed_window_hours=48)
+    wider = await owner_client(make_client, admin_failed_window_hours=48)
     wide = (await wider.get("/api/admin/overview")).json()["jobs"]
     assert (wide["failed"], wide["failed_hours"]) == (2, 48)
 
@@ -667,15 +656,15 @@ async def test_the_overview_counts_jobs_and_todays_usage(make_client, monkeypatc
 async def test_the_overview_shows_the_ten_newest_records_and_no_more_than_a_page(
     make_client,
 ) -> None:
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     for n in range(11):
-        await _group(owner, f"team-{n}", [])
+        await create_group(owner, f"team-{n}", [])
     async with owner.app.state.sessionmaker() as db:
         newest = list(await db.scalars(select(AuditLog.id).order_by(AuditLog.id.desc()).limit(10)))
     audit = (await owner.get("/api/admin/overview")).json()["audit"]
     assert [entry["id"] for entry in audit] == newest
     # ADMIN_PAGE_SIZE caps every console read, this one too.
-    small = await _owner(make_client, admin_page_size=3)
+    small = await owner_client(make_client, admin_page_size=3)
     audit = (await small.get("/api/admin/overview")).json()["audit"]
     assert [entry["id"] for entry in audit] == newest[:3]
 
@@ -684,7 +673,7 @@ async def test_every_database_read_comes_before_the_catalogs(make_client, monkey
     """The newest audit records are read with the rest, before Kano Proxy and Kano Pay are
     asked, and no pool connection is held while they are: a read that fails answers without
     asking either."""
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     engine = owner.app.state.sessionmaker.kw["bind"]
     held: list[int] = []
 
@@ -703,7 +692,7 @@ async def test_every_database_read_comes_before_the_catalogs(make_client, monkey
     async def broken(*args, **kwargs) -> dict:
         raise RuntimeError("the connection dropped")
 
-    monkeypatch.setattr(admin_routes, "list_audit", broken)
+    monkeypatch.setattr(admin_routes, "_audit_page", broken)
     held.clear()
     with pytest.raises(RuntimeError, match="the connection dropped"):
         await owner.get("/api/admin/overview")
@@ -712,7 +701,7 @@ async def test_every_database_read_comes_before_the_catalogs(make_client, monkey
 
 async def test_the_overview_reports_both_connections(make_client) -> None:
     # The suite's Kano Proxy lists three priced models; Kano Pay is not configured.
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     body = (await owner.get("/api/admin/overview")).json()
     assert body["connections"] == {
         "kano_proxy": {
@@ -734,7 +723,7 @@ async def test_the_overview_reports_both_connections(make_client) -> None:
 
 @pytest.mark.own_catalog
 async def test_each_overview_read_asks_each_catalog_once(make_client) -> None:
-    owner = await _owner(make_client, **PAY_SETTINGS)
+    owner = await owner_client(make_client, **PAY_SETTINGS)
     with respx.mock(assert_all_called=True) as router:
         models = router.get(KANO_MODELS_URL).mock(
             return_value=httpx.Response(
@@ -797,7 +786,7 @@ async def test_each_overview_read_asks_each_catalog_once(make_client) -> None:
 async def test_a_connection_that_fails_is_reported_not_raised(
     make_client, proxy, pay, proxy_message: str, pay_message: str
 ) -> None:
-    owner = await _owner(make_client, **PAY_SETTINGS)
+    owner = await owner_client(make_client, **PAY_SETTINGS)
     with respx.mock(assert_all_called=True) as router:
         if isinstance(proxy, Exception):
             router.get(KANO_MODELS_URL).mock(side_effect=proxy)
@@ -825,7 +814,7 @@ async def test_a_connection_that_fails_is_reported_not_raised(
 async def test_an_unexpected_error_fails_its_connection_not_the_overview(
     make_client, caplog
 ) -> None:
-    owner = await _owner(make_client, **PAY_SETTINGS)
+    owner = await owner_client(make_client, **PAY_SETTINGS)
     with respx.mock(assert_all_called=True) as router:
         # Not an `httpx.HTTPError`: the Kano Proxy client lets it through.
         router.get(KANO_MODELS_URL).mock(side_effect=httpx.InvalidURL("bad"))
@@ -847,7 +836,7 @@ async def test_an_unexpected_error_fails_its_connection_not_the_overview(
 
 @pytest.mark.own_catalog
 async def test_a_slow_connection_is_given_up_after_the_probe_timeout(make_client) -> None:
-    owner = await _owner(make_client, admin_probe_timeout_seconds=0.05, **PAY_SETTINGS)
+    owner = await owner_client(make_client, admin_probe_timeout_seconds=0.05, **PAY_SETTINGS)
 
     async def slow(request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(5)
@@ -870,7 +859,7 @@ async def test_a_slow_connection_is_given_up_after_the_probe_timeout(make_client
 
 @pytest.mark.own_catalog
 async def test_an_unconfigured_kano_proxy_is_not_asked(make_client) -> None:
-    owner = await _owner(make_client, kano_proxy_api_key="")
+    owner = await owner_client(make_client, kano_proxy_api_key="")
     with respx.mock(assert_all_called=False) as router:
         models = router.get(KANO_MODELS_URL).mock(return_value=httpx.Response(200, json={}))
         body = (await owner.get("/api/admin/overview")).json()

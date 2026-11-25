@@ -7,7 +7,7 @@
  * screen opens the dialogs.
  */
 import type { AdminUserDetail } from '~/lib/api'
-import { planLabel } from '~/lib/admin'
+import { JOB_TONES, nameOrEmail, planLabel } from '~/lib/admin'
 import { formatBytes, formatCount, formatDate, formatShortDateTime } from '~/lib/format'
 
 const props = defineProps<{
@@ -22,18 +22,12 @@ const props = defineProps<{
 
 const emit = defineEmits<{ grant: [kind: 'credits' | 'days']; addToGroup: [] }>()
 
-const { t, te, locale } = useI18n()
+const { t, locale } = useI18n()
+const { planLine } = useAdminLabels()
 
 const user = computed(() => props.detail.user)
-const displayName = computed(() => user.value.name?.trim() || user.value.email)
+const displayName = computed(() => nameOrEmail(user.value))
 const initial = computed(() => displayName.value.charAt(0).toUpperCase())
-
-const planLine = computed(() => {
-  const plan = props.detail.plan
-  return plan.source === 'subscription' || plan.source === 'grant'
-    ? `${planLabel(plan.id)} · ${t(`admin.users.paidBy.${plan.source}`)}`
-    : t('admin.users.free')
-})
 
 /** A Pay subscription's state, said only when it is not simply paying. */
 const subscriptionLine = computed(() => {
@@ -53,16 +47,6 @@ const storageShare = computed(() => {
   const storage = props.detail.storage
   return storage && storage.quota_bytes > 0 ? storage.bytes / storage.quota_bytes : 0
 })
-
-function jobTone(status: string): 'ok' | 'danger' | 'info' | 'neutral' {
-  if (status === 'succeeded') return 'ok'
-  if (status === 'failed') return 'danger'
-  return status === 'running' ? 'info' : 'neutral'
-}
-
-function jobStatus(status: string): string {
-  return te(`admin.users.jobStatus.${status}`) ? t(`admin.users.jobStatus.${status}`) : status
-}
 
 function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
   const time = formatShortDateTime(job.finished_at ?? job.created_at, locale.value)
@@ -92,7 +76,7 @@ function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
 
     <section class="block">
       <h3 class="block-title">{{ t('admin.users.planTitle') }}</h3>
-      <p class="value">{{ planLine }}</p>
+      <p class="value">{{ planLine(detail.plan) }}</p>
       <p class="muted">{{ t('admin.users.periodEnds', { date: formatDate(detail.plan.end, locale) }) }}</p>
       <p v-if="subscriptionLine" class="muted">{{ subscriptionLine }}</p>
     </section>
@@ -133,7 +117,7 @@ function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
           {{
             t('admin.users.storageUsed', {
               used: formatBytes(detail.storage.bytes, locale),
-              quota: formatBytes(detail.storage.quota_bytes, locale),
+              quota: formatBytes(detail.storage.quota_bytes, locale, { limit: true }),
             })
           }}
         </p>
@@ -149,7 +133,7 @@ function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
       </h3>
       <ul v-if="detail.jobs.recent.length" class="jobs">
         <li v-for="job in detail.jobs.recent" :key="job.id" class="job">
-          <UiStatusDot :tone="jobTone(job.status)" :label="jobStatus(job.status)" />
+          <UiStatusDot :tone="JOB_TONES[job.status]" :label="t(`admin.jobs.statuses.${job.status}`)" />
           <span class="file" :title="job.filename">{{ job.filename }}</span>
           <span class="muted tabular">{{ jobLine(job) }}</span>
         </li>

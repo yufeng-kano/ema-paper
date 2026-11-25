@@ -9,65 +9,31 @@ from __future__ import annotations
 
 import io
 import re
-from pathlib import Path
 
-import httpx
-import pytest
 from httpx import AsyncClient
 from PIL import Image
 
 from sightread.workspace.documents import sweep_orphaned_images
-from sightread.workspace.layout import images_dir, user_root
-from tests.conftest import CSRF_HEADERS
-from tests.test_chat import _seed_document
+from sightread.workspace.layout import images_dir
+from tests.chat_helpers import seed_document
+from tests.conftest import CSRF_HEADERS, sign_in
+from tests.helpers import staged_uploads
+from tests.library_helpers import image_bytes, insert_image, new_document
 
 IMAGE_PATH = re.compile(r"figures/img-[0-9a-f]{16}\.(png|jpg)")
 
 
-@pytest.fixture
-async def writer(make_client, tmp_path) -> AsyncClient:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
-
-
-def _image(image_format: str, size: tuple[int, int] = (40, 30), mode: str = "RGB") -> bytes:
-    buffer = io.BytesIO()
-    Image.new(mode, size, (200, 40, 40) if mode == "RGB" else (200, 40, 40, 128)).save(
-        buffer, format=image_format
-    )
-    return buffer.getvalue()
-
-
-async def _document(client: AsyncClient, name: str = "Draft") -> int:
-    created = await client.post(
-        "/api/library/documents/new", json={"name": name}, headers=CSRF_HEADERS
-    )
+async def _document(client: AsyncClient) -> int:
+    """A new markdown document, `Draft.md`; its id."""
+    created = await new_document(client, "Draft")
     assert created.status_code == 201, created.text
     return created.json()["id"]
 
 
-async def _insert(
-    client: AsyncClient,
-    document_id: int | str,
-    data: bytes,
-    name: str = "shot.png",
-    media_type: str = "image/png",
-) -> httpx.Response:
-    return await client.post(
-        "/api/library/images",
-        files={"file": (name, data, media_type)},
-        data={"document_id": str(document_id)},
-        headers=CSRF_HEADERS,
-    )
-
-
 async def test_an_inserted_image_is_kept_copied_and_served(writer) -> None:
     document_id = await _document(writer)
-    data = _image("PNG")
-    inserted = await _insert(writer, document_id, data)
+    data = image_bytes("PNG")
+    inserted = await insert_image(writer, document_id, data)
     assert inserted.status_code == 201, inserted.text
     path = inserted.json()["path"]
     assert IMAGE_PATH.fullmatch(path) and path.endswith(".png")
@@ -78,7 +44,7 @@ async def test_an_inserted_image_is_kept_copied_and_served(writer) -> None:
     # The shell sees what the text will name, in the directory history excludes.
     assert (writer.root / "files" / "Draft.md" / "figures" / name).read_bytes() == kept.read_bytes()
     # Nothing staged is left behind.
-    assert list(Path(writer.app.state.settings.upload_dir).iterdir()) == []
+    assert staged_uploads(writer) == []
     # The route writes no text: the line is the caller's.
     content = (await writer.get(f"/api/library/documents/{document_id}/content")).json()
     assert content["markdown"] == ""
@@ -92,21 +58,22 @@ async def test_an_inserted_image_is_kept_copied_and_served(writer) -> None:
         assert image.size == (40, 30)
 
     # The same picture again is the same file.
-    again = await _insert(writer, document_id, data, name="again.png")
+    again = await insert_image(writer, document_id, data, name="again.png")
     assert again.json()["path"] == path
     assert sorted(entry.name for entry in kept.parent.iterdir()) == [name]
 
 
-async def test_an_image_is_kept_as_png_or_jpeg_within_the_long_edge(make_client, tmp_path) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), document_image_long_edge=50)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+async def test_an_image_is_kept_as_png_or_jpeg_within_the_long_edge(make_client) -> None:
+    client = await sign_in(make_client(document_image_long_edge=50))
     document_id = await _document(client)
-    jpeg = await _insert(client, document_id, _image("JPEG", (200, 100)), "photo.jpg", "image/jpeg")
+    jpeg = await insert_image(
+        client, document_id, image_bytes("JPEG", (200, 100)), "photo.jpg", "image/jpeg"
+    )
     assert jpeg.json()["path"].endswith(".jpg")
-    gif = await _insert(client, document_id, _image("GIF"), "anim.gif", "image/gif")
+    gif = await insert_image(client, document_id, image_bytes("GIF"), "anim.gif", "image/gif")
     assert gif.json()["path"].endswith(".jpg")
     # Transparency is flattened, and a PNG stays a PNG.
-    png = await _insert(client, document_id, _image("PNG", mode="RGBA"), "alpha.png")
+    png = await insert_image(client, document_id, image_bytes("PNG", mode="RGBA"), "alpha.png")
     assert png.json()["path"].endswith(".png")
     name = jpeg.json()["path"].removeprefix("figures/")
     served = await client.get(f"/api/library/documents/{document_id}/images/{name}")
@@ -119,51 +86,50 @@ async def test_only_the_accepted_formats_are_decoded(writer) -> None:
     """A format Pillow could read but the route does not accept is refused before it is
     decoded, whatever the request calls it."""
     document_id = await _document(writer)
-    bmp = await _insert(writer, document_id, _image("BMP"), "shot.png", "image/png")
+    bmp = await insert_image(writer, document_id, image_bytes("BMP"), "shot.png", "image/png")
     assert bmp.status_code == 400
     assert "PNG, JPEG, WebP, GIF or HEIC" in bmp.json()["error"]["message"]
-    text = await _insert(writer, document_id, b"not an image", "shot.png", "image/png")
+    text = await insert_image(writer, document_id, b"not an image", "shot.png", "image/png")
     assert text.status_code == 400
     assert not (images_dir(writer.root) / str(document_id)).exists()
-    assert list(Path(writer.app.state.settings.upload_dir).iterdir()) == []
+    assert staged_uploads(writer) == []
 
 
-async def test_an_image_past_its_caps_is_refused(make_client, tmp_path) -> None:
-    client = make_client(
-        workspaces_dir=str(tmp_path / "ws"),
-        document_image_max_bytes=2048,
-        chat_page_image_max_pixels=1000,
+async def test_an_image_past_its_caps_is_refused(make_client) -> None:
+    client = await sign_in(
+        make_client(document_image_max_bytes=2048, chat_page_image_max_pixels=1000)
     )
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     document_id = await _document(client)
-    large = await _insert(client, document_id, b"\x89PNG" + b"\0" * 4096)
+    large = await insert_image(client, document_id, b"\x89PNG" + b"\0" * 4096)
     assert large.status_code == 413
     assert "DOCUMENT_IMAGE_MAX_BYTES" in large.json()["error"]["message"]
-    wide = await _insert(client, document_id, _image("PNG", (100, 20)))
+    wide = await insert_image(client, document_id, image_bytes("PNG", (100, 20)))
     assert wide.status_code == 400
     assert wide.json()["error"]["message"] == "The image has too many pixels"
-    assert list(Path(client.app.state.settings.upload_dir).iterdir()) == []
+    assert staged_uploads(client) == []
 
 
-async def test_an_image_needs_the_callers_document_and_the_csrf_header(writer, make_client) -> None:
+async def test_an_image_needs_the_callers_document_and_the_csrf_header(writer) -> None:
     document_id = await _document(writer)
-    unknown = await _insert(writer, document_id + 1, _image("PNG"))
+    unknown = await insert_image(writer, document_id + 1, image_bytes("PNG"))
     assert unknown.status_code == 404
     missing = await writer.post(
         "/api/library/images",
-        files={"file": ("a.png", _image("PNG"), "image/png")},
+        files={"file": ("a.png", image_bytes("PNG"), "image/png")},
         headers=CSRF_HEADERS,
     )
     assert missing.status_code == 400
     forged = await writer.post(
         "/api/library/images",
-        files={"file": ("a.png", _image("PNG"), "image/png")},
+        files={"file": ("a.png", image_bytes("PNG"), "image/png")},
         data={"document_id": str(document_id)},
     )
     assert forged.status_code == 403
 
     name = (
-        (await _insert(writer, document_id, _image("PNG"))).json()["path"].removeprefix("figures/")
+        (await insert_image(writer, document_id, image_bytes("PNG")))
+        .json()["path"]
+        .removeprefix("figures/")
     )
     # Only a name the store makes is ever looked up.
     for bad in ("img-0123456789abcdef.gif", "../1.sources", "source.pdf", name.upper()):
@@ -173,11 +139,28 @@ async def test_an_image_needs_the_callers_document_and_the_csrf_header(writer, m
     assert absent.status_code == 404
 
 
+async def test_the_image_route_serves_only_a_plain_file(writer) -> None:
+    document_id = await _document(writer)
+    inserted = await insert_image(writer, document_id, image_bytes("PNG"))
+    assert inserted.status_code == 201, inserted.text
+    store = images_dir(writer.root) / str(document_id)
+    stored = store / inserted.json()["path"].removeprefix("figures/")
+    # A link under a name the store makes is never followed, nor a directory read.
+    link = store / f"img-{'3' * 16}.png"
+    link.symlink_to(stored)
+    (store / f"img-{'4' * 16}.png").mkdir()
+    for name in (link.name, f"img-{'4' * 16}.png"):
+        response = await writer.get(f"/api/library/documents/{document_id}/images/{name}")
+        assert response.status_code == 404, name
+    served = await writer.get(f"/api/library/documents/{document_id}/images/{stored.name}")
+    assert served.status_code == 200
+
+
 async def test_an_image_goes_into_a_parsed_document_and_comes_back_when_removed(
     writer,
 ) -> None:
-    document_id = await _seed_document(writer, writer.user_id)
-    path = (await _insert(writer, document_id, _image("PNG"))).json()["path"]
+    document_id = await seed_document(writer, writer.user_id)
+    path = (await insert_image(writer, document_id, image_bytes("PNG"))).json()["path"]
     copy = writer.root / "files" / "Papers" / "paper.pdf" / path
     assert copy.is_file()
     copy.unlink()
@@ -188,7 +171,7 @@ async def test_an_image_goes_into_a_parsed_document_and_comes_back_when_removed(
 
 async def test_the_images_go_with_the_document(writer) -> None:
     document_id = await _document(writer)
-    await _insert(writer, document_id, _image("PNG"))
+    await insert_image(writer, document_id, image_bytes("PNG"))
     store = images_dir(writer.root) / str(document_id)
     assert store.is_dir()
     deleted = await writer.delete(f"/api/library/documents/{document_id}", headers=CSRF_HEADERS)
@@ -198,11 +181,11 @@ async def test_the_images_go_with_the_document(writer) -> None:
 
 async def test_the_images_of_rows_that_are_gone_are_swept(writer) -> None:
     live = await _document(writer)
-    await _insert(writer, live, _image("PNG"))
+    await insert_image(writer, live, image_bytes("PNG"))
     orphan = images_dir(writer.root) / "999"
     orphan.mkdir()
     (orphan / f"img-{'1' * 16}.png").write_bytes(b"left behind")
-    assert sweep_orphaned_images(writer.root, {live}) == 1
+    assert sweep_orphaned_images(writer.root, {live}) == (1, 0)
     assert not orphan.exists()
     assert (images_dir(writer.root) / str(live)).is_dir()
 
@@ -210,10 +193,7 @@ async def test_the_images_of_rows_that_are_gone_are_swept(writer) -> None:
 async def test_an_image_the_quota_has_no_room_for_is_refused(writer) -> None:
     document_id = await _document(writer)
     writer.app.state.settings.workspace_quota_bytes = 1
-    try:
-        refused = await _insert(writer, document_id, _image("PNG"))
-    finally:
-        writer.app.state.settings.workspace_quota_bytes = 10 * 1024 * 1024 * 1024
+    refused = await insert_image(writer, document_id, image_bytes("PNG"))
     assert refused.status_code == 409
     assert not (images_dir(writer.root) / str(document_id)).exists()
 
@@ -229,7 +209,7 @@ async def test_an_image_counts_towards_the_workspace_once(writer) -> None:
         return workspace["files_bytes"], row["storage_bytes"]
 
     files, share = await measured()
-    inserted = await _insert(writer, document_id, _image("PNG"))
+    inserted = await insert_image(writer, document_id, image_bytes("PNG"))
     assert inserted.status_code == 201, inserted.text
     name = inserted.json()["path"].removeprefix("figures/")
     stored = (images_dir(writer.root) / str(document_id) / name).stat().st_size
@@ -238,14 +218,17 @@ async def test_an_image_counts_towards_the_workspace_once(writer) -> None:
     assert await measured() == (files + stored, share + stored)
 
 
-async def test_me_lists_what_an_image_may_be(writer) -> None:
-    limits = (await writer.get("/api/me")).json()["limits"]
-    assert limits["image_media_types"] == [
-        "image/png",
-        "image/jpeg",
-        "image/webp",
-        "image/gif",
-        "image/heic",
-        "image/heif",
-    ]
-    assert limits["image_max_bytes"] == writer.app.state.settings.document_image_max_bytes
+async def test_a_staging_copy_a_dead_writer_left_is_swept_and_the_live_image_kept(writer) -> None:
+    document_id = await _document(writer)
+    inserted = await insert_image(writer, document_id, image_bytes("PNG"))
+    assert inserted.status_code == 201, inserted.text
+    store = images_dir(writer.root) / str(document_id)
+    live = store / inserted.json()["path"].removeprefix("figures/")
+    staged = store / f".tmp-img-{'2' * 16}.png"
+    staged.write_bytes(b"cut off before its rename")
+
+    assert sweep_orphaned_images(writer.root, {document_id}) == (0, 1)
+    assert not staged.exists()
+    assert live.is_file()
+    assert sweep_orphaned_images(writer.root, {document_id}) == (0, 0)
+    assert live.is_file()

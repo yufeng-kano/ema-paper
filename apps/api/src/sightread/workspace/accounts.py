@@ -18,12 +18,12 @@ from pathlib import Path
 from . import safe_io
 from .layout import (
     DELETED_SUFFIX,
-    REPOS_DIR,
     deletion_marker,
     git_dir,
     images_dir,
     sources_dir,
     user_root,
+    users_with_suffix,
 )
 from .locks import SHELL_SUFFIX, WORKSPACE_SUFFIX, WRITING_SUFFIX
 
@@ -51,12 +51,7 @@ def write_marker(workspaces_dir: str | Path, user_id: int, job_ids: list[uuid.UU
 
 def marked_users(workspaces_dir: str | Path) -> list[int]:
     """The users whose marker stands."""
-    try:
-        names = os.listdir(Path(workspaces_dir) / REPOS_DIR)
-    except FileNotFoundError:
-        return []
-    stems = (name.removesuffix(DELETED_SUFFIX) for name in names if name.endswith(DELETED_SUFFIX))
-    return sorted(int(stem) for stem in stems if stem.isdigit())
+    return users_with_suffix(workspaces_dir, DELETED_SUFFIX)
 
 
 def read_marker(workspaces_dir: str | Path, user_id: int) -> list[uuid.UUID]:

@@ -12,7 +12,6 @@ import uuid
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
 from httpx import AsyncClient
 from PIL import Image, ImageDraw
@@ -34,8 +33,8 @@ from sightread.parsing.figure_check import (
     read_verdicts,
 )
 from sightread.parsing.figures import CROP_MARGIN, crop_rect
-from tests.conftest import KANO_CHAT_URL
-from tests.test_parse_end_to_end import MODEL, _authorize, _completion, _drain_queue
+from tests.conftest import KANO_CHAT_URL, PARSE_MODEL
+from tests.helpers import completion, drain_queue, v1_parse
 
 # A chart's plotted area on a 1000 x 1000 page, and the box a model that boxes only that
 # area draws around it: its crop runs from 292 to 708 on both axes.
@@ -236,11 +235,6 @@ def _corrected(*box: int) -> str:
     return json.dumps({"figures": [{"n": 1, "ok": False, "box": list(box)}]})
 
 
-@pytest.fixture
-async def api_client(make_client, sessionmaker) -> AsyncClient:
-    return await _authorize(make_client(), sessionmaker)
-
-
 class Upstream:
     """Transcribes every page as `markdown`, and answers the figure check with `answers`
     in order: a JSON string, or a whole response."""
@@ -256,9 +250,9 @@ class Upstream:
         if body["messages"][0]["content"][0]["text"].startswith("This page image has"):
             self.checks.append(body)
             answer = self.answers.pop(0)
-            return answer if isinstance(answer, httpx.Response) else _completion(answer)
+            return answer if isinstance(answer, httpx.Response) else completion(answer)
         self.transcriptions += 1
-        return _completion(self.markdown)
+        return completion(self.markdown)
 
 
 def _sent(body: dict) -> tuple[str, Image.Image]:
@@ -269,13 +263,9 @@ def _sent(body: dict) -> tuple[str, Image.Image]:
 
 
 async def _parse_image(client: AsyncClient, sessionmaker, path: Path) -> str:
-    accepted = await client.post(
-        "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "image/png")},
-        data={"model": MODEL},
-    )
+    accepted = await v1_parse(client, path, media_type="image/png", model=PARSE_MODEL)
     assert accepted.status_code == 202, accepted.text
-    await _drain_queue(client, sessionmaker)
+    await drain_queue(client, sessionmaker)
     return accepted.json()["job_id"]
 
 
@@ -318,7 +308,7 @@ async def test_a_box_the_rules_moved_is_confirmed_by_the_model(
     # The page's own model was shown the page with the moved box's crop drawn on it, clear
     # of the title, and the crop in its convention.
     [asked] = upstream.checks
-    assert asked["model"] == MODEL
+    assert asked["model"] == PARSE_MODEL
     prompt, image = _sent(asked)
     assert "1: [292, 268, 708, 708]" in prompt
     assert image.getpixel((267, 500)) == MARK
@@ -438,11 +428,7 @@ async def test_a_job_queued_before_the_check_runs_without_it(
     upstream = Upstream(CHART)
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     path = _page(tmp_path / "chart.png", PLOT, TITLE)
-    accepted = await api_client.post(
-        "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "image/png")},
-        data={"model": MODEL},
-    )
+    accepted = await v1_parse(api_client, path, media_type="image/png", model=PARSE_MODEL)
     job_id = accepted.json()["job_id"]
     async with sessionmaker() as db:
         await db.execute(
@@ -452,7 +438,7 @@ async def test_a_job_queued_before_the_check_runs_without_it(
         )
         await db.commit()
 
-    await _drain_queue(api_client, sessionmaker)
+    await drain_queue(api_client, sessionmaker)
 
     result = (await api_client.get(f"/v1/jobs/{job_id}/result")).json()
     assert result["figures"][0]["bbox"] == [300, 300, 700, 700]
@@ -480,13 +466,9 @@ async def test_a_rendered_pdf_page_is_checked_too(api_client, sessionmaker, tmp_
     upstream = Upstream(CHART, (OK,))
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
 
-    accepted = await api_client.post(
-        "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "application/pdf")},
-        data={"model": MODEL},
-    )
+    accepted = await v1_parse(api_client, path)
     job_id = accepted.json()["job_id"]
-    await _drain_queue(api_client, sessionmaker)
+    await drain_queue(api_client, sessionmaker)
 
     [figure] = (await api_client.get(f"/v1/jobs/{job_id}/result")).json()["figures"]
     assert figure["check"] == "adjusted"
@@ -509,11 +491,7 @@ async def test_a_kept_page_keeps_its_statuses_and_is_not_checked_again(
     margin = "![fig](sightread://p{page}/900,100,980,900)\nFigure: a margin"
     upstream = Upstream(margin.format(page=2))
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    accepted = await api_client.post(
-        "/v1/parse",
-        files={"file": ("mixed.pdf", documents["mixed_pdf"].read_bytes(), "application/pdf")},
-        data={"model": MODEL},
-    )
+    accepted = await v1_parse(api_client, documents["mixed_pdf"])
     job_id = uuid.UUID(accepted.json()["job_id"])
     async with sessionmaker() as db:
         db.add_all(
@@ -524,7 +502,7 @@ async def test_a_kept_page_keeps_its_statuses_and_is_not_checked_again(
                     method="vision",
                     status="succeeded",
                     markdown=margin.format(page=page_no),
-                    model=MODEL,
+                    model=PARSE_MODEL,
                     figures=figures,
                 )
                 for page_no, figures in ((1, {"900,100,980,900": "unverified"}), (3, None))
@@ -533,7 +511,7 @@ async def test_a_kept_page_keeps_its_statuses_and_is_not_checked_again(
         await db.execute(update(Job).where(Job.id == job_id).values(pages_done=2))
         await db.commit()
 
-    await _drain_queue(api_client, sessionmaker)
+    await drain_queue(api_client, sessionmaker)
 
     result = (await api_client.get(f"/v1/jobs/{job_id}/result")).json()
     assert [figure.get("check") for figure in result["figures"]] == [
@@ -546,14 +524,14 @@ async def test_a_kept_page_keeps_its_statuses_and_is_not_checked_again(
 
 
 def test_a_running_jobs_snapshot_carries_its_finished_pages_statuses() -> None:
-    job = Job(id=uuid.uuid4(), agent="parse", model=MODEL, bbox_format="yxyx_norm1000")
+    job = Job(id=uuid.uuid4(), agent="parse", model=PARSE_MODEL, bbox_format="yxyx_norm1000")
     rows = [
         JobPage(
             page_no=1,
             method="vision",
             status="succeeded",
             markdown="![fig](sightread://p1/10,10,20,20)\n",
-            model=MODEL,
+            model=PARSE_MODEL,
             figures={"10,10,20,20": "adjusted"},
         )
     ]

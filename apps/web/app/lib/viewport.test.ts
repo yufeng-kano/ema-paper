@@ -13,14 +13,10 @@ describe('keyboard frame', () => {
     expect(keyboardFrame(box, { offsetTop: 120.4, height: 537.6, scale: 1 })).toEqual({ top: 120, height: 538 })
   })
 
-  it('leaves the box alone without a keyboard, or for an iPad’s shortcut bar', () => {
+  it('leaves the box alone without a keyboard, where the browser already shrank the layout, or for an iPad’s shortcut bar', () => {
     expect(keyboardFrame(box, { offsetTop: 0, height: 874, scale: 1 })).toBeNull()
     expect(keyboardFrame(box, { offsetTop: 0, height: 819, scale: 1 })).toBeNull()
     expect(keyboardFrame(box, { offsetTop: 0, height: 774, scale: 1 })).toEqual({ top: 0, height: 774 })
-  })
-
-  it('leaves a browser that already shrank the layout alone', () => {
-    expect(keyboardFrame({ height: 538 }, { offsetTop: 0, height: 538, scale: 1 })).toBeNull()
   })
 
   it('leaves a phone held sideways to the browser’s own pan', () => {

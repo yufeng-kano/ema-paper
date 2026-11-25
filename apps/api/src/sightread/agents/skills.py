@@ -8,7 +8,7 @@ model. It reads no database: the caller hands it the rows.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -152,15 +152,17 @@ def _resolved(
     )
 
 
-def resolve_skills(rows: Iterable[SkillRow]) -> list[ResolvedSkill]:
+def overlay[Resolved](
+    builtins: Iterable, rows: Iterable, resolved: Callable[..., Resolved]
+) -> list[Resolved]:
     """The built-ins in their code order, each as the user's edit when there is one, then
-    the user's own by name (docs/api.md)."""
+    the user's own by name (docs/api.md). `resolved` builds one entry from its source."""
     by_name = {row.name: row for row in rows}
-    resolved = []
-    for builtin in BUILTIN_SKILLS:
+    merged = []
+    for builtin in builtins:
         row = by_name.pop(builtin.name, None)
-        resolved.append(
-            _resolved(
+        merged.append(
+            resolved(
                 row if row is not None else builtin,
                 builtin=True,
                 modified=row is not None,
@@ -168,8 +170,13 @@ def resolve_skills(rows: Iterable[SkillRow]) -> list[ResolvedSkill]:
             )
         )
     for name in sorted(by_name):
-        resolved.append(_resolved(by_name[name], builtin=False, modified=False, default=None))
-    return resolved
+        merged.append(resolved(by_name[name], builtin=False, modified=False, default=None))
+    return merged
+
+
+def resolve_skills(rows: Iterable[SkillRow]) -> list[ResolvedSkill]:
+    """The built-in skills overlaid with the user's rows (see `overlay`)."""
+    return overlay(BUILTIN_SKILLS, rows, _resolved)
 
 
 def same_as_default(values: dict, default: SkillDefinition) -> bool:

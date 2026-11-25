@@ -14,7 +14,7 @@
  * dismissed, nor left by Back, while it sends.
  */
 import { ApiRequestError, grantAdminUser, type AdminGrantFacts, type AdminUserDetail } from '~/lib/api'
-import { adminFailure, grantNumber } from '~/lib/admin'
+import { formatUsd, nameOrEmail, planLabel, wholeNumberOf } from '~/lib/admin'
 import { formatCount, formatDate } from '~/lib/format'
 
 /** A grant's `reason` (docs/admin.md § Users and grants). */
@@ -35,8 +35,8 @@ const props = defineProps<{
 const emit = defineEmits<{ close: []; granted: [] }>()
 
 const { t, locale } = useI18n()
-const router = useRouter()
 const { explain } = useAdminFailure()
+const hold = useHeldRequest()
 
 const requestId = crypto.randomUUID()
 
@@ -51,9 +51,9 @@ const pending = ref(false)
 const unsettled = ref(false)
 const error = ref<string | null>(null)
 
-const creditCount = computed(() => grantNumber(credits.value, props.facts.max_credits))
-const validCount = computed(() => grantNumber(validDays.value, props.facts.max_days))
-const dayCount = computed(() => grantNumber(days.value, props.facts.max_days))
+const creditCount = computed(() => wholeNumberOf(credits.value, props.facts.max_credits))
+const validCount = computed(() => wholeNumberOf(validDays.value, props.facts.max_days))
+const dayCount = computed(() => wholeNumberOf(days.value, props.facts.max_days))
 
 /** The rule, under a field whose text is not a number it takes. */
 function ruleFor(text: string, value: number | null, max: number): string | undefined {
@@ -72,7 +72,7 @@ const subtitle = computed(() =>
   t(
     'admin.users.grant.subtitle',
     {
-      name: props.user.name?.trim() || props.user.email,
+      name: nameOrEmail(props.user),
       email: props.user.email,
       credits: formatCount(props.available, locale.value),
     },
@@ -84,12 +84,7 @@ const subtitle = computed(() =>
 const creditsNote = computed(() => {
   const count = creditCount.value ?? 0
   const expires = new Date(Date.now() + (validCount.value ?? props.facts.valid_days) * DAY_MS).toISOString()
-  const usd = new Intl.NumberFormat(locale.value, {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 4,
-  }).format(count * props.facts.credit_usd)
+  const usd = formatUsd(count * props.facts.credit_usd, locale.value)
   return t(
     'admin.users.grant.creditsNote',
     { date: formatDate(expires, locale.value), n: formatCount(count, locale.value), usd },
@@ -118,50 +113,33 @@ async function submit() {
   pending.value = true
   error.value = null
   const note = reason.value.trim() || undefined
-  // Back would close the dialog while the request runs, and its answer would land unseen.
-  const release = router.beforeEach(() => false)
-  let failure: unknown = null
-  try {
-    await grantAdminUser(
+  const result = await hold(() =>
+    grantAdminUser(
       props.user.id,
       kind.value === 'credits'
         ? { kind: 'credits', credits: creditCount.value!, valid_days: validCount.value!, request_id: requestId, reason: note }
         : { kind: 'days', plan: plan.value, days: dayCount.value!, request_id: requestId, reason: note },
-    )
-  } catch (caught) {
-    failure = caught
-  } finally {
-    release()
-  }
-  if (!failure) {
+    ),
+  )
+  if (!('failure' in result)) {
     pending.value = false
     emit('granted')
     return
   }
+  const { failure } = result
   // A 4xx is a refusal and wrote nothing; anything else — no answer, a 5xx — may have
   // come after the commit.
   if (!(failure instanceof ApiRequestError && failure.status >= 400 && failure.status < 500)) {
     unsettled.value = true
   }
-  const refusal = adminFailure(failure)
-  if (refusal.kind === 'conflict' && refusal.reason === 'plan_conflict') {
-    error.value = t('admin.users.grant.planConflict')
-  } else {
-    const explained = await explain(failure, t('admin.users.gone'))
-    error.value = unsettled.value && explained ? `${explained} ${t('admin.users.grant.unsettled')}` : explained
-  }
+  const explained = await explain(failure, t('admin.users.gone'))
+  error.value = unsettled.value && explained ? `${explained} ${t('admin.users.grant.unsettled')}` : explained
   pending.value = false
 }
 </script>
 
 <template>
-  <UiModal :title="title" size="md" :busy="pending" @close="emit('close')">
-    <template #title>
-      <div class="heading">
-        <h2 class="title">{{ title }}</h2>
-        <p class="subtitle">{{ subtitle }}</p>
-      </div>
-    </template>
+  <UiModal :title="title" :subtitle="subtitle" size="md" :busy="pending" @close="emit('close')">
     <form id="admin-grant-form" class="form" novalidate @submit.prevent="submit">
       <UiSegmented v-if="plans.length" role="radiogroup" :aria-label="t('admin.users.grant.kind')">
         <button
@@ -215,7 +193,7 @@ async function submit() {
       <div v-else class="pair">
         <UiField v-slot="{ id, describedBy }" :label="t('admin.users.grant.plan')">
           <UiSelect :id="id" v-model="plan" :described-by="describedBy" :disabled="pending || unsettled">
-            <option v-for="option in plans" :key="option" :value="option">{{ option }}</option>
+            <option v-for="option in plans" :key="option" :value="option">{{ planLabel(option) }}</option>
           </UiSelect>
         </UiField>
         <UiField
@@ -264,23 +242,6 @@ async function submit() {
 </template>
 
 <style scoped>
-.heading {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.title {
-  font-size: var(--text-lg);
-  letter-spacing: var(--tracking-heading);
-}
-
-.subtitle {
-  color: var(--muted);
-  font-size: var(--text-xs);
-  overflow-wrap: anywhere;
-}
-
 .form {
   display: grid;
   gap: var(--space-3);

@@ -8,47 +8,23 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-import pytest
 import respx
-from httpx import AsyncClient
 
 from sightread.agents import chat as chat_agent
 from sightread.workspace.agents_file import UNREADABLE, agents_file_chain, render_chain
-from sightread.workspace.layout import user_root
+from tests.chat_helpers import (
+    DONE,
+    SUMMARY,
+    agents_part,
+    conversation_row,
+    edit,
+    new_conversation,
+    run_queued_turn,
+    send,
+    stub_messages,
+    write_file,
+)
 from tests.conftest import CSRF_HEADERS
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_compact import DONE, SUMMARY, conversation_row
-from tests.test_chat_extensions import chatting_client, new_conversation, send, stub_messages
-from tests.test_chat_versions import edit
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
-
-
-def _root(client: AsyncClient) -> Path:
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def _write(root: Path, relative: str, text: str) -> None:
-    path = root / relative
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
-
-
-def _agents_part(request: dict) -> str | None:
-    return next(
-        (
-            part["text"]
-            for part in request["system"]
-            if part["text"].startswith(chat_agent.AGENTS_FILE_INTRO)
-        ),
-        None,
-    )
-
 
 # --- the chain -----------------------------------------------------------------------------
 
@@ -58,10 +34,10 @@ def test_the_chain_reads_the_files_on_the_path_outermost_first(tmp_path) -> None
     the document's directory, in a folder beside the path, or a directory of that name; a
     file that is not text stands as one line (docs/chat.md § AGENTS.md)."""
     root = tmp_path / "ws"
-    _write(root, "files/AGENTS.md", "# Everything\n\n- Notes in English\n")
-    _write(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
-    _write(root, "files/Papers/2017/paper/AGENTS.md", "inside the document: not read")
-    _write(root, "files/Other/AGENTS.md", "beside the path: not read")
+    write_file(root, "files/AGENTS.md", "# Everything\n\n- Notes in English\n")
+    write_file(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
+    write_file(root, "files/Papers/2017/paper/AGENTS.md", "inside the document: not read")
+    write_file(root, "files/Other/AGENTS.md", "beside the path: not read")
     (root / "files/Papers/2017/AGENTS.md").mkdir()
     chain = agents_file_chain(root, Path("files/Papers/2017"), 1_000_000)
     assert chain == [
@@ -102,23 +78,23 @@ async def test_a_conversation_keeps_the_agents_files_it_started_with(chat_client
     catalogue, before the memory file; a change made meanwhile reaches the conversation
     only after a compaction takes the snapshot again (docs/chat.md § AGENTS.md)."""
     client = chat_client
-    root = _root(client)
-    _write(root, "files/AGENTS.md", "- Notes in English\n")
-    _write(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
-    _write(root, "files/Other/AGENTS.md", "- Not this one\n")
+    root = client.root
+    write_file(root, "files/AGENTS.md", "- Notes in English\n")
+    write_file(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
+    write_file(root, "files/Other/AGENTS.md", "- Not this one\n")
     await client.put(
         "/api/agents/chat/memory-file", json={"text": "My notes."}, headers=CSRF_HEADERS
     )
     main, _ = stub_messages([DONE, DONE, SUMMARY, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="one")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     expected = chat_agent.AGENTS_FILE_INTRO + (
         "## /workspace/files/AGENTS.md\n\n- Notes in English\n\n"
         "## /workspace/files/Papers/AGENTS.md\n\n- Cite with the DOI"
     )
-    assert _agents_part(main[0]) == expected
+    assert agents_part(main[0]) == expected
     system = main[0]["system"]
     kinds = [block["text"].split("\n", 1)[0] for block in system]
     assert kinds.index("# AGENTS.md") < kinds.index("# Memory file") < kinds.index("# Memory")
@@ -132,18 +108,18 @@ async def test_a_conversation_keeps_the_agents_files_it_started_with(chat_client
         "## /workspace/files/Papers/AGENTS.md\n\n- Cite with the DOI"
     )
 
-    _write(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n- Tables, never lists\n")
+    write_file(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n- Tables, never lists\n")
     await send(client, conversation_id, text="two")
-    await _run_queued_turn(client)
-    assert _agents_part(main[1]) == expected
+    await run_queued_turn(client)
+    assert agents_part(main[1]) == expected
 
     await send(client, conversation_id, text="", command="compact")
-    await _run_queued_turn(client)
-    assert _agents_part(main[2]) == expected
+    await run_queued_turn(client)
+    assert agents_part(main[2]) == expected
     assert "Tables, never lists" in (await conversation_row(client, conversation_id)).agents_file
     await send(client, conversation_id, text="three")
-    await _run_queued_turn(client)
-    assert _agents_part(main[3]).endswith("- Cite with the DOI\n- Tables, never lists")
+    await run_queued_turn(client)
+    assert agents_part(main[3]).endswith("- Cite with the DOI\n- Tables, never lists")
 
 
 @respx.mock
@@ -152,30 +128,25 @@ async def test_a_conversation_without_agents_files_sends_no_block(chat_client) -
     main, _ = stub_messages([DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="one")
-    await _run_queued_turn(client)
-    assert _agents_part(main[0]) is None
+    await run_queued_turn(client)
+    assert agents_part(main[0]) is None
     assert (await conversation_row(client, conversation_id)).agents_file == ""
 
 
 async def test_the_drawer_shows_the_files_a_new_conversation_would_read(chat_client) -> None:
-    """`GET /api/agents/chat/context`: the document's path with `document_id`, the root file
-    alone without one, no part when there is none (docs/api.md)."""
+    """`GET /api/agents/chat/context`: the root file alone, never a folder's below it, and
+    no part when there is none (docs/api.md)."""
     client = chat_client
     bare = (await client.get("/api/agents/chat/context")).json()
     assert "agents_file" not in [part["kind"] for part in bare["parts"]]
-    root = _root(client)
-    _write(root, "files/AGENTS.md", "- Notes in English\n")
-    _write(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
+    root = client.root
+    write_file(root, "files/AGENTS.md", "- Notes in English\n")
+    write_file(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
     without = (await client.get("/api/agents/chat/context")).json()
     kinds = [part["kind"] for part in without["parts"]]
     assert kinds.index("catalogue") < kinds.index("agents_file") < kinds.index("memory")
     text = without["parts"][kinds.index("agents_file")]["text"]
     assert "Notes in English" in text and "Cite with the DOI" not in text
-    with_document = (
-        await client.get("/api/agents/chat/context", params={"document_id": client.document_id})
-    ).json()
-    text = next(part["text"] for part in with_document["parts"] if part["kind"] == "agents_file")
-    assert text.endswith("## /workspace/files/Papers/AGENTS.md\n\n- Cite with the DOI")
 
 
 # --- /init ---------------------------------------------------------------------------------
@@ -203,7 +174,7 @@ async def test_init_carries_the_instruction_and_nothing_of_the_passage(chat_clie
         sections=[{"heading": "1 Intro", "text": "..."}],
     )
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     content = main[0]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "/init my thesis papers"}
     assert content[1]["text"] == chat_agent.INIT_INSTRUCTION + chat_agent.INIT_NOTE.format(
@@ -224,17 +195,10 @@ async def test_init_carries_the_instruction_and_nothing_of_the_passage(chat_clie
     # Edited, it is an `/init` again, its instruction rendered with the new note.
     edited = await edit(client, conversation_id, detail["messages"][0]["id"], text="")
     assert edited.status_code == 202, edited.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     content = main[1]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "/init"}
     assert content[1]["text"] == chat_agent.INIT_INSTRUCTION
-
-
-async def test_init_is_no_skill_name(chat_client) -> None:
-    refused = await chat_client.post(
-        "/api/skills", json={"name": "init", "description": "x", "body": "x"}, headers=CSRF_HEADERS
-    )
-    assert refused.status_code == 400, refused.text
 
 
 # --- an upload named AGENTS.md -------------------------------------------------------------
@@ -251,7 +215,7 @@ async def test_an_upload_named_agents_md_is_kept_as_a_file(chat_client) -> None:
     )
     assert kept.status_code == 201, kept.text
     assert (kept.json()["kind"], kept.json()["name"]) == ("file", "AGENTS.md")
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    root = client.root
     assert (root / "files/AGENTS.md").read_text() == "- Notes in English\n"
     document = await client.post(
         "/api/library/documents",

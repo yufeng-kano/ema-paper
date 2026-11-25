@@ -6,6 +6,7 @@
  * (`ViewerOutline`) and, where they do not fit, the header's button (`ViewerOutlineButton`).
  * Each places it; this draws it, opens scrolled to the current row, and hands Escape back.
  */
+import { blockKey } from '~/lib/blocks'
 import type { OutlineEntry } from '~/lib/markdown'
 
 const props = defineProps<{
@@ -56,7 +57,7 @@ function onKey(event: KeyboardEvent) {
 // Opened scrolled to the current row, which is where a reader looks first.
 onMounted(() => currentRow()?.scrollIntoView({ block: 'center' }))
 
-defineExpose({ root, focusCurrent })
+defineExpose({ focusCurrent })
 </script>
 
 <template>
@@ -71,7 +72,7 @@ defineExpose({ root, focusCurrent })
     <ul class="rows">
       <li
         v-for="(entry, index) in entries"
-        :key="`${entry.page}-${entry.index}`"
+        :key="blockKey(entry)"
         class="row"
         :class="{ deep: entry.level > 2, current: index === current }"
       >
@@ -113,7 +114,6 @@ defineExpose({ root, focusCurrent })
 <style scoped>
 /* The menu's floating surface; where it stands is its opener's to say. */
 .panel {
-  pointer-events: auto;
   width: 264px;
   overflow-y: auto;
   overscroll-behavior: contain;

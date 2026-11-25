@@ -31,6 +31,7 @@
 import {
   attachmentUrl,
   cancelTurn,
+  CHAT_AGENT,
   createConversation,
   createLibraryConversation,
   deleteConversation,
@@ -43,7 +44,6 @@ import {
   listConversations,
   listLibraryConversations,
   listMemories,
-  renameConversation,
   generateTitle,
   revertRevision,
   sendMessage,
@@ -58,13 +58,12 @@ import {
   type Conversation,
   type Memory,
 } from '~/lib/api'
-import { blockName, type NameText } from '~/lib/blocks'
+import { blockName } from '~/lib/blocks'
 import {
   COMPACT_COMMAND,
   INIT_COMMAND,
   RENAME_COMMAND,
   commandArguments,
-  formatBytes,
   type AskOutcome,
   type AskRequest,
   type ComposerPayload,
@@ -72,31 +71,42 @@ import {
 import { idleReloadDelay } from '~/lib/context'
 import { byRecency } from '~/lib/conversations'
 import { nodesToMarkdown } from '~/lib/copy'
-import { formatCount, formatDate } from '~/lib/format'
+import { formatBytes, formatCount, formatDate } from '~/lib/format'
 import { turnErrorKey, turnErrorNeedsPlan } from '~/lib/turnError'
-import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE, ROWS_DRAG_TYPE, claimDrag } from '~/lib/dnd'
+import {
+  ANSWER_DRAG_TYPE,
+  BLOCK_DRAG_TYPE,
+  ROWS_DRAG_TYPE,
+  carries,
+  carriesFiles,
+  claimDrag,
+  droppedFiles,
+  setDropEffect,
+} from '~/lib/dnd'
 import type { LibraryPlace } from '~/lib/library'
 import { basename, type LibraryStep } from '~/lib/steps'
 import {
   blockPlain,
-  documentOutline,
   findHeading,
   inlinePlain,
-  parseResultMarkdown,
-  placedBlocks,
+  parseBlocks,
+  passageKeys,
   readBlockAnchor,
   resolveAnchor,
   sectionSource,
   type CiteResolver,
   type OutlineEntry,
+  type PlacedBlock,
   type ResultBlock,
   type ResultPageBlocks,
 } from '~/lib/markdown'
 import type { MenuItem, Point } from '~/lib/menu'
 import {
+  appendFrames,
   applyMemoryEvent,
   buildThread,
   isLive,
+  isTurnEnd,
   type CardState,
   type ContextCardView,
   type EditCard,
@@ -105,10 +115,11 @@ import {
   type UndoState,
   type UserAttachment,
 } from '~/lib/thread'
-import type { StreamedEvent } from '~/composables/useConversationStream'
+import type { DragCardControls } from '~/components/DragCard.vue'
 import { libraryStepsKey } from '~/composables/useStepLabels'
 
-/** How long to wait before following a still-live turn again after the stream gave up. */
+/** How long to wait before trying the stream again after it gave up and the record could
+ *  not be read, while the last record read lists a live turn. */
 const RESUME_AFTER_MS = 10_000
 
 /** How close to the thread's end counts as at it: the thread follows a live turn only
@@ -122,14 +133,25 @@ const REOPEN_GUARD_MS = 300
 /** How many names of a sent selection the line above its bubble shows before an ellipsis. */
 const PICKED_NAMES_MAX = 3
 
+/** How many parsed messages the panel keeps (`messageBlocks`). */
+const PARSED_MESSAGES_MAX = 200
+
+/** The document as the viewer renders it, with the outline and the blocks in reading order
+ *  the viewer derives from it: its headings are what sections are added by, and its headings
+ *  and blocks what an answer's links lead to (docs/web.md § The agent panel, *Links*). */
+export interface DocumentIndex {
+  pages: ResultPageBlocks[]
+  outline: OutlineEntry[]
+  placed: PlacedBlock[]
+}
+
 const props = defineProps<{
   /** The document the thread is about; null in the Files page's card, about the library. */
   documentId: number | null
   /** The document pane's current selection, read at the moment a message is composed. */
   documentSelection: () => string | null
-  /** The document as the viewer renders it: its headings are what sections are added by
-   *  and what an answer's section links lead to. */
-  documentPages: () => ResultPageBlocks[]
+  /** The document, read when the panel needs it rather than handed over whole. */
+  documentIndex: () => DocumentIndex
   /** Where the heading of the section the document is scrolled to sits, if any. */
   currentSection: () => { page: number; index: number } | null
   /** The head's close is drawn. Not on a phone, where the agent is a pane the viewer's switch
@@ -213,6 +235,11 @@ const current = computed(
 )
 const title = computed(() => current.value?.title || t('chat.untitled'))
 
+/** One row's fields replaced in place: `patch` reads the row as it stands. */
+function patchRow(id: number, patch: (row: Conversation) => Partial<Conversation>) {
+  conversations.value = conversations.value.map((row) => (row.id === id ? { ...row, ...patch(row) } : row))
+}
+
 async function readConversations() {
   const request = ++listRequest
   listPending.value = true
@@ -290,7 +317,12 @@ function closeList(refocus: boolean) {
 
 /** The thread stops following while the list is open, as under a block's menu: a streamed
  *  frame's scroll would close a row's menu. It follows again as the list closes if it did as
- *  the list opened and the reader has not scrolled it since. */
+ *  the list opened and the reader has not scrolled it since.
+ *
+ *  A refusal said in the list is not said again once it closes. One that lands while it is
+ *  closed — the click elsewhere that kept a name also closed it — is said over the thread
+ *  until the list next opens and says it there (docs/web.md § The agent panel). Run before
+ *  the list unmounts, so the rename its unmount sends is not cleared with it. */
 let followedUnderList: { top: number } | null = null
 watch(
   () => list.value !== null,
@@ -299,20 +331,10 @@ watch(
     if (open) {
       followedUnderList = following ? { top } : null
       following = false
-    } else if (followedUnderList?.top === top) {
-      following = true
-    }
-  },
-)
-
-/** A refusal said in the list is not said again once it closes. One that lands while it is
- *  closed — the click elsewhere that kept a name also closed it — is said over the thread
- *  until the list next opens and says it there (docs/web.md § The agent panel). Run before
- *  the list unmounts, so the rename its unmount sends is not cleared with it. */
-watch(
-  () => list.value !== null,
-  (open) => {
-    if (!open) {
+    } else {
+      if (followedUnderList?.top === top) {
+        following = true
+      }
       renameError.value = null
     }
   },
@@ -344,17 +366,15 @@ async function renameRow(id: number, name: string) {
   renameError.value = null
   listChanged()
   countRename(id)
-  conversations.value = conversations.value.map((row) => (row.id === id ? { ...row, title: name } : row))
+  patchRow(id, () => ({ title: name }))
   try {
-    const saved = await renameConversation(id, name)
+    const saved = await updateConversation(id, { title: name })
     listChanged()
     countRename(id)
-    conversations.value = conversations.value.map((row) => (row.id === id ? { ...row, title: saved.title } : row))
+    patchRow(id, () => ({ title: saved.title }))
   } catch (error) {
     countRename(id)
-    conversations.value = conversations.value.map((row) =>
-      row.id === id && row.title === name ? { ...row, title: before } : row,
-    )
+    patchRow(id, (row) => (row.title === name ? { title: before } : {}))
     renameError.value = await resolve(error)
   }
 }
@@ -401,8 +421,10 @@ async function removeConversation() {
 
 // --- the open conversation --------------------------------------------------------
 
-const messages = ref<ChatMessage[]>([])
-const turns = ref<ChatTurn[]>([])
+/** The record of the open conversation. `shallowRef`: each is replaced whole, never
+ *  edited, and the thread is rebuilt from them on every streamed flush. */
+const messages = shallowRef<ChatMessage[]>([])
+const turns = shallowRef<ChatTurn[]>([])
 const detailError = ref<string | null>(null)
 const detailPending = ref(false)
 /** Load generation: a conversation switched away from must not fill the thread late. */
@@ -430,9 +452,7 @@ async function loadDetail(id: number) {
     // A rename sent or answered since this read began keeps its title: the read may predate it.
     const fresh = (renames.get(id) ?? 0) === renamed
     // The payload whole — the ring reads its context and clock from the row.
-    conversations.value = conversations.value.map((row) =>
-      row.id === id ? { ...row, ...detail.conversation, title: fresh ? detail.conversation.title : row.title } : row,
-    )
+    patchRow(id, (row) => ({ ...detail.conversation, title: fresh ? detail.conversation.title : row.title }))
   } catch (error) {
     if (seq === detailSeq) {
       detailError.value = await resolve(error)
@@ -449,16 +469,11 @@ async function select(id: number) {
     return
   }
   currentId.value = id
-  messages.value = []
-  turns.value = []
-  discardFrames()
   card.value = null
-  following = true
   // The cards' state stays: keyed by tool-call id, it belongs to the card, not to the
   // conversation now open, and a thread switched away from and back must not offer to
-  // revert a commit the reader already reverted (docs/web.md § Agent panel).
-  stream.open(id, 0)
-  await loadDetail(id)
+  // revert a commit the reader already reverted (docs/web.md § The agent panel, *Revert*).
+  await reloadBranch(id, null)
 }
 
 /** The conversation a refused first send made: empty, so never listed, and where the next
@@ -479,11 +494,8 @@ function openDraft() {
   detailSeq++
   detailPending.value = false
   detailError.value = null
-  messages.value = []
-  turns.value = []
-  discardFrames()
+  resetThread()
   card.value = null
-  following = true
 }
 
 /** *New conversation* — the head's button, the list's foot, `/new` — makes nothing on the
@@ -501,30 +513,31 @@ onMounted(loadConversations)
 
 // --- the document's sections ----------------------------------------------------------
 
-const outline = computed(() => documentOutline(props.documentPages()))
-/** The document's blocks in reading order, kept with the outline: what a block link's chip
- *  is resolved against on every render (docs/web.md § The agent panel, *Links*). */
-const placed = computed(() => placedBlocks(props.documentPages()))
+/** The placed blocks' passage keys, kept apart from the index so that only a block link
+ *  reads them: a document whose answers hold none never reads every block's text. */
+const placedKeys = computed(() => passageKeys(props.documentIndex().placed))
 
 /** Whether an answer's section link leads to a heading the document still has — or its
  *  block link, one with `~` in its anchor, to a block (docs/web.md § The agent panel,
  *  *Section links*, *Links*): one that does is a chip, one that does not reads as its plain
- *  text. Read as the answer renders, so it follows the document. */
-const resolveCite: CiteResolver = (label, anchor) =>
-  anchor.includes('~')
-    ? resolveAnchor(props.documentPages(), readBlockAnchor(anchor), outline.value, placed.value) !== null
-    : findHeading(outline.value, label, anchor) !== null
-/** With no document, a section or block link is still read, so it is drawn as its label
- *  rather than its source, but leads nowhere: its plain text, as a heading that is gone. */
-const answerCite = computed<CiteResolver>(() => (props.documentId === null ? () => false : resolveCite))
+ *  text. Read as the answer renders, so it follows the document. The Files page's card has
+ *  no pages, so no link resolves there. */
+const resolveCite: CiteResolver = (label, anchor) => {
+  const { pages, outline, placed } = props.documentIndex()
+  return anchor.includes('~')
+    ? resolveAnchor(pages, readBlockAnchor(anchor), outline, placed, placedKeys.value) !== null
+    : findHeading(outline, label, anchor) !== null
+}
 
 function currentSectionEntry(): OutlineEntry | null {
   const at = props.currentSection()
-  return at ? (outline.value.find((entry) => entry.page === at.page && entry.index === at.index) ?? null) : null
+  return at
+    ? (props.documentIndex().outline.find((entry) => entry.page === at.page && entry.index === at.index) ?? null)
+    : null
 }
 
 function sectionSourceOf(entry: OutlineEntry): string | null {
-  return sectionSource(props.documentPages(), entry.page, entry.index)
+  return sectionSource(props.documentIndex().pages, entry.page, entry.index)
 }
 
 /** A click on a section link in an answer: the viewer scrolls there. Taken here, from the
@@ -591,10 +604,8 @@ const shownMemories = computed(() => (memoriesStale.value && memoriesError.value
 /** Turns the panel knows are over: the record says so, or their terminal frame has come. */
 function endedTurns(): Set<string> {
   const ended = new Set(turns.value.filter((turn) => !isLive(turn)).map((turn) => turn.id))
-  for (const frame of events.value) {
-    if (frame.event.event === 'turn_done' || frame.event.event === 'turn_error') {
-      ended.add(frame.event.turn_id)
-    }
+  for (const turnId of endedIds) {
+    ended.add(turnId)
   }
   return ended
 }
@@ -605,7 +616,7 @@ function endedTurns(): Set<string> {
  * read as undone for a round trip. A replayed frame of a turn already over is left to the read
  * that follows — the list may well be newer than it. `live` says which turns are running.
  */
-function applyMemoryFrames(frames: readonly StreamedEvent[], live: (turnId: string) => boolean) {
+function applyMemoryFrames(frames: readonly ChatEvent[], live: (turnId: string) => boolean) {
   if (memories.value === null) {
     return
   }
@@ -615,7 +626,7 @@ function applyMemoryFrames(frames: readonly StreamedEvent[], live: (turnId: stri
     now: new Date().toISOString(),
   }
   let rows = memories.value
-  for (const { event } of frames) {
+  for (const event of frames) {
     if (event.event === 'memory' && live(event.turn_id)) {
       rows = applyMemoryEvent(rows, event, context)
     }
@@ -625,15 +636,10 @@ function applyMemoryFrames(frames: readonly StreamedEvent[], live: (turnId: stri
 
 onMounted(loadMemories)
 
-/** A memory pinned, edited or deleted in the settings dialog over this panel: the dialog
- *  keeps the panel mounted, so the change is read here rather than on a remount. */
-const { version: contextVersion } = useAgentContextVersion()
-watch(contextVersion, () => void memoriesChanged())
-
 // --- the model pill and the context ring (docs/web.md § The agent panel) ---------------
 
 /** The chat agent's settings — its model, effort and the idle-compaction switch — as last
- *  read; read again whenever the Agent page saves. */
+ *  read; read again whenever the Agent settings section saves. */
 const agentSettings = ref<AgentSettings | null>(null)
 let agentSettingsRequest = 0
 
@@ -641,7 +647,7 @@ async function loadAgentSettings() {
   const request = ++agentSettingsRequest
   try {
     const { agents } = await listAgents()
-    const chat = agents.find((agent) => agent.name === 'chat')
+    const chat = agents.find((agent) => agent.name === CHAT_AGENT)
     if (request === agentSettingsRequest && chat) {
       agentSettings.value = chat.settings
     }
@@ -651,7 +657,15 @@ async function loadAgentSettings() {
 }
 
 onMounted(loadAgentSettings)
-watch(contextVersion, () => void loadAgentSettings())
+
+/** A memory pinned, edited or deleted, or the Agent settings saved, in the settings dialog
+ *  over this panel: the dialog keeps the panel mounted, so the change is read here rather
+ *  than on a remount. */
+const { version: contextVersion } = useAgentContextVersion()
+watch(contextVersion, () => {
+  void memoriesChanged()
+  void loadAgentSettings()
+})
 
 function onAgentSaved(settings: AgentSettings) {
   agentSettingsRequest++
@@ -661,7 +675,7 @@ function onAgentSaved(settings: AgentSettings) {
 /** The open conversation moved to another model: its row as the server answered. */
 function onConversationMoved(moved: Conversation) {
   listChanged()
-  conversations.value = conversations.value.map((row) => (row.id === moved.id ? { ...row, ...moved } : row))
+  patchRow(moved.id, () => moved)
 }
 
 function onExtrasError(message: string) {
@@ -670,7 +684,7 @@ function onExtrasError(message: string) {
 
 /** **Compact now**: the conversation open, no turn in flight, an answer since the last
  *  summary (docs/chat.md § Compaction). */
-const canCompact = computed(() => current.value !== null && !running.value && current.value.compactable === true)
+const canCompact = computed(() => current.value !== null && !running.value && current.value.compactable)
 
 function compactNow() {
   if (!canCompact.value) {
@@ -718,16 +732,21 @@ function usedExpanded(item: FootItem): UsedPart | null {
 
 // --- the stream --------------------------------------------------------------------
 
-/** Every frame of the open conversation, replayed and live. `shallowRef`: frames are
- *  appended in batches and never edited, and a deep proxy over thousands of deltas would
- *  cost more than it reads. */
-const events = shallowRef<StreamedEvent[]>([])
-let pendingFrames: StreamedEvent[] = []
+/** The frames of the open conversation, replayed and live, by turn — by the id every frame
+ *  carries, never by position, since a turn whose load failed emits only its `turn_error`.
+ *  `shallowRef`, replaced once per batch: a turn the batch touches gets a new array and
+ *  every other turn keeps its own, and a deep proxy over thousands of deltas would cost more
+ *  than it reads. */
+const groups = shallowRef(new Map<string, ChatEvent[]>())
+/** The turns whose terminal frame has come. */
+let endedIds = new Set<string>()
+/** How many frames the thread holds: it is followed to its end as they grow. */
+const frameCount = ref(0)
+let pendingFrames: ChatEvent[] = []
 let flushTimer: ReturnType<typeof setTimeout> | null = null
-/** An `edit` of a turn the record still lists as unfinished arrived since the last flush:
- *  the viewer must reload. Decided as the frame arrives — an `edit` and the `turn_done`
- *  behind it can share a batch, by which time the stream no longer counts as active. */
-let liveEdit = false
+/** An `edit` frame arrived since the last flush: the viewer reloads its files, once per
+ *  batch. */
+let edited = false
 /** A `download_file` result that kept a file, or a `convert_file` result that made one a
  *  document, arrived since the last flush: the Files page behind the viewer must read its
  *  library again. A replayed one asks for a read too — one request, never wrong. */
@@ -740,9 +759,11 @@ function discardFrames() {
     flushTimer = null
   }
   pendingFrames = []
-  liveEdit = false
+  edited = false
   filed = false
-  events.value = []
+  groups.value = new Map()
+  endedIds = new Set()
+  frameCount.value = 0
 }
 
 /** Frames land in bursts — a replay is thousands of them — so they are folded into the
@@ -754,28 +775,26 @@ function flushFrames() {
   }
   const batch = pendingFrames
   pendingFrames = []
-  const memoryFrames = batch.filter((frame) => frame.event.event === 'memory')
+  const memoryFrames = batch.filter((event) => event.event === 'memory')
   // The library's changes, and the ends of turns that may have made them (library mode).
   const libraryFrames =
     props.documentId === null
-      ? batch.filter(
-          (frame) =>
-            (frame.event.event === 'tool_result' && frame.event.library) ||
-            frame.event.event === 'turn_done' ||
-            frame.event.event === 'turn_error',
-        )
+      ? batch.filter((event) => (event.event === 'tool_result' && event.library) || isTurnEnd(event))
       : []
   // Which turns were running is read before this batch joins the thread: a turn's terminal
   // frame follows its memory frames, often in the same batch (a Stop during a save), and must
   // not make that save read as a replay. A turn the panel does not know yet — a replay racing
   // the record — counts as running only while this batch does not end it.
   const endedBefore = memoryFrames.length || libraryFrames.length ? endedTurns() : null
-  const liveBefore = new Set(turns.value.filter(isLive).map((turn) => turn.id))
-  events.value = events.value.concat(batch)
-  // A replayed edit of a finished turn changed nothing since the viewer loaded; one of a
-  // turn still in flight did. One reload covers however many landed in this batch.
-  if (liveEdit) {
-    liveEdit = false
+  groups.value = appendFrames(groups.value, batch)
+  for (const event of batch) {
+    if (isTurnEnd(event)) {
+      endedIds.add(event.turn_id)
+    }
+  }
+  frameCount.value += batch.length
+  if (edited) {
+    edited = false
     emit('changed')
   }
   if (filed) {
@@ -784,6 +803,7 @@ function flushFrames() {
   }
   // A memory saved, changed or forgotten: its line's state is read from the list.
   if (endedBefore) {
+    const liveBefore = new Set(turns.value.filter(isLive).map((turn) => turn.id))
     const endedNow = endedTurns()
     const live = (turnId: string) => !endedBefore.has(turnId) && (liveBefore.has(turnId) || !endedNow.has(turnId))
     if (memoryFrames.length) {
@@ -796,7 +816,7 @@ function flushFrames() {
     // frame of a turn long over changed nothing since the page read its library.
     const records: LibraryStep[] = []
     let turnEnded = false
-    for (const { event } of libraryFrames) {
+    for (const event of libraryFrames) {
       if (event.event === 'tool_result' && event.library && live(event.turn_id)) {
         records.push(event.library)
       } else if (event.event !== 'tool_result' && !endedBefore.has(event.turn_id)) {
@@ -807,9 +827,7 @@ function flushFrames() {
       emit('library', records)
     }
   }
-  const ended = batch.some(
-    (frame) => frame.event.event === 'turn_done' || frame.event.event === 'turn_error',
-  )
+  const ended = batch.some(isTurnEnd)
   if (ended && currentId.value !== null) {
     // The runner has now stored the assistant message and the turn's outcome; the thread
     // switches from the events to the record.
@@ -818,34 +836,36 @@ function flushFrames() {
 }
 
 const stream = useConversationStream(
-  (frame) => {
-    if (frame.event.event === 'edit') {
+  (event) => {
+    if (event.event === 'edit') {
       // Every edit frame reloads the document, replayed ones included: the content was
       // fetched on its own, and nothing says the edit came before it (docs/web.md).
-      liveEdit = true
+      edited = true
     }
     if (
-      frame.event.event === 'tool_result' &&
-      (frame.event.name === 'convert_file' || (frame.event.name === 'download_file' && !frame.event.is_error))
+      event.event === 'tool_result' &&
+      (event.name === 'convert_file' || (event.name === 'download_file' && !event.is_error))
     ) {
       filed = true
     }
-    pendingFrames.push(frame)
+    pendingFrames.push(event)
     if (flushTimer === null) {
       flushTimer = setTimeout(flushFrames, 16)
     }
   },
   () => {
-    // Six silent drops: the record decides. A turn it still lists as live is waited on
-    // again — a fresh retry budget after a pause, until the record says it ended.
+    // Six silent drops: the record decides. A turn it still lists as live is followed
+    // again at once by the read itself (expectTurn reconnects with a fresh retry budget).
+    // Only a read that failed leaves the stream down: then, unless something else has
+    // reopened it meanwhile, the panel tries again after a pause.
     const id = currentId.value
     if (id === null) {
       return
     }
     void loadDetail(id).then(() => {
-      if (currentId.value === id && turns.value.some(isLive)) {
+      if (currentId.value === id && !stream.active.value && turns.value.some(isLive)) {
         setTimeout(() => {
-          if (currentId.value === id) {
+          if (currentId.value === id && !stream.active.value && turns.value.some(isLive)) {
             stream.resume()
           }
         }, RESUME_AFTER_MS)
@@ -853,21 +873,6 @@ const stream = useConversationStream(
     })
   },
 )
-
-/** The frames of each turn, by the id every frame carries — never by position, since a
- *  turn whose load failed emits only its `turn_error`. */
-const groups = computed(() => {
-  const out = new Map<string, ChatEvent[]>()
-  for (const frame of events.value) {
-    const list = out.get(frame.event.turn_id)
-    if (list) {
-      list.push(frame.event)
-    } else {
-      out.set(frame.event.turn_id, [frame.event])
-    }
-  }
-  return out
-})
 
 // --- the thread --------------------------------------------------------------------
 
@@ -1009,7 +1014,7 @@ watch(
 const offersPack = computed(() => canTopUp.value && topUp.pack !== null)
 const creditsNotice = computed(() => {
   const me = auth.me.value
-  return offersPack.value && me?.period_end
+  return offersPack.value && me
     ? t('chat.blockedCreditsPack', { date: formatDate(me.period_end, locale.value) })
     : t('chat.blockedCredits')
 })
@@ -1085,7 +1090,7 @@ function keepThreadFoot() {
 
 /** Keeps the end in view as the thread grows, while it is followed. */
 watch(
-  () => [items.value.length, events.value.length],
+  () => [items.value.length, frameCount.value],
   async () => {
     if (!following) {
       return
@@ -1100,20 +1105,24 @@ watch(
 
 /** Parsed messages by text: the panel re-renders on every streamed delta, and re-parsing
  *  every answer in a long thread each time would make typing stutter. Streaming makes many
- *  short-lived texts, so the cache is simply emptied once it grows. */
+ *  short-lived texts, so the cache keeps the most recently read ones: the map's insertion
+ *  order is its recency, and the least recently read text is evicted past the cap. The
+ *  answers on screen are read on every render, so it is the streamed prefixes that age out. */
 const parsedMessages = new Map<string, ResultBlock[]>()
 
 /** A message as the blocks the viewer's parser reads in it — markdown and TeX drawn, not
  *  shown as source. */
 function messageBlocks(text: string): ResultBlock[] {
   let blocks = parsedMessages.get(text)
-  if (!blocks) {
-    if (parsedMessages.size > 200) {
-      parsedMessages.clear()
+  if (blocks) {
+    parsedMessages.delete(text)
+  } else {
+    blocks = parseBlocks(text)
+    if (parsedMessages.size >= PARSED_MESSAGES_MAX) {
+      parsedMessages.delete(parsedMessages.keys().next().value!)
     }
-    blocks = parseResultMarkdown(text).flatMap((page) => page.blocks)
-    parsedMessages.set(text, blocks)
   }
+  parsedMessages.set(text, blocks)
   return blocks
 }
 
@@ -1152,7 +1161,6 @@ function turnErrorLine(text: string): string {
 /** The message being edited in place: which one, the text as the reader has it — a
  *  command's arguments, for a command — and the edit's state. */
 interface Editing {
-  messageId: number
   item: UserItem
   text: string
   pending: boolean
@@ -1167,9 +1175,7 @@ const editorInput = ref<HTMLTextAreaElement | HTMLTextAreaElement[] | null>(null
 function canAct(item: UserItem): boolean {
   return (
     !running.value &&
-    item.messageId !== null &&
-    item.messageId > 0 &&
-    editing.value?.messageId !== item.messageId &&
+    editing.value?.item.messageId !== item.messageId &&
     turns.value.some((turn) => turn.id === item.turnId)
   )
 }
@@ -1190,10 +1196,10 @@ function onEditorInput(event: Event) {
 }
 
 function startEdit(item: UserItem) {
-  if (!canAct(item) || item.messageId === null) {
+  if (!canAct(item)) {
     return
   }
-  editing.value = { messageId: item.messageId, item, text: userText(item), pending: false, error: null }
+  editing.value = { item, text: userText(item), pending: false, error: null }
   void nextTick(() => {
     const input = Array.isArray(editorInput.value) ? editorInput.value[0] : editorInput.value
     if (input) {
@@ -1233,15 +1239,19 @@ function onEditorKeydown(event: KeyboardEvent) {
   }
 }
 
-/** The thread read again on another branch — after an edit, after a version switch: the
- *  stream from 0 and the record, as when a conversation is opened; `turnId` the turn an
- *  edit queued, followed from here. */
-async function reloadBranch(id: number, turnId: string | null) {
+/** Empties the thread — its record and its frames — and follows its end again. */
+function resetThread() {
   messages.value = []
   turns.value = []
   discardFrames()
   following = true
-  stream.open(id, 0)
+}
+
+/** The thread read again — a conversation opened, after an edit, after a version switch:
+ *  the stream from 0 and the record; `turnId` the turn an edit queued, followed from here. */
+async function reloadBranch(id: number, turnId: string | null) {
+  resetThread()
+  stream.open(id)
   if (turnId) {
     stream.expectTurn(turnId)
   }
@@ -1257,7 +1267,7 @@ async function saveEdit() {
   state.pending = true
   state.error = null
   try {
-    const { turn_id } = await editMessage(id, state.messageId, { text: state.text, locale: locale.value })
+    const { turn_id } = await editMessage(id, state.item.messageId, { text: state.text, locale: locale.value })
     editing.value = null
     if (currentId.value === id) {
       await reloadBranch(id, turn_id)
@@ -1290,7 +1300,7 @@ async function showVersion(item: UserItem, step: 1 | -1) {
     if (currentId.value !== id) {
       return
     }
-    conversations.value = conversations.value.map((entry) => (entry.id === id ? { ...entry, ...row } : entry))
+    patchRow(id, () => row)
     await reloadBranch(id, null)
   } catch (error) {
     detailError.value = await resolve(error)
@@ -1303,7 +1313,7 @@ function imageSource(item: UserItem, attachment: UserAttachment): string | null 
   if (attachment.preview) {
     return attachment.preview
   }
-  if (item.messageId === null || item.messageId < 0 || currentId.value === null) {
+  if (currentId.value === null) {
     return null
   }
   return attachmentUrl(currentId.value, item.messageId, attachment.index)
@@ -1404,7 +1414,7 @@ const cardError = ref<string | null>(null)
 /**
  * Revert writes the file as it was before the edit's commit, as a new commit; that new
  * commit is what *Apply again* reverts in turn, and so on — undo is itself a revision
- * (docs/workspace.md § Revisions). The revision list, newest first, names each one.
+ * (docs/workspace.md § Revisions).
  */
 async function toggleEdit(card: EditCard) {
   const state = cardState(card)
@@ -1520,10 +1530,10 @@ async function renameFromComposer(text: string): Promise<boolean> {
   listChanged()
   countRename(id)
   try {
-    const saved = text ? await renameConversation(id, text) : await generateTitle(id, locale.value)
+    const saved = text ? await updateConversation(id, { title: text }) : await generateTitle(id, locale.value)
     listChanged()
     countRename(id)
-    conversations.value = conversations.value.map((row) => (row.id === id ? { ...row, title: saved.title } : row))
+    patchRow(id, () => ({ title: saved.title }))
     return true
   } catch (error) {
     countRename(id)
@@ -1587,7 +1597,7 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
         return true
       }
       currentId.value = id
-      stream.open(id, 0)
+      stream.open(id)
     } else if (currentId.value !== id) {
       // The reader switched threads while the send was in flight: the turn belongs to
       // the thread it was sent to, which shows it when it is opened again. What was sent
@@ -1604,9 +1614,8 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
     messages.value = [
       ...messages.value,
       {
-        // The stored id, so an attached image's bytes can be asked for once its preview
-        // is gone; negative only if the server named none, so it never meets a stored one.
-        id: message_id ?? -(messages.value.length + 1),
+        // The stored id, so an attached image's bytes can be asked for once its preview is gone.
+        id: message_id,
         role: 'user',
         content: sentContent(payload),
         turn_id,
@@ -1621,7 +1630,9 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
         kind: payload.command === COMPACT_COMMAND ? 'compact' : 'message',
         status: 'queued',
         error: null,
+        credits: null,
         finished_at: null,
+        versions: null,
       },
     ]
     stream.expectTurn(turn_id)
@@ -1650,12 +1661,6 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
       draftSending = false
     }
   }
-}
-
-/** What a turn cost, from the record (`credits` is settled once the turn ends and the
- *  record is read again); null until then (docs/billing.md § Routes). */
-function turnCredits(turnId: string): number | null {
-  return turns.value.find((turn) => turn.id === turnId)?.credits ?? null
 }
 
 const stopping = ref(false)
@@ -1785,21 +1790,13 @@ const pressedBlock = ref<string | null>(null)
 const draggedBlock = ref<string | null>(null)
 /** The open menu's block by where it is, not as it read then: a live answer grows under it. */
 const blockMenu = ref<{ at: Point; key: string; itemKey: string; index: number; fromKey: boolean } | null>(null)
-const dragCard = ref<HTMLElement | null>(null)
+const dragCard = ref<DragCardControls | null>(null)
 let blockMenuClosedAt = 0
 let blockMenuClosedBy: EventTarget | null = null
 let blockMenuClosedKey: string | null = null
 
 /** What a handle calls its block, as the document's handles do. */
-const nameText = computed<NameText>(() => ({
-  formula: t('viewer.names.formula'),
-  formulaTag: (tag) => t('viewer.names.formulaTag', { tag }),
-  quoted: (words) => t('viewer.names.quoted', { words }),
-  figure: (words) => t('viewer.names.figure', { name: t('viewer.names.quoted', { words }) }),
-  figureBare: t('viewer.names.figureBare'),
-  image: (words) => t('viewer.names.image', { name: t('viewer.names.quoted', { words }) }),
-  imageBare: t('viewer.names.imageBare'),
-}))
+const { nameText } = useBlockNames()
 
 function handleShown(key: string): boolean {
   return (
@@ -1875,12 +1872,7 @@ function onBlockDragStart(event: DragEvent, key: string, block: ResultBlock) {
   transfer.setData(BLOCK_DRAG_TYPE, '[]')
   transfer.setData(ANSWER_DRAG_TYPE, '')
   transfer.setData('text/plain', block.src)
-  const card = dragCard.value
-  const text = card?.querySelector('.drag-card-text')
-  if (card && text) {
-    text.textContent = blockPlain(block) || blockName(block, nameText.value)
-    transfer.setDragImage(card, 12, 14)
-  }
+  dragCard.value?.paint(transfer, blockPlain(block) || blockName(block, nameText.value))
 }
 
 /** The menu's block as it reads now, or null when the answer it was in is gone or stored
@@ -1969,20 +1961,14 @@ const dragging = ref<'files' | 'rows' | null>(null)
 /** Enter and leave fire for every child the drag crosses: the zone stays while any holds it. */
 let dragDepth = 0
 
-function carriesFiles(event: DragEvent): boolean {
-  return Array.from(event.dataTransfer?.types ?? []).includes('Files')
-}
-
 /** What a drag over the panel brings: files to attach, or — in the Files page's card — the
  *  page's own rows, which attach no bytes and bring the selection chip back (docs/web.md
  *  § The Files page's Agent card). */
 function dragKind(event: DragEvent): 'files' | 'rows' | null {
-  if (carriesFiles(event)) {
+  if (carriesFiles(event.dataTransfer)) {
     return 'files'
   }
-  return props.documentId === null && Array.from(event.dataTransfer?.types ?? []).includes(ROWS_DRAG_TYPE)
-    ? 'rows'
-    : null
+  return props.documentId === null && carries(event.dataTransfer, ROWS_DRAG_TYPE) ? 'rows' : null
 }
 
 function onDragEnter(event: DragEvent) {
@@ -2004,9 +1990,7 @@ function onDragOver(event: DragEvent) {
   // claimed, so the page behind does not refuse it as a drop nothing wants.
   event.preventDefault()
   claimDrag(event, 'attach')
-  if (event.dataTransfer) {
-    event.dataTransfer.dropEffect = running.value ? 'none' : 'copy'
-  }
+  setDropEffect(event, running.value ? 'none' : 'copy')
 }
 
 function onDragLeave(event: DragEvent) {
@@ -2035,7 +2019,7 @@ function onDrop(event: DragEvent) {
     return
   }
   if (kind === 'files') {
-    composer.value?.addFiles(Array.from(event.dataTransfer?.files ?? []))
+    composer.value?.addFiles(droppedFiles(event))
   } else {
     // The page makes the rows the selection again, in the folder they came from — a folder
     // the drag sprang open on its way had cleared it — and the chip comes back.
@@ -2164,10 +2148,7 @@ onBeforeUnmount(() => {
     />
 
     <!-- An answer block's drag picture, written as the drag starts; never seen in place. -->
-    <div ref="dragCard" class="drag-card" aria-hidden="true">
-      <UiIcon name="grip-vertical" />
-      <span class="drag-card-text" />
-    </div>
+    <DragCard ref="dragCard" />
 
     <div
       ref="scroller"
@@ -2224,7 +2205,7 @@ onBeforeUnmount(() => {
           <!-- The bubble as an editor, in place: the text alone changes; a command stays, and
                what went with the message is sent again as stored (docs/web.md § The agent
                panel, *Editing a sent message*). -->
-          <div v-if="editing && editing.messageId === item.messageId" class="user-editor">
+          <div v-if="editing && editing.item.messageId === item.messageId" class="user-editor">
             <span v-if="item.command" class="user-editor-command mono">/{{ item.command }}</span>
             <textarea
               ref="editorInput"
@@ -2303,7 +2284,7 @@ onBeforeUnmount(() => {
           <template v-for="(block, index) in messageBlocks(item.text)" :key="index">
             <!-- A comment draws nothing, and takes no wrapper that would count as a block. -->
             <div v-if="block.kind !== 'comment'" class="answer-block" :data-answer-block="`${item.key}:${index}`">
-              <MdBlock :block="block" :cite="answerCite" links :files="documentId === null" />
+              <MdBlock :block="block" :cite="resolveCite" links :files="documentId === null" />
               <!-- After the block, so a heading stays its wrapper's first child. -->
               <div
                 v-if="handleShown(`${item.key}:${index}`)"
@@ -2345,8 +2326,8 @@ onBeforeUnmount(() => {
         <div v-else-if="item.kind === 'foot'" class="answer-foot" :class="{ dimmed: position < thread.dimBefore }">
           <UiCopyButton :text="item.text" size="xs" :label="t('chat.copyAnswer')" />
           <!-- The turn's credits: a cost figure, so in the accent (docs/web.md § The agent panel). -->
-          <span v-if="turnCredits(item.turnId) !== null" class="answer-credits tabular">
-            {{ t('credits.n', { n: formatCount(turnCredits(item.turnId)!, locale) }, turnCredits(item.turnId)!) }}
+          <span v-if="item.credits !== null" class="answer-credits tabular">
+            {{ t('credits.n', { n: formatCount(item.credits, locale) }, item.credits) }}
           </span>
           <ChatUsedLine
             v-if="item.used"
@@ -2365,7 +2346,6 @@ onBeforeUnmount(() => {
           :open-steps="openSteps"
           :card-state="cardState"
           :locked="running"
-          :revertable="documentId !== null"
           :undo-state="undoState"
           @toggle="toggleGroup(item)"
           @toggle-step="toggleStep"
@@ -2383,8 +2363,6 @@ onBeforeUnmount(() => {
           :open-steps="openSteps"
           :card-state="cardState"
           :locked="running"
-          :revertable="documentId !== null"
-          :files="documentId === null"
           @toggle="toggleCard(item)"
           @toggle-step="toggleStep"
           @toggle-edit="toggleEdit"
@@ -2426,12 +2404,12 @@ onBeforeUnmount(() => {
               {{ summaryOpen.has(item.key) ? t('chat.hideSummary') : t('chat.viewSummary') }}
             </button>
           </div>
-          <span v-if="turnCredits(item.turnId) !== null" class="answer-credits tabular">
-            {{ t('credits.n', { n: formatCount(turnCredits(item.turnId)!, locale) }, turnCredits(item.turnId)!) }}
+          <span v-if="item.credits !== null" class="answer-credits tabular">
+            {{ t('credits.n', { n: formatCount(item.credits, locale) }, item.credits) }}
           </span>
           <div v-if="summaryOpen.has(item.key)" class="compact-summary md-message md-side">
             <template v-for="(block, blockIndex) in messageBlocks(item.summary)" :key="blockIndex">
-              <MdBlock v-if="block.kind !== 'comment'" :block="block" :cite="answerCite" links :files="documentId === null" />
+              <MdBlock v-if="block.kind !== 'comment'" :block="block" :cite="resolveCite" links :files="documentId === null" />
             </template>
           </div>
         </div>
@@ -2444,7 +2422,10 @@ onBeforeUnmount(() => {
           sendBlock === 'credits'
             ? creditsNotice
             : storage
-              ? t('chat.blockedStorage', { used: formatBytes(storage.bytes), quota: formatBytes(storage.quota) })
+              ? t('chat.blockedStorage', {
+                  used: formatBytes(storage.bytes, locale),
+                  quota: formatBytes(storage.quota, locale, { limit: true }),
+                })
               : t('chat.blockedStorageBare')
         }}
         <template v-if="topUp.error"> {{ topUp.error }}</template>
@@ -2463,7 +2444,7 @@ onBeforeUnmount(() => {
       :stopping="stopping"
       :limits="limits"
       :document-selection="documentSelection"
-      :outline="outline"
+      :outline="documentIndex().outline"
       :current-section="currentSectionEntry"
       :section-source="sectionSourceOf"
       :submit="submit"
@@ -2512,7 +2493,7 @@ onBeforeUnmount(() => {
     <div v-if="dragging" class="drop-zone" aria-hidden="true">
       <p class="drop-title">{{ dragging === 'rows' ? t('chat.dropRows') : t('chat.dropToAttach') }}</p>
       <p v-if="dragging === 'files' && maxAttachmentBytes" class="drop-kinds">
-        {{ t('chat.dropKinds', { size: formatBytes(maxAttachmentBytes) }) }}
+        {{ t('chat.dropKinds', { size: formatBytes(maxAttachmentBytes, locale, { limit: true }) }) }}
       </p>
     </div>
 
@@ -2943,39 +2924,6 @@ onBeforeUnmount(() => {
 .answer-handle > :deep(svg) {
   width: 16px;
   height: 16px;
-}
-
-/* The drag's picture, as the document's: off screen until the browser takes it. */
-.drag-card {
-  position: fixed;
-  top: -1000px;
-  left: -1000px;
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  max-width: 280px;
-  padding: var(--space-1) var(--space-3) var(--space-1) var(--space-2);
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: var(--paper);
-  box-shadow: var(--shadow-menu);
-  color: var(--ink);
-  font-size: var(--text-sm);
-  white-space: nowrap;
-  pointer-events: none;
-}
-
-.drag-card > :deep(svg) {
-  flex: none;
-  width: 16px;
-  height: 16px;
-  color: var(--faint);
-}
-
-.drag-card-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 /* The memory lines and the foot belong to the answer above them, not to the thread's rhythm:

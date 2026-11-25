@@ -1,29 +1,25 @@
 """Single-use upload tickets for the MCP `parse` tool (docs/auth.md § 5).
 
 Format ``srt_<32 url-safe chars>``. Returned by the tool exactly once, stored as a SHA-256
-hash plus a display string. A ticket is worth one `POST /v1/parse` — a parse, or the retry
-of a failed one — and then only reads of the job that upload created — never an API key's
-rights, never `/mcp`.
+hash. A ticket is worth one `POST /v1/parse` — a parse, or the retry of a failed one — and
+then only reads of the job that upload created — never an API key's rights, never `/mcp`.
 """
 
 from __future__ import annotations
 
-import hmac
-import secrets
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..db.models import UploadTicket, User, utcnow
 from ..errors import ApiError
-from .crypto import hash_token
+from .crypto import hash_token, new_token
+from .tickets import check_rate, delete_expired, resolve_ticket
 
 TICKET_PREFIX = "srt_"
-TICKET_RANDOM_CHARS = 32
-MINT_WINDOW = timedelta(hours=1)
 
 # The agent's only recovery hint, so it travels in the 401 body itself (docs/auth.md § 5).
 REJECTION_MESSAGE = (
@@ -33,26 +29,16 @@ REJECTION_MESSAGE = (
 )
 
 
-def generate_ticket() -> str:
-    # token_urlsafe(24) is exactly 32 url-safe characters.
-    return TICKET_PREFIX + secrets.token_urlsafe(24)[:TICKET_RANDOM_CHARS]
-
-
-def display_prefix(token: str) -> str:
-    """The `srt_...abc4` form stored alongside the hash."""
-    return f"{TICKET_PREFIX}...{token[-4:]}"
-
-
 async def check_mint_rate(db: AsyncSession, settings: Settings, user_id: int) -> None:
     """429 once the user minted `UPLOAD_TICKET_RATE_PER_HOUR` tickets in the last hour:
     `mint`'s own check, and the parse tool's before it makes a folder for the ticket."""
-    minted = await db.scalar(
-        select(func.count())
-        .select_from(UploadTicket)
-        .where(UploadTicket.user_id == user_id, UploadTicket.created_at > utcnow() - MINT_WINDOW)
+    await check_rate(
+        db,
+        UploadTicket,
+        user_id,
+        settings.upload_ticket_rate_per_hour,
+        "Too many upload tickets minted; retry later",
     )
-    if minted >= settings.upload_ticket_rate_per_hour:
-        raise ApiError(429, "rate_limit", "Too many upload tickets minted; retry later")
 
 
 async def mint(
@@ -60,37 +46,27 @@ async def mint(
     settings: Settings,
     user: User,
     *,
-    library_access: bool = False,
     into_library: bool = False,
     folder_id: int | None = None,
 ) -> tuple[UploadTicket, str]:
     """Issue a ticket for this user, tidying up their dead ones on the way.
 
-    The rate limit counts tickets *minted* in the last hour, before cleanup, so a short TTL
-    cannot dilute it. Commits, and returns the row plus the plaintext shown exactly once.
+    The rate limit counts tickets minted in the last hour, expired ones included: the
+    cleanup leaves those the hour still counts. Commits, and returns the row plus the
+    plaintext shown exactly once.
 
-    `library_access` records that the minting grant reaches the library; `into_library`
-    and `folder_id` where the upload is filed, decided here and never by the upload's own
-    form (docs/auth.md § 5, docs/mcp.md § Filing into Files).
+    `into_library` and `folder_id` say where the upload is filed, decided here and never by
+    the upload's own form (docs/auth.md § 5, docs/mcp.md § Filing into Files).
     """
-    if into_library and not library_access:
-        raise ValueError("A ticket that files into the library needs the library's access")
     now = utcnow()
     await check_mint_rate(db, settings, user.id)
-
-    # Opportunistic cleanup in the same transaction: every mint tidies up, so the table
-    # stays small without a sweeper (docs/auth.md § 5).
-    await db.execute(
-        delete(UploadTicket).where(UploadTicket.user_id == user.id, UploadTicket.expires_at <= now)
-    )
-    token = generate_ticket()
+    await delete_expired(db, UploadTicket, user.id, now)
+    token = new_token(TICKET_PREFIX)
     row = UploadTicket(
         user_id=user.id,
         token_hash=hash_token(token),
-        prefix=display_prefix(token),
         created_at=now,
         expires_at=now + timedelta(seconds=settings.upload_ticket_ttl_seconds),
-        library_access=library_access,
         into_library=into_library,
         folder_id=folder_id if into_library else None,
     )
@@ -100,22 +76,19 @@ async def mint(
 
 
 async def resolve(db: AsyncSession, presented: str) -> tuple[UploadTicket, User] | None:
-    """Look a ticket up by hash and compare in constant time; None means "not a live ticket"."""
-    if not presented.startswith(TICKET_PREFIX):
-        return None
-    token_hash = hash_token(presented)
-    row = (
-        await db.execute(select(UploadTicket).where(UploadTicket.token_hash == token_hash))
-    ).scalar_one_or_none()
-    if row is None or not hmac.compare_digest(row.token_hash, token_hash):
-        return None
-    if row.expires_at <= utcnow():
-        return None
-    user = (await db.execute(select(User).where(User.id == row.user_id))).scalar_one_or_none()
-    return None if user is None else (row, user)
+    """Look a ticket up by its hash; None means "not a live ticket"."""
+    return await resolve_ticket(db, UploadTicket, TICKET_PREFIX, presented)
 
 
-def spend(ticket: UploadTicket, job_id: uuid.UUID) -> None:
-    """Bind a ticket to the job its upload produced and burn it (docs/auth.md § 5)."""
-    ticket.job_id = job_id
-    ticket.spent_at = utcnow()
+async def spend(db: AsyncSession, ticket: UploadTicket, job_id: uuid.UUID) -> None:
+    """Bind a ticket to the job its upload produced and burn it, in the caller's
+    transaction (docs/auth.md § 5). Conditional on the ticket still being unspent: the
+    request that authenticated on it may have raced another, and the loser's update waits
+    on the winner's row lock, then matches nothing and is the 401."""
+    spent = await db.execute(
+        update(UploadTicket)
+        .where(UploadTicket.id == ticket.id, UploadTicket.spent_at.is_(None))
+        .values(job_id=job_id, spent_at=utcnow())
+    )
+    if spent.rowcount != 1:
+        raise ApiError(401, "auth", REJECTION_MESSAGE)

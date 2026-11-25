@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import io
 import os
 import re
@@ -13,7 +14,6 @@ import shlex
 import shutil
 import subprocess
 import threading
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,19 +22,19 @@ import respx
 from PIL import Image, ImageFile
 
 from sightread.jobs import chat_runner, chat_tools
-from sightread.workspace.layout import user_root
 from sightread.workspace.locks import workspace_lock
-from tests.conftest import CSRF_HEADERS
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_extensions import (
-    chatting_client,
+from tests.chat_helpers import (
     new_conversation,
     one_call,
+    record_round,
+    round_ctx,
+    run_queued_turn,
     send,
     stub_messages,
 )
+from tests.conftest import CSRF_HEADERS, image_view
 
-# The crop the reader's screenshot showed failing as "not a text file".
+# A figure crop under a path with spaces and a .pdf/ segment is viewed as an image.
 CROP = "files/DL/DIO/DINO Paper Presentation.pdf/figures/p11_330_115_785_880.png"
 # What every command does to the image read from stdin before its own step.
 FLAT = "+repage -background white -alpha remove -alpha off -strip"
@@ -46,20 +46,10 @@ def _encoded(image: Image.Image, fmt: str, **save) -> bytes:
     return buffer.getvalue()
 
 
-def _images(*, max_bytes: int = 32 << 20, shell: bool = True) -> chat_tools.ImageView:
-    return chat_tools.ImageView(
-        max_bytes=max_bytes,
-        max_pixels=40_000_000,
-        long_edge=1568,
-        decode_slot=asyncio.Semaphore(1),
-        shell=shell,
-    )
-
-
 async def _view(
     root: Path,
     path: str,
-    images: chat_tools.ImageView | None,
+    images: chat_tools.ImageView,
     *,
     max_bytes: int = 1_000_000,
     view_range: list[int] | None = None,
@@ -89,7 +79,7 @@ def _shown(outcome: chat_tools.ToolOutcome) -> tuple[str, Image.Image, str]:
     return block["source"]["media_type"], image, line["text"]
 
 
-async def test_a_view_of_an_image_answers_the_image_whatever_its_name(tmp_path) -> None:
+async def test_a_view_of_an_image_answers_the_image_whatever_its_name(tmp_path, documents) -> None:
     root = tmp_path / "ws" / "1"
     crop = Image.new("RGBA", (200, 100), (255, 0, 0, 0))
     _place(root, CROP, _encoded(crop, "PNG"))
@@ -102,9 +92,8 @@ async def test_a_view_of_an_image_answers_the_image_whatever_its_name(tmp_path) 
     gif = io.BytesIO()
     frames[0].save(gif, format="GIF", save_all=True, append_images=frames[1:])
     _place(root, "files/moving.gif", gif.getvalue())
-    _place(root, "files/phone.heic", _encoded(Image.new("RGB", (64, 32), "gray"), "HEIF"))
 
-    media, image, line = _shown(await _view(root, CROP, _images()))
+    media, image, line = _shown(await _view(root, CROP, image_view()))
     assert media == "image/png" and image.size == (200, 100)
     # Transparency is flattened onto white, as a page is.
     assert image.convert("RGB").getpixel((0, 0)) == (255, 255, 255)
@@ -115,10 +104,13 @@ async def test_a_view_of_an_image_answers_the_image_whatever_its_name(tmp_path) 
         ".cache/photo": ("image/jpeg", (40, 30)),
         "files/a.webp": ("image/jpeg", (16, 16)),
         "files/moving.gif": ("image/jpeg", (12, 8)),
-        "files/phone.heic": ("image/jpeg", (64, 32)),
     }
+    # Some pillow-heif wheels decode HEIC but cannot encode it, so no fixture exists there.
+    if "heic" in documents:
+        _place(root, "files/phone.heic", documents["heic"].read_bytes())
+        expected["files/phone.heic"] = ("image/jpeg", (320, 240))
     for path, (media_type, size) in expected.items():
-        media, image, line = _shown(await _view(root, path, _images()))
+        media, image, line = _shown(await _view(root, path, image_view()))
         assert (media, image.size) == (media_type, size), path
         assert line.startswith(f"The image /workspace/{path}, "), line
 
@@ -129,7 +121,7 @@ async def test_an_image_is_shown_upright(tmp_path) -> None:
     exif = Image.Exif()
     exif[0x0112] = 6  # rotate 90° clockwise to display
     _place(root, "files/turned.jpg", _encoded(photo, "JPEG", exif=exif))
-    _media, image, line = _shown(await _view(root, "files/turned.jpg", _images()))
+    _media, image, line = _shown(await _view(root, "files/turned.jpg", image_view()))
     assert image.size == (20, 40)
     assert "20x40 pixels" in line
     # Turned once: the bytes sent carry no orientation that would turn them again, nor
@@ -145,15 +137,15 @@ async def test_a_malformed_exif_block_shows_the_image_rather_than_failing(tmp_pa
     exif[0x0112] = 6
     exif[0x010F] = "Camera"  # Make, ASCII
     data = _encoded(Image.new("RGB", (40, 20), "red"), "JPEG", exif=exif)
-    # Relabel Make as BitsPerSample, a SHORT tag: Pillow reads the file, and its own
-    # `exif_transpose` raised rewriting the block.
+    # Relabel Make as BitsPerSample, a SHORT tag Pillow reads but cannot write back: the
+    # image is still shown.
     for make, bits in (
         (b"\x01\x0f\x00\x02", b"\x01\x02\x00\x02"),
         (b"\x0f\x01\x02\x00", b"\x02\x01\x02\x00"),
     ):
         data = data.replace(make, bits)
     _place(root, "files/odd.jpg", data)
-    _media, image, _line = _shown(await _view(root, "files/odd.jpg", _images()))
+    _media, image, _line = _shown(await _view(root, "files/odd.jpg", image_view()))
     assert image.size in ((20, 40), (40, 20))
 
 
@@ -162,7 +154,7 @@ async def test_sixteen_bit_grey_is_not_clipped_to_white(tmp_path) -> None:
     grey = Image.new("I;16", (20, 10), 1000)
     grey.paste(Image.new("I;16", (10, 10), 30000), (10, 0))
     _place(root, "files/depth.png", _encoded(grey, "PNG"))
-    _media, image, _line = _shown(await _view(root, "files/depth.png", _images()))
+    _media, image, _line = _shown(await _view(root, "files/depth.png", image_view()))
     rgb = image.convert("RGB")
     assert rgb.getpixel((2, 2)) == (3, 3, 3)
     assert rgb.getpixel((15, 2)) == (117, 117, 117)
@@ -173,7 +165,7 @@ async def test_a_large_image_is_shrunk_and_says_how_to_read_it_in_pieces(tmp_pat
     path = "files/Scans/board (1).png"
     _place(root, path, _encoded(Image.new("RGB", (4000, 1600), "white"), "PNG"))
 
-    media, image, line = _shown(await _view(root, path, _images()))
+    media, image, line = _shown(await _view(root, path, image_view()))
     assert media == "image/png" and image.size == (1568, 627)
     assert "4000x1600 pixels, shown shrunk to 1568x627" in line
     # Pieces of the long edge are shown at full size: three across, two down. The file
@@ -194,14 +186,14 @@ async def test_a_large_image_is_shrunk_and_says_how_to_read_it_in_pieces(tmp_pat
     gif = io.BytesIO()
     frames[0].save(gif, format="GIF", save_all=True, append_images=frames[1:])
     _place(root, "files/anim.gif", gif.getvalue())
-    _media, _image, line = _shown(await _view(root, "files/anim.gif", _images()))
+    _media, _image, line = _shown(await _view(root, "files/anim.gif", image_view()))
     assert (
         f"`convert '-[0]' {FLAT} -crop 1568x1568 +repage /workspace/.cache/piece-%d.jpg "
         "< /workspace/files/anim.gif`" in line
     )
 
     # Without a shell the commands are not offered: the turn could not run them.
-    _media, _image, line = _shown(await _view(root, path, _images(shell=False)))
+    _media, _image, line = _shown(await _view(root, path, image_view(shell=False)))
     assert "shown shrunk to 1568x627" in line and "convert" not in line
 
 
@@ -210,26 +202,27 @@ async def test_an_image_past_the_pixel_cap_says_how_to_look_at_it_in_steps(tmp_p
     # A 1-bit image is a few kilobytes on disk and 49 million pixels decoded.
     _place(root, "files/huge.png", _encoded(Image.new("1", (7000, 7000)), "PNG"))
 
-    refused = await _view(root, "files/huge.png", _images())
+    refused = await _view(root, "files/huge.png", image_view())
     assert refused.is_error and isinstance(refused.content, str)
     assert "is 7000x7000 pixels, more than this tool opens (40,000,000)" in refused.content
     assert "-resize 1568x1568 /workspace/.cache/small.jpg" in refused.content
     assert "(25 pieces)" in refused.content
 
-    plain = await _view(root, "files/huge.png", _images(shell=False))
+    plain = await _view(root, "files/huge.png", image_view(shell=False))
     assert plain.is_error and "convert" not in plain.content
 
     # A portrait photo stored on its side is stated upright, and cut upright.
     exif = Image.Exif()
     exif[0x0112] = 6
-    _place(root, "files/portrait.jpg", _encoded(Image.new("RGB", (8000, 6000)), "JPEG", exif=exif))
-    turned = await _view(root, "files/portrait.jpg", _images())
-    assert "is 6000x8000 pixels" in turned.content
+    _place(root, "files/portrait.jpg", _encoded(Image.new("RGB", (2000, 1500)), "JPEG", exif=exif))
+    lowered = dataclasses.replace(image_view(), max_pixels=2_000_000)
+    turned = await _view(root, "files/portrait.jpg", lowered)
+    assert "is 1500x2000 pixels, more than this tool opens (2,000,000)" in turned.content
     assert (
         f"`convert '-[0]' -rotate 90 {FLAT} -resize 1568x1568 /workspace/.cache/small.jpg "
         "< /workspace/files/portrait.jpg`" in turned.content
     )
-    assert "(24 pieces)" in turned.content and "piece-%d.jpg" in turned.content
+    assert "(2 pieces)" in turned.content and "piece-%d.jpg" in turned.content
 
 
 async def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded(
@@ -247,12 +240,12 @@ async def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded(
         return load(image)
 
     monkeypatch.setattr(ImageFile.ImageFile, "load", recording_load)
-    refused = await _view(root, "files/huge.png", _images())
+    refused = await _view(root, "files/huge.png", image_view())
     assert refused.is_error and "is 7000x7000 pixels" in refused.content
     assert decoded == []
     # Within the cap the same read finds the image and decodes it once.
     _place(root, "files/fits.png", _encoded(Image.new("1", (700, 700)), "PNG"))
-    _shown(await _view(root, "files/fits.png", _images()))
+    _shown(await _view(root, "files/fits.png", image_view()))
     assert (700, 700) in decoded
 
 
@@ -265,15 +258,15 @@ async def test_pieces_without_a_header_are_named_by_what_is_known(tmp_path, monk
     _place(root, "files/plot.png", plot_data)
     _place(root, "files/photo", photo_data)
     monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
-    plot = await _view(root, "files/plot.png", _images())
+    plot = await _view(root, "files/plot.png", image_view())
     assert "is too many pixels" in plot.content and "-auto-orient" in plot.content
     assert "piece-%d.png" in plot.content
-    photo = await _view(root, "files/photo", _images())
+    photo = await _view(root, "files/photo", image_view())
     assert "is too many pixels" in photo.content and "piece-%d.jpg" in photo.content
     monkeypatch.undo()
 
     cap = min(len(plot_data), len(photo_data)) // 2
-    tight = _images(max_bytes=cap)
+    tight = image_view(max_bytes=cap)
     by_name = await _view(root, "files/plot.png", tight, max_bytes=cap)
     assert "is larger than this tool reads" in by_name.content
     assert "piece-%d.png" in by_name.content
@@ -288,7 +281,7 @@ async def test_a_transparent_key_colour_is_shown_on_white(tmp_path) -> None:
         keyed = Image.new(mode, (10, 10), key)
         keyed.putpixel((0, 0), ink)
         _place(root, f"files/{mode}.png", _encoded(keyed, "PNG", transparency=key))
-        _media, image, _line = _shown(await _view(root, f"files/{mode}.png", _images()))
+        _media, image, _line = _shown(await _view(root, f"files/{mode}.png", image_view()))
         rgb = image.convert("RGB")
         assert rgb.getpixel((5, 5)) == (255, 255, 255), mode
         assert rgb.getpixel((0, 0)) != (255, 255, 255), mode
@@ -297,7 +290,7 @@ async def test_a_transparent_key_colour_is_shown_on_white(tmp_path) -> None:
 async def _run_in_shell(command: str, root: Path) -> None:
     """A command the note gave, run as the VM's bash would, /workspace being `root`."""
     argv = ["/bin/bash", "-c", command.replace("/workspace/", f"{root}/")]
-    await asyncio.to_thread(subprocess.run, argv, check=True, cwd=root)  # noqa: S603
+    await asyncio.to_thread(subprocess.run, argv, check=True, cwd=root)
 
 
 @pytest.mark.skipif(shutil.which("convert") is None, reason="ImageMagick is not installed here")
@@ -310,13 +303,7 @@ async def test_the_pieces_are_cut_from_the_image_the_tool_showed(tmp_path) -> No
     root = tmp_path / "ws" / "1"
     cache = root / ".cache"
     cache.mkdir(parents=True)
-    small = chat_tools.ImageView(  # noqa: S604 - shell means the agent has bash
-        max_bytes=1 << 25,
-        max_pixels=40_000_000,
-        long_edge=100,
-        decode_slot=asyncio.Semaphore(1),
-        shell=True,
-    )
+    small = dataclasses.replace(image_view(), long_edge=100)
     upright = Image.new("RGB", (150, 300), (0, 0, 255))
     upright.paste((255, 0, 0), (0, 0, 75, 150))  # the top-left quarter is red
     stored_as = {1: None, **{o: turn for o, (turn, _option) in chat_tools.ORIENTATIONS.items()}}
@@ -369,7 +356,7 @@ async def test_the_pieces_are_cut_from_the_image_the_tool_showed(tmp_path) -> No
     whole = root / "whole.png"
     upright.resize((300, 300)).save(whole)
     await asyncio.to_thread(
-        subprocess.run,  # noqa: S603 - fixed argv
+        subprocess.run,  # fixed argv
         ["convert", str(whole), "-crop", "150x100+50+50", str(root / "files/offset.png")],
         check=True,
     )
@@ -388,14 +375,14 @@ async def test_the_image_cap_is_not_the_text_cap(tmp_path) -> None:
 
     # Past the text cap, within the image one: the image is shown.
     media, _image, _line = _shown(
-        await _view(root, "files/noise.png", _images(), max_bytes=text_cap)
+        await _view(root, "files/noise.png", image_view(), max_bytes=text_cap)
     )
     assert media == "image/png"
     # A text file that size is still too large to view.
-    big = await _view(root, "files/big.txt", _images(), max_bytes=text_cap)
+    big = await _view(root, "files/big.txt", image_view(), max_bytes=text_cap)
     assert big.is_error and big.content == "/workspace/files/big.txt is too large to view; use bash"
     # Past the image cap too: refused before anything is decoded, with the way round it.
-    over = await _view(root, "files/noise.png", _images(max_bytes=text_cap), max_bytes=text_cap)
+    over = await _view(root, "files/noise.png", image_view(max_bytes=text_cap), max_bytes=text_cap)
     assert over.is_error and "is larger than this tool reads" in over.content
     assert "-resize 1568x1568" in over.content
 
@@ -410,29 +397,26 @@ async def test_other_binaries_are_still_refused(tmp_path) -> None:
     _place(root, "files/cut.png", whole[: len(whole) // 2])
 
     for path in ("files/scan.bmp", "files/scan.tiff", "files/blob.bin"):
-        refused = await _view(root, path, _images())
+        refused = await _view(root, path, image_view())
         assert refused.is_error, path
         assert refused.content == (
             f"/workspace/{path} is not a text file or an image this tool shows "
             "(PNG, JPEG, WebP, GIF, HEIC); use bash"
         )
     # An SVG is text.
-    svg = await _view(root, "files/logo.svg", _images())
+    svg = await _view(root, "files/logo.svg", image_view())
     assert not svg.is_error and svg.content.startswith("     1\t<svg")
     # A PNG by its header whose data stops short.
-    cut = await _view(root, "files/cut.png", _images())
+    cut = await _view(root, "files/cut.png", image_view())
     assert (
         cut.is_error and cut.content == "/workspace/files/cut.png could not be decoded as an image"
     )
-    # A caller that offers no image view keeps the old answer.
-    old = await _view(root, "files/cut.png", None)
-    assert old.is_error and old.content == "/workspace/files/cut.png is not a text file"
 
 
 async def test_view_range_does_not_apply_to_an_image(tmp_path) -> None:
     root = tmp_path / "ws" / "1"
     _place(root, "files/a.png", _encoded(Image.new("RGB", (10, 10)), "PNG"))
-    _media, _image, line = _shown(await _view(root, "files/a.png", _images(), view_range=[1, 5]))
+    _media, _image, line = _shown(await _view(root, "files/a.png", image_view(), view_range=[1, 5]))
     assert line.endswith("view_range does not apply to an image; this is all of it.")
 
 
@@ -450,7 +434,7 @@ async def test_an_image_is_decoded_after_the_workspace_lock_is_released(
         return decode(*args, **kwargs)
 
     monkeypatch.setattr(chat_tools, "_model_image", slow_decode)
-    images = _images()
+    images = image_view()
     viewing = asyncio.ensure_future(_view(root, "files/a.png", images))
     await asyncio.to_thread(started.wait, 5)
     # Mid-decode: another write may take the lock; the turn's one decode slot is held.
@@ -463,30 +447,13 @@ async def test_an_image_is_decoded_after_the_workspace_lock_is_released(
 
 
 def _editor_round_ctx(root: Path, *, round_budget: int, turn_budget: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        settings=SimpleNamespace(
-            chat_image_round_max_bytes=round_budget,
-            chat_image_turn_max_bytes=turn_budget,
-            chat_page_image_max_pixels=40_000_000,
-            chat_attachment_image_long_edge=1568,
-            chat_tool_result_max_chars=1000,
-            upload_max_bytes=1,
-            content_max_bytes=1000,
-            chat_bash_timeout_seconds=1,
-        ),
-        conversation=SimpleNamespace(id=1, session="s"),
+    """A round's context with the workspace at `root`, `view_page` declared, and a pixel cap
+    no test image reaches."""
+    return round_ctx(
+        round_budget=round_budget,
+        turn_budget=turn_budget,
+        settings={"chat_page_image_max_pixels": 40_000_000},
         paths=SimpleNamespace(root=root),
-        document=SimpleNamespace(id=1),
-        decode_slot=asyncio.Semaphore(1),
-        job=SimpleNamespace(page_count=12, kind="pdf"),
-        render_slots=None,
-        sandbox=None,
-        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        image_spent=0,
-        credits_exhausted=False,
-        round_admission=lambda calls: lambda index: True,
-        writers={},
-        write_gate=asyncio.Lock(),
         tools=[{"name": "view_page"}],
     )
 
@@ -505,16 +472,9 @@ async def test_an_editor_image_counts_against_the_image_budgets(tmp_path, monkey
         image = {"type": "image", "source": {"type": "base64", "data": "x" * 100}}
         return chat_tools.ToolOutcome([image, {"type": "text", "text": "Page."}])
 
-    async def no_events(ctx, event, data):
-        return None
-
-    async def never_cancelled(ctx):
-        return False
-
     monkeypatch.setattr(chat_tools, "run_editor", fake_run_editor)
     monkeypatch.setattr(chat_tools, "view_page", fake_view_page)
-    monkeypatch.setattr(chat_runner, "_emit", no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    record_round(monkeypatch)
 
     def view(index: int) -> dict:
         return {
@@ -541,7 +501,7 @@ async def test_an_editor_image_counts_against_the_image_budgets(tmp_path, monkey
         for result in results
         if result.get("is_error")
     )
-    assert ctx.image_spent == 200
+    assert ctx.images.total == 200
     # The editor offers the image view, without crop commands on a turn with no shell.
     assert viewed[0]["images"].max_bytes == 250 and viewed[0]["images"].shell is False
 
@@ -551,7 +511,7 @@ async def test_an_editor_image_counts_against_the_image_budgets(tmp_path, monkey
     assert [bool(result.get("is_error")) for result in first] == [False, False, True]
     assert first[2]["content"] == chat_runner.IMAGE_TURN_BUDGET_SPENT
     # The turn's budget is spent to the byte: the next round's edit must still run.
-    assert ctx.image_spent == 200
+    assert ctx.images.total == 200
     edit = {
         "type": "tool_use",
         "id": "e",
@@ -568,12 +528,9 @@ async def test_an_editor_image_counts_against_the_image_budgets(tmp_path, monkey
 
 
 @respx.mock
-async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(
-    make_client, tmp_path
-) -> None:
-    client = await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    _place(root, ".cache/chart.png", _encoded(Image.new("RGB", (300, 200), "navy"), "PNG"))
+async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(chat_client) -> None:
+    client = chat_client
+    _place(client.root, ".cache/chart.png", _encoded(Image.new("RGB", (300, 200), "navy"), "PNG"))
     view = {"command": "view", "path": "/workspace/.cache/chart.png"}
     created = await client.post(
         "/api/subagents",
@@ -595,7 +552,7 @@ async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(
     conversation_id = await new_conversation(client)
     sent = await send(client, conversation_id, text="What is in the chart?")
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     for requests in (main, sub):
         result = requests[1]["messages"][2]["content"][0]
@@ -614,10 +571,3 @@ async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(
         for part in item["content"]
     ]
     assert stored and all("data" not in part.get("source", {}) for part in stored)
-
-
-def test_the_prompt_and_the_subagent_editor_say_the_view_shows_images() -> None:
-    from sightread.agents import chat as chat_agent
-
-    assert "shows you the image itself" in chat_agent.DEFAULT_SYSTEM_PROMPT
-    assert "as the image itself" in chat_agent.SUBAGENT_EDITOR_TOOL["description"]

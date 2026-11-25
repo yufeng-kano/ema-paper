@@ -1,0 +1,53 @@
+"""The app's database engine and sessions (sightread.db.session)."""
+
+from __future__ import annotations
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy import text as sql
+from sqlalchemy.exc import DBAPIError
+
+from sightread.db.models import User
+from sightread.db.session import commit_or_conflict, create_engine
+from sightread.errors import ApiError
+from tests.factories import user_row
+
+
+async def test_a_failed_statement_never_carries_the_readers_text(tmp_path) -> None:
+    """The engine hides bound values, so a database error logged with its traceback cannot
+    write a memory's text — or instructions, or a message — into the log."""
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'hidden.db'}")
+    try:
+        async with engine.connect() as connection:
+            with pytest.raises(DBAPIError) as failed:
+                await connection.execute(
+                    sql("insert into no_such_table (text) values (:text)"),
+                    {"text": "the reader reads with a screen reader"},
+                )
+    finally:
+        await engine.dispose()
+    assert "screen reader" not in str(failed.value)
+
+
+async def test_a_commit_a_constraint_refuses_is_rolled_back_and_answered_409(
+    sessionmaker,
+) -> None:
+    """`commit_or_conflict`: the loser of a race on a unique value rolls back and is answered
+    409 with the caller's message, and its session stays usable."""
+    async with sessionmaker() as first:
+        first.add(user_row("taken@example.com"))
+        await first.commit()
+    async with sessionmaker() as db:
+        db.add(user_row("taken@example.com"))
+        with pytest.raises(ApiError) as refused:
+            await commit_or_conflict(db, "That account was just made elsewhere")
+        assert (refused.value.status_code, refused.value.error_type, refused.value.message) == (
+            409,
+            "invalid_request",
+            "That account was just made elsewhere",
+        )
+        db.add(user_row("free@example.com"))
+        await commit_or_conflict(db, "unused")
+    async with sessionmaker() as db:
+        emails = (await db.execute(select(User.email).order_by(User.email))).scalars().all()
+    assert emails == ["free@example.com", "taken@example.com"]

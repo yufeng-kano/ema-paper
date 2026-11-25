@@ -2,8 +2,8 @@
 /**
  * What a finished answer's turn was given beyond the document — *Used: your instructions ·
  * 3 memories* — from its `turn_start` (docs/web.md § The agent panel, *What the answer used,
- * and memory lines*). Each part opens the card of what it names; a turn given neither has
- * no line at all.
+ * and memory lines*). Each part opens the card of what it names. It is mounted only for a
+ * turn given at least one of them: `usedContext` is null for a turn given neither.
  */
 import type { UsedContext } from '~/lib/thread'
 
@@ -27,7 +27,7 @@ function open(part: UsedPart, event: MouseEvent) {
 </script>
 
 <template>
-  <p v-if="used.instructions || count" class="used">
+  <p class="used">
     <UiIcon name="book-open" />
     <span>{{ t('chat.used.label') }}</span>
     <button

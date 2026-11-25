@@ -25,15 +25,15 @@ from pathlib import Path
 
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.orm import defer
 from starlette.concurrency import iterate_in_threadpool
-from starlette.datastructures import UploadFile
-from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..agents import PARSE
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger
+from ..body_limit import is_multipart
 from ..db.models import (
     DOCUMENT_VIEWS,
     FILE_KIND,
@@ -71,8 +71,10 @@ from ..workspace import documents as workspace_documents
 from ..workspace import filing, git, safe_io, trash
 from ..workspace.agents_file import AGENTS_FILE
 from ..workspace.documents import (
+    STORAGE_FULL,
     live_document,
     live_folder,
+    live_text_document,
     markdown_name,
     nearest_live,
     own_subtree,
@@ -80,8 +82,8 @@ from ..workspace.documents import (
 )
 from ..workspace.filing import (
     DOCUMENT_NAME_MAX,
+    FILE_CLASH,
     FOLDER_NAME_MAX,
-    STORAGE_FULL,
     clean_name,
     commit_filing,
     document_relative,
@@ -102,24 +104,11 @@ from ..workspace.layout import (
 )
 from ..workspace.locks import backup_shared, workspace_lock
 from ..workspace.trash import commit_then_discard, lock_user, read_row, refuse_while_answering
-from .multipart import Sink, read_upload_form
+from .multipart import NEEDS_FILE, Sink, capped_form, form_file, read_upload_form
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/library", tags=["library"])
-
-# --- names and places -------------------------------------------------------------------
-
-
-async def live_text_document(db: DbSession, user_id: int, document_id: int) -> Document:
-    """A live document that is a parse or a markdown document: what the routes of a
-    document's own take — its content, result, revisions, pages, figures, images, retry
-    and re-convert — since a file of the library has none of those (docs/workspace.md
-    § Files); 404 for one, as for nothing."""
-    row = await live_document(db, user_id, document_id)
-    if row.kind == FILE_KIND:
-        raise ApiError(404, "invalid_request", "No such document")
-    return row
 
 
 # --- payloads ---------------------------------------------------------------------------
@@ -131,7 +120,6 @@ def folder_payload(row: Folder) -> dict:
         "parent_id": row.parent_id,
         "name": row.name,
         "created_at": row.created_at,
-        "updated_at": row.updated_at,
     }
 
 
@@ -150,105 +138,75 @@ def document_payload(
     job: Job | None,
     failed: dict[uuid.UUID, int] | None = None,
     reconvert: Job | None = None,
-    credits: dict[uuid.UUID, int | None] | None = None,
     storage: dict[int, int] | None = None,
-    originals: Collection[int] | None = None,
+    originals: Collection[int] = frozenset(),
 ) -> dict:
     """The row the file list draws: the entry, plus the live state of its parse and of
     its re-convert, the view it was last read in and whether its original is kept.
 
     Joined rather than fetched per row, so one `GET /api/library` renders every name,
-    status and progress bar the page needs (docs/web.md § Files). A markdown document
-    (`job` None) has no parse to report on: every parse field is null. `failed` holds
-    what a retry of each failed parse would send (`failed_page_counts`); `checking` says
-    a running parse is past its last page and being checked; `reconvert` is the parse
-    the row points at as its re-convert (docs/api.md); `credits` what each parse cost
-    (`ledger.credits_by_job`, docs/billing.md § Routes); `storage` each document's share
-    of the storage (`StorageUsage.documents`), None where the workspace was not measured;
-    `originals` the ids whose `…/original` answers (`answering_original`), None where it
-    was not looked up — a parse's `original` is then null (docs/api.md).
+    status and progress bar the page needs (docs/web.md § Files). A file or a markdown
+    document (no `job`) has no parse to report on: every parse field is null. `failed`
+    holds what a retry of each failed parse would send (`failed_page_counts`); `checking`
+    says a running parse is past its last page and being checked; `reconvert` is the
+    parse the row points at as its re-convert (docs/api.md); `storage` each document's
+    share of the storage (`StorageUsage.documents`), None where the workspace was not
+    measured; `originals` the ids whose `…/original` answers (`answering_original`),
+    which a parse's `original` reports (docs/api.md).
     """
-    failed = failed or {}
-    credits = credits or {}
-    storage_bytes = None if storage is None else storage.get(row.id, 0)
+    payload = {
+        "id": row.id,
+        "folder_id": row.folder_id,
+        "name": row.name,
+        "job_id": None,
+        "status": None,
+        "kind": MARKDOWN_KIND,
+        "media_type": None,
+        "model": None,
+        "page_count": None,
+        "pages_done": None,
+        "size_bytes": None,
+        "storage_bytes": None if storage is None else storage.get(row.id, 0),
+        "error": None,
+        "created_at": row.created_at,
+        "failed_pages": None,
+        "checking": False,
+        "reconvert": None,
+        "view": row.view,
+        "original": None,
+    }
     if row.kind == FILE_KIND:
         # A file kept as it is (docs/workspace.md § Files): no parse to report on; its
         # size is its share of the storage, the one copy counted once.
         return {
-            "id": row.id,
-            "folder_id": row.folder_id,
-            "name": row.name,
-            "job_id": None,
-            "status": None,
+            **payload,
             "kind": FILE_KIND,
             "media_type": row.media_type,
-            "model": None,
-            "page_count": None,
-            "pages_done": None,
             "size_bytes": row.size_bytes,
             "storage_bytes": row.size_bytes,
-            "error": None,
-            "created_at": row.created_at,
-            "finished_at": None,
-            "failed_pages": None,
-            "checking": False,
-            "reconvert": None,
-            "credits": None,
-            "view": row.view,
-            "original": None,
         }
     if job is None:
-        return {
-            "id": row.id,
-            "folder_id": row.folder_id,
-            "name": row.name,
-            "job_id": None,
-            "status": None,
-            "kind": MARKDOWN_KIND,
-            "media_type": None,
-            "model": None,
-            "page_count": None,
-            "pages_done": None,
-            "size_bytes": None,
-            "storage_bytes": storage_bytes,
-            "error": None,
-            "created_at": row.created_at,
-            "finished_at": None,
-            "failed_pages": None,
-            "checking": False,
-            "reconvert": None,
-            "credits": None,
-            "view": row.view,
-            "original": None,
-        }
+        return payload
+    failed = failed or {}
     return {
-        "id": row.id,
-        "folder_id": row.folder_id,
-        "name": row.name,
+        **payload,
         "job_id": str(row.job_id),
         "status": job.status,
         "kind": job.kind,
-        "media_type": None,
         "model": job.model,
         "page_count": job.page_count,
         "pages_done": job.pages_done,
         "size_bytes": job.size_bytes,
-        "storage_bytes": storage_bytes,
         "error": job.error,
-        "created_at": row.created_at,
-        "finished_at": job.finished_at,
         "failed_pages": failed.get(job.id),
         "checking": is_checking(job),
-        "credits": credits.get(job.id),
-        "view": row.view,
         # Whether `…/original` answers: known from one listing on the library read
         # (docs/api.md).
-        "original": (row.id in originals) if originals is not None else None,
+        "original": row.id in originals,
         "reconvert": (
             None
             if reconvert is None
             else {
-                "job_id": str(reconvert.id),
                 "status": reconvert.status,
                 "model": reconvert.model,
                 "page_count": reconvert.page_count,
@@ -256,9 +214,6 @@ def document_payload(
                 "error": reconvert.error,
                 "failed_pages": failed.get(reconvert.id),
                 "checking": is_checking(reconvert),
-                "created_at": reconvert.created_at,
-                "finished_at": reconvert.finished_at,
-                "credits": credits.get(reconvert.id),
             }
         ),
     }
@@ -294,55 +249,59 @@ async def read_document_payload(db: DbSession, settings: AppSettings, row: Docum
     original is kept."""
     job = await job_of(db, row.job_id) if row.job_id is not None else None
     reconvert = await job_of(db, row.reconvert_job_id) if row.reconvert_job_id is not None else None
-    jobs = [job, reconvert]
     originals: set[int] = set()
     if job is not None:
         root = user_root(settings.workspaces_dir, row.user_id)
         if await workspace_documents.answering_original(db, root, row.id, job) is not None:
             originals.add(row.id)
     return document_payload(
-        row,
-        job,
-        await failed_page_counts(db, jobs),
-        reconvert,
-        await ledger.credits_by_job(db, [one.id for one in jobs if one is not None]),
-        originals=originals,
+        row, job, await failed_page_counts(db, [job, reconvert]), reconvert, originals=originals
     )
 
 
 # --- read ---------------------------------------------------------------------------------
 
 
-async def read_folders(db: DbSession, user_id: int):
-    query = select(Folder).where(Folder.user_id == user_id).order_by(Folder.name)
-    return (await db.execute(query)).scalars().all()
+async def library_snapshot(db: DbSession) -> None:
+    """Start the one snapshot a library read takes: `GET /api/library` and the data
+    plane's `GET /v1/library`.
 
-
-@router.get("")
-async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
-    """The whole library in one read — navigation between folders is then local.
-
-    Both collections come from one snapshot. Under READ COMMITTED the two statements would
-    see two, and the client would hold either documents whose folder it has never heard of
-    (drawn nowhere) or a folder that has already been deleted (drawn empty) until something
-    refreshed. `REPEATABLE READ` is the cheap way to make one response internally
+    Folders and documents come from one snapshot. Under READ COMMITTED the two statements
+    would see two, and the client would hold either documents whose folder it has never
+    heard of (drawn nowhere) or a folder that has already been deleted (drawn empty) until
+    something refreshed. `REPEATABLE READ` is the cheap way to make one response internally
     consistent. An isolation level applies to a transaction's first statement, and the
     request's session has already spent one on authentication, so that transaction is
     ended first and the snapshot asked for on the next one — on the same session, so a
     request holds one connection, never two (docs/api.md). The SQLite test fallback has no
-    such isolation level and one writer, so it is asked for only where it exists.
+    such isolation level and one writer, so it is asked for only where it exists. The
+    rollback expires every row the session holds: read what is needed of them first.
     """
-    user_id = user.id  # read before the rollback expires the row
     await db.rollback()
     if db.get_bind().dialect.name == "postgresql":
         await db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
-    folders = await read_folders(db, user_id)
+
+
+# A job's prompt and check prompt, which no library listing shows: left in the database
+# by GET /api/library, GET /v1/library and the connector's list_library, and refused
+# loudly if anything reaches for them.
+UNREAD_JOB_TEXT = (defer(Job.prompt, raiseload=True), defer(Job.check_prompt, raiseload=True))
+
+
+@router.get("")
+async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
+    """The whole library in one read, from one snapshot (`library_snapshot`) — navigation
+    between folders is then local."""
+    user_id = user.id  # read before the rollback expires the row
+    await library_snapshot(db)
+    folders = await workspace_documents.user_folders(db, user_id)
     documents = (
         await db.execute(
             select(Document, Job)
             .outerjoin(Job, Job.id == Document.job_id)
             .where(Document.user_id == user_id)
             .order_by(Document.created_at.desc())
+            .options(*UNREAD_JOB_TEXT)
         )
     ).all()
     # The re-converts the rows point at: a second read only when there is one.
@@ -350,27 +309,27 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
     reconverts = (
         {
             job.id: job
-            for job in (await db.execute(select(Job).where(Job.id.in_(pointed)))).scalars()
+            for job in (
+                await db.execute(select(Job).where(Job.id.in_(pointed)).options(*UNREAD_JOB_TEXT))
+            ).scalars()
         }
         if pointed
         else {}
     )
     every = [job for _, job in documents] + list(reconverts.values())
     failed = await failed_page_counts(db, every)
-    credits = await ledger.credits_by_job(db, [job.id for job in every if job is not None])
 
     # The live rows are the library; the Trash lists what was trashed itself, never
     # what sits inside a trashed folder (docs/api.md).
-    by_id = {row.id: row for row in folders}
-    trashed = workspace_documents.trashed_folder_ids(folders)
+    trashed = workspace_documents.trashed_folder_ids(folders.values())
     items: dict[int, int] = {}
     for row, _job in documents:
         if row.trashed_at is not None or row.folder_id not in trashed:
             continue
         # A document that comes back with the nearest trashed folder above it.
-        cursor = by_id.get(row.folder_id)
+        cursor = folders.get(row.folder_id)
         while cursor is not None and cursor.trashed_at is None:
-            cursor = by_id.get(cursor.parent_id) if cursor.parent_id is not None else None
+            cursor = folders.get(cursor.parent_id) if cursor.parent_id is not None else None
         if cursor is not None:
             items[cursor.id] = items.get(cursor.id, 0) + 1
 
@@ -416,21 +375,20 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
             originals.add(heir)
 
     def origin(parent_id: int | None) -> list[str]:
-        place = nearest_live(by_id, parent_id)
-        return [row.name for row in workspace_documents.folder_chain(by_id, place)]
+        place = nearest_live(folders, parent_id, trashed=trashed)
+        return [row.name for row in workspace_documents.folder_chain(folders, place)]
 
     def recent(row) -> float:
         return -row.trashed_at.timestamp()
 
     return {
-        "folders": [folder_payload(row) for row in folders if row.id not in trashed],
+        "folders": [folder_payload(row) for row in folders.values() if row.id not in trashed],
         "documents": [
             document_payload(
                 row,
                 job,
                 failed,
                 reconverts.get(row.reconvert_job_id),
-                credits,
                 storage,
                 originals,
             )
@@ -445,7 +403,7 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
                     "origin": origin(row.parent_id),
                     "items": items.get(row.id, 0),
                 }
-                for row in sorted((row for row in folders if row.trashed_at), key=recent)
+                for row in sorted((row for row in folders.values() if row.trashed_at), key=recent)
             ],
             "documents": [
                 {
@@ -454,7 +412,6 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
                         job,
                         failed,
                         reconverts.get(row.reconvert_job_id),
-                        credits,
                         storage,
                         originals,
                     ),
@@ -637,7 +594,7 @@ async def remove_then_commit(
             # beside no row is a nuisance, files gone with a row that stayed is a loss.
             try:
                 await workspace_documents.restore_removed(settings, user_id, relative, removal)
-            except Exception:  # noqa: BLE001 - the directory waits aside, whole
+            except Exception:  # the directory waits aside, whole
                 logger.exception("could not restore %s after a failed delete", relative)
         raise
     await _finish_delete(settings, user_id, relative, removal, document_ids)
@@ -649,11 +606,11 @@ async def _finish_delete(
     if removal is not None:
         try:
             await workspace_documents.discard_removed(settings, user_id, removal)
-        except Exception:  # noqa: BLE001 - the next reconciliation sweeps it
+        except Exception:  # the next reconciliation sweeps it
             logger.exception("could not discard %s set aside by a delete", relative)
     try:
         await workspace_documents.discard_originals(settings, user_id, document_ids)
-    except Exception:  # noqa: BLE001 - an original with no row is dead weight, not a leak
+    except Exception:  # an original with no row is dead weight, not a leak
         logger.exception("could not discard the originals of %s", relative)
 
 
@@ -781,7 +738,7 @@ async def upload_document(
     # A primitive copy: a retry inside `insert_named` follows a rollback, which expires
     # the row behind `user`, and an expired attribute cannot be loaded here.
     user_id = user.id
-    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+    if not is_multipart(request.headers.get("content-type", "")):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     # Cheap rejection before a byte is read: the largest body any kind may send — the
     # largest of the three caps, which a deployment may order as it likes; each kind's own
@@ -847,7 +804,7 @@ async def upload_document(
         open_sink,
     )
     if part is None:
-        raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
+        raise ApiError(400, "invalid_request", NEEDS_FILE)
     try:
         folder_id = form_folder_id(fields)
         if folder_id is not None:
@@ -873,16 +830,23 @@ async def upload_document(
                 settings=settings,
             )
             return await read_document_payload(db, settings, row)
-        return await file_upload(
-            part.sink.path,
-            filename,
-            part.content_type,
-            part.size,
-            user_id=user_id,
-            folder_id=folder_id,
-            db=db,
-            settings=settings,
-        )
+        # A file of any other kind, kept as it is (docs/workspace.md § Files): its bytes are
+        # in the tree already, under a write-in-progress name; the row and the move into
+        # place under one hold of the workspace lock, the row committed last, as a markdown
+        # filing is — no entry without its file, no file without its entry — through the
+        # filing the agent's download shares (`workspace/filing.py`).
+        async with backup_shared(root), workspace_lock(root):
+            row = await keep_file(
+                db,
+                settings,
+                user_id=user_id,
+                folder_id=folder_id,
+                temp=part.sink.path,
+                filename=filename,
+                declared_type=part.content_type,
+                size=part.size,
+            )
+        return document_payload(row, None)
     finally:
         # Whatever was not moved into place goes: a staged upload the parse copied, the
         # temporary file of a filing that was refused. The descriptor last: the lock a
@@ -938,14 +902,9 @@ async def file_parse(
         model=model,
         force=force,
         ticket=ticket,
-        # The browser cannot tell a lost response from a lost request, so its retry of an
-        # upload that in fact landed must not buy a second parse (docs/jobs.md § Dedup).
-        reuse_in_flight=True,
         # A library upload keeps its original even if the worker finishes before the
         # document row below exists (docs/jobs.md § Retention).
         retain_source=True,
-        # Checked before it opens (docs/parsing.md § Format check).
-        check=True,
     )
     # A dedup hit is a finished parse rather than a new one, so the file points at the job
     # that already produced it (docs/jobs.md § Dedup).
@@ -975,7 +934,7 @@ async def file_parse(
                 taken=taken,
                 wanted=wanted,
                 limit=DOCUMENT_NAME_MAX,
-                message="A file with this name already exists here",
+                message=FILE_CLASH,
                 commit=False,
             )
 
@@ -1108,24 +1067,19 @@ async def file_markdown(
     # The row, its original and their commit under one hold of the workspace lock, the
     # backup lock shared around it, as for a parse's upload (docs/workspace.md § Backups).
     async with backup_shared(root), workspace_lock(root):
-        try:
-            row = await insert_named(
-                db,
-                user_id=user_id,
-                into=folder_id,
-                build=lambda name: Document(
-                    user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
-                ),
-                taken=lambda: sibling_names(db, user_id, folder_id),
-                wanted=wanted,
-                limit=DOCUMENT_NAME_MAX,
-                message="A file with this name already exists here",
-                commit=False,
-            )
-        except ApiError:
-            if folder_id is None or await folder_exists(db, user_id, folder_id):
-                raise
-            raise ApiError(404, "invalid_request", "No such folder") from None
+        row = await insert_named(
+            db,
+            user_id=user_id,
+            into=folder_id,
+            build=lambda name: Document(
+                user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
+            ),
+            taken=lambda: sibling_names(db, user_id, folder_id),
+            wanted=wanted,
+            limit=DOCUMENT_NAME_MAX,
+            message=FILE_CLASH,
+            commit=False,
+        )
         row_id = row.id
         try:
             await workspace_documents.adopt_markdown(db, settings, row, staged)
@@ -1146,37 +1100,6 @@ async def file_markdown(
             row,
             what="The upload",
             undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
-        )
-    return document_payload(row, None)
-
-
-async def file_upload(
-    temp: Path,
-    filename: str,
-    declared_type: str,
-    size: int,
-    *,
-    user_id: int,
-    folder_id: int | None,
-    db: DbSession,
-    settings: AppSettings,
-) -> dict:
-    """A file of any other kind, kept as it is (docs/workspace.md § Files): its bytes are in
-    the tree already, under a write-in-progress name; the row and the move into place
-    under one hold of the workspace lock, the row committed last, as a markdown filing
-    is — no entry without its file, no file without its entry — through the filing the
-    agent's download shares (`workspace/filing.py`)."""
-    root = user_root(settings.workspaces_dir, user_id)
-    async with backup_shared(root), workspace_lock(root):
-        row = await keep_file(
-            db,
-            settings,
-            user_id=user_id,
-            folder_id=folder_id,
-            temp=temp,
-            filename=filename,
-            declared_type=declared_type,
-            size=size,
         )
     return document_payload(row, None)
 
@@ -1265,7 +1188,7 @@ async def take_pending_reconvert(db: DbSession, settings: AppSettings, row: Docu
     document_id, user_id = row.id, row.user_id
     try:
         await workspace_documents.take_reconvert(db, settings, row)
-    except Exception:  # noqa: BLE001 - the document opens as it is; the next read tries again
+    except Exception:  # the document opens as it is; the next read tries again
         logger.exception("document %d could not take its re-convert", document_id)
     return await live_document(db, user_id, document_id)
 
@@ -1395,9 +1318,16 @@ async def document_pages(document_id: int, user: SessionUser, db: DbSession):
         reconvert = await job_of(db, row.reconvert_job_id)
         if reconvert.status == "failed":
             job = reconvert
+    # The four columns the dialog reads, never a page's markdown or figures.
     rows = {
         page.page_no: page
-        for page in (await db.execute(select(JobPage).where(JobPage.job_id == job.id))).scalars()
+        for page in (
+            await db.execute(
+                select(JobPage.page_no, JobPage.status, JobPage.error, JobPage.model).where(
+                    JobPage.job_id == job.id
+                )
+            )
+        ).all()
     }
     return {
         "pages": [
@@ -1438,7 +1368,6 @@ async def document_page_image(
     slots = request.app.state.preview_slots
     try:
         data = await original_page_png(
-            root,
             source,
             kind=job.kind,
             page=page,
@@ -1455,10 +1384,17 @@ async def document_page_image(
     )
 
 
-class DocumentRetry(BaseModel):
-    """The model the failed pages are sent to; none is the job's own."""
+class ModelChoice(BaseModel):
+    """The model a parse runs on, its padding stripped. None or a blank name is the
+    default: a retry sends the failed pages to the job's own model while the deployment
+    offers it, else to `PARSE_MODEL`; a re-convert runs on the parse agent's."""
 
     model: str | None = Field(default=None, max_length=255)
+
+    @field_validator("model")
+    @classmethod
+    def _blank_is_none(cls, value: str | None) -> str | None:
+        return (value or "").strip() or None
 
 
 @router.post(
@@ -1467,14 +1403,14 @@ class DocumentRetry(BaseModel):
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def retry_document(
-    document_id: int, body: DocumentRetry, user: SessionUser, db: DbSession, settings: AppSettings
+    document_id: int, body: ModelChoice, user: SessionUser, db: DbSession, settings: AppSettings
 ):
     """Put the failed parse behind the document back on the queue, its succeeded pages
     kept (docs/jobs.md § Retrying failed pages) — or its failed re-convert, when the
     document's own parse stands (§ Re-converting a document) — under the workspace lock,
     through the function the chat agent's `convert_file` retries with
     (`retry_library_parse`)."""
-    model = (body.model or "").strip() or None
+    model = body.model
     if model is not None:
         # One of the parse agent's two, as at enqueue (docs/agents.md § Enqueue rules).
         model = checked_parse_model(settings, model)
@@ -1485,12 +1421,6 @@ async def retry_document(
     return {"job_id": str(job_id), "status": "queued"}
 
 
-class DocumentReconvert(BaseModel):
-    """The model the new parse runs on; none is the parse agent's own."""
-
-    model: str | None = Field(default=None, max_length=255)
-
-
 @router.post(
     "/documents/{document_id}/reconvert",
     dependencies=[CsrfGuard],
@@ -1498,7 +1428,7 @@ class DocumentReconvert(BaseModel):
 )
 async def reconvert_document(
     document_id: int,
-    body: DocumentReconvert,
+    body: ModelChoice,
     user: SessionUser,
     db: DbSession,
     settings: AppSettings,
@@ -1509,7 +1439,6 @@ async def reconvert_document(
     succeeds (docs/jobs.md § Re-converting a document). Decided under the workspace
     lock, which every writer of the pointer holds, so two clicks cannot start two
     parses; the job and the pointer land in one commit."""
-    model = (body.model or "").strip() or None
     root = user_root(settings.workspaces_dir, user.id)
     async with workspace_lock(root):
         row = await live_text_document(db, user.id, document_id)
@@ -1547,9 +1476,8 @@ async def reconvert_document(
             chunks=file_chunks(original),
             media_type=job.media_type,
             filename=job.filename,
-            model=model,
+            model=body.model,
             force=True,
-            check=True,
             reconvert=row,
         )
     return {"job_id": str(submission.job.id), "status": "queued"}
@@ -1587,26 +1515,13 @@ IMAGE_CAP_NAME = "DOCUMENT_IMAGE_MAX_BYTES"
 async def upload_image(request: Request, user: SessionUser, db: DbSession, settings: AppSettings):
     """An image for a document's text: kept as the document's, its path answered for the
     markdown line the caller writes (docs/api.md)."""
-    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+    if not is_multipart(request.headers.get("content-type", "")):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     cap = settings.document_image_max_bytes
-    declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > cap + MULTIPART_ENVELOPE_BYTES:
-        raise ApiError(413, "invalid_request", f"The upload exceeds {IMAGE_CAP_NAME}")
     # Bounded before the parser spools a byte, as an attachment's body is.
+    form = await capped_form(request, cap, IMAGE_CAP_NAME)
     try:
-        form = await MultiPartParser(
-            request.headers,
-            capped_stream(
-                request.stream(), cap + MULTIPART_ENVELOPE_BYTES, cap_name=IMAGE_CAP_NAME
-            ),
-        ).parse()
-    except MultiPartException as exc:
-        raise ApiError(400, "invalid_request", "The multipart body could not be read") from exc
-    try:
-        upload = form.get("file")
-        if not isinstance(upload, UploadFile):
-            raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
+        upload = form_file(form)
         document_id = form.get("document_id")
         if not isinstance(document_id, str) or not document_id.isdigit():
             raise ApiError(400, "invalid_request", "Multipart requests need a 'document_id' part")
@@ -1642,18 +1557,14 @@ async def document_image(
 ):
     row = await live_text_document(db, user.id, document_id)
     root = user_root(settings.workspaces_dir, row.user_id)
-    image = workspace_documents.image_of(root, row.id, name)
-    if image is None:
+    handle = workspace_documents.open_image(root, row.id, name)
+    if handle is None:
         raise ApiError(404, "invalid_request", "No such image")
-    try:
-        handle = image.open("rb")
-    except OSError as exc:
-        raise ApiError(404, "invalid_request", "No such image") from exc
     size = os.fstat(handle.fileno()).st_size
     # Never cached, as a crop is not: a cached image would outlive a sign-out.
     return StreamingResponse(
         iterate_in_threadpool(crop_chunks(handle)),
-        media_type=workspace_documents.IMAGE_SUFFIX_MEDIA[image.suffix],
+        media_type=workspace_documents.IMAGE_SUFFIX_MEDIA[Path(name).suffix],
         headers={"Cache-Control": "private, no-store", "Content-Length": str(size)},
     )
 
@@ -1870,7 +1781,6 @@ async def put_document_view(
 
 
 class DocumentConvert(BaseModel):
-    model: str | None = Field(default=None, max_length=255)
     # The view the document opens on once converted: the result viewer names `markdown`
     # when the reader asked for it there (docs/api.md).
     view: str | None = Field(default=None, max_length=16)
@@ -1892,7 +1802,6 @@ async def convert_document(
     naming the job, its id, name and place kept. A row that does not commit brings the
     file back; the worker files the source as the document's original when the parse
     ends (§ Retention)."""
-    model = (body.model or "").strip() or None
     view = checked_view(body.view)
     user_id = user.id
     root = user_root(settings.workspaces_dir, user_id)
@@ -1901,7 +1810,7 @@ async def convert_document(
         row = await live_document(db, user_id, document_id)
         if row.kind != FILE_KIND:
             raise ApiError(404, "invalid_request", "No such file")
-        row = await convert_kept_file(db, settings, user=user, row=row, model=model, view=view)
+        row = await convert_kept_file(db, settings, user=user, row=row, view=view)
     return await read_document_payload(db, settings, row)
 
 
@@ -1953,9 +1862,6 @@ async def copy_folder(
     return folder_payload(row)
 
 
-# --- the workspace: where a row's directory is ----------------------------------------------
-
-
 # --- content, notes, revisions (docs/workspace.md) -----------------------------------------
 
 
@@ -1981,7 +1887,6 @@ async def document_content(
         "revision": content.revision,
         "notes": content.notes,
         "notes_revision": content.notes_revision,
-        "has_source": content.has_source,
     }
 
 
@@ -2005,26 +1910,6 @@ async def put_document_notes(
         db, settings, row, text=body.text, base_revision=body.base_revision
     )
     return {"revision": revision}
-
-
-@router.get("/documents/{document_id}/revisions")
-async def document_revisions(
-    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    row = await live_text_document(db, user.id, document_id)
-    history = await workspace_documents.revisions(db, settings, row)
-    return {
-        "revisions": [
-            {
-                "commit": entry.commit,
-                "author": entry.author,
-                "message": entry.message,
-                "created_at": entry.created_at,
-                "files": list(entry.files),
-            }
-            for entry in history
-        ]
-    }
 
 
 @router.post("/documents/{document_id}/revisions/{commit}/revert", dependencies=[CsrfGuard])
@@ -2055,6 +1940,5 @@ async def revert_document_revision(
             else select(Document.id).where(Document.id == row.id)
         )
         await refuse_while_answering(db, user.id, guarded)
-        await workspace_documents.materialize_document(db, settings, row, locked=True)
         reverted = await workspace_documents.revert(db, settings, row, commit, locked=True)
     return {"revision": reverted.revision, "commit": reverted.commit}

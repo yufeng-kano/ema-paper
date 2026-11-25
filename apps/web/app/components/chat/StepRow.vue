@@ -2,26 +2,22 @@
 /**
  * One tool step of a group or a subagent's card (docs/web.md § The agent panel): its line,
  * a control that opens its detail — a shell step's whole command, its output and its exit;
- * a write's diff card with **Revert**. A library step with an undo record has **Undo** at
- * the line's end, and the server's refusal under it (docs/web.md § The Files page's Agent
- * card).
+ * a write's diff card, with **Revert** outside library mode. A library step with an undo
+ * record has **Undo** at the line's end, and the server's refusal under it (docs/web.md
+ * § The Files page's Agent card).
  */
 import type { CardState, EditCard, ToolStep, UndoState } from '~/lib/thread'
 
-const props = withDefaults(
-  defineProps<{
-    step: ToolStep
-    open: boolean
-    cardState: (card: EditCard) => CardState
-    /** A turn is unfinished: the revisions route refuses a revert under one, and a library
-     *  step's Undo waits for it too. */
-    locked: boolean
-    revertable?: boolean
-    /** The step's Undo, when it has one: a library step whose result carried an undo record. */
-    undo?: UndoState | null
-  }>(),
-  { revertable: true, undo: null },
-)
+const props = defineProps<{
+  step: ToolStep
+  open: boolean
+  cardState: (card: EditCard) => CardState
+  /** A turn is unfinished: the revisions route refuses a revert under one, and a library
+   *  step's Undo waits for it too. */
+  locked: boolean
+  /** The step's Undo, when it has one: a library step whose result carried an undo record. */
+  undo?: UndoState | null
+}>()
 
 const emit = defineEmits<{
   toggle: []
@@ -78,7 +74,6 @@ const meta = computed(() => {
         :card="step.card"
         :state="cardState(step.card)"
         :locked="locked"
-        :revertable="revertable"
         @toggle="emit('toggle-edit', step.card)"
       />
       <div v-else class="box">

@@ -29,7 +29,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
 JSON_COLUMN = JSONB().with_variant(JSON(), "sqlite")
@@ -122,22 +122,6 @@ class ApiKey(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
 
 
-class PromptPreset(Base):
-    """A named prompt for one agent; selecting one replaces that agent's template entirely
-    (docs/parsing.md § Prompts)."""
-
-    __tablename__ = "prompt_presets"
-    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_prompt_presets_user_name"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    agent: Mapped[str] = mapped_column(String(32))
-    name: Mapped[str] = mapped_column(String(255))
-    text: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
-
-
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 EFFORT_DEFAULT = "medium"
 
@@ -154,17 +138,13 @@ class AgentSetting(Base):
         ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     agent: Mapped[str] = mapped_column(String(32), primary_key=True)
-    # The chat agent's pick among `CHAT_MODELS`; NULL means the first offered. The parse
-    # and check agents' models are the deployment's, never stored here (docs/billing.md
-    # § Models).
+    # The chat agent's pick among the offered chat models; NULL means the first offered.
+    # The parse and check agents' models are the deployment's, never stored here
+    # (docs/billing.md § Models).
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # The user's own template for the agent; NULL means the agent's default. It replaces
-    # the default whole and is never set together with a preset (docs/agents.md).
+    # the default whole (docs/agents.md).
     prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # The legacy selection of a prompt preset; NULL means none (docs/parsing.md § Prompts).
-    prompt_preset_id: Mapped[int | None] = mapped_column(
-        ForeignKey("prompt_presets.id", ondelete="SET NULL"), nullable=True
-    )
     # The chat agent's reasoning depth (docs/chat.md); parse ignores it.
     effort: Mapped[str] = mapped_column(
         String(8), default=EFFORT_DEFAULT, server_default=text("'medium'")
@@ -194,13 +174,9 @@ class AgentSetting(Base):
     # § Format check).
     auto_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     # The parse agent's switch: a PDF or an image uploaded on the Files page is converted on
-    # arrival; off — the default since 2026-10-26 — it is kept as a file until the reader
-    # asks for Markdown (docs/workspace.md § Files).
+    # arrival; off — the default — it is kept as a file until the reader asks for Markdown
+    # (docs/workspace.md § Files).
     auto_convert: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
-
-    prompt_preset: Mapped[PromptPreset | None] = relationship(
-        foreign_keys=[prompt_preset_id], lazy="selectin"
-    )
 
 
 class Job(Base):
@@ -215,7 +191,6 @@ class Job(Base):
             "agent",
             "sha256",
             "model",
-            "connection_id",
             "pages_spec",
             "prompt_sha256",
             "pipeline_version",
@@ -237,26 +212,17 @@ class Job(Base):
     model: Mapped[str] = mapped_column(String(255))
     pipeline_version: Mapped[int] = mapped_column(Integer, default=0)
     bbox_format: Mapped[str] = mapped_column(String(32))
-    # The job whose output this job took as input; NULL when the input was an upload.
-    # No foreign key, for the same reason as `connection_id` (docs/database.md).
-    source_job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
-    # The upstream this job ran on; NULL means the built-in upstream — Kano Proxy, or
-    # OpenRouter on historical rows (docs/api.md § Upstreams). Deliberately NOT a foreign
-    # key: provider identity is immutable job history. A FK with SET NULL would relabel a
-    # deleted connection's jobs as Kano Proxy jobs — a queued one would then run on the
-    # wrong key, and a succeeded one would satisfy Kano Proxy dedup lookups with another
-    # upstream's output (docs/database.md).
-    connection_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Endpoint snapshot at enqueue — the connection's base_url, or KANO_PROXY_BASE_URL for
-    # the built-in upstream; part of the dedup key so editing a connection's URL
-    # invalidates results parsed through the old endpoint, and historical OpenRouter rows
-    # (NULL) never answer a new upload (docs/jobs.md § Dedup).
+    # Endpoint snapshot at enqueue: KANO_PROXY_BASE_URL, part of the dedup key, so results
+    # parsed through another origin never answer (docs/jobs.md § Dedup). NULL on a job of
+    # an upstream the deployment no longer has — OpenRouter, a provider connection — which
+    # never answers a lookup and never runs (docs/database.md § Rules).
     connection_base_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # The effective prompt template, verbatim; its hash is part of the dedup key.
-    prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt: Mapped[str] = mapped_column(Text)
     prompt_sha256: Mapped[str] = mapped_column(String(64), default="", server_default="")
     # The fallback a blocked page goes to, snapshotted at enqueue while the agent's
-    # `auto_fallback` was on; NULL otherwise (docs/parsing.md § Fallback model).
+    # `auto_fallback` was on, cleared by a retry once the deployment no longer offers it;
+    # NULL otherwise (docs/parsing.md § Fallback model).
     fallback_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # The model a retry runs the remaining pages on; NULL is `model` (docs/jobs.md
     # § Retrying failed pages). Neither is part of the dedup key.
@@ -372,6 +338,14 @@ class Folder(Base):
             postgresql_where=text("trashed_at IS NOT NULL"),
             sqlite_where=text("trashed_at IS NOT NULL"),
         ),
+        # What a folder delete's cascade to its subfolders reads: the unique indexes above
+        # lead with user_id and skip the Trash, so they cannot serve it (docs/database.md).
+        Index(
+            "ix_folders_parent_id",
+            "parent_id",
+            postgresql_where=text("parent_id IS NOT NULL"),
+            sqlite_where=text("parent_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -422,6 +396,13 @@ class Document(Base):
             sqlite_where=text("folder_id IS NULL AND trashed_at IS NULL"),
         ),
         Index("ix_documents_user_created", "user_id", "created_at"),
+        # What a folder delete's cascade to its documents reads (docs/database.md).
+        Index(
+            "ix_documents_folder_id",
+            "folder_id",
+            postgresql_where=text("folder_id IS NOT NULL"),
+            sqlite_where=text("folder_id IS NOT NULL"),
+        ),
         # The parse retention's keep rule and a job delete's cascade read it
         # (docs/jobs.md § Retention).
         Index("ix_documents_job_id", "job_id"),
@@ -440,7 +421,7 @@ class Document(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     folder_id: Mapped[int | None] = mapped_column(
         ForeignKey("folders.id", ondelete="CASCADE"), nullable=True
     )
@@ -483,6 +464,14 @@ class UsageLog(Base):
         Index("ix_usage_log_user_created", "user_id", "created_at"),
         # A job delete's SET NULL reads it (docs/jobs.md § Retention).
         Index("ix_usage_log_job_id", "job_id"),
+        # A turn's settlement sums its rows, and a turn delete's SET NULL reads it
+        # (docs/billing.md § A chat turn).
+        Index(
+            "ix_usage_log_turn_id",
+            "turn_id",
+            postgresql_where=text("turn_id IS NOT NULL"),
+            sqlite_where=text("turn_id IS NOT NULL"),
+        ),
         # An unknown cost is NULL and only an unknown cost is: a call nobody priced must
         # never be summed as a free one (docs/database.md).
         CheckConstraint(
@@ -499,7 +488,8 @@ class UsageLog(Base):
     )
     # The chat turn that made the call; NULL on parse rows (docs/chat.md).
     turn_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("chat_turns.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("chat_turns.id", name="fk_usage_log_turn_id", ondelete="SET NULL"),
+        nullable=True,
     )
     # Which agent billed the call, written with the row (docs/database.md § Rules).
     agent: Mapped[str] = mapped_column(String(32), default="parse", server_default="parse")
@@ -607,8 +597,8 @@ class ChatTurn(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
-    # The user message this turn answers. No FK the other way: messages.turn_id names the
-    # turn that produced an assistant message.
+    # The user message this turn answers, a messages.id without a foreign key; the key is
+    # the other way: messages.turn_id names the turn that produced an assistant message.
     message_id: Mapped[int] = mapped_column(Integer)
     # message | compact | idle_compact (docs/chat.md § Compaction).
     kind: Mapped[str] = mapped_column(
@@ -619,7 +609,6 @@ class ChatTurn(Base):
     # The web app's locale when the message was sent: the language the turn answers in.
     locale: Mapped[str] = mapped_column(String(16), default="en", server_default="en")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
-    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     # The turn before this one on its branch, NULL for a conversation's first: turns with
     # one parent are the versions of one message, and `conversations.head_id` names the
@@ -631,7 +620,7 @@ class ChatTurn(Base):
 
 class ChatToolCall(Base):
     """One web tool call of a turn that was answered or kept a file — `web_search`,
-    `search_papers`, `download_file` — what the per-day caps count and what a turn's web
+    `search_papers`, `download_file`: what the per-day caps count and what a turn's web
     searches are charged from (docs/chat.md § Tools, docs/billing.md § A chat turn). A
     deleted turn keeps its rows for the day's count, as a purged parse keeps its entry."""
 
@@ -657,7 +646,16 @@ class Message(Base):
     every later request replays them verbatim (docs/chat.md § History is append-only)."""
 
     __tablename__ = "messages"
-    __table_args__ = (Index("ix_messages_conversation_id", "conversation_id", "id"),)
+    __table_args__ = (
+        Index("ix_messages_conversation_id", "conversation_id", "id"),
+        # A turn delete's SET NULL reads it (docs/database.md).
+        Index(
+            "ix_messages_turn_id",
+            "turn_id",
+            postgresql_where=text("turn_id IS NOT NULL"),
+            sqlite_where=text("turn_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
@@ -675,6 +673,8 @@ class ChatEvent(Base):
     __tablename__ = "chat_events"
     __table_args__ = (
         UniqueConstraint("conversation_id", "seq", name="uq_chat_events_conversation_seq"),
+        # A turn delete's cascade reads it (docs/database.md).
+        Index("ix_chat_events_turn_id", "turn_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -694,7 +694,7 @@ class Skill(Base):
     __table_args__ = (UniqueConstraint("user_id", "name", name="uq_skills_user_name"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     name: Mapped[str] = mapped_column(String(64))
     description: Mapped[str] = mapped_column(Text, default="")
     argument_hint: Mapped[str] = mapped_column(String(128), default="")
@@ -716,7 +716,7 @@ class Subagent(Base):
     __table_args__ = (UniqueConstraint("user_id", "name", name="uq_subagents_user_name"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     name: Mapped[str] = mapped_column(String(64))
     description: Mapped[str] = mapped_column(Text, default="")
     # NULL: the conversation's model.
@@ -729,9 +729,6 @@ class Subagent(Base):
     prompt: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
-
-
-MEMORY_KINDS = ("term", "preference", "about", "document")
 
 
 class Memory(Base):
@@ -807,28 +804,40 @@ class UploadTicket(Base):
 
     Unspent it authenticates one `POST /v1/parse`; spending it binds `job_id`, after which
     it only reads that one job. `token_hash` is the SHA-256 of the `srt_...` plaintext.
-    `library_access` says the minting grant reached the library; `into_library` that the
-    upload is filed into Files, in `folder_id` — NULL the top level (docs/mcp.md § Filing
-    into Files).
+    `into_library` says the upload is filed into Files, in `folder_id` — NULL the top level
+    (docs/mcp.md § Filing into Files).
     """
 
     __tablename__ = "upload_tickets"
-    # Mint rate limit: tickets this user created in the last hour.
-    __table_args__ = (Index("ix_upload_tickets_user_created", "user_id", "created_at"),)
+    __table_args__ = (
+        # Mint rate limit: tickets this user created in the last hour.
+        Index("ix_upload_tickets_user_created", "user_id", "created_at"),
+        # A job delete's SET NULL and the parse retention's ticket rule read it
+        # (docs/jobs.md § Retention).
+        Index(
+            "ix_upload_tickets_job_id",
+            "job_id",
+            postgresql_where=text("job_id IS NOT NULL"),
+            sqlite_where=text("job_id IS NOT NULL"),
+        ),
+        # What a folder delete's SET NULL reads (docs/database.md).
+        Index(
+            "ix_upload_tickets_folder_id",
+            "folder_id",
+            postgresql_where=text("folder_id IS NOT NULL"),
+            sqlite_where=text("folder_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    prefix: Mapped[str] = mapped_column(String(32))
     job_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
     spent_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
-    library_access: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default=text("false")
-    )
     into_library: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     folder_id: Mapped[int | None] = mapped_column(
         ForeignKey("folders.id", name="fk_upload_tickets_folder_id_folders", ondelete="SET NULL"),
@@ -838,7 +847,7 @@ class UploadTicket(Base):
 
 class DocumentTicket(Base):
     """A short-lived credential for one document, minted by the MCP library tools
-    (docs/auth.md § 7).
+    (docs/auth.md § 6).
 
     Not spent by use: within its lifetime it reads the document's routes under
     `/v1/library/documents/{id}` and, with `scope` `write`, saves its `doc.md` and `notes.md`.
@@ -846,9 +855,11 @@ class DocumentTicket(Base):
     """
 
     __tablename__ = "document_tickets"
-    # Mint rate limit: tickets this user created in the last hour.
     __table_args__ = (
+        # Mint rate limit: tickets this user created in the last hour.
         Index("ix_document_tickets_user_created", "user_id", "created_at"),
+        # What a document delete's cascade reads (docs/database.md).
+        Index("ix_document_tickets_document_id", "document_id"),
         CheckConstraint("scope IN ('read', 'write')", name="ck_document_tickets_scope"),
     )
 
@@ -857,13 +868,12 @@ class DocumentTicket(Base):
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
     scope: Mapped[str] = mapped_column(String(8))
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    prefix: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
 
 
 class OAuthClient(Base):
-    """Dynamically registered Claude Connector clients (docs/auth.md § OAuth AS)."""
+    """Dynamically registered Claude Connector clients (docs/auth.md § 4)."""
 
     __tablename__ = "oauth_clients"
 
@@ -906,7 +916,8 @@ class Subscription(Base):
     __table_args__ = (CheckConstraint("period_end > period_start", name="ck_subscriptions_period"),)
 
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("users.id", name="fk_subscriptions_user_id_users", ondelete="CASCADE"),
+        primary_key=True,
     )
     subscription_id: Mapped[str] = mapped_column(String(255), unique=True)
     status: Mapped[str] = mapped_column(String(32))
@@ -928,7 +939,8 @@ class Checkout(Base):
     __tablename__ = "checkouts"
 
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("users.id", name="fk_checkouts_user_id_users", ondelete="CASCADE"),
+        primary_key=True,
     )
     plan_id: Mapped[str] = mapped_column(String(64))
     idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
@@ -944,12 +956,11 @@ class PayEvent(Base):
     __tablename__ = "pay_events"
 
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
-    type: Mapped[str] = mapped_column(String(64))
     # The record of the event outlives the user it was about.
     user_id: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("users.id", name="fk_pay_events_user_id_users", ondelete="SET NULL"),
+        nullable=True,
     )
-    received_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 
 class CreditPeriod(Base):
@@ -963,12 +974,11 @@ class CreditPeriod(Base):
     )
 
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("users.id", name="fk_credit_periods_user_id_users", ondelete="CASCADE"),
+        primary_key=True,
     )
     period_start: Mapped[datetime] = mapped_column(TIMESTAMPTZ, primary_key=True)
     period_end: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
-    # NULL = Free.
-    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     granted: Mapped[int] = mapped_column(Integer)
     # Reserved and consumed entries of the period; a release subtracts. May exceed
     # `granted` only through a chat turn's overdraft.
@@ -999,19 +1009,26 @@ class CreditEntry(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", name="fk_credit_entries_user_id_users", ondelete="CASCADE")
+    )
     # The period the entry was made in, where it is settled whenever that happens.
     period_start: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
     kind: Mapped[str] = mapped_column(String(8))  # parse | chat
     state: Mapped[str] = mapped_column(String(8))  # reserved | consumed | released
     amount: Mapped[int] = mapped_column(Integer)
     job_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("jobs.id", ondelete="SET NULL"), unique=True, nullable=True
+        ForeignKey("jobs.id", name="fk_credit_entries_job_id_jobs", ondelete="SET NULL"),
+        unique=True,
+        nullable=True,
     )
     turn_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("chat_turns.id", ondelete="SET NULL"), unique=True, nullable=True
+        ForeignKey(
+            "chat_turns.id", name="fk_credit_entries_turn_id_chat_turns", ondelete="SET NULL"
+        ),
+        unique=True,
+        nullable=True,
     )
-    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     settled_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
 
@@ -1048,9 +1065,6 @@ class CreditPack(Base):
     # operator's, which nothing refunds and the webhook and the refresh never touch
     # (docs/billing.md § Redeem codes, § Operator grants).
     source: Mapped[str] = mapped_column(String(8), default="pay", server_default=text("'pay'"))
-    redemption_id: Mapped[int | None] = mapped_column(
-        ForeignKey("redemptions.id", ondelete="SET NULL"), unique=True, nullable=True
-    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
@@ -1222,7 +1236,7 @@ class AuditLog(Base):
     # What the route required; NULL for a sign-in's owner join.
     permission: Mapped[str | None] = mapped_column(String(32), nullable=True)
     action: Mapped[str] = mapped_column(String(64))  # <area>.<verb>
-    target_type: Mapped[str] = mapped_column(String(32))  # group | user | setting
+    target_type: Mapped[str] = mapped_column(String(32))  # group | user | code | job | setting
     # No foreign key: a record outlives what it names.
     target_id: Mapped[str] = mapped_column(String(64))
     # A side with nothing is SQL NULL (docs/admin.md § The audit log): `none_as_null`, or a

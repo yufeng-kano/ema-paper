@@ -6,57 +6,32 @@
  * worker, Kano Proxy, Kano Pay), the newest audit records for a caller who holds `audit.read`,
  * and today's usage per model. Every figure is the API's; *Refresh* reads them again.
  */
-import { getAdminOverview, type AdminOverviewResponse, type AuditEntry } from '~/lib/api'
+import { getAdminOverview, type AdminOverviewResponse } from '~/lib/api'
 import { formatElapsed, formatUsd, formatUtcDay } from '~/lib/admin'
-import { formatCount, formatShortDateTime } from '~/lib/format'
+import { formatCount, formatShortDateTime, formatTime } from '~/lib/format'
 import type { TableColumn } from '~/lib/table'
 
 /** A row of today's usage: a model's, or the totals under them. */
 type UsageRow = AdminOverviewResponse['usage']['models'][number] & { total: boolean }
 type Tone = 'ok' | 'danger' | 'info' | 'neutral'
 
-const { t, te, locale } = useI18n()
+const { t, locale } = useI18n()
+const { actorName, actionLabel, targetLabel } = useAdminLabels()
 const localePath = useLocalePath()
-const { explain } = useAdminFailure()
 
-const data = shallowRef<AdminOverviewResponse | null>(null)
-const pending = ref(false)
-const error = ref<string | null>(null)
 /** When the figures were read: *updated {time}*, and what the oldest job's age counts to. */
 const readAt = ref(Date.now())
-let seq = 0
 
-async function load(): Promise<void> {
-  const mine = ++seq
-  pending.value = true
-  try {
-    const loaded = await getAdminOverview()
-    if (mine !== seq) {
-      return
-    }
-    data.value = loaded
+const { data, pending, error, load } = useAdminRead(getAdminOverview, {
+  onLoaded: () => {
     readAt.value = Date.now()
-    error.value = null
-  } catch (failure) {
-    const message = await explain(failure)
-    if (mine === seq) {
-      error.value = message
-    }
-  } finally {
-    if (mine === seq) {
-      pending.value = false
-    }
-  }
-}
+  },
+})
 
 onMounted(load)
 
 function count(value: number): string {
   return formatCount(value, locale.value)
-}
-
-function time(iso: string | number): string {
-  return new Intl.DateTimeFormat(locale.value, { timeStyle: 'short' }).format(new Date(iso))
 }
 
 const headline = computed(() => {
@@ -67,7 +42,7 @@ const headline = computed(() => {
   return t('admin.overview.meta', {
     date: formatUtcDay(overview.day, locale.value),
     accounts: t('admin.overview.accounts', { n: count(overview.accounts) }, overview.accounts),
-    time: time(readAt.value),
+    time: formatTime(readAt.value, locale.value),
   })
 })
 
@@ -154,26 +129,6 @@ const services = computed<ServiceRow[]>(() => {
     },
   ]
 })
-
-// --- recent changes ----------------------------------------------------------------------
-
-function actorName(row: AuditEntry): string {
-  return row.actor ? row.actor.name?.trim() || row.actor.email : t('admin.deletedAccount')
-}
-
-/** The catalog's words for an action; one it does not know prints as its key. */
-function actionLabel(action: string): string {
-  return te(`admin.audit.actions.${action}`) ? t(`admin.audit.actions.${action}`) : action
-}
-
-/** What the target is called now; a job, or one gone, by its type and id. */
-function targetLabel(row: AuditEntry): string {
-  if (row.target_label) {
-    return row.target_label
-  }
-  const type = te(`admin.audit.targets.${row.target_type}`) ? t(`admin.audit.targets.${row.target_type}`) : row.target_type
-  return `${type} ${row.target_id}`
-}
 
 // --- today's usage -----------------------------------------------------------------------
 
@@ -303,7 +258,7 @@ function usageRowAttrs(row: UsageRow): Record<string, unknown> {
             <div v-for="entry in data.audit" :key="entry.id" class="row record">
               <span class="record-time tabular">{{ formatShortDateTime(entry.created_at, locale) }}</span>
               <p class="record-text">
-                <span class="record-who">{{ actorName(entry) }}</span>
+                <span class="record-who">{{ actorName(entry) ?? t('admin.deletedAccount') }}</span>
                 {{ actionLabel(entry.action) }}
                 <span class="muted">{{ targetLabel(entry) }}</span>
               </p>

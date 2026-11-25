@@ -19,12 +19,15 @@
  * is not inside the scrolling region at all. `overscroll-behavior: contain` on the panel
  * body stops a scroll that reaches its end from chaining anywhere.
  */
+import { focusablesIn, wrapTab } from '~/lib/focus'
 import { modalAboveKey, modalPanelKey } from '~/lib/menu'
 
 const props = withDefaults(
   defineProps<{
     /** The dialog's accessible name. Also the visible title unless the `title` slot fills it. */
     title: string
+    /** One muted line under the visible title — whom or what the dialog is about. */
+    subtitle?: string
     /** `wide` is a form around one long text — a prompt, a skill's body. */
     size?: 'sm' | 'md' | 'wide' | 'lg' | 'full'
     /** Fixed-height grid body — for a dialog whose content owns its own scroll regions. */
@@ -65,7 +68,7 @@ const props = withDefaults(
      */
     above?: boolean
   }>(),
-  { size: 'sm', backLabel: undefined },
+  { size: 'sm', subtitle: undefined, backLabel: undefined },
 )
 
 const emit = defineEmits<{ close: [] }>()
@@ -92,26 +95,6 @@ function heldAbove(): HTMLElement | null {
 /** Restored on unmount, so closing a dialog does not dump focus on `<body>`. */
 let previouslyFocused: HTMLElement | null = null
 
-const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
-
-function focusables(): HTMLElement[] {
-  if (!panel.value) {
-    return []
-  }
-  // An inert region — a pane of the phone's reader that is not shown — takes no focus.
-  return [...panel.value.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
-    (el) => (el.offsetParent !== null && !el.closest('[inert]')) || el === document.activeElement,
-  )
-}
-
-/**
- * Bound on the document rather than on the overlay, because focus does not reliably stay
- * inside a dialog: a control that goes `loading` disables itself, and a disabled element
- * hands focus back to `<body>`. A key pressed there never reaches a listener on the
- * overlay, so a dialog whose action failed could not be closed with Escape and Tab
- * restarted from the top of the page behind it.
- */
 /**
  * Whether this dialog is the one a key is meant for. Dialogs open over dialogs — the
  * settings dialog's confirmations, a prompt dialog inside it — and each listens on the
@@ -127,6 +110,13 @@ function topmost(selector: string): boolean {
   return overlays[overlays.length - 1] === panel.value
 }
 
+/**
+ * Bound on the document rather than on the overlay, because focus does not reliably stay
+ * inside a dialog: a control that goes `loading` disables itself, and a disabled element
+ * hands focus back to `<body>`. A key pressed there never reaches a listener on the
+ * overlay, so a dialog whose action failed could not be closed with Escape and Tab
+ * restarted from the top of the page behind it.
+ */
 function onKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape') {
     if (!topmost('[aria-modal="true"], [role="menu"], [data-escape-owner]')) {
@@ -142,26 +132,15 @@ function onKeydown(event: KeyboardEvent) {
     return
   }
 
-  const items = focusables()
-  if (!items.length) {
+  const items = focusablesIn(panel.value)
+  if (!panel.value || !items.length) {
     // Nothing focusable inside: keep focus on the panel rather than letting Tab escape to
     // the page behind the overlay.
     event.preventDefault()
     panel.value?.focus()
     return
   }
-  const first = items[0]!
-  const last = items[items.length - 1]!
-  const active = document.activeElement
-  const outside = !panel.value?.contains(active)
-
-  if (event.shiftKey && (active === first || active === panel.value || outside)) {
-    event.preventDefault()
-    last.focus()
-  } else if (!event.shiftKey && (active === last || outside)) {
-    event.preventDefault()
-    first.focus()
-  }
+  wrapTab(event, panel.value, items)
 }
 
 onMounted(async () => {
@@ -177,7 +156,7 @@ onMounted(async () => {
   await nextTick()
   // The first field if there is one, else the panel — never the close button, which would
   // make Escape and Enter do the same thing on open.
-  const target = focusables().find((el) => el.tagName !== 'BUTTON') ?? panel.value
+  const target = focusablesIn(panel.value).find((el) => el.tagName !== 'BUTTON') ?? panel.value
   target?.focus()
 })
 
@@ -222,6 +201,7 @@ onBeforeUnmount(() => {
           <div class="panel-heading">
             <slot name="title">
               <h2 class="panel-title">{{ title }}</h2>
+              <p v-if="subtitle" class="panel-subtitle">{{ subtitle }}</p>
             </slot>
           </div>
           <div class="panel-actions">
@@ -427,6 +407,14 @@ onBeforeUnmount(() => {
   font-size: var(--display-xs);
   font-weight: var(--weight-semibold);
   letter-spacing: var(--tracking-heading);
+}
+
+/* Wraps anywhere: it can be an address or a batch's long label. */
+.panel-subtitle {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
 }
 
 .panel-actions {

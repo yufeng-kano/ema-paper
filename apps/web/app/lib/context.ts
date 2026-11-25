@@ -7,7 +7,7 @@
  */
 import type { Conversation } from './api'
 
-export type RingLevel = 'accent' | 'warning' | 'danger'
+type RingLevel = 'accent' | 'warning' | 'danger'
 
 /** The ring's fill: the context over the window, 0 while no context is known (the draft,
  *  and a compacted conversation until its next call reports one), never past 1. */
@@ -59,7 +59,7 @@ export function contextLine(
  * model whose usage names no cache; null while there is nothing to say — the draft, and a
  * compacted conversation whose next call has not reported yet.
  */
-export type CacheState =
+type CacheState =
   | { kind: 'warm'; minutesLeft: number }
   | { kind: 'expired'; recacheCredits: number | null }
   | { kind: 'none' }
@@ -76,7 +76,7 @@ export function cacheState(
     const left = until - now
     return left > 0
       ? { kind: 'warm', minutesLeft: Math.max(1, Math.ceil(left / 60_000)) }
-      : { kind: 'expired', recacheCredits: conversation.recache_credits ?? null }
+      : { kind: 'expired', recacheCredits: conversation.recache_credits }
   }
   return conversation.context_tokens == null ? null : { kind: 'none' }
 }

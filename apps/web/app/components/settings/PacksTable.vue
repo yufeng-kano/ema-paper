@@ -24,7 +24,7 @@ const columns = computed<TableColumn<BillingPack>[]>(() => [
   { key: 'remaining', header: t('usage.columnLeft'), numeric: true },
 ])
 
-/** What a pack is, by where its credits came from; bought where the API does not say. */
+/** What a pack is, by where its credits came from. */
 function packItem(pack: BillingPack): string {
   if (pack.source === 'code') {
     return t('usage.itemCode')

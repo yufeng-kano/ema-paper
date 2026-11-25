@@ -43,7 +43,7 @@ RUN mkdir -p /workspace
 
 WORKDIR /workspace
 # The default environment: what `python` runs and `uv pip install` installs into, made by
-# the runner after each start when its interpreter does not run (docs/sandbox.md § The
+# the runner after each start when its interpreter is missing (docs/sandbox.md § The
 # image). In the workspace's .cache, so it survives a stop and goes with a reset.
 ENV UV_CACHE_DIR=/workspace/.cache/uv \
     UV_PYTHON_INSTALL_DIR=/workspace/.cache/python \

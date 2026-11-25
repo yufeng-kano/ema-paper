@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from collections.abc import Callable
 from pathlib import Path
 
 import pillow_heif
@@ -14,7 +15,7 @@ from reportlab.pdfgen import canvas
 # Registers the HEIF plugin for both reading and writing the .heic fixture.
 pillow_heif.register_heif_opener()
 
-PAGE_WIDTH, PAGE_HEIGHT = letter
+PAGE_HEIGHT = letter[1]
 
 BODY_LINE = "the quick brown fox jumps over the lazy dog and keeps running"
 
@@ -40,69 +41,27 @@ def _write_paragraph(pdf: canvas.Canvas, x: float, top: float, lines: int, width
 
 
 def text_layer_page(pdf: canvas.Canvas) -> None:
-    """A plain single-column page: the text-layer path."""
+    """A plain single-column page of text."""
     pdf.setFont("Helvetica-Bold", 16)
     pdf.drawString(72, PAGE_HEIGHT - 72, "A Very Ordinary Report")
     _write_paragraph(pdf, 72, PAGE_HEIGHT - 110, lines=30, width=90)
 
 
 def scanned_page(pdf: canvas.Canvas) -> None:
-    """A page that is only a bitmap: no text layer at all, so the vision path."""
+    """A page that is only a bitmap: no text layer at all."""
     pdf.drawImage(_photo(480, 620), 72, 100, width=460, height=600)
 
 
 def two_column_page(pdf: canvas.Canvas) -> None:
-    """Two text columns with a clear gutter: the vision path."""
+    """Two text columns with a clear gutter."""
     _write_paragraph(pdf, 60, PAGE_HEIGHT - 80, lines=40, width=42)
     _write_paragraph(pdf, 330, PAGE_HEIGHT - 80, lines=40, width=42)
 
 
-def table_page(pdf: canvas.Canvas) -> None:
-    """A grid of widely separated cells: the vision path."""
-    pdf.setFont("Helvetica", 10)
-    y = PAGE_HEIGHT - 80
-    for row in range(24):
-        for column, x in enumerate((72, 220, 370, 500)):
-            pdf.drawString(x, y, f"r{row}c{column}")
-        y -= 16
-
-
-def build_text_layer_pdf(path: Path) -> Path:
+def build_pdf(path: Path, *pages: Callable[[canvas.Canvas], None]) -> Path:
+    """A letter-size PDF, one page drawn by each of `pages` in order."""
     pdf = canvas.Canvas(str(path), pagesize=letter)
-    text_layer_page(pdf)
-    pdf.showPage()
-    pdf.save()
-    return path
-
-
-def build_scanned_pdf(path: Path) -> Path:
-    pdf = canvas.Canvas(str(path), pagesize=letter)
-    scanned_page(pdf)
-    pdf.showPage()
-    pdf.save()
-    return path
-
-
-def build_two_column_pdf(path: Path) -> Path:
-    pdf = canvas.Canvas(str(path), pagesize=letter)
-    two_column_page(pdf)
-    pdf.showPage()
-    pdf.save()
-    return path
-
-
-def build_table_pdf(path: Path) -> Path:
-    pdf = canvas.Canvas(str(path), pagesize=letter)
-    table_page(pdf)
-    pdf.showPage()
-    pdf.save()
-    return path
-
-
-def build_mixed_pdf(path: Path) -> Path:
-    """Three pages: text layer, scan, two columns."""
-    pdf = canvas.Canvas(str(path), pagesize=letter)
-    for page in (text_layer_page, scanned_page, two_column_page):
+    for page in pages:
         page(pdf)
         pdf.showPage()
     pdf.save()

@@ -6,6 +6,7 @@ fixed public address and `respx` answers the connection to it."""
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import logging
 import os
@@ -23,18 +24,17 @@ from sightread.db.models import ChatToolCall, Document, Folder
 from sightread.jobs import chat_runner, chat_web
 from sightread.workspace import safe_io
 from sightread.workspace.documents import measure_storage
-from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, PARSE_MODEL, TEST_MODEL_PRICES
-from tests.fixtures.documents import build_text_layer_pdf
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_extensions import (
+from tests.chat_helpers import (
     chatting_client,
     new_conversation,
     one_call,
-    replayed_events,
+    run_queued_turn,
     send,
     stub_messages,
+    tool_results,
+    turn_credits,
 )
+from tests.conftest import PARSE_MODEL, TEST_MODEL_PRICES, postgres_only, sign_in
 
 PUBLIC_IP = "1.2.3.4"
 HOSTS = {
@@ -55,10 +55,8 @@ def fake_resolver(monkeypatch) -> None:
     monkeypatch.setattr(chat_web, "resolve_host", resolve)
 
 
-async def web_client(make_client, tmp_path, **overrides) -> httpx.AsyncClient:
-    return await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), **WEB_KEYS, **overrides)
-    )
+async def web_client(make_client, **overrides) -> httpx.AsyncClient:
+    return await chatting_client(make_client(**WEB_KEYS, **overrides))
 
 
 def brave_results(*titles: str) -> dict:
@@ -77,24 +75,29 @@ def brave_results(*titles: str) -> dict:
     }
 
 
-async def tool_results(client, conversation_id: int) -> list[dict]:
-    return [
-        data
-        for name, data in await replayed_events(client, conversation_id)
-        if name == "tool_result"
-    ]
+async def fetch(
+    url: str,
+    *,
+    max_bytes: int = 1000,
+    max_chars: int = 20_000,
+    timeout: float = 5,
+    pdf_timeout: float = 5,
+) -> chat_web.ToolOutcome:
+    """`read_url` as a turn calls it, under the test's User-Agent."""
+    return await chat_web.read_url(
+        url,
+        max_bytes=max_bytes,
+        max_chars=max_chars,
+        timeout=timeout,
+        pdf_timeout=pdf_timeout,
+        user_agent=AGENT,
+    )
 
 
 async def recorded(client, tool: str) -> int:
     async with client.app.state.sessionmaker() as db:
         rows = (await db.execute(select(ChatToolCall).where(ChatToolCall.tool == tool))).scalars()
         return len(rows.all())
-
-
-async def turn_credits(client, conversation_id: int) -> tuple[str, int | None]:
-    thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
-    [turn] = thread["turns"]
-    return turn["status"], turn["credits"]
 
 
 # --- what is declared -------------------------------------------------------------------------
@@ -136,10 +139,9 @@ def test_the_web_tools_are_declared_only_where_the_deployment_runs_them() -> Non
 
 def test_the_fullest_tool_list_keeps_its_strict_grammar_small() -> None:
     """docs/chat.md § Upstream: the upstream compiles every strict schema of a request into
-    one grammar and refuses the whole request past a size it does not publish — ten strict
-    tools crossed it and every Claude turn failed, nine never had. The fullest list a
-    deployment declares (a shell, both search keys, a parse model) stays well under, and a
-    tool whose input is one string is never strict."""
+    one grammar and refuses the whole request past a size it does not publish. The fullest
+    list a deployment declares (a shell, both search keys, a parse model) keeps at most six
+    strict tools, and a tool whose input is one string is never strict."""
     settings = Settings(**WEB_KEYS, parse_model=PARSE_MODEL, model_prices_json=TEST_MODEL_PRICES)
     tools = chat_runner.turn_tools(True, settings)
     assert {"bash", "web_search", "search_papers", "convert_file", "insert_image"} <= {
@@ -154,13 +156,11 @@ def test_the_fullest_tool_list_keeps_its_strict_grammar_small() -> None:
         ), tool["name"]
 
 
-async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(
-    make_client, tmp_path
-) -> None:
+async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(make_client) -> None:
     """docs/api.md `GET /api/agents`, docs/billing.md § Routes: the tools the caller's turn
     declares, and the price of a web search — null where there is none."""
-    client = make_client(workspaces_dir=str(tmp_path / "ws"), **WEB_KEYS)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    client = make_client(**WEB_KEYS)
+    await sign_in(client)
     chat = next(
         a for a in (await client.get("/api/agents")).json()["agents"] if a["name"] == "chat"
     )
@@ -175,8 +175,8 @@ async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(
     assert (await client.get("/api/billing/catalog")).json()["rates"]["web_search_per_call"] == 3
     assert (await client.get("/api/billing")).json()["rates"]["web_search_per_call"] == 3
 
-    bare = make_client(workspaces_dir=str(tmp_path / "ws2"))
-    await bare.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    bare = make_client()
+    await sign_in(bare)
     chat = next(a for a in (await bare.get("/api/agents")).json()["agents"] if a["name"] == "chat")
     assert chat["tools"][-5:] == [
         "memory",
@@ -187,8 +187,8 @@ async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(
     ]
     assert (await bare.get("/api/billing/catalog")).json()["rates"]["web_search_per_call"] is None
 
-    off = make_client(workspaces_dir=str(tmp_path / "ws3"), chat_web_access=False, **WEB_KEYS)
-    await off.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    off = make_client(chat_web_access=False, **WEB_KEYS)
+    await sign_in(off)
     chat = next(a for a in (await off.get("/api/agents")).json()["agents"] if a["name"] == "chat")
     assert chat["tools"][-3:] == ["memory", "convert_file", "insert_image"]
     assert (await off.get("/api/billing/catalog")).json()["rates"]["web_search_per_call"] is None
@@ -198,12 +198,12 @@ async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(
 
 
 @respx.mock
-async def test_a_web_search_answers_results_and_is_charged_per_call(make_client, tmp_path) -> None:
+async def test_a_web_search_answers_results_and_is_charged_per_call(make_client) -> None:
     """docs/billing.md § A chat turn: an answered search adds `WEB_SEARCH_CREDITS` to the
     turn's entry on top of its tokens (two stubbed calls round up to 1), recorded as a
     `chat_tool_calls` row; the model gets titles, URLs and plain snippets. The call names
     the deployment in its User-Agent, as every web tool's does (docs/chat.md § Tools)."""
-    client = await web_client(make_client, tmp_path, web_url="https://paper.example/")
+    client = await web_client(make_client, web_url="https://paper.example/")
     brave = respx.get(host="api.search.brave.com", path="/res/v1/web/search").mock(
         return_value=httpx.Response(200, json=brave_results("Attention", "Transformers"))
     )
@@ -215,7 +215,7 @@ async def test_a_web_search_answers_results_and_is_charged_per_call(make_client,
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Search")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     request = brave.calls.last.request
     assert request.headers["x-subscription-token"] == "brave-test"
@@ -234,8 +234,8 @@ async def test_a_web_search_answers_results_and_is_charged_per_call(make_client,
 
 
 @respx.mock
-async def test_a_search_brave_did_not_answer_costs_nothing(make_client, tmp_path) -> None:
-    client = await web_client(make_client, tmp_path)
+async def test_a_search_brave_did_not_answer_costs_nothing(make_client) -> None:
+    client = await web_client(make_client)
     respx.get(host="api.search.brave.com", path="/res/v1/web/search").mock(
         return_value=httpx.Response(503, text="down")
     )
@@ -247,7 +247,7 @@ async def test_a_search_brave_did_not_answer_costs_nothing(make_client, tmp_path
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Search")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     [result] = await tool_results(client, conversation_id)
     assert result["is_error"] is True and "HTTP 503" in result["output"]
     assert await recorded(client, "web_search") == 0
@@ -255,10 +255,10 @@ async def test_a_search_brave_did_not_answer_costs_nothing(make_client, tmp_path
 
 
 @respx.mock
-async def test_web_searches_stop_at_the_turn_cap(make_client, tmp_path) -> None:
+async def test_web_searches_stop_at_the_turn_cap(make_client) -> None:
     """docs/chat.md § Tools: a search past `WEB_SEARCH_MAX_PER_TURN` answers an error
     result and is neither run nor charged."""
-    client = await web_client(make_client, tmp_path, web_search_max_per_turn=1)
+    client = await web_client(make_client, web_search_max_per_turn=1)
     brave = respx.get(host="api.search.brave.com", path="/res/v1/web/search").mock(
         return_value=httpx.Response(200, json=brave_results("One"))
     )
@@ -271,7 +271,7 @@ async def test_web_searches_stop_at_the_turn_cap(make_client, tmp_path) -> None:
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Search twice")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     first, second = await tool_results(client, conversation_id)
     assert first["is_error"] is False
     assert second["is_error"] is True and "made its 1 web searches" in second["output"]
@@ -280,10 +280,10 @@ async def test_web_searches_stop_at_the_turn_cap(make_client, tmp_path) -> None:
 
 
 @respx.mock
-async def test_web_searches_stop_at_the_deployments_day_cap(make_client, tmp_path) -> None:
+async def test_web_searches_stop_at_the_deployments_day_cap(make_client) -> None:
     """docs/chat.md § Tools: the per-day cap counts every user's recorded searches of the
     UTC day, so a turn after it is reached is refused before Brave is called."""
-    client = await web_client(make_client, tmp_path, web_search_max_per_day=1)
+    client = await web_client(make_client, web_search_max_per_day=1)
     brave = respx.get(host="api.search.brave.com", path="/res/v1/web/search").mock(
         return_value=httpx.Response(200, json=brave_results("One"))
     )
@@ -296,7 +296,7 @@ async def test_web_searches_stop_at_the_deployments_day_cap(make_client, tmp_pat
         )
         conversation_id = await new_conversation(client)
         await send(client, conversation_id, text="Search")
-        await _run_queued_turn(client)
+        await run_queued_turn(client)
         [result] = await tool_results(client, conversation_id)
         assert result["is_error"] is expected_error, result
     assert "Today's limit on web searches (this deployment's)" in result["output"]
@@ -305,15 +305,13 @@ async def test_web_searches_stop_at_the_deployments_day_cap(make_client, tmp_pat
 
 
 @respx.mock
-async def test_a_web_search_is_refused_once_the_credits_are_gone(make_client, tmp_path) -> None:
+async def test_a_web_search_is_refused_once_the_credits_are_gone(make_client) -> None:
     """docs/billing.md § A chat turn: the search that overdraws the period is charged — it
     was answered — and the next one is refused rather than run on the overdraft; the turn
     still answers."""
     # 105 tokens a call at US$1 per million, a credit US$0.00005: 3 credits a call. Four
     # granted: the first call leaves one, the search takes three more.
-    client = await web_client(
-        make_client, tmp_path, free_credits_per_period=4, credit_usd="0.00005"
-    )
+    client = await web_client(make_client, free_credits_per_period=4, credit_usd="0.00005")
     brave = respx.get(host="api.search.brave.com", path="/res/v1/web/search").mock(
         return_value=httpx.Response(200, json=brave_results("One"))
     )
@@ -326,7 +324,7 @@ async def test_a_web_search_is_refused_once_the_credits_are_gone(make_client, tm
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Search")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     first, second = await tool_results(client, conversation_id)
     assert first["is_error"] is False
     assert second["is_error"] is True and second["output"] == chat_runner.NO_CREDITS_FOR_SEARCH
@@ -340,8 +338,8 @@ async def test_a_web_search_is_refused_once_the_credits_are_gone(make_client, tm
 
 
 @respx.mock
-async def test_search_papers_lists_works_with_their_open_access_pdf(make_client, tmp_path) -> None:
-    client = await web_client(make_client, tmp_path)
+async def test_search_papers_lists_works_with_their_open_access_pdf(make_client) -> None:
+    client = await web_client(make_client)
     openalex = respx.get(host="api.openalex.org", path="/works").mock(
         return_value=httpx.Response(
             200,
@@ -381,7 +379,7 @@ async def test_search_papers_lists_works_with_their_open_access_pdf(make_client,
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Find the paper")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     request = openalex.calls.last.request
     # The key travels as a header: httpx logs every request's URL (docs/auth.md).
     assert request.headers["authorization"] == "Bearer openalex-test"
@@ -407,13 +405,13 @@ async def test_search_papers_lists_works_with_their_open_access_pdf(make_client,
 
 @respx.mock
 async def test_read_url_reads_a_page_as_text_through_the_checked_address(
-    make_client, tmp_path, monkeypatch
+    make_client, monkeypatch
 ) -> None:
     """docs/chat.md § Tools: the connection goes to the address the guard checked, with the
     name kept for TLS and the Host header, under a User-Agent naming the deployment's own
     address; the page comes back as its title and text."""
     fake_resolver(monkeypatch)
-    client = await web_client(make_client, tmp_path, web_url="https://paper.example/")
+    client = await web_client(make_client, web_url="https://paper.example/")
     page = respx.get(host=PUBLIC_IP, path="/paper").mock(
         return_value=httpx.Response(
             200,
@@ -433,7 +431,7 @@ async def test_read_url_reads_a_page_as_text_through_the_checked_address(
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Read it")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     request = page.calls.last.request
     assert request.url.host == PUBLIC_IP and request.headers["host"] == "example.org"
     assert request.extensions["sni_hostname"] == "example.org"
@@ -449,19 +447,14 @@ async def test_read_url_reads_a_page_as_text_through_the_checked_address(
 
 
 @respx.mock
-async def test_read_url_reads_a_pdfs_text_layer(tmp_path, monkeypatch) -> None:
+async def test_read_url_reads_a_pdfs_text_layer(documents, monkeypatch) -> None:
     fake_resolver(monkeypatch)
-    pdf = build_text_layer_pdf(tmp_path / "paper.pdf").read_bytes()
+    pdf = documents["text_pdf"].read_bytes()
     respx.get(host=PUBLIC_IP, path="/paper.pdf").mock(
         return_value=httpx.Response(200, headers={"content-type": "application/pdf"}, content=pdf)
     )
-    outcome = await chat_web.read_url(
-        "https://example.org/paper.pdf",
-        max_bytes=10_000_000,
-        max_chars=20_000,
-        timeout=30,
-        pdf_timeout=60,
-        user_agent=AGENT,
+    outcome = await fetch(
+        "https://example.org/paper.pdf", max_bytes=10_000_000, timeout=30, pdf_timeout=60
     )
     assert outcome.is_error is False
     assert outcome.content.startswith("https://example.org/paper.pdf\n\n")
@@ -485,11 +478,6 @@ async def test_read_url_refuses_what_the_guard_refuses(monkeypatch) -> None:
         return_value=httpx.Response(200, headers={"content-type": "application/zip"}, content=b"PK")
     )
 
-    async def read(url: str) -> chat_web.ToolOutcome:
-        return await chat_web.read_url(
-            url, max_bytes=1000, max_chars=1000, timeout=5, pdf_timeout=5, user_agent=AGENT
-        )
-
     for url in (
         "ftp://example.org/x",
         "http://localhost/x",
@@ -501,7 +489,7 @@ async def test_read_url_refuses_what_the_guard_refuses(monkeypatch) -> None:
         "http://user:pw@example.org/x",
         "https://example.org/bounce",
     ):
-        outcome = await read(url)
+        outcome = await fetch(url)
         assert outcome.is_error is True, url
         assert (
             "private or local" in outcome.content
@@ -509,9 +497,11 @@ async def test_read_url_refuses_what_the_guard_refuses(monkeypatch) -> None:
             or "credentials" in outcome.content
         ), (url, outcome.content)
     assert private.call_count == 0
-    assert (await read("https://example.org/loop")).content == "Too many redirects."
-    assert (await read("https://nowhere.test/x")).content == "The URL's host could not be resolved."
-    assert "not text" in (await read("https://example.org/binary")).content
+    assert (await fetch("https://example.org/loop")).content == "Too many redirects."
+    assert (
+        await fetch("https://nowhere.test/x")
+    ).content == "The URL's host could not be resolved."
+    assert "not text" in (await fetch("https://example.org/binary")).content
 
 
 @respx.mock
@@ -522,14 +512,7 @@ async def test_read_url_stops_at_its_byte_cap(monkeypatch) -> None:
             200, headers={"content-type": "text/plain"}, content=b"x" * 5000
         )
     )
-    outcome = await chat_web.read_url(
-        "https://example.org/long.txt",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    outcome = await fetch("https://example.org/long.txt")
     assert outcome.is_error is False
     assert outcome.content.split("\n\n", 1)[1].count("x") == 1000
     assert outcome.content.endswith("[... the content goes on past what was read ...]")
@@ -538,14 +521,7 @@ async def test_read_url_stops_at_its_byte_cap(monkeypatch) -> None:
             200, headers={"content-type": "text/plain"}, content=b"y" * 1000
         )
     )
-    exact = await chat_web.read_url(
-        "https://example.org/exact.txt",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    exact = await fetch("https://example.org/exact.txt")
     assert exact.content.endswith("y" * 1000)
 
 
@@ -571,19 +547,22 @@ async def test_read_url_tries_each_address_in_the_resolvers_order(monkeypatch) -
     respx.get(host=PUBLIC_IP, path="/page").mock(
         return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"Words.")
     )
-    outcome = await chat_web.read_url(
-        "https://dual.test/page",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    outcome = await fetch("https://dual.test/page")
     assert outcome.is_error is False and outcome.content == "https://dual.test/page\n\nWords."
     assert [call.request.url.host for call in respx.calls] == [ipv6, PUBLIC_IP]
     request = respx.calls.last.request
     assert request.headers["host"] == "dual.test"
     assert request.extensions["sni_hostname"] == "dual.test"
+
+
+async def test_an_ipv6_literal_is_bracketed_in_the_host_header() -> None:
+    """RFC 3986: an IPv6 literal in a `Host` header is bracketed, or its port could not be
+    told from its last group; the TLS name is the bare address."""
+    ported = await chat_web.check_target("https://[2606:4700::1111]:8443/x")
+    assert ported.host_header == "[2606:4700::1111]:8443"
+    assert ported.host == "2606:4700::1111"
+    default = await chat_web.check_target("https://[2606:4700::1111]/x")
+    assert default.host_header == "[2606:4700::1111]"
 
 
 @respx.mock
@@ -594,30 +573,23 @@ async def test_a_failed_read_says_what_failed(monkeypatch) -> None:
     fake_resolver(monkeypatch)
     route = respx.get(host=PUBLIC_IP, path="/x")
 
-    async def read() -> str:
-        outcome = await chat_web.read_url(
-            "https://example.org/x",
-            max_bytes=1000,
-            max_chars=20_000,
-            timeout=5,
-            pdf_timeout=5,
-            user_agent=AGENT,
-        )
+    async def failed() -> str:
+        outcome = await fetch("https://example.org/x")
         assert outcome.is_error is True
         return outcome.content
 
     advice = "; find another source rather than retrying it."
     route.mock(side_effect=httpx.ConnectError("[Errno 111] Connection refused"))
-    assert await read() == (
+    assert await failed() == (
         "The URL could not be read: no connection could be made (refused, unreachable or TLS "
         "failed)" + advice
     )
     route.mock(side_effect=httpx.ReadTimeout("timed out"))
-    assert await read() == (
+    assert await failed() == (
         "The URL could not be read: the server did not answer within 5 seconds" + advice
     )
     route.mock(side_effect=httpx.RemoteProtocolError("peer closed connection"))
-    assert await read() == (
+    assert await failed() == (
         "The URL could not be read: the connection broke off before the answer was read" + advice
     )
 
@@ -647,14 +619,14 @@ def test_html_to_text_and_names() -> None:
 
 @respx.mock
 async def test_download_file_files_the_bytes_like_an_upload(
-    make_client, tmp_path, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/workspace.md § Files, *A download is an upload*: the file lands at
     `files/<folder>/<name>` with its row, the folders made where missing, a taken name
     suffixed, the staging name gone, and the call recorded."""
     fake_resolver(monkeypatch)
-    client = await web_client(make_client, tmp_path)
-    pdf = build_text_layer_pdf(tmp_path / "paper.pdf").read_bytes()
+    client = await web_client(make_client)
+    pdf = documents["text_pdf"].read_bytes()
     respx.get(host=PUBLIC_IP, path="/dl").mock(
         return_value=httpx.Response(
             200,
@@ -682,7 +654,7 @@ async def test_download_file_files_the_bytes_like_an_upload(
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Keep the paper")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     first, second = await tool_results(client, conversation_id)
     assert first["is_error"] is False and first["output"].startswith(
         f"Kept attention.pdf ({len(pdf):,} bytes, application/pdf) in Papers/2017."
@@ -706,11 +678,12 @@ async def test_download_file_files_the_bytes_like_an_upload(
         ("attention.pdf", year.id, "application/pdf", len(pdf)),
         ("attention (2).pdf", year.id, "application/pdf", len(pdf)),
     ]
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    assert (root / "files" / "Papers" / "2017" / "attention.pdf").read_bytes() == pdf
-    assert (root / "files" / "Papers" / "2017" / "attention (2).pdf").read_bytes() == pdf
+    assert (client.root / "files" / "Papers" / "2017" / "attention.pdf").read_bytes() == pdf
+    assert (client.root / "files" / "Papers" / "2017" / "attention (2).pdf").read_bytes() == pdf
     assert not [
-        name for name, _ in safe_io.list_dir(root, root / "files") if name.startswith(".sr-tmp")
+        name
+        for name, _ in safe_io.list_dir(client.root, client.root / "files")
+        if name.startswith(".sr-tmp")
     ]
     assert await recorded(client, "download_file") == 2
     assert await turn_credits(client, conversation_id) == ("succeeded", 1)
@@ -720,13 +693,61 @@ async def test_download_file_files_the_bytes_like_an_upload(
 
 
 @respx.mock
-async def test_a_download_past_a_cap_or_the_quota_keeps_nothing(
-    make_client, tmp_path, monkeypatch
+async def test_a_download_names_its_folder_as_the_library_tools_do(
+    make_client, monkeypatch
 ) -> None:
-    """docs/chat.md § Tools: a body past `DOWNLOAD_MAX_BYTES`, past the storage the quota
-    leaves, or past the user's day cap is refused, nothing filed and nothing staged."""
+    """docs/chat.md § Tools: `folder` reads as the library tools read a folder — the same
+    path under `/workspace/files/` names the same folder, and a path with `..` names none
+    and is refused before anything is fetched."""
     fake_resolver(monkeypatch)
-    client = await web_client(make_client, tmp_path, download_max_bytes=100, download_max_per_day=1)
+    client = await web_client(make_client)
+    fetched = respx.get(host=PUBLIC_IP, path="/dl").mock(
+        return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
+    )
+    stub_messages(
+        [
+            one_call(
+                "d1",
+                "download_file",
+                {"url": "https://example.org/dl", "folder": "Papers/../..", "name": "a.txt"},
+            ),
+            one_call(
+                "d2",
+                "download_file",
+                {
+                    "url": "https://example.org/dl",
+                    "folder": "/workspace/files/Papers/2017",
+                    "name": "b.txt",
+                },
+            ),
+            ([{"type": "text", "text": "Kept."}], "end_turn"),
+        ]
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Keep")
+    await run_queued_turn(client)
+    refused, kept = await tool_results(client, conversation_id)
+    assert refused["is_error"] is True
+    assert refused["output"].startswith("Papers/../.. names no folder of the library")
+    assert fetched.call_count == 1
+    assert kept["is_error"] is False and kept["output"].startswith(
+        "Kept b.txt (2 bytes, text/plain) in Papers/2017."
+    )
+    async with client.app.state.sessionmaker() as db:
+        folders = (await db.execute(select(Folder.name))).scalars().all()
+    assert sorted(folders) == ["2017", "Papers"]
+    assert (client.root / "files" / "Papers" / "2017" / "b.txt").read_bytes() == b"ok"
+    assert await recorded(client, "download_file") == 1
+
+
+@respx.mock
+async def test_a_download_past_a_cap_or_refused_keeps_nothing(make_client, monkeypatch) -> None:
+    """docs/chat.md § Tools: a body past `DOWNLOAD_MAX_BYTES`, a private address the guard
+    refuses, an HTTP error, a refused connection and a call past the user's day cap are
+    each refused, nothing filed and nothing staged; the one within every cap is kept and
+    recorded."""
+    fake_resolver(monkeypatch)
+    client = await web_client(make_client, download_max_bytes=100, download_max_per_day=1)
     respx.get(host=PUBLIC_IP, path="/big").mock(
         return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"x" * 500)
     )
@@ -770,7 +791,7 @@ async def test_a_download_past_a_cap_or_the_quota_keeps_nothing(
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Keep")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     big, private, missing, refused, small, capped = await tool_results(client, conversation_id)
     assert big["is_error"] and "larger than the 100 bytes" in big["output"]
     assert private["is_error"] and "private or local" in private["output"]
@@ -783,29 +804,25 @@ async def test_a_download_past_a_cap_or_the_quota_keeps_nothing(
         "Kept a.txt (2 bytes, text/plain) in the top level"
     )
     assert capped["is_error"] and "Today's limit on downloads (the user's)" in capped["output"]
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    names = {name for name, _ in safe_io.list_dir(root, root / "files")}
+    names = {name for name, _ in safe_io.list_dir(client.root, client.root / "files")}
     assert "a.txt" in names and not [name for name in names if name.startswith(".sr-tmp")]
     assert "big.txt" not in names and "b.txt" not in names
     assert await recorded(client, "download_file") == 1
 
 
 @respx.mock
-async def test_a_download_the_quota_cannot_hold_is_refused(
-    make_client, tmp_path, monkeypatch
-) -> None:
+async def test_a_download_the_quota_cannot_hold_is_refused(make_client, monkeypatch) -> None:
     """docs/workspace.md § Files: the room the quota leaves is checked before a byte lands,
     so a file that does not fit is never written, let alone filed."""
     fake_resolver(monkeypatch)
-    client = await web_client(make_client, tmp_path)
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    client = await web_client(make_client)
     conversation_id = await new_conversation(client)
     async with client.app.state.sessionmaker() as db:
-        used = (await measure_storage(db, client.app.state.settings, client.user_id, root)).total
+        used = (
+            await measure_storage(db, client.app.state.settings, client.user_id, client.root)
+        ).total
     # The same workspace and user, on a plan with just enough room for a few bytes more.
-    tight = make_client(
-        workspaces_dir=str(tmp_path / "workspaces"), free_storage_bytes=used + 50, **WEB_KEYS
-    )
+    tight = make_client(free_storage_bytes=used + 50, **WEB_KEYS)
     respx.get(host=PUBLIC_IP, path="/f").mock(
         return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"x" * 400)
     )
@@ -820,23 +837,21 @@ async def test_a_download_the_quota_cannot_hold_is_refused(
         ]
     )
     await send(client, conversation_id, text="Keep")
-    await _run_queued_turn(tight)
+    await run_queued_turn(tight)
     [result] = await tool_results(client, conversation_id)
     assert result["is_error"] and "storage is full" in result["output"]
-    names = {name for name, _ in safe_io.list_dir(root, root / "files")}
+    names = {name for name, _ in safe_io.list_dir(client.root, client.root / "files")}
     assert "f.txt" not in names and not [name for name in names if name.startswith(".sr-tmp")]
     assert await recorded(client, "download_file") == 0
 
 
 @respx.mock
-async def test_a_web_tool_the_turn_does_not_declare_is_never_run(
-    make_client, tmp_path, monkeypatch
-) -> None:
+async def test_a_web_tool_the_turn_does_not_declare_is_never_run(make_client, monkeypatch) -> None:
     """docs/chat.md § Tools: with `CHAT_WEB_ACCESS` off the tools are not declared, and a
     call to one all the same — a history that still names it, a model's guess — answers an
     error without a fetch, a record or a charge."""
     fake_resolver(monkeypatch)
-    client = await web_client(make_client, tmp_path, chat_web_access=False)
+    client = await web_client(make_client, chat_web_access=False)
     page = respx.get(host=PUBLIC_IP, path="/p").mock(
         return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"p")
     )
@@ -857,7 +872,7 @@ async def test_a_web_tool_the_turn_does_not_declare_is_never_run(
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Try the web")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert [
         (result["is_error"], result["output"])
         for result in await tool_results(client, conversation_id)
@@ -869,13 +884,12 @@ async def test_a_web_tool_the_turn_does_not_declare_is_never_run(
     assert page.call_count == 0 and brave.call_count == 0
     assert await recorded(client, "web_search") == 0
     assert await recorded(client, "download_file") == 0
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    assert "p.txt" not in {name for name, _ in safe_io.list_dir(root, root / "files")}
+    assert "p.txt" not in {name for name, _ in safe_io.list_dir(client.root, client.root / "files")}
     assert await turn_credits(client, conversation_id) == ("succeeded", 1)
 
 
 @respx.mock
-async def test_read_url_bounds_the_title_and_caps_the_whole_result(tmp_path, monkeypatch) -> None:
+async def test_read_url_bounds_the_title_and_caps_the_whole_result(documents, monkeypatch) -> None:
     """The title is one line at most and the cap holds for the whole result, so a page
     whose title alone would fill it still answers its text; a response without a type is
     read as text, or as a PDF by its magic."""
@@ -889,65 +903,37 @@ async def test_read_url_bounds_the_title_and_caps_the_whole_result(tmp_path, mon
             200, headers={"content-type": "text/html"}, content=page.encode()
         )
     )
-    outcome = await chat_web.read_url(
-        "https://example.org/titled",
-        max_bytes=100_000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    outcome = await fetch("https://example.org/titled", max_bytes=100_000)
     assert outcome.is_error is False
     title, rest = outcome.content.split("\n", 1)
     assert title == "t" * chat_web.TITLE_MAX_CHARS
     assert rest.startswith("https://example.org/titled\n\n") and "The body is here." in rest
-    small = await chat_web.read_url(
-        "https://example.org/titled",
-        max_bytes=100_000,
-        max_chars=100,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    small = await fetch("https://example.org/titled", max_bytes=100_000, max_chars=100)
     assert small.is_error is False and len(small.content) <= 100
 
     respx.get(host=PUBLIC_IP, path="/untyped").mock(
         return_value=httpx.Response(200, content=b"plain words")
     )
-    untyped = await chat_web.read_url(
-        "https://example.org/untyped",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    untyped = await fetch("https://example.org/untyped")
     assert untyped.is_error is False and untyped.content.endswith("plain words")
-    pdf = build_text_layer_pdf(tmp_path / "paper.pdf").read_bytes()
+    pdf = documents["text_pdf"].read_bytes()
     respx.get(host=PUBLIC_IP, path="/untyped.pdf").mock(
         return_value=httpx.Response(200, content=pdf)
     )
-    as_pdf = await chat_web.read_url(
-        "https://example.org/untyped.pdf",
-        max_bytes=100_000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    as_pdf = await fetch("https://example.org/untyped.pdf", max_bytes=100_000)
     assert as_pdf.is_error is False and "<html" not in as_pdf.content
     assert as_pdf.content.strip() != "https://example.org/untyped.pdf"
 
 
 @respx.mock
 async def test_a_download_without_a_content_type_takes_the_names_type(
-    make_client, tmp_path, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/workspace.md § Files: a server that says nothing about the type leaves it to the
     name's extension, as a browser's shrug on an upload does — never `text/plain`."""
     fake_resolver(monkeypatch)
-    client = await web_client(make_client, tmp_path)
-    pdf = build_text_layer_pdf(tmp_path / "paper.pdf").read_bytes()
+    client = await web_client(make_client)
+    pdf = documents["text_pdf"].read_bytes()
     assert chat_web.media_type_of(httpx.Response(200, content=pdf)) == ("", None)
     respx.get(host=PUBLIC_IP, path="/paper.pdf").mock(return_value=httpx.Response(200, content=pdf))
     stub_messages(
@@ -962,7 +948,7 @@ async def test_a_download_without_a_content_type_takes_the_names_type(
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Keep it")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     [result] = await tool_results(client, conversation_id)
     assert result["is_error"] is False
     assert result["output"].startswith(f"Kept paper.pdf ({len(pdf):,} bytes, application/pdf)")
@@ -986,13 +972,8 @@ async def test_httpx_request_logs_carry_no_query(monkeypatch, caplog) -> None:
     chat_web.redact_request_logs()
     try:
         with caplog.at_level(logging.INFO, logger="httpx"):
-            outcome = await chat_web.read_url(
-                "https://example.org/signed.txt?X-Amz-Signature=secret-signature#frag",
-                max_bytes=1000,
-                max_chars=20_000,
-                timeout=5,
-                pdf_timeout=5,
-                user_agent=AGENT,
+            outcome = await fetch(
+                "https://example.org/signed.txt?X-Amz-Signature=secret-signature#frag"
             )
     finally:
         logging.getLogger("httpx").removeFilter(chat_web.QUERY_REDACTOR)
@@ -1016,14 +997,7 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
             content=gzip.compress(page),
         )
     )
-    outcome = await chat_web.read_url(
-        "https://example.org/zipped",
-        max_bytes=100_000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    outcome = await fetch("https://example.org/zipped", max_bytes=100_000)
     assert outcome.content == "Zipped\nhttps://example.org/zipped\n\nSmall words."
 
     bomb = gzip.compress(b"a" * 20_000_000)  # about twenty kilobytes on the wire
@@ -1060,14 +1034,7 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
             200, headers={"content-type": "text/plain", "content-encoding": "gzip"}, content=bomb
         )
     )
-    bombed = await chat_web.read_url(
-        "https://example.org/bomb",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    bombed = await fetch("https://example.org/bomb")
     assert bombed.is_error is False
     assert bombed.content.endswith("[... the content goes on past what was read ...]")
 
@@ -1091,14 +1058,7 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
             200, headers={"content-type": "text/plain", "content-encoding": "br"}, content=b"x"
         )
     )
-    refused = await chat_web.read_url(
-        "https://example.org/brotli",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    refused = await fetch("https://example.org/brotli")
     assert refused.is_error is True and "encoded as br" in refused.content
 
     respx.get(host=PUBLIC_IP, path="/zipped.txt").mock(
@@ -1142,26 +1102,12 @@ async def test_a_signed_urls_query_never_reaches_a_result(tmp_path, monkeypatch)
             content=b"<html><head><title>Page</title></head><body>Words.</body></html>",
         )
     )
-    missing = await chat_web.read_url(
-        "https://example.org/gone.txt?X-Amz-Signature=secret-signature",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    missing = await fetch("https://example.org/gone.txt?X-Amz-Signature=secret-signature")
     assert missing.is_error and missing.content == (
         "https://example.org/gone.txt answered HTTP 404; find another source rather than "
         "retrying it."
     )
-    hopped = await chat_web.read_url(
-        "https://example.org/hop",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    hopped = await fetch("https://example.org/hop")
     assert hopped.content == "Page\nhttps://example.org/page.html\n\nWords."
     fd = os.open(tmp_path / "kept", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -1180,3 +1126,48 @@ async def test_a_signed_urls_query_never_reaches_a_result(tmp_path, monkeypatch)
         "https://example.org/gone.txt answered HTTP 404; find another source rather than "
         "retrying it."
     )
+
+
+# The round's results land together, which the SQLite fallback cannot sequence (`one_call`).
+@postgres_only
+@respx.mock
+@pytest.mark.parametrize("granted", [4, 100])
+async def test_the_searches_of_one_round_never_run_on_the_overdraft(make_client, granted) -> None:
+    """docs/chat.md § Tools: the searches of one round run together, each holding its price
+    against the balance from its start to its settlement. On a balance one search spends
+    (3 credits a call, 4 granted: 1 left), one runs and the rest are refused, as one at a
+    time would be; on a larger balance all of them run, side by side."""
+    client = await web_client(make_client, free_credits_per_period=granted, credit_usd="0.00005")
+    running = peak = 0
+
+    async def answer(request: httpx.Request) -> httpx.Response:
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.2)
+        running -= 1
+        return httpx.Response(200, json=brave_results("One"))
+
+    brave = respx.get(host="api.search.brave.com", path="/res/v1/web/search").mock(
+        side_effect=answer
+    )
+    searches = [
+        {"type": "tool_use", "id": f"s{index}", "name": "web_search", "input": {"query": "q"}}
+        for index in range(4)
+    ]
+    stub_messages(
+        [(searches, "tool_use"), ([{"type": "text", "text": "Here is what I have."}], "end_turn")]
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Search")
+    await run_queued_turn(client)
+    refused = [
+        result for result in await tool_results(client, conversation_id) if result["is_error"]
+    ]
+    if granted == 4:
+        assert brave.call_count == 1
+        assert [result["output"] for result in refused] == [chat_runner.NO_CREDITS_FOR_SEARCH] * 3
+    else:
+        assert (brave.call_count, refused) == (4, [])
+        assert peak > 1
+    assert await recorded(client, "web_search") == brave.call_count

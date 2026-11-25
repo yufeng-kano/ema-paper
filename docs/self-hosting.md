@@ -4,8 +4,10 @@ How to run your own Ema Paper: on a laptop to try it, then on a server. This pag
 
 ## What you need
 
-- **Docker with Compose.** A recent Compose: the front-proxy overlay (§ Behind a front proxy) was verified on 2.40.1.
-- **A Kano Proxy and an API key from it.** Every model call goes there, on that one key ([auth.md](./auth.md) § 3). Run your own from [kano-proxy](https://github.com/yufeng-kano/kano-proxy), or use an account on one someone else runs. Whoever owns the key pays for the models; users bring no key of their own.
+- **Docker with Compose.** A recent Compose: the front-proxy overlay (§ Behind a front proxy) is verified on 2.40.1.
+- **A Kano Proxy and an API key from it.** Every model call goes there, on that one key ([auth.md](./auth.md) § 3).
+  - Run your own from [kano-proxy](https://github.com/yufeng-kano/kano-proxy), or use an account on one someone else runs.
+  - Whoever owns the key pays for the models; users bring no key of their own.
 - **A Google OAuth client** for sign-in. Production only: locally a dev sign-in stands in.
 - **A domain** pointing at the server, for production. Caddy obtains and renews the certificate itself.
 
@@ -28,7 +30,7 @@ Paid plans and the chat agent's sandbox are optional, and neither is needed to r
    | `KANO_PROXY_BASE_URL`, `KANO_PROXY_API_KEY` | your Kano Proxy's origin and key; leave both empty to run without models |
    | `PARSE_MODEL`, `MODEL_PRICES_JSON` | the parse model and the price table (§ Models and prices) |
 
-3. Start the stack:
+3. Start the stack from the checkout's root (or set `WORKSPACES_HOST_DIR` to an absolute path first):
 
    ```bash
    docker compose up --build
@@ -36,7 +38,10 @@ Paid plans and the chat agent's sandbox are optional, and neither is needed to r
 
 4. Open http://localhost:8080 and choose **Dev sign-in**. It exists only while `APP_ENV=local` and `AUTH_DEV_MODE=true`.
 
-Without the Kano Proxy values the app still runs: Files, markdown documents, notes and editing work, and parsing and chat answer 503.
+Without the Kano Proxy values the app still runs:
+
+- Files, markdown documents, notes and editing work.
+- Parsing and chat answer 503.
 
 ## Models and prices
 
@@ -49,7 +54,7 @@ MODEL_PRICES_JSON='{"<vision-model-id>": {"input": <usd>, "cache_read": <usd>, "
 
 - The chat agent offers the catalog's models that the table prices, in the table's order. The first is the default.
 - The API and the worker refuse to start while a model they would run has no price.
-- Credits are derived from these prices and `CREDIT_USD` ([billing.md](./billing.md) § Credits, § Models).
+- Credits are derived from these prices and `CREDIT_USD` ([billing.md](./billing.md) § Credits, § Models and the operator's upstream).
 - Once the console is on, the models and prices can also be changed on its Settings page, without a restart (§ The operator console).
 
 ## Run it on a server
@@ -93,17 +98,31 @@ docker network create proxy
 docker compose -f docker-compose.production.yaml -f docker-compose.only-container-network.yaml up -d --build
 ```
 
-The router must pass TLS through untouched (SNI passthrough). Caddy still terminates TLS and owns its certificate, which it validates over 443 alone ([deployment.md](./deployment.md) § `docker-compose.only-container-network.yaml`).
+- The router must pass TLS through untouched (SNI passthrough).
+- Caddy still terminates TLS and owns its certificate, which it validates over 443 alone ([deployment.md](./deployment.md) § `docker-compose.only-container-network.yaml`).
 
 ## Plans, credits and the sandbox
 
-- **Every account is on Free** until it buys a paid plan. Free grants `FREE_CREDITS_PER_PERIOD` credits each UTC month, `FREE_STORAGE_BYTES` of storage and `FREE_MAX_JOBS` parses at once. Raise them for a private deployment, within `WORKSPACE_QUOTA_BYTES` and `MAX_JOBS_PER_USER`, or the API refuses to start — in `.env`, or on the console's Settings page (§ The operator console).
+- **Every account is on Free** until it buys a paid plan.
+  - Free grants `FREE_CREDITS_PER_PERIOD` credits each UTC month, `FREE_STORAGE_BYTES` of storage and `FREE_MAX_JOBS` parses at once.
+  - Raise them for a private deployment, in `.env` or on the console's Settings page (§ The operator console).
+  - `FREE_STORAGE_BYTES` must stay within `WORKSPACE_QUOTA_BYTES` and `FREE_MAX_JOBS` within `MAX_JOBS_PER_USER`, or the API refuses to start.
 - **Paid plans go through Kano Pay**, a separate payment service ([billing.md](./billing.md) § Kano Pay). With the four `KANO_PAY_*` values empty, nobody can check out and Free keeps working.
-- **The sandbox comes with a paid plan.** It gives the chat agent `bash` in one Kata microVM per user, and needs a host with `/dev/kvm` and the Kata runtime ([sandbox.md](./sandbox.md) § Operations). A deployment without paid plans sets `SANDBOX_URL=` (empty): the agent then works without `bash`, and everything else stays.
+- **The sandbox comes with a paid plan.**
+  - It gives the chat agent `bash` in one Kata microVM per user.
+  - It needs a host with `/dev/kvm` and the Kata runtime ([sandbox.md](./sandbox.md) § Operations).
+  - Build its VM image once, and again whenever `deploy/sandbox-image/` changes: `docker build -t ema-paper-sandbox deploy/sandbox-image` ([deployment.md](./deployment.md) § Compose files).
+  - Without the image every command fails: the agent's `bash` answers "The sandbox is unavailable: the sandbox runner returned 503", and the runner's log says "could not start sandbox for user N" with Docker's error.
+  - A deployment without paid plans sets `SANDBOX_URL=` (empty): the agent then works without `bash`, and everything else stays.
 
 ### Redeem codes
 
-A redeem code gives an account credits, or days of a paid plan, without Kano Pay ([billing.md](./billing.md) § Redeem codes) — a gift to a user, a launch campaign, or the way a private deployment hands out a paid plan's storage and sandbox with Pay left unconfigured. Codes are made on the operator console's *Redeem codes* page (§ The operator console), or on the server, in the api container, with the CLI — the same rules, the same codes:
+A redeem code gives an account credits, or days of a paid plan, without Kano Pay ([billing.md](./billing.md) § Redeem codes). It serves as a gift to a user, a launch campaign, or the way a private deployment hands out a paid plan's storage and sandbox with Pay left unconfigured.
+
+Codes are made, listed and disabled in either of two places, with the same rules and the same codes; the CLI needs no console and keeps working beside it:
+
+- the operator console's *Redeem codes* page (§ The operator console);
+- the CLI, on the server, in the api container:
 
 ```sh
 # 100 codes of 500 credits, valid a year once redeemed, redeemable until the end of 2026
@@ -112,15 +131,41 @@ docker compose exec api python -m sightread.codes create --credits 500 --valid-d
 # one code anyone may use 200 times, 30 days of the plan "pro" each
 docker compose exec api python -m sightread.codes create --plan pro --days 30 --uses 200 --label "beta"
 docker compose exec api python -m sightread.codes list            # live codes and their uses
-docker compose exec api python -m sightread.codes list --all      # disabled and exhausted ones too
+docker compose exec api python -m sightread.codes list --all      # disabled, expired, used-up and plan-missing ones too
 docker compose exec api python -m sightread.codes disable EMA-XXXX-XXXX-XXXX
 ```
 
-`create` prints each code once, as a user types it (`EMA-XXXX-XXXX-XXXX`; the prefix is `REDEEM_CODE_PREFIX`); `--uses` is how many accounts may redeem one code (1 unless given), `--valid-days` and `--days` are at most 36,500, a plan must be one of `KANO_PAY_PLANS_JSON` — the console's Settings page's, when it overrides it —, `--redeem-by` cannot be a day already past (UTC), and one batch holds at most `REDEEM_CODES_MAX_COUNT` (1000) codes, or the command refuses. The console shows a code in full only once, when it creates it; `list` here prints every code whole, which is how to read back one whose dialog was closed. A plan code whose plan was taken out of `KANO_PAY_PLANS_JSON` lists as `plan missing` and is refused to users until the plan is back. A user redeems a code in the settings dialog's Usage section. Granted days are spent only while no subscription pays for the account, and a code's credits are never refunded.
+`create` prints each code once, as a user types it (`EMA-XXXX-XXXX-XXXX`; the prefix is `REDEEM_CODE_PREFIX`). `--uses` is how many accounts may redeem one code (1 unless given). The command refuses unless:
+
+- `--valid-days` and `--days` are at most 36,500;
+- a plan is one of `KANO_PAY_PLANS_JSON` — the console's Settings page's, when it overrides it;
+- `--redeem-by` is not a day already past (UTC);
+- the batch holds at most `REDEEM_CODES_MAX_COUNT` (1000) codes.
+
+Reading codes back:
+
+- The console shows a code in full only once, when it creates it.
+- `list` here prints every code whole, which is how to read back one whose dialog was closed.
+- A plan code whose plan was taken out of `KANO_PAY_PLANS_JSON` lists as `plan missing` (under `list --all`) and is refused to users until the plan is back.
+
+Redeeming:
+
+- A user redeems a code in the settings dialog's Usage section.
+- Granted days are spent only while no subscription pays for the account.
+- A code's credits are never refunded.
 
 ## The operator console
 
-The console is your own pages inside the app — today *Overview*, *Jobs* and *Usage*, to see whether the worker runs, put a stuck job back in the queue and see what the model calls cost, *Users*, to look an account up and give it credits or days, *Redeem codes*, *Groups*, to give other people access, *Settings*, to change prices, plans and allowances without a restart, and *Audit*, the record of every change made there ([admin.md](./admin.md)). It does not exist until you name its first owner. Put your Google address in `.env`:
+The console is your own pages inside the app ([admin.md](./admin.md)):
+
+- *Overview*, *Jobs* and *Usage*: see whether the worker runs, put a stuck job back in the queue, and see what the model calls cost.
+- *Users*: look an account up and give it credits or days.
+- *Redeem codes*: create, list and disable codes (§ Redeem codes).
+- *Groups*: give other people access.
+- *Settings*: change prices, plans and allowances without a restart.
+- *Audit*: the record of every change made there.
+
+It does not exist until you name its first owner. Put your Google address in `.env`:
 
 ```sh
 OWNER_EMAILS=you@example.com    # comma-separated for several; empty = no console
@@ -133,11 +178,29 @@ docker compose -f docker-compose.production.yaml up -d --no-deps api
 # behind a front proxy: add -f docker-compose.only-container-network.yaml, as always
 ```
 
-Sign in with that Google account (or sign out and in again): the account menu now has *Admin console*. The address joins the built-in `owner` group, which holds every permission, at a sign-in whose address Google has verified; taking it out of `OWNER_EMAILS` later removes no one — an owner does that on the Groups page. The console asks for a fresh sign-in once a session is older than `ADMIN_REAUTH_HOURS` (12). Locally, `OWNER_EMAILS=dev@localhost` makes the dev login an owner.
+Sign in with that Google account (or sign out and in again): the account menu now has *Admin console*.
 
-The *Redeem codes* page creates, lists and disables codes by the same rules as `python -m sightread.codes` (§ Redeem codes); the CLI needs no console and keeps working beside it.
+- The address joins the built-in `owner` group, which holds every permission, at a sign-in whose address Google has verified.
+- Taking the address out of `OWNER_EMAILS` later removes no one — an owner does that on the Groups page.
+- The console asks for a fresh sign-in once a session is older than `ADMIN_REAUTH_HOURS` (12).
+- Locally, `OWNER_EMAILS=dev@localhost` makes the dev login an owner.
 
-**Settings without a restart.** The console's *Settings* page changes thirteen values of `.env` from the browser: the models (`PARSE_MODEL`, `CHECK_MODEL`, `PARSE_FALLBACK_MODEL`), `MODEL_PRICES_JSON`, the credits (`CREDIT_USD`, `PARSE_CREDITS_PER_PAGE`, `CHAT_MIN_CREDITS`), the Free plan (`FREE_*`), the sites the sandbox may reach (`SANDBOX_EGRESS_HOSTS`, [sandbox.md](./sandbox.md) § Network), `KANO_PAY_PLANS_JSON` and `KANO_PAY_PACKS_JSON` ([admin.md](./admin.md) § Settings). A value saved there is stored in the database and overrides `.env` within `RUNTIME_SETTINGS_CACHE_SECONDS` (30), with no container recreated; *Restore to .env* hands the key back to the file. Each change is checked as a start would check it, and one that takes away what accounts have — a priced model in use, a plan or pack in use, a smaller Free plan — asks first. Secrets and connections stay in `.env`: the page shows only whether each is set.
+**Settings without a restart.** The console's *Settings* page changes thirteen values of `.env` from the browser ([admin.md](./admin.md) § Settings):
+
+- the models: `PARSE_MODEL`, `CHECK_MODEL`, `PARSE_FALLBACK_MODEL`;
+- `MODEL_PRICES_JSON`;
+- the credits: `CREDIT_USD`, `PARSE_CREDITS_PER_PAGE`, `CHAT_MIN_CREDITS`;
+- the Free plan: `FREE_*`;
+- the sites the sandbox may reach: `SANDBOX_EGRESS_HOSTS` ([sandbox.md](./sandbox.md) § Network);
+- `KANO_PAY_PLANS_JSON` and `KANO_PAY_PACKS_JSON`.
+
+How a saved value behaves:
+
+- It is stored in the database and overrides `.env` within `RUNTIME_SETTINGS_CACHE_SECONDS` (30), with no container recreated.
+- *Restore to .env* hands the key back to the file.
+- Each change is checked as a start would check it.
+- A change that takes away what accounts have — a priced model in use, a plan or pack in use, a smaller Free plan — asks first.
+- Secrets and connections stay in `.env`: the page shows only whether each is set.
 
 ## Connect your tools
 
@@ -164,11 +227,46 @@ The *Redeem codes* page creates, lists and disables codes by the same rules as `
   }
   ```
 
-  The connector's tools hand back short-lived tickets and `curl` commands — `parse` an upload ticket, `read_document` and `write_document` a document ticket for one document of the library —, so the client needs a shell with network access ([mcp.md](./mcp.md)).
+  The connector's tools hand back short-lived tickets and `curl` commands, so the client needs a shell with network access ([mcp.md](./mcp.md)). `parse` hands back an upload ticket; `read_document` and `write_document` a document ticket for one document of the library.
 
 ## Keep it running
 
-- **Update:** `git pull`, then the same `docker compose -f … up -d --build` you started with. A changed Caddyfile also needs `docker compose -f … restart caddy` ([deployment.md](./deployment.md) § Release flow).
+- **Update:** `git pull`, then the same `docker compose -f … up -d --build` you started with. A changed Caddyfile also needs `docker compose -f … restart caddy`. [deployment.md](./deployment.md) § Release flow has the rest:
+  - before the pull, the commit and the database revision to note and the dump to take;
+  - how to tell the update finished, the worker included;
+  - how to go back.
+- **An install whose containers are named `sightread-*`** runs compose files that name the project after the checkout directory, and its containers, its sandbox network and its VMs `sightread-*`. The current files name all of them `ema-paper` ([deployment.md](./deployment.md) § Compose files). Before its first update:
+  1. Read the old project's name, which prefixes its volumes: `docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' sightread-api`. Compose made it from the checkout directory's name, lowercased and stripped of every character other than `a-z`, `0-9`, `-` and `_`, so it can differ from what the directory is called.
+  2. Bring the old stack down, which keeps its volumes and stops the old runner, so no new VM starts: before the pull, `docker compose -f … down` with the files it was started with; after it, `docker compose -p <project> -f … down`. While VMs are attached to `sightread-sandbox`, `down` reports that network still in use.
+  3. Remove the VMs the old runner started, which the current runner never lists, then the old network if it is left: `docker ps -aq --filter 'name=^sightread-sandbox-[0-9]' | xargs -r docker rm -f`, then `docker network rm sightread-sandbox`.
+  4. If the project is not named `ema-paper`, the data is in the volumes `<project>_pgdata` and so on, and the current files mount `ema-paper_*`. Copy each into the volume of the same suffix:
+
+     ```bash
+     for v in pgdata uploads figures caddy_data caddy_config sandbox_egress; do
+       docker run --rm -v "<project>_$v:/from" -v "ema-paper_$v:/to" postgres:16 cp -a /from/. /to/
+     done
+     ```
+
+     - The `ema-paper_*` volumes must not exist yet (`docker volume ls`). One an `up` on the current files already made holds a new, empty database, and a copy into it mixes the two.
+     - Docker refuses to remove a volume a container still uses: first `docker compose -f … down` with the current files, which removes the `ema-paper-*` containers and keeps the volumes, then `docker volume rm` each `ema-paper_*` volume.
+     - Compose then warns that these volumes already exist and were not created by it, and uses them as they are.
+     - Restoring the newest backup stamp into the new stack instead brings back the database, the figures and the workspaces as of that stamp ([deployment.md](./deployment.md) § Backups).
+  5. The VM image and `.env`:
+     - Build the VM image under its current tag: `docker build -t ema-paper-sandbox deploy/sandbox-image`. An `.env` without a `SANDBOX_IMAGE` line takes that tag as its default, which an old host does not have, and every VM start fails until it is built.
+     - `SANDBOX_IMAGE=sightread-sandbox` keeps working, since that image stays on the host. Set `SANDBOX_IMAGE=ema-paper-sandbox`, so that a later rebuild, which these pages tag `ema-paper-sandbox`, takes effect.
+     - `SANDBOX_NETWORK=sightread-sandbox` becomes `SANDBOX_NETWORK=ema-paper-sandbox`.
+  6. Run the update: twice for a database from before the migration baseline (below).
+  7. With the sandbox network on, the new network has a new bridge: write its line into `/etc/sysctl.d/90-ema-paper-sandbox.conf` and delete `/etc/sysctl.d/90-sightread-sandbox.conf` ([sandbox.md](./sandbox.md) § Operations, *Turning the network on*).
+  8. Behind a front proxy, point the router at the alias `ema-paper-caddy`.
+- **An install, or a restored backup, from before the migration baseline** — its database on any revision other than `4449f68533c0` or a later one — updates twice:
+  1. Once to commit `945b2e9`, the last release that carries the earlier migrations: `git checkout 945b2e9`, then the same `up -d --build`.
+  2. Then back to the current release: `git checkout main && git pull`, then the same `up -d --build`.
+
+  Before `git pull`, `docker compose -f … exec api alembic current` prints the running database's revision. After it, the api restarts over and over and `exec` refuses it; `docker compose -f … run --rm --no-deps api alembic current` asks the new image instead, which answers *Can't locate revision* for such a database.
+
+  `--no-deps` starts no `pg`: the check reads a `pg` already running on the install's own volumes. An install whose containers are named `sightread-*` takes the revision noted before the pull ([deployment.md](./deployment.md) § Release flow), or finishes steps 1–5 above and starts `pg` alone first, `docker compose -f … up -d pg`.
+
+  Started directly on the current release, the api stops at *Can't locate revision* and does not come up; nothing in the database is changed ([database.md](./database.md) § Migrations).
 - **Back up:** the `backup` service writes the database dump, the figure crops and every workspace into `./backups/<stamp>/` once a day and keeps the newest seven. Copy them off the server, and test a restore before you rely on it ([deployment.md](./deployment.md) § Compose files).
 - **Logs:** `docker logs -f ema-paper-api`, and likewise `ema-paper-worker`, `ema-paper-web` and `ema-paper-caddy`.
 

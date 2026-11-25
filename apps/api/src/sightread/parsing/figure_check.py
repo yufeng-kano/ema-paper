@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 from ..agents.bbox import BboxConvention, from_canonical, to_canonical
 from ..agents.parse import FIGURE_CHECK_PROMPT
 from .figures import CROP_MARGIN, Bbox, crop_rect
-from .markdown import BBOX_MAX, PLACEHOLDER_RE, clean_bbox
+from .markdown import BBOX_MAX, PLACEHOLDER_RE, clean_bbox, match_bbox, placeholder
 
 # Ink is a pixel whose luminance differs from the page's background, its most common
 # luminance, by more than this; a line with fewer ink pixels than INK_MIN_PIXELS is blank.
@@ -297,18 +297,10 @@ def move_boxes(markdown: str, moves: dict[Bbox, Bbox]) -> str:
     else changes: the text, the alt text and the page the model wrote stay as they were."""
 
     def rewrite(match) -> str:
-        bbox = clean_bbox(
-            (
-                int(match.group("ymin")),
-                int(match.group("xmin")),
-                int(match.group("ymax")),
-                int(match.group("xmax")),
-            )
-        )
+        bbox = match_bbox(match)
         moved = moves.get(bbox) if bbox is not None else None
         if moved is None or moved == bbox:
             return match.group(0)
-        y_min, x_min, y_max, x_max = moved
-        return f"![{match.group('alt')}](sightread://p{match.group('page')}/{y_min},{x_min},{y_max},{x_max})"
+        return placeholder(match.group("alt"), match.group("page"), moved)
 
     return PLACEHOLDER_RE.sub(rewrite, markdown)

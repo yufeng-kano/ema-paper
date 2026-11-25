@@ -11,7 +11,8 @@
  * stays, hidden and inert while closed, so a close keeps the conversation, the draft and the
  * attachments, and a reader who never opens it costs no conversation read.
  */
-import { COLUMN_WIDTHS, clampWidth, collapses, storedWidth } from '~/lib/columns'
+import type { DocumentIndex } from '~/components/ChatPanel.vue'
+import { COLUMN_WIDTHS, clampWidth, storedWidth } from '~/lib/columns'
 import type { LibraryPlace } from '~/lib/library'
 import type { LibraryStep } from '~/lib/steps'
 
@@ -24,6 +25,8 @@ const LIST_MIN_WIDTH = 360
 const CARD_GAP = 16
 /** Matches the 900px breakpoint of this component's stylesheet and the layout's drawer. */
 const SHEET_QUERY = '(max-width: 900px)'
+/** The panel's document here: none, the card being about the library. */
+const NO_DOCUMENT: DocumentIndex = { pages: [], outline: [], placed: [] }
 
 defineProps<{
   library: LibraryPlace
@@ -47,9 +50,6 @@ const { t } = useI18n()
 
 function readStored(): { open: boolean; width: number } {
   const initial = { open: false, width: COLUMN_WIDTHS.agent.initial }
-  if (!import.meta.client) {
-    return initial
-  }
   try {
     const stored: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
     if (!stored || typeof stored !== 'object') {
@@ -88,7 +88,7 @@ watch(open, (value) => {
 
 // --- the phone's sheet -------------------------------------------------------------------
 
-const narrowWindow = ref(import.meta.client && window.matchMedia(SHEET_QUERY).matches)
+const narrowWindow = ref(window.matchMedia(SHEET_QUERY).matches)
 let sheetQuery: MediaQueryList | null = null
 
 function onSheetChange(event: MediaQueryListEvent) {
@@ -97,7 +97,6 @@ function onSheetChange(event: MediaQueryListEvent) {
 
 onMounted(() => {
   sheetQuery = window.matchMedia(SHEET_QUERY)
-  narrowWindow.value = sheetQuery.matches
   sheetQuery.addEventListener('change', onSheetChange)
 })
 
@@ -115,9 +114,6 @@ function openFiles(target: { kind: 'folder' | 'document'; id: number }) {
 }
 
 // --- the width ---------------------------------------------------------------------------
-// The grip's behaviour below, and its `.split` and `.card` styles, are the reader's Agent card's
-// (ResultViewer.vue's column resizing), kept as a copy for one card beside a list rather than
-// two beside a document: the two must change together (docs/web.md § Column widths).
 
 /** The page's width, which the list and the card share: what the card is clamped against. */
 const pageWidth = ref(Number.POSITIVE_INFINITY)
@@ -133,10 +129,20 @@ const sheet = computed(
 )
 /** The card's width as drawn: the width the reader chose, as far as the window allows. */
 const width = ref(stored.width)
-/** The grip being dragged: where the drag started, and the card's width then. */
-const resizing = ref<{ x: number; width: number } | null>(null)
-/** A drag below half the minimum hides the card while it lasts, and closes it if it ends there. */
-const dragHidden = ref(false)
+/** The grip on the card's left edge. A release with the card hidden closes it, its chosen width
+ *  the one it had before the drag. */
+const grip = useColumnGrip({
+  column: 'agent',
+  side: 'right',
+  width,
+  setWidth,
+  choose: chooseWidth,
+  card: () => panel.value,
+  close: (startWidth) => {
+    width.value = startWidth
+    emit('close')
+  },
+})
 let pageObserver: ResizeObserver | null = null
 
 // The page is the card's parent: the Files page's row of the list and the card.
@@ -168,7 +174,7 @@ function setWidth(value: number) {
 /** Clamped from the chosen width, never from the width the window last allowed, so a card
  *  the window narrowed grows back as it widens; the card being dragged follows the pointer. */
 watch([pageWidth, chosenWidth], () => {
-  if (!resizing.value) {
+  if (!grip.dragging.value) {
     setWidth(chosenWidth.value)
   }
 })
@@ -179,120 +185,9 @@ function chooseWidth(value: number) {
   save()
 }
 
-function startResize(event: PointerEvent) {
-  if (event.button !== 0 || !(event.currentTarget instanceof HTMLElement)) {
-    return
-  }
-  event.preventDefault()
-  event.currentTarget.setPointerCapture(event.pointerId)
-  resizing.value = { x: event.clientX, width: width.value }
-  // The column-resize cursor holds over the whole page while the drag lasts.
-  document.documentElement.classList.add('col-resizing')
-}
-
-function onResize(event: PointerEvent) {
-  const drag = resizing.value
-  if (!drag) {
-    return
-  }
-  // The card is right of its grip: a drag to the left widens it.
-  const next = drag.width - (event.clientX - drag.x)
-  // Below half its minimum the card goes, live, and the list takes its room; dragged back
-  // past that line it returns at its minimum.
-  const hidden = collapses('agent', next)
-  if (hidden !== dragHidden.value) {
-    if (hidden) {
-      holdFocus()
-    }
-    dragHidden.value = hidden
-    if (!hidden) {
-      void giveFocusBack()
-    }
-  }
-  if (!hidden) {
-    setWidth(next)
-  }
-}
-
-/** What held focus in the card a drag hid: hiding it drops the focus to the page, so it is
- *  given back as the card returns. */
-let heldFocus: HTMLElement | null = null
-
-function holdFocus() {
-  const active = document.activeElement
-  heldFocus = active instanceof HTMLElement && panel.value?.contains(active) ? active : null
-}
-
-/** Called once the card is shown again in state: the wait is for the render that shows it. */
-async function giveFocusBack() {
-  const held = heldFocus
-  heldFocus = null
-  await nextTick()
-  if (held?.isConnected && (!document.activeElement || document.activeElement === document.body)) {
-    held.focus({ preventScroll: true })
-  }
-}
-
-function stopResize() {
-  resizing.value = null
-  dragHidden.value = false
-  document.documentElement.classList.remove('col-resizing')
-}
-
-/** The drag's release: a card released hidden closes, its chosen width the one it had before
- *  the drag; otherwise the width as it stands is the reader's choice — unless the press moved
- *  nothing, which chooses nothing. */
-function endResize() {
-  const drag = resizing.value
-  if (!drag) {
-    return
-  }
-  const hidden = dragHidden.value
-  stopResize()
-  if (hidden) {
-    heldFocus = null
-    width.value = drag.width
-    emit('close')
-  } else if (width.value !== drag.width) {
-    chooseWidth(width.value)
-  }
-}
-
-/** A cancelled drag puts the width back and never closes the card. */
-function cancelResize() {
-  const drag = resizing.value
-  if (drag) {
-    const hidden = dragHidden.value
-    stopResize()
-    width.value = drag.width
-    if (hidden) {
-      void giveFocusBack()
-    }
-  }
-}
-
-function onResizeKey(event: KeyboardEvent) {
-  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
-    return
-  }
-  event.preventDefault()
-  // The arrow moves the edge: to the left widens the card. It stops at the card's minimum:
-  // only a drag puts the card away.
-  const before = width.value
-  const step = event.shiftKey ? 64 : 16
-  setWidth(before + (event.key === 'ArrowLeft' ? step : -step))
-  // A key that moves nothing — the edge already at a bound — chooses nothing.
-  if (width.value !== before) {
-    chooseWidth(width.value)
-  }
-}
-
 onBeforeUnmount(() => {
   pageObserver?.disconnect()
   sheetQuery?.removeEventListener('change', onSheetChange)
-  if (resizing.value) {
-    document.documentElement.classList.remove('col-resizing')
-  }
 })
 
 const chat = ref<{ holds: boolean } | null>(null)
@@ -319,8 +214,8 @@ defineExpose({
   >
     <div
       v-if="!sheet"
-      class="split"
-      :class="{ dragging: resizing }"
+      class="column-grip"
+      :class="{ dragging: grip.dragging.value }"
       role="separator"
       tabindex="0"
       aria-orientation="vertical"
@@ -328,15 +223,10 @@ defineExpose({
       :aria-valuenow="width"
       :aria-valuemin="COLUMN_WIDTHS.agent.min"
       :aria-valuemax="widthMax()"
-      @pointerdown="startResize"
-      @pointermove="onResize"
-      @pointerup="endResize"
-      @pointercancel="cancelResize"
-      @dblclick="chooseWidth(COLUMN_WIDTHS.agent.initial)"
-      @keydown="onResizeKey"
+      v-bind="grip.handlers"
     />
     <aside
-      v-show="!dragHidden"
+      v-show="!grip.hidden.value"
       ref="panel"
       class="card"
       :style="
@@ -348,11 +238,11 @@ defineExpose({
       "
       :aria-label="t('chat.panel')"
     >
-      <ChatPanel
+      <LazyChatPanel
         ref="chat"
         :document-id="null"
         :document-selection="() => null"
-        :document-pages="() => []"
+        :document-index="() => NO_DOCUMENT"
         :current-section="() => null"
         :closable="!sheet"
         :library="library"
@@ -369,7 +259,7 @@ defineExpose({
             <span>{{ t('files.agentBack') }}</span>
           </button>
         </template>
-      </ChatPanel>
+      </LazyChatPanel>
     </aside>
   </div>
 </template>
@@ -384,45 +274,10 @@ defineExpose({
   padding: var(--space-4) var(--space-4) var(--space-4) 0;
 }
 
-/* The grip is the 16px gap between the list and the card, the whole gap the hit area; its
-   pill is drawn while it is dragged or holds keyboard focus, and always under a finger. */
-.split {
-  position: relative;
-  z-index: 1;
+/* The grip is the 16px gap between the list and the card, the whole gap the hit area. */
+.column-grip {
   flex: none;
   width: var(--space-4);
-  border-radius: var(--radius-full);
-  cursor: col-resize;
-  touch-action: none;
-}
-
-.split::after {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 5px;
-  height: 40px;
-  border-radius: var(--radius-full);
-  background: var(--grip);
-  opacity: 0;
-  transform: translate(-50%, -50%);
-  transition:
-    background var(--duration-fast) var(--ease),
-    height var(--duration-fast) var(--ease);
-}
-
-.split.dragging::after,
-.split:focus-visible::after {
-  height: 56px;
-  background: var(--grip-active);
-  opacity: 1;
-}
-
-@media (hover: none) {
-  .split::after {
-    opacity: 1;
-  }
 }
 
 /* Widths, not flex-bases, here and on the grip: this box sizes itself from what it holds, and

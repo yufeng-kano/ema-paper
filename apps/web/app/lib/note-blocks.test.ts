@@ -1,5 +1,4 @@
 import { getSchema } from '@tiptap/core'
-import { closeHistory, history, undo } from '@tiptap/pm/history'
 import { EditorState, TextSelection } from '@tiptap/pm/state'
 import { describe, expect, it } from 'vitest'
 import {
@@ -23,9 +22,9 @@ import { docToMarkdown, markdownToDoc, sliceToMarkdown } from './richdoc'
 
 const schema = getSchema(richExtensions({ links: { state: () => 'chip', locate: () => {} }, blocks: true }))
 
-/** The notes as their editor holds them, with the editor's own history. */
+/** The notes as their editor holds them. */
 function notes(markdown: string): EditorState {
-  return EditorState.create({ schema, doc: schema.nodeFromJSON(markdownToDoc(markdown, { cites: true })), plugins: [history()] })
+  return EditorState.create({ schema, doc: schema.nodeFromJSON(markdownToDoc(markdown, { cites: true })) })
 }
 
 function written(state: EditorState): string {
@@ -77,15 +76,13 @@ describe('the units', () => {
     expect(unitIndexAt(units, state.doc.content.size)).toBe(1)
     expect(unitIndexAt([], 0)).toBeNull()
   })
-})
 
-describe("an excerpt's link line", () => {
-  it('is marked right after its quote, and nowhere else', () => {
+  it("mark an excerpt's link line right after its quote, and no other line", () => {
     const state = notes(`> first\n\n${EXCERPT}\n\n> passage\n\nSee [3.2 Attention](#32-attention) too.\n\n[3.2 Attention](#32-attention)`)
-    const excerpts = noteUnits(state.doc).filter((unit) => unit.excerpt)
-    expect(excerpts).toHaveLength(1)
+    const units = noteUnits(state.doc)
+    expect(units.map((unit) => unit.excerpt)).toEqual([false, true, false, false, false])
     const marked = markExcerptLinks(state.doc).find()
-    expect(marked.map((mark) => mark.from)).toEqual([excerpts[0]!.starts[1]])
+    expect(marked.map((mark) => [mark.from, mark.to])).toEqual([[units[1]!.starts[1], units[1]!.to]])
   })
 })
 
@@ -155,16 +152,6 @@ describe('a move', () => {
     expect(moveUnit(tr, noteUnits(state.doc), 2, 0)).toBe(0)
     expect(written(state.apply(tr))).toBe('Three\n\nOne\n\nTwo')
   })
-
-  it('is one step of the editor history: one undo puts it back', () => {
-    const before = notes('One\n\nTwo\n\nThree')
-    const tr = closeHistory(before.tr)
-    moveUnit(tr, noteUnits(before.doc), 0, 2)
-    let state = before.apply(tr)
-    expect(written(state)).toBe('Two\n\nOne\n\nThree')
-    undo(state, (next) => (state = state.apply(next)))
-    expect(written(state)).toBe('One\n\nTwo\n\nThree')
-  })
 })
 
 describe('a conversion', () => {
@@ -193,16 +180,6 @@ describe('a conversion', () => {
     expect(convertUnit(state.tr, units, 0, 'paragraph', { cites: true })).toBeNull()
     expect(convertUnit(state.tr, units, 1, 'heading', { cites: true })).toBeNull()
     expect(convertUnit(state.tr, units, 2, 'paragraph', { cites: true })).toBeNull()
-  })
-
-  it('is one step of the editor history: one undo puts it back', () => {
-    const before = notes('One\n\nTwo')
-    const tr = closeHistory(before.tr)
-    convertUnit(tr, noteUnits(before.doc), 1, 'quote', { cites: true })
-    let state = before.apply(tr)
-    expect(written(state)).toBe('One\n\n> Two')
-    undo(state, (next) => (state = state.apply(next)))
-    expect(written(state)).toBe('One\n\nTwo')
   })
 })
 

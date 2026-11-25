@@ -8,30 +8,22 @@
  * The filter, the search and the page live in the route query (`?area=&q=&page=`), so Back
  * and a reload return to them; nothing of the log is kept in browser storage.
  */
-import { listAdminAudit, type AdminList, type AuditEntry } from '~/lib/api'
+import { listAdminAudit, type AuditEntry } from '~/lib/api'
 import { AUDIT_FILTER_AREAS, auditAreaOf, pageOf, type AdminArea } from '~/lib/admin'
 import { formatCount, formatShortDateTime } from '~/lib/format'
 import type { TableColumn } from '~/lib/table'
 
-/** How long typing rests before the search runs. */
-const SEARCH_DELAY_MS = 300
 /** The longest search the field takes: an address is at most 320 characters. */
 const SEARCH_MAX = 320
 
-const { t, te, locale } = useI18n()
+const { t, locale } = useI18n()
+const { actorName, actionLabel, targetLabel } = useAdminLabels()
 const route = useRoute()
-const router = useRouter()
-const { explain } = useAdminFailure()
+const { setQuery, goToPage, withinPages } = useAdminQuery()
 
 const area = computed(() => auditAreaOf(route.query.area))
 const q = computed(() => (typeof route.query.q === 'string' ? route.query.q.trim() : ''))
 const page = computed(() => pageOf(route.query.page))
-
-/** Moves the query; a filter or a search starts again at the first page. */
-function setQuery(patch: Record<string, string | null>, replace = false) {
-  const query = Object.fromEntries(Object.entries({ ...route.query, ...patch }).filter(([, value]) => value !== null))
-  void (replace ? router.replace({ query }) : router.push({ query }))
-}
 
 function chooseArea(value: AdminArea | null) {
   if (value !== area.value) {
@@ -39,70 +31,14 @@ function chooseArea(value: AdminArea | null) {
   }
 }
 
-function goToPage(next: number) {
-  setQuery({ page: next > 1 ? String(next) : null })
-}
-
-// --- the search, typed ahead of the query ------------------------------------------------
-
-const search = ref(q.value)
-let searchTimer: ReturnType<typeof setTimeout> | undefined
-
-watch(search, (value) => {
-  clearTimeout(searchTimer)
-  searchTimer = setTimeout(() => {
-    const next = value.trim()
-    if (next !== q.value) {
-      setQuery({ q: next || null, page: null }, true)
-    }
-  }, SEARCH_DELAY_MS)
-})
-
-// Back and Forward move the query under the field: the field follows.
-watch(q, (value) => {
-  if (value !== search.value.trim()) {
-    search.value = value
-  }
-})
-
-onBeforeUnmount(() => clearTimeout(searchTimer))
+const search = useQuerySearch(q, setQuery)
 
 // --- the log -------------------------------------------------------------------------------
 
-const data = shallowRef<AdminList<AuditEntry> | null>(null)
-const pending = ref(false)
-const error = ref<string | null>(null)
-/** Only the newest read may write. */
-let seq = 0
-
-async function load(): Promise<void> {
-  const mine = ++seq
-  pending.value = true
-  try {
-    const loaded = await listAdminAudit({ page: page.value, area: area.value ?? undefined, q: q.value || undefined })
-    if (mine !== seq) {
-      return
-    }
-    const last = Math.max(1, Math.ceil(loaded.total / loaded.page_size))
-    if (!loaded.items.length && page.value > last) {
-      // A page past the end — a link from a longer log: its last page instead, which the
-      // query's change reads.
-      setQuery({ page: last > 1 ? String(last) : null }, true)
-      return
-    }
-    data.value = loaded
-    error.value = null
-  } catch (failure) {
-    const message = await explain(failure)
-    if (mine === seq) {
-      error.value = message
-    }
-  } finally {
-    if (mine === seq) {
-      pending.value = false
-    }
-  }
-}
+const { data, pending, error, load } = useAdminRead(
+  () => listAdminAudit({ page: page.value, area: area.value ?? undefined, q: q.value || undefined }),
+  { accept: (loaded) => withinPages(loaded, page.value) },
+)
 
 onMounted(load)
 
@@ -146,24 +82,6 @@ function rowAttrs(row: AuditEntry): Record<string, unknown> {
       }
     },
   }
-}
-
-function actorName(row: AuditEntry): string | null {
-  return row.actor ? row.actor.name?.trim() || row.actor.email : null
-}
-
-/** The catalog's words for an action; one it does not know prints as its key. */
-function actionLabel(action: string): string {
-  return te(`admin.audit.actions.${action}`) ? t(`admin.audit.actions.${action}`) : action
-}
-
-/** What the target is called now; once it is gone, its type and id. */
-function targetLabel(row: AuditEntry): string {
-  if (row.target_label) {
-    return row.target_label
-  }
-  const type = te(`admin.audit.targets.${row.target_type}`) ? t(`admin.audit.targets.${row.target_type}`) : row.target_type
-  return `${type} ${row.target_id}`
 }
 
 /** A side of the change as the row holds it, pretty-printed; null where there was none. */
@@ -283,10 +201,7 @@ function json(value: unknown): string | null {
         </template>
       </UiDataTable>
 
-      <footer v-if="data && data.total" class="foot">
-        <span>{{ t('admin.audit.hint') }}</span>
-        <UiPager :page="data.page" :page-size="data.page_size" :total="data.total" @update:page="goToPage" />
-      </footer>
+      <AdminListFoot v-if="data && data.total" :hint="t('admin.audit.hint')" :list="data" @page="goToPage" />
     </UiPanel>
   </UiScreen>
 </template>
@@ -353,17 +268,6 @@ function json(value: unknown): string | null {
 
 .json.none {
   color: var(--faint);
-}
-
-.foot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2) var(--space-4);
-  padding: var(--space-3) var(--cell-x) 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
 }
 
 @media (max-width: 1180px) {

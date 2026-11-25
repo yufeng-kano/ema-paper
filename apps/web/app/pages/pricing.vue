@@ -10,9 +10,9 @@
  * lands here signed out, and a signed-in reader is not sent away.
  */
 import { createCheckout, getBillingCatalog, type CatalogPlan, type CatalogResponse } from '~/lib/api'
-import { formatBytes, formatCount, formatMinorAmount, packValidity } from '~/lib/format'
+import { CYCLE_INTERVALS } from '~/lib/billing'
+import { formatBytes, formatCount, formatMinorAmount } from '~/lib/format'
 import { SETTINGS_QUERY, keepAfterSignIn } from '~/lib/settings'
-import type { TableColumn } from '~/lib/table'
 
 definePageMeta({ layout: false })
 
@@ -40,9 +40,10 @@ onMounted(async () => {
   }
 })
 
-/** Null until the catalog answers: no rate is ever assumed (docs/web.md § Rules). */
-const parsePerPage = computed(() => catalog.value?.rates.parse_per_page ?? null)
-const webSearchPerCall = computed(() => catalog.value?.rates.web_search_per_call ?? null)
+/** Until the catalog answers or fails: no rate is ever assumed (docs/web.md § Rules). */
+const loading = computed(() => !catalog.value && !loadError.value)
+/** The chat models' table and its heading stand only while the catalog prices a model. */
+const hasChatRates = computed(() => Object.keys(catalog.value?.rates.chat ?? {}).length > 0)
 
 // --- the top-up pack ----------------------------------------------------------------------
 
@@ -50,23 +51,18 @@ const webSearchPerCall = computed(() => catalog.value?.rates.web_search_per_call
  *  question stand only then (docs/billing.md § Top-up packs). No button here: a pack is
  *  bought where the reader is signed in, the Usage section or the credits dialog. */
 const pack = computed(() => catalog.value?.packs[0] ?? null)
-const packPrice = computed(() => (pack.value ? formatMinorAmount(pack.value.amount, pack.value.currency, locale.value) : ''))
-/** `12 months`, or the days when the validity is not a whole number of months. */
-const validity = computed(() => {
-  if (!pack.value) {
-    return ''
-  }
-  const { unit, n } = packValidity(pack.value.valid_days)
-  return t(`topUp.${unit}`, { n: formatCount(n, locale.value) }, n)
-})
+const { price: packPrice, validity } = usePackWords(pack)
 
-/** `per month`, `per year`, or `per 3 months` — as Pay reports the cycle. */
+/** `month`, `3 months`, `week` — as Pay reports the cycle, worded and pluralized by the
+ *  catalog for every interval it knows; an interval it does not know is printed as Pay
+ *  names it. */
 function cycleOf(plan: CatalogPlan): string {
   const { interval, frequency } = plan.cycle
-  if (frequency === 1 && (interval === 'month' || interval === 'year')) {
-    return t(`pricing.cycle.${interval}`)
+  const n = formatCount(frequency, locale.value)
+  if ((CYCLE_INTERVALS as readonly string[]).includes(interval)) {
+    return t(`pricing.cycle.${interval}`, { n }, frequency)
   }
-  return t('pricing.cycle.other', { n: formatCount(frequency, locale.value), interval })
+  return t('pricing.cycle.other', { n, interval })
 }
 
 /** The Usage section, where *Upgrade* is; a signed-out visitor is sent to sign in first
@@ -105,32 +101,6 @@ function price(plan: CatalogPlan): string {
   return formatMinorAmount(plan.amount, plan.currency, locale.value)
 }
 
-// --- the rates table ----------------------------------------------------------------------
-
-interface RateRow {
-  model: string
-  input: number
-  cache_read: number
-  cache_write: number
-  output: number
-}
-
-const rateRows = computed<RateRow[]>(() =>
-  Object.entries(catalog.value?.rates.chat ?? {}).map(([model, rate]) => ({ model, ...rate })),
-)
-
-const rateColumns = computed<TableColumn<RateRow>[]>(() => [
-  { key: 'model', header: t('pricing.columnModel') },
-  { key: 'input', header: t('pricing.columnInput'), numeric: true },
-  { key: 'cache_read', header: t('pricing.columnCacheRead'), numeric: true },
-  { key: 'cache_write', header: t('pricing.columnCacheWrite'), numeric: true },
-  { key: 'output', header: t('pricing.columnOutput'), numeric: true },
-])
-
-function rate(value: number): string {
-  return new Intl.NumberFormat(locale.value, { maximumFractionDigits: 3 }).format(value)
-}
-
 /** The fifth question is the pack's, asked only while one is on sale. */
 const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1', '2', '3', '4']))
 </script>
@@ -154,7 +124,7 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
             <p class="for">{{ t('pricing.freeFor') }}</p>
             <ul class="gives">
               <li>{{ t('pricing.creditsPerMonth', { n: formatCount(catalog.free.credits, locale) }, catalog.free.credits) }}</li>
-              <li>{{ t('pricing.storageKept', { size: formatBytes(catalog.free.storage_bytes, locale) }) }}</li>
+              <li>{{ t('pricing.storageKept', { size: formatBytes(catalog.free.storage_bytes, locale, { limit: true }) }) }}</li>
               <li>{{ t('pricing.jobsAtOnce', { n: formatCount(catalog.free.max_jobs, locale) }, catalog.free.max_jobs) }}</li>
               <li>{{ t('pricing.api') }}</li>
               <li>{{ catalog.free.sandbox ? t('pricing.chatSandbox') : t('pricing.chatNoSandbox') }}</li>
@@ -181,7 +151,7 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
               <ul class="gives">
                 <li>{{ t('pricing.creditsPerCycle', { n: formatCount(plan.credits, locale), cycle: cycleOf(plan) }, plan.credits) }}</li>
                 <li v-if="pack">{{ t('pricing.topUpGives') }}</li>
-                <li>{{ t('pricing.storageKept', { size: formatBytes(plan.storage_bytes, locale) }) }}</li>
+                <li>{{ t('pricing.storageKept', { size: formatBytes(plan.storage_bytes, locale, { limit: true }) }) }}</li>
                 <li>{{ t('pricing.jobsAtOnce', { n: formatCount(plan.max_jobs, locale) }, plan.max_jobs) }}</li>
                 <li>{{ t('pricing.api') }}</li>
                 <li>{{ plan.sandbox ? t('pricing.chatSandbox') : t('pricing.chatNoSandbox') }}</li>
@@ -237,63 +207,20 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
           <h2 class="section-title">{{ t('pricing.howTitle') }}</h2>
           <p class="section-lede">{{ pack ? t('pricing.howLedePack', { validity }) : t('pricing.howLede') }}</p>
         </div>
-        <UiSkeleton v-if="parsePerPage === null && !loadError" class="sheet" :rows="4" />
-        <table v-else-if="parsePerPage !== null" class="how-table sheet">
-          <thead>
-            <tr>
-              <th scope="col">{{ t('pricing.columnAction') }}</th>
-              <th scope="col" class="num">{{ t('pricing.columnCredits') }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>{{ t('pricing.parseRow') }}</td>
-              <td class="num tabular">{{ t('pricing.perPage', { n: formatCount(parsePerPage, locale) }) }}</td>
-            </tr>
-            <tr>
-              <td>{{ t('pricing.retryRow') }}</td>
-              <td class="num tabular">{{ t('pricing.perPage', { n: formatCount(parsePerPage, locale) }) }}</td>
-            </tr>
-            <tr>
-              <td>{{ t('pricing.reconvertRow') }}</td>
-              <td class="num tabular">{{ t('pricing.perPage', { n: formatCount(parsePerPage, locale) }) }}</td>
-            </tr>
-            <tr>
-              <td>{{ t('pricing.chatRow') }}</td>
-              <td class="num">
-                {{ t('pricing.chatRate') }}
-                <NuxtLink class="rates-link" :to="localePath('/rates')">{{ t('pricing.ratesLink') }}</NuxtLink>
-              </td>
-            </tr>
-            <tr v-if="webSearchPerCall !== null">
-              <td>{{ t('pricing.webSearchRow') }}</td>
-              <td class="num tabular">{{ t('pricing.perCall', { n: formatCount(webSearchPerCall, locale) }) }}</td>
-            </tr>
-          </tbody>
-        </table>
+        <CreditsHowTable :rates="catalog?.rates ?? null" :loading="loading">
+          <template #chat>
+            {{ t('pricing.chatRate') }}
+            <NuxtLink class="rates-link" :to="localePath('/rates')">{{ t('pricing.ratesLink') }}</NuxtLink>
+          </template>
+        </CreditsHowTable>
       </section>
 
-      <section v-if="rateRows.length" class="rates">
+      <section v-if="hasChatRates" class="rates">
         <div class="how-head">
           <h2 class="section-title">{{ t('pricing.ratesTitle') }}</h2>
           <p class="section-lede">{{ t('pricing.ratesLede') }}</p>
         </div>
-        <!-- Wider than a phone: the sheet scrolls sideways, the page does not. -->
-        <div class="sheet rates-sheet">
-          <UiDataTable
-            :columns="rateColumns"
-            :rows="rateRows"
-            :row-key="(row) => row.model"
-            :caption="t('pricing.ratesTitle')"
-            density="tight"
-          >
-            <template #cell-model="{ row }"><span class="mono">{{ row.model }}</span></template>
-            <template #cell-input="{ row }">{{ rate(row.input) }}</template>
-            <template #cell-cache_read="{ row }">{{ rate(row.cache_read) }}</template>
-            <template #cell-cache_write="{ row }">{{ rate(row.cache_write) }}</template>
-            <template #cell-output="{ row }">{{ rate(row.output) }}</template>
-          </UiDataTable>
-        </div>
+        <ChatRatesTable :rates="catalog?.rates ?? null" />
       </section>
 
       <section class="faq">
@@ -372,6 +299,14 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
   box-shadow:
     0 0 0 2px var(--accent),
     var(--shadow-pane);
+}
+
+/* The label that names a figure or a group: sentence case, quiet, a step under the text it
+   labels — never tracked capitals. */
+.eyebrow {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  color: var(--muted);
 }
 
 .plan .eyebrow {
@@ -528,51 +463,6 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
 .section-lede {
   max-width: 40em;
   font-size: var(--text-base);
-}
-
-/* A table on the desk sits on a paper sheet with the plans' edge, at the grouped list's
-   radius. */
-.sheet {
-  overflow: hidden;
-  border-radius: var(--radius-lg);
-  background: var(--paper);
-  box-shadow: 0 0 0 0.5px var(--pane-edge);
-}
-
-.rates-sheet {
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
-  padding: var(--space-2) var(--space-3);
-}
-
-.how-table {
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  font-size: var(--text-sm);
-}
-
-.how-table th,
-.how-table td {
-  padding: var(--space-3) var(--space-5);
-  border-bottom: 1px solid var(--line);
-  text-align: left;
-  vertical-align: top;
-}
-
-.how-table tbody tr:last-child td {
-  border-bottom: 0;
-}
-
-.how-table th {
-  color: var(--muted);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-}
-
-.num {
-  text-align: right !important;
-  white-space: nowrap;
 }
 
 .questions {

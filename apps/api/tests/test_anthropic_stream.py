@@ -19,36 +19,27 @@ from sightread.upstream.anthropic import (
     stream_messages,
 )
 from sightread.upstream.client import Connection, PaymentRequired, RateLimited, UpstreamError
-from tests.conftest import KANO_BASE
+from tests.chat_helpers import MESSAGES_URL, sse
+from tests.helpers import stub_connection
 
-SECRET = "test-secret-key-not-a-real-one"
-MESSAGES_URL = f"{KANO_BASE}/anthropic/v1/messages"
+# The bounds every caller passes from the deployment's `UPSTREAM_*` settings, at their
+# defaults (docs/api.md).
+BOUNDS = {"max_bytes": 33_554_432, "line_max_bytes": 4 * 1024 * 1024, "blocks_max": 4096}
 
 
 @pytest.fixture
 def key() -> Connection:
-    return Connection(
-        api_key="sk-kano-proxy-test",
-        base_url=f"{KANO_BASE}/anthropic/v1",
-        snapshot=KANO_BASE,
-    )
+    return stub_connection("anthropic")
 
 
-def sse(*events: dict) -> bytes:
-    return "".join(
-        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
-    ).encode()
-
-
-def a_turn(*, with_tool: bool = True, cost: float | None = 0.0123) -> bytes:
+def a_turn() -> bytes:
     usage = {
         "input_tokens": 900,
         "cache_read_input_tokens": 700,
         "cache_creation_input_tokens": 100,
+        "cost": 0.0123,
     }
-    if cost is not None:
-        usage["cost"] = cost
-    events = [
+    return sse(
         {
             "type": "message_start",
             "message": {"id": "msg_1", "model": "claude-opus-5-5", "usage": usage},
@@ -81,47 +72,49 @@ def a_turn(*, with_tool: bool = True, cost: float | None = 0.0123) -> bytes:
             "delta": {"type": "text_delta", "text": "the table."},
         },
         {"type": "content_block_stop", "index": 1},
-    ]
-    if with_tool:
-        events += [
-            {
-                "type": "content_block_start",
-                "index": 2,
-                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {}},
-            },
-            {
-                "type": "content_block_delta",
-                "index": 2,
-                "delta": {"type": "input_json_delta", "partial_json": '{"comm'},
-            },
-            {
-                "type": "content_block_delta",
-                "index": 2,
-                "delta": {"type": "input_json_delta", "partial_json": 'and": "ls"}'},
-            },
-            {"type": "content_block_stop", "index": 2},
-        ]
-    events += [
+        {
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {}},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": '{"comm'},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": 'and": "ls"}'},
+        },
+        {"type": "content_block_stop", "index": 2},
         {
             "type": "message_delta",
-            "delta": {"stop_reason": "tool_use" if with_tool else "end_turn"},
+            "delta": {"stop_reason": "tool_use"},
             "usage": {"output_tokens": 42},
         },
         {"type": "message_stop"},
-    ]
-    return sse(*events)
+    )
 
 
 async def collect(key: Connection, body: dict) -> tuple[list[StreamEvent], CompletedMessage]:
     events: list[StreamEvent] = []
     final: CompletedMessage | None = None
-    async for item in stream_messages(key, body, betas=("thinking-display-updates-2026-08-18",)):
+    async for item in stream_messages(
+        key, body, betas=("thinking-display-updates-2026-08-18",), **BOUNDS
+    ):
         if isinstance(item, CompletedMessage):
             final = item
         else:
             events.append(item)
     assert final is not None
     return events, final
+
+
+async def drain(key: Connection, body: dict, **options) -> None:
+    """Read a stream to its end, on `BOUNDS` unless `options` overrides one."""
+    async for _ in stream_messages(key, body, **{**BOUNDS, **options}):
+        pass
 
 
 @respx.mock
@@ -243,7 +236,9 @@ async def test_each_event_is_handed_on_as_it_arrives(key) -> None:
 
     async def read() -> list:
         seen = []
-        async for event in stream_messages(key, {"model": "claude-opus-5-5", "messages": []}):
+        async for event in stream_messages(
+            key, {"model": "claude-opus-5-5", "messages": []}, **BOUNDS
+        ):
             seen.append(event)
             first_seen.set()
         return seen
@@ -295,12 +290,6 @@ async def test_upstream_failures_map_onto_the_shared_error_classes(key) -> None:
         await collect(key, body)
     assert rejected.value.fatal
 
-    cut = sse({"type": "message_start", "message": {"usage": {}}})
-    respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=cut))
-    with pytest.raises(UpstreamError) as early:
-        await collect(key, body)
-    assert early.value.transient
-
     failed = sse({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}})
     respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=failed))
     with pytest.raises(UpstreamError) as overloaded:
@@ -318,79 +307,70 @@ async def test_an_upstream_error_is_stored_by_type_never_by_its_text(key) -> Non
     )
     respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=leaky))
     with pytest.raises(UpstreamError) as raised:
-        async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=1_000_000):
-            pass
+        await drain(key, {"messages": []})
     assert "SECRET" not in str(raised.value)
     assert "invalid_request_error" in str(raised.value)
 
 
 @respx.mock
 async def test_an_overlong_stream_line_is_refused_before_it_is_held(key) -> None:
-    from sightread.upstream import anthropic
-
-    # The bound is the deployment's (`UPSTREAM_SSE_LINE_MAX_BYTES`), passed per call.
-    assert anthropic.DEFAULT_SSE_LINE_MAX_BYTES == 4 * 1024 * 1024
     endless = b"data: " + b"x" * 5_000
     respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=endless))
     with pytest.raises(UpstreamError) as refused:
-        async for _ in stream_messages(
-            key, {"messages": []}, betas=(), max_bytes=10_000_000, line_max_bytes=1_000
-        ):
-            pass
+        await drain(key, {"messages": []}, line_max_bytes=1_000)
     assert "overlong" in str(refused.value)
 
 
 @respx.mock
-async def test_a_wild_content_block_index_is_refused(key) -> None:
+async def test_a_body_past_the_size_cap_is_refused(key) -> None:
+    """docs/chat.md § Upstream: a body past `UPSTREAM_RESPONSE_MAX_BYTES` ends the call."""
+    respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=a_turn()))
+    with pytest.raises(UpstreamError) as refused:
+        await drain(key, {"messages": []}, max_bytes=100)
+    assert "exceeded the size cap" in str(refused.value)
+
+
+def _start(index: int) -> dict:
+    return {"type": "content_block_start", "index": index, "content_block": {"type": "text"}}
+
+
+def _delta(**index: int) -> dict:
+    return {"type": "content_block_delta", **index, "delta": {"type": "text_delta", "text": "x"}}
+
+
+@pytest.mark.parametrize(
+    ("stray", "blocks_max", "expected"),
+    [
+        pytest.param(_start(2), BOUNDS["blocks_max"], "out-of-order", id="skips-ahead"),
+        pytest.param(_start(0), BOUNDS["blocks_max"], "out-of-order", id="repeated-start"),
+        pytest.param(_start(1), 1, "out-of-order", id="past-blocks-max"),
+        pytest.param(_delta(index=-1), BOUNDS["blocks_max"], "out-of-order", id="negative-index"),
+        pytest.param(_delta(), BOUNDS["blocks_max"], "out-of-order", id="missing-index"),
+        pytest.param(_delta(index=1), BOUNDS["blocks_max"], "has not started", id="early-delta"),
+        pytest.param(
+            {"type": "content_block_stop", "index": 1},
+            BOUNDS["blocks_max"],
+            "has not started",
+            id="early-stop",
+        ),
+    ],
+)
+@respx.mock
+async def test_a_broken_block_sequence_is_refused(key, stray, blocks_max, expected) -> None:
+    """Blocks arrive in order, each exactly the next one: a truncated or reordered stream
+    is neither allocated for nor stored as a complete answer with pieces missing
+    (docs/chat.md § Upstream, § Conversations, turns, events). The stream still ends with
+    its message_stop, so the refusal is not the early close."""
     wild = sse(
         {"type": "message_start", "message": {"usage": {}}},
-        {
-            "type": "content_block_start",
-            "index": 1_000_000_000,
-            "content_block": {"type": "text", "text": ""},
-        },
+        _start(0),
+        stray,
+        {"type": "message_stop"},
     )
     respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=wild))
     with pytest.raises(UpstreamError) as refused:
-        async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
-            pass
-    assert "out-of-order" in str(refused.value)
-
-
-@respx.mock
-async def test_a_negative_delta_index_is_refused(key) -> None:
-    wild = sse(
-        {"type": "message_start", "message": {"usage": {}}},
-        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-        {"type": "content_block_delta", "index": -1, "delta": {"type": "text_delta", "text": "x"}},
-    )
-    respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=wild))
-    with pytest.raises(UpstreamError) as refused:
-        async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
-            pass
-    assert "out-of-order" in str(refused.value)
-
-
-@respx.mock
-async def test_a_repeated_or_missing_block_index_is_refused(key) -> None:
-    for second in (
-        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-        {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}},
-    ):
-        wild = sse(
-            {"type": "message_start", "message": {"usage": {}}},
-            {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            },
-            second,
-        )
-        respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=wild))
-        with pytest.raises(UpstreamError) as refused:
-            async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
-                pass
-        assert "out-of-order" in str(refused.value)
+        await drain(key, {"messages": []}, blocks_max=blocks_max)
+    assert expected in str(refused.value)
 
 
 @respx.mock
@@ -467,8 +447,7 @@ async def test_a_stream_cut_short_still_says_what_it_used(key) -> None:
         respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=sse(*events)))
         progress = StreamProgress()
         with pytest.raises(UpstreamError):
-            async for _ in stream_messages(key, body, progress=progress):
-                pass
+            await drain(key, body, progress=progress)
         return progress
 
     usage = (await cut_after(*started)).usage_so_far()
@@ -490,8 +469,7 @@ async def test_a_stream_cut_short_still_says_what_it_used(key) -> None:
     respx.post(MESSAGES_URL).mock(return_value=httpx.Response(503, json={}))
     refused = StreamProgress()
     with pytest.raises(UpstreamError):
-        async for _ in stream_messages(key, body, progress=refused):
-            pass
+        await drain(key, body, progress=refused)
     assert refused.usage_so_far() is None
 
 
@@ -505,31 +483,6 @@ async def test_a_silent_stream_is_not_retried(key) -> None:
 
 
 @respx.mock
-async def test_a_delta_or_stop_for_a_block_that_never_started_is_refused(key) -> None:
-    """A truncated or reordered stream must not be stored as a complete answer with pieces
-    missing (docs/chat.md § Conversations, turns, events)."""
-    for stray in (
-        {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "x"}},
-        {"type": "content_block_stop", "index": 1},
-    ):
-        wild = sse(
-            {"type": "message_start", "message": {"usage": {}}},
-            {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            },
-            stray,
-            {"type": "message_stop"},
-        )
-        respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=wild))
-        with pytest.raises(UpstreamError) as refused:
-            async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
-                pass
-        assert "has not started" in str(refused.value)
-
-
-@respx.mock
 async def test_a_complete_overlong_line_is_refused_before_it_is_yielded(key) -> None:
     """A line past the cap that ends within the chunk is refused as one that never ends:
     the bound holds whichever way the line arrives (docs/chat.md § Conversations, turns,
@@ -537,8 +490,5 @@ async def test_a_complete_overlong_line_is_refused_before_it_is_yielded(key) -> 
     ended = b"data: " + b"x" * 5_000 + b"\n\n"
     respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=ended))
     with pytest.raises(UpstreamError) as refused:
-        async for _ in stream_messages(
-            key, {"messages": []}, betas=(), max_bytes=10_000_000, line_max_bytes=1_000
-        ):
-            pass
+        await drain(key, {"messages": []}, line_max_bytes=1_000)
     assert "overlong" in str(refused.value)

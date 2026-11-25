@@ -31,16 +31,26 @@ async def conversation_turns(db: AsyncSession, conversation_id: int) -> list[Cha
     )
 
 
+async def unfinished_turn(db: AsyncSession, conversation_id: int) -> bool:
+    """Whether a turn of the conversation is one the worker may still be driving: queued,
+    running, or cancelled but not yet wound down — anything without `finished_at`
+    (docs/chat.md § Conversations, turns, events)."""
+    return (
+        await db.execute(
+            select(ChatTurn.id).where(
+                ChatTurn.conversation_id == conversation_id, ChatTurn.finished_at.is_(None)
+            )
+        )
+    ).first() is not None
+
+
 def branch(turns: list[ChatTurn], head_id: uuid.UUID | None) -> list[ChatTurn]:
-    """The turns from the root to `head_id`, oldest first. With no head among `turns` —
-    a conversation with no turn yet, or rows written before versions that no migration
-    reached — every turn in order: one branch, the thread as it was before versions."""
+    """The turns from the root to `head_id`, oldest first; none when `head_id` is None or
+    not among `turns`."""
     by_id = {turn.id: turn for turn in turns}
-    if head_id is None or head_id not in by_id:
-        return list(turns)
     path: list[ChatTurn] = []
     cursor: uuid.UUID | None = head_id
-    while cursor is not None and cursor in by_id and by_id[cursor] not in path:
+    while cursor is not None and cursor in by_id:
         path.append(by_id[cursor])
         cursor = by_id[cursor].parent_id
     path.reverse()
@@ -54,9 +64,7 @@ def newest_leaf(turns: list[ChatTurn], start_id: uuid.UUID) -> uuid.UUID:
     for turn in turns:
         children.setdefault(turn.parent_id, []).append(turn)
     cursor = start_id
-    seen: set[uuid.UUID] = set()
-    while cursor not in seen and (below := children.get(cursor)):
-        seen.add(cursor)
+    while below := children.get(cursor):
         cursor = below[-1].id  # `turns` is oldest first
     return cursor
 
@@ -82,7 +90,11 @@ async def branch_boundary(db: AsyncSession, path: list[ChatTurn]) -> int | None:
         if turn.kind not in COMPACTION_TURNS or turn.status != "succeeded":
             continue
         summary_id = (
-            await db.execute(select(func.max(Message.id)).where(Message.turn_id == turn.id))
+            await db.execute(
+                select(func.max(Message.id)).where(
+                    Message.conversation_id == turn.conversation_id, Message.turn_id == turn.id
+                )
+            )
         ).scalar_one_or_none()
         if summary_id is not None:
             return summary_id

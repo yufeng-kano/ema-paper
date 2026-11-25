@@ -10,37 +10,6 @@
  * Pure and framework-free, so the parsing — the part with edges — is unit tested.
  */
 
-export type StepKind =
-  | 'read'
-  | 'search'
-  | 'list'
-  | 'count'
-  | 'run'
-  | 'restart'
-  | 'edit'
-  | 'create'
-  | 'page'
-  | 'figure'
-  | 'skill'
-  | 'subagent'
-  | 'web'
-  | 'papers'
-  | 'fetch'
-  | 'download'
-  | 'convert'
-  | 'retry'
-  | 'image'
-  // The library tools of the Files page's Agent (docs/chat.md § The library tools).
-  | 'browse'
-  | 'folder'
-  | 'move'
-  | 'rename'
-  | 'duplicate'
-  | 'trash'
-  | 'putBack'
-  | 'newDocument'
-  | 'tool'
-
 export interface Step {
   kind: StepKind
   /** What the step acted on, drawn in mono: a file, a pattern, a program, a skill. A library
@@ -99,8 +68,12 @@ export type LibraryStep =
   | { type: 'move'; moves: LibraryMove[] }
   | { type: 'rename'; item: LibraryItem; from: string; to: string }
 
-/** The order a group's summary names its kinds in: what was looked at, then what changed. */
-export const SUMMARY_ORDER: readonly StepKind[] = [
+/**
+ * Every kind of step, in the order a group's summary names them: what was looked at, then
+ * what changed. `browse`, and `folder` through `putBack`, are the library tools of the Files
+ * page's Agent (docs/chat.md § The library tools).
+ */
+export const SUMMARY_ORDER = [
   'read',
   'search',
   'list',
@@ -109,7 +82,6 @@ export const SUMMARY_ORDER: readonly StepKind[] = [
   'page',
   'figure',
   'skill',
-  'subagent',
   'web',
   'papers',
   'fetch',
@@ -129,9 +101,12 @@ export const SUMMARY_ORDER: readonly StepKind[] = [
   'trash',
   'putBack',
   'tool',
-]
+] as const
 
-const EDITOR_TOOL = 'str_replace_based_edit_tool'
+export type StepKind = (typeof SUMMARY_ORDER)[number]
+
+/** The chat agent's editor tool (docs/chat.md § Tools). */
+export const EDITOR_TOOL = 'str_replace_based_edit_tool'
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value : ''
@@ -427,7 +402,6 @@ function readEditor(input: Record<string, unknown>): Step {
       return { kind: 'create', target, document }
     case 'str_replace':
     case 'insert':
-    case 'undo_edit':
       return { kind: 'edit', target, document }
     default:
       return { kind: 'tool', target: EDITOR_TOOL }
@@ -476,8 +450,6 @@ export function readStep(name: string, input: Record<string, unknown>): Step {
       return { kind: 'figure', target: '', page: integer(input.page) }
     case 'skill':
       return { kind: 'skill', target: text(input.name) }
-    case 'subagent':
-      return { kind: 'subagent', target: text(input.name) }
     case 'web_search':
       return { kind: 'web', target: text(input.query) }
     case 'search_papers':
@@ -593,7 +565,7 @@ export function parseDiff(diff: string): DiffLine[] {
 /** The diff a stored editor call implies, for a card whose `edit` event is not at hand. */
 export function diffFromInput(input: Record<string, unknown>): DiffLine[] {
   const removed = text(input.old_str)
-  const added = text(input.new_str ?? input.file_text)
+  const added = text(input.new_str ?? input.insert_text ?? input.file_text)
   return [
     ...(removed ? removed.split('\n').map((line) => ({ kind: 'removed' as const, text: line })) : []),
     ...(added ? added.split('\n').map((line) => ({ kind: 'added' as const, text: line })) : []),

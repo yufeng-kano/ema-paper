@@ -2,15 +2,15 @@
 /**
  * The chat agent's subagents on the Agent page (docs/web.md § Pages, docs/chat.md
  * § Subagents): one table, the built-ins marked, each row's model (or *Follows the
- * conversation*) and how many read-only tools it holds, an edit control on every row. No
- * row has a delete: deleting is the edit dialog's.
+ * conversation*) and how many tools it holds, read-only or able to edit, and an edit
+ * control on every row. No row has a delete: deleting is the edit dialog's.
  */
-import { listSubagents, type ConnectionModel, type Subagent } from '~/lib/api'
+import { listSubagents, type AgentModel, type Subagent } from '~/lib/api'
 import type { TableColumn } from '~/lib/table'
 
 defineProps<{
   /** The chat agent's catalog, for the dialog's model picker. */
-  models: ConnectionModel[] | null
+  models: AgentModel[] | null
   maxChars: number | null
 }>()
 
@@ -67,7 +67,7 @@ function onDeleted(name: string) {
 <template>
   <section class="section" aria-labelledby="agents-subagents">
     <div class="section-head">
-      <h3 id="agents-subagents" class="section-label">{{ t('agents.subagentsLabel') }}</h3>
+      <h3 id="agents-subagents" class="agents-label">{{ t('agents.subagentsLabel') }}</h3>
       <UiButton variant="ghost" size="sm" @click="editing = 'new'">
         <template #icon><UiIcon name="plus" /></template>
         {{ t('agents.subagentNew') }}
@@ -133,15 +133,6 @@ function onDeleted(name: string) {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-}
-
-/* The field label's treatment: a section of the panel, not a heading of the page. */
-.section-label {
-  margin: 0;
-  font-family: inherit;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
 }
 
 .table-scroll {

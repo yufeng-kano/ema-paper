@@ -1,22 +1,25 @@
 """`python -m sightread.worker` — the process that drains the job queue (docs/jobs.md).
 
-Same codebase and same image as the API, run as its own process. One job at a time per
-worker: concurrency inside a job comes from the page fan-out, and concurrency across jobs
-comes from running more workers, which the FIFO `SKIP LOCKED` claim already supports.
+Same codebase and same image as the API, run as its own process. One worker per
+deployment, holding the worker lock for its life (`jobs.queue.try_worker_lock`); it runs
+one job or turn at a time, and concurrency inside a job comes from the page fan-out
+(docs/jobs.md § One worker per deployment).
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import signal
 import time
+from collections.abc import Coroutine
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .db.models import ChatTurn, Conversation
@@ -29,6 +32,7 @@ from .jobs.queue import (
     claim_next_turn,
     fail_orphaned_turns,
     fail_turn,
+    has_worker_lock,
     next_worker_generation,
     recover_unsettled_commands,
     release_worker_lock,
@@ -43,6 +47,7 @@ from .parsing.figures import discard_job_figures
 from .runtime_settings import RuntimeSettings
 from .sandbox.client import SandboxClient
 from .sandbox.egress import write_hosts_forever
+from .stopping import pause
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +66,33 @@ def render_worker_count(configured: int) -> int:
     return configured if configured > 0 else (os.cpu_count() or 1)
 
 
+async def _run_until_stopped(
+    work: Coroutine[Any, Any, None], stop: asyncio.Event
+) -> asyncio.Task[None] | None:
+    """Run `work` until it ends or `stop` is set: the finished task, or None when the stop
+    came first, the task then cancelled and waited out."""
+    running = asyncio.create_task(work)
+    shutdown = asyncio.create_task(stop.wait())
+    done, _ = await asyncio.wait({running, shutdown}, return_when=asyncio.FIRST_COMPLETED)
+    shutdown.cancel()
+    if running in done:
+        return running
+    running.cancel()
+    await asyncio.gather(running, return_exceptions=True)
+    return None
+
+
+async def _requeue_orphans(
+    db: AsyncSession, figures_dir: Path, generation: int | None, why: str
+) -> None:
+    """Put back on the queue the jobs `requeue_orphaned_jobs` finds, their crops discarded
+    with their partial progress (docs/jobs.md § Queue), each logged with `why`. A database
+    error reaches the caller."""
+    for orphan in await requeue_orphaned_jobs(db, generation):
+        await asyncio.to_thread(discard_job_figures, figures_dir, orphan)
+        logger.warning("requeued job %s %s", orphan, why)
+
+
 async def run_worker(stop: asyncio.Event) -> None:
     settings = get_settings()
     engine = create_engine(settings.database_url)
@@ -70,13 +102,12 @@ async def run_worker(stop: asyncio.Event) -> None:
     # the one being replaced in a rolling restart releases it as it stops.
     lock = None
     while lock is None and not stop.is_set():
-        if engine.dialect.name != "postgresql":
+        if not has_worker_lock(engine):
             break
         lock = await try_worker_lock(engine)
         if lock is None:
             logger.warning("another worker holds the worker lock; waiting for it")
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=WORKER_LOCK_RETRY_SECONDS)
+            await pause(stop, WORKER_LOCK_RETRY_SECONDS)
     if stop.is_set():
         if lock is not None:
             await release_worker_lock(lock)
@@ -101,6 +132,7 @@ async def run_worker(stop: asyncio.Event) -> None:
         generation = await next_worker_generation(db)
     render_count = render_worker_count(settings.render_workers)
     render_slots = asyncio.Semaphore(render_count)
+    figures_dir = Path(settings.figures_dir)
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
@@ -153,9 +185,9 @@ async def run_worker(stop: asyncio.Event) -> None:
                     async with sessionmaker() as db:
                         # The parses a dead worker held go back to the queue first, their
                         # crops with their partial progress (docs/jobs.md).
-                        for orphan in await requeue_orphaned_jobs(db):
-                            discard_job_figures(Path(settings.figures_dir), orphan)
-                            logger.warning("requeued job %s a previous worker left running", orphan)
+                        await _requeue_orphans(
+                            db, figures_dir, None, "a previous worker left running"
+                        )
                         finished, left = await fail_orphaned_turns(db, sandbox, settings)
                     # Then the markers that still stand: commands the runner could not
                     # confirm over in turns that ended (docs/workspace.md § Revisions).
@@ -177,8 +209,7 @@ async def run_worker(stop: asyncio.Event) -> None:
                     orphans_pending = bool(left)
                     recovered_once = True
             if not recovered_once:
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=IDLE_POLL_SECONDS)
+                await pause(stop, IDLE_POLL_SECONDS)
                 continue
             job_id = None
             turn_id = None
@@ -212,8 +243,7 @@ async def run_worker(stop: asyncio.Event) -> None:
             prefer_turns = not prefer_turns
 
             if job_id is None and turn_id is None:
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=IDLE_POLL_SECONDS)
+                await pause(stop, IDLE_POLL_SECONDS)
                 continue
 
             if turn_id is not None:
@@ -225,27 +255,20 @@ async def run_worker(stop: asyncio.Event) -> None:
                     runtime.invalidate()
                     snapshot = await runtime.current()
                 logger.info("running chat turn %s", turn_id)
-                running = asyncio.create_task(
-                    run_turn(sessionmaker, snapshot, turn_id, render_slots, generation)
+                ran = await _run_until_stopped(
+                    run_turn(sessionmaker, snapshot, turn_id, render_slots, generation), stop
                 )
-                shutdown = asyncio.create_task(stop.wait())
-                done, _ = await asyncio.wait(
-                    {running, shutdown}, return_when=asyncio.FIRST_COMPLETED
-                )
-                shutdown.cancel()
-                if running not in done:
+                if ran is None:
                     # A turn is never requeued: its tool calls may already have run
                     # (docs/jobs.md § Chat turns).
-                    running.cancel()
-                    await asyncio.gather(running, return_exceptions=True)
                     async with sessionmaker() as db:
                         await fail_turn(db, turn_id, "worker stopped")
                     logger.info("failed turn %s on shutdown", turn_id)
-                elif running.exception() is not None:
+                elif ran.exception() is not None:
                     # The runner answers for the turn's own faults; what escaped it is
                     # ours, and the row must not stay `running` with nobody driving it.
                     logger.error(
-                        "turn %s raised past its runner", turn_id, exc_info=running.exception()
+                        "turn %s raised past its runner", turn_id, exc_info=ran.exception()
                     )
                     async with sessionmaker() as db:
                         await fail_turn(db, turn_id, "internal error")
@@ -255,28 +278,21 @@ async def run_worker(stop: asyncio.Event) -> None:
                 # § Queue).
                 try:
                     async with sessionmaker() as db:
-                        left = await requeue_orphaned_jobs(db, generation)
+                        await _requeue_orphans(
+                            db, figures_dir, generation, f"that turn {turn_id} left running"
+                        )
                 except SQLAlchemyError:
                     logger.exception("could not look for parses turn %s left running", turn_id)
-                else:
-                    for orphan in left:
-                        discard_job_figures(Path(settings.figures_dir), orphan)
-                        logger.warning("requeued job %s that turn %s left running", orphan, turn_id)
                 continue
 
             logger.info("running job %s", job_id)
-            running = asyncio.create_task(
-                run_job(sessionmaker, snapshot, job_id, render_slots, generation)
+            ran = await _run_until_stopped(
+                run_job(sessionmaker, snapshot, job_id, render_slots, generation), stop
             )
-            shutdown = asyncio.create_task(stop.wait())
-            done, _ = await asyncio.wait({running, shutdown}, return_when=asyncio.FIRST_COMPLETED)
-            shutdown.cancel()
-
-            if running not in done:
+            if ran is None:
                 # Shutting down mid-run: hand the job back to the queue rather than
-                # leaving it stuck in `running` (docs/jobs.md § Retention covers the file).
-                running.cancel()
-                await asyncio.gather(running, return_exceptions=True)
+                # leaving it stuck in `running`
+                # (docs/jobs.md § Interrupted and failed jobs, *Shutdown*).
                 async with sessionmaker() as db:
                     requeued = await requeue_job(db, job_id, generation)
                 if requeued:
@@ -285,20 +301,20 @@ async def run_worker(stop: asyncio.Event) -> None:
                     # the time the cancelled task has been gathered above, nothing can
                     # write them back. A job whose result was committed before the cancel
                     # landed is not requeued, and keeps its crops (docs/jobs.md).
-                    discard_job_figures(Path(settings.figures_dir), job_id)
+                    await asyncio.to_thread(discard_job_figures, figures_dir, job_id)
                     logger.info("requeued job %s on shutdown", job_id)
                 else:
                     # Finished before the cancel landed, or another worker's since this
                     # one lost the lock — its pages and crops are not this one's to take.
                     logger.info("job %s is finished or another worker's; not requeued", job_id)
-            elif running.exception() is not None:
+            elif ran.exception() is not None:
                 # The runner answers for the document's faults; what escaped it is ours,
                 # and the row must not stay `running` with nobody driving it, against
                 # its user's cap. Failed, not requeued: the parse ran and billed.
-                logger.error("job %s raised past its runner", job_id, exc_info=running.exception())
+                logger.error("job %s raised past its runner", job_id, exc_info=ran.exception())
                 try:
-                    await fail_job(sessionmaker, snapshot, job_id, "internal error", generation)
-                except Exception:  # noqa: BLE001 - the next start requeues what stays running
+                    await fail_job(sessionmaker, snapshot, job_id, generation)
+                except Exception:  # the next start requeues what stays running
                     logger.exception("could not fail job %s", job_id)
     finally:
         background = [task for task in (sweeper, compactor, egress) if task is not None]

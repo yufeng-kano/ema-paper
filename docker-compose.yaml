@@ -40,10 +40,6 @@ services:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
       WORKSPACES_DIR: /data/workspaces
-      # The runner's address, from the port it listens on (SANDBOX_PORT) — unless .env sets
-      # SANDBOX_URL itself, an empty one included, which disables the sandbox
-      # (docs/deployment.md): `-`, not `:-`, so only an unset variable takes the default.
-      SANDBOX_URL: ${SANDBOX_URL-http://sandbox:${SANDBOX_PORT:-8100}}
     depends_on:
       pg:
         condition: service_healthy
@@ -55,11 +51,8 @@ services:
       # A bind mount, not a named volume: the sandbox runner hands the same host path to
       # `docker run` (docs/workspace.md, docs/sandbox.md).
       - ${WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
-    command: >
-      sh -c "alembic upgrade head &&
-      uvicorn sightread.main:app --host 0.0.0.0 --port 8000"
-    # Healthy only once /healthz answers, i.e. after migrations finished (the production
-    # file explains why the worker gates on this).
+    # Healthy only once /healthz answers, i.e. after the image's start command finished the
+    # migrations (the production file explains why the worker gates on this).
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
       interval: 5s
@@ -79,10 +72,6 @@ services:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
       WORKSPACES_DIR: /data/workspaces
-      # The runner's address, from the port it listens on (SANDBOX_PORT) — unless .env sets
-      # SANDBOX_URL itself, an empty one included, which disables the sandbox
-      # (docs/deployment.md): `-`, not `:-`, so only an unset variable takes the default.
-      SANDBOX_URL: ${SANDBOX_URL-http://sandbox:${SANDBOX_PORT:-8100}}
       # Where the worker writes the sandbox's sites for the egress proxy, which mounts the
       # same volume read-only (docs/sandbox.md § Network).
       SANDBOX_EGRESS_HOSTS_FILE: /data/sandbox-egress/hosts
@@ -113,16 +102,16 @@ services:
       - path: .env
         required: false
     environment:
-      SANDBOX_BACKEND: docker
       SANDBOX_WORKSPACES_MOUNT: /data/workspaces
       # The egress proxy as a VM reaches it — by address, since Docker's DNS does not
       # answer inside a Kata VM — once SANDBOX_NETWORK names its network
       # (docs/sandbox.md § Network).
       SANDBOX_PROXY_URL: http://${SANDBOX_EGRESS_ADDRESS:-10.250.250.2}:${SANDBOX_EGRESS_PORT:-3128}
-      # The workspaces as the Docker daemon sees them: the same host path api and worker
-      # mount, which must then be absolute (the runner refuses a relative one), or the
-      # compose project's ./workspaces when nothing names one.
-      SANDBOX_WORKSPACES_DIR: ${SANDBOX_WORKSPACES_DIR:-${WORKSPACES_HOST_DIR:-${PWD}/workspaces}}
+      # The workspaces as the Docker daemon sees them: always the host path api and worker
+      # mount, which must then be absolute (the runner refuses a relative one). Left empty,
+      # it is ${PWD}/workspaces, the mounts' ./workspaces only when compose runs from the
+      # repository root; from anywhere else, set an absolute WORKSPACES_HOST_DIR.
+      SANDBOX_WORKSPACES_DIR: ${WORKSPACES_HOST_DIR:-${PWD}/workspaces}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
@@ -181,7 +170,7 @@ services:
   # The web app only ever calls the API on its own origin; caddy provides that origin
   # locally exactly like production does — use http://localhost:8080 for the full stack.
   caddy:
-    image: caddy:2
+    image: caddy:2-alpine
     container_name: ema-paper-caddy
     depends_on:
       - api
