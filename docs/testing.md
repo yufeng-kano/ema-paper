@@ -30,6 +30,8 @@
 - So a shell that exported `.env`, or the compose api container's `env_file`, changes no result; each test passes the settings it needs.
 - `TEST_DATABASE_URL` is not a `Settings` field; it is read once, at import, before that fixture runs.
 - Tests of PostgreSQL-only behavior (foreign-key actions, row locks, SKIP LOCKED, `pg_locks`, the migrations) skip on the SQLite fallback, so run with `TEST_DATABASE_URL` set before shipping a change they cover.
+- What several test modules share lives in `tests/conftest.py` and the plain helper modules beside it (`helpers.py`, `factories.py` and one `*_helpers.py` per area); no test module imports from another.
+- `tests/__init__.py` registers the helper modules for pytest's assertion rewriting, so a failing assert in one shows its values as a test module's does.
 - Fixture documents in `tests/fixtures/`: a small text-layer PDF, a scanned-style PDF (rendered-only), a multi-page mix, one corrupt file, tiny jpg/png/webp/heic images. Generate or vendor tiny files — keep fixtures under a few hundred KB each.
 - The fixture PDFs are built with `reportlab`, a dev dependency (BSD). The application imports no PDF library ([parsing.md](./parsing.md) § PDF engine: Poppler via subprocess — this is a hard rule).
 - Poppler is a real dependency of the test environment. Subprocess wrappers are tested against real fixtures, not mocked.

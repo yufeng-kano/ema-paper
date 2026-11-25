@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from sightread import codes as codes_cli
 from sightread import runtime_settings, worker
-from sightread.config import Settings, parse_egress_hosts
+from sightread.config import parse_egress_hosts
 from sightread.db.models import (
     ChatTurn,
     Checkout,
@@ -55,11 +55,11 @@ from tests.chat_helpers import MESSAGES_URL, assistant_turn, seed_document
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_API_KEY,
-    PARSE_MODEL,
     PAY_SETTINGS,
     PRO_PLANS_JSON,
     TEST_MODEL_PRICES,
     TEST_SECRET_KEY,
+    base_settings,
     grant_plan,
     sign_in,
 )
@@ -67,19 +67,6 @@ from tests.factories import user_row
 
 # Every secret the tests' settings carry: none may appear in an answer or a log line.
 KNOWN_SECRETS = (TEST_SECRET_KEY, KANO_API_KEY, PAY_SETTINGS["kano_pay_api_key"])
-
-
-def _base(**overrides) -> Settings:
-    return Settings(
-        **{
-            "app_env": "local",
-            "secret_key": TEST_SECRET_KEY,
-            "kano_proxy_api_key": KANO_API_KEY,
-            "parse_model": PARSE_MODEL,
-            "model_prices_json": TEST_MODEL_PRICES,
-            **overrides,
-        }
-    )
 
 
 async def _store(sessionmaker, key: str, value: str) -> None:
@@ -126,7 +113,7 @@ def _counting(sessionmaker, reads: list[int]):
 
 
 def test_effective_is_the_very_object_without_rows_and_a_checked_new_one_with_them() -> None:
-    base = _base()
+    base = base_settings()
     assert effective(base, {}) is base
     prices = json.loads(TEST_MODEL_PRICES)
     prices["vendor/new-model"] = {"input": 2, "cache_read": 2, "cache_write": 2, "output": 2}
@@ -173,12 +160,12 @@ def test_the_start_checks_refuse_a_negative_free_plan_credits_past_32_bits_and_n
     field: str, value: int
 ):
     with pytest.raises(ValueError, match=field.upper()):
-        _base(**{field: value})
+        base_settings(**{field: value})
 
 
 def test_the_most_credits_the_ledger_holds_pass_the_start_checks() -> None:
     most = 2_147_483_647
-    settings = _base(
+    settings = base_settings(
         parse_credits_per_page=most,
         chat_min_credits=most,
         free_credits_per_period=most,
@@ -193,7 +180,7 @@ def test_the_most_credits_the_ledger_holds_pass_the_start_checks() -> None:
 async def test_the_rows_are_kept_for_the_cache_time_and_read_again_after_a_change(
     sessionmaker, clock
 ) -> None:
-    base = _base(runtime_settings_cache_seconds=30)
+    base = base_settings(runtime_settings_cache_seconds=30)
     reads: list[int] = []
     runtime = RuntimeSettings(lambda: base, _counting(sessionmaker, reads))
     assert await runtime.current() is base
@@ -216,7 +203,7 @@ async def test_the_rows_are_kept_for_the_cache_time_and_read_again_after_a_chang
 
 async def test_one_read_at_a_time_and_the_others_wait_for_its_answer(sessionmaker) -> None:
     await _store(sessionmaker, "CHAT_MIN_CREDITS", "4")
-    base = _base()
+    base = base_settings()
     reads: list[int] = []
     runtime = RuntimeSettings(lambda: base, _counting(sessionmaker, reads))
     answers = await asyncio.gather(*(runtime.current() for _ in range(8)))
@@ -229,7 +216,7 @@ async def test_a_read_after_a_change_is_waited_for_and_one_that_missed_a_change_
     sessionmaker,
 ) -> None:
     await _store(sessionmaker, "CREDIT_USD", "0.004")
-    base = _base()
+    base = base_settings()
     gate = {"on": False}
     held = asyncio.Event()
     release = asyncio.Event()
@@ -271,7 +258,7 @@ async def test_an_unreadable_database_keeps_the_last_settings_and_logs_once(
     sessionmaker, clock, caplog
 ) -> None:
     await _store(sessionmaker, "CREDIT_USD", "0.004")
-    base = _base()
+    base = base_settings()
     reachable = [True]
 
     def flaky():
@@ -299,7 +286,7 @@ async def test_a_request_reads_on_its_own_session_and_goes_on_after_a_failed_rea
     sessionmaker, monkeypatch, clock
 ) -> None:
     await _store(sessionmaker, "CHAT_MIN_CREDITS", "4")
-    base = _base()
+    base = base_settings()
 
     def no_second_session():
         raise AssertionError("a request's read asked the pool for another session")
@@ -337,7 +324,7 @@ async def test_a_request_reads_on_its_own_session_and_goes_on_after_a_failed_rea
 @pytest.mark.usefixtures("clock")
 async def test_a_request_connects_before_it_waits_for_the_read(sessionmaker) -> None:
     await _store(sessionmaker, "CHAT_MIN_CREDITS", "4")
-    base = _base()
+    base = base_settings()
     # A pool of one connection, which a request already holds.
     engine = create_async_engine(
         sessionmaker.kw["bind"].url, pool_size=1, max_overflow=0, pool_timeout=5
@@ -364,9 +351,7 @@ async def test_a_request_connects_before_it_waits_for_the_read(sessionmaker) -> 
         await engine.dispose()
 
 
-async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(
-    make_client, monkeypatch, caplog
-) -> None:
+async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(make_client, caplog) -> None:
     owner = await owner_client(make_client, max_jobs_per_user=2)
     sessionmaker = owner.app.state.sessionmaker
     # Stored when the ceiling allowed it; `.env`'s ceiling is 2 now. A row of no key the
@@ -796,7 +781,7 @@ async def _run_worker(
     is set: its reader is `runtime_cls`, the sweep and idle compaction only wait, and each
     of `worker_patches` replaces the worker's name of that name."""
     url = sessionmaker.kw["bind"].url.render_as_string(hide_password=False)
-    base = _base(
+    base = base_settings(
         database_url=url,
         upload_dir=str(tmp_path / "uploads"),
         figures_dir=str(tmp_path / "figures"),
@@ -941,7 +926,7 @@ async def test_the_worker_reads_again_for_a_turn_on_a_model_priced_since_its_cop
 
 
 async def test_idle_compaction_reads_the_settings_once_per_pass(sessionmaker, monkeypatch):
-    base = _base(chat_idle_compact_sweep_seconds=1)
+    base = base_settings(chat_idle_compact_sweep_seconds=1)
     runtime = RuntimeSettings(lambda: base, lambda: sessionmaker)
     stop = asyncio.Event()
     seen: list[int] = []
@@ -995,11 +980,11 @@ def test_the_sandbox_sites_are_host_names_alone() -> None:
         )
     # Refused at start as on the page.
     with pytest.raises(ValueError, match="SANDBOX_EGRESS_HOSTS: 10.0.0.1 is not a host name"):
-        _base(sandbox_egress_hosts="10.0.0.1")
+        base_settings(sandbox_egress_hosts="10.0.0.1")
 
 
 async def test_the_worker_writes_the_sites_in_effect_for_the_proxy(sessionmaker, tmp_path) -> None:
-    base = _base(sandbox_egress_hosts="pypi.org,files.pythonhosted.org")
+    base = base_settings(sandbox_egress_hosts="pypi.org,files.pythonhosted.org")
     runtime = RuntimeSettings(lambda: base, lambda: sessionmaker)
     path = tmp_path / "sandbox-egress" / "hosts"
     stop = asyncio.Event()
@@ -1036,7 +1021,7 @@ async def test_a_list_the_worker_cannot_write_is_warned_of_once(
     sessionmaker, tmp_path, caplog
 ) -> None:
     caplog.set_level(logging.WARNING)
-    base = _base()
+    base = base_settings()
     runtime = RuntimeSettings(lambda: base, lambda: sessionmaker)
     blocked = tmp_path / "a-file"
     blocked.write_text("")
@@ -1094,7 +1079,7 @@ async def test_the_codes_cli_gives_a_plan_only_the_database_configures(
     sessionmaker, monkeypatch, capsys
 ) -> None:
     url = sessionmaker.kw["bind"].url.render_as_string(hide_password=False)
-    base = _base(database_url=url, kano_pay_plans_json=PRO_PLANS_JSON)
+    base = base_settings(database_url=url, kano_pay_plans_json=PRO_PLANS_JSON)
     team = [{"planId": "team", "credits": 9000, "storageBytes": 1, "sandbox": True, "maxJobs": 2}]
     await _store(sessionmaker, "KANO_PAY_PLANS_JSON", json.dumps(team))
     monkeypatch.setattr(codes_cli, "get_settings", lambda: base)

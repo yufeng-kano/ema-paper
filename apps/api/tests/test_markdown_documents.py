@@ -196,15 +196,6 @@ async def test_a_markdown_document_is_renamed_moved_and_deleted(writer) -> None:
     assert not (writer.root / "files" / "Kept" / "plan.md").exists()
 
 
-async def test_me_lists_markdown_with_its_own_cap(writer) -> None:
-    limits = (await writer.get("/api/me")).json()["limits"]
-    assert "text/markdown" in limits["accepted_media_types"]
-    assert {".md", ".markdown"} <= set(limits["accepted_extensions"])
-    assert limits["markdown_media_types"] == ["text/markdown"]
-    assert limits["markdown_extensions"] == [".md", ".markdown"]
-    assert limits["markdown_max_bytes"] == writer.app.state.settings.content_max_bytes
-
-
 @respx.mock
 async def test_a_turn_on_a_markdown_document_edits_it_and_has_no_pages(writer) -> None:
     chosen = await writer.put(

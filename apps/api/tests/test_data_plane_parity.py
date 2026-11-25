@@ -20,6 +20,14 @@ from sqlalchemy import select, update
 
 from sightread.db.models import Job, UploadTicket, utcnow
 from tests.chat_helpers import MESSAGES_URL
+from tests.check_helpers import (
+    READING,
+    TRANSCRIPTION,
+    agent_done,
+    agent_turn,
+    paper_upstream,
+    tool_use,
+)
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_CHAT_URL,
@@ -40,7 +48,6 @@ from tests.helpers import (
     vision_stub,
 )
 from tests.library_helpers import upload_file
-from tests.test_format_check import READING, TRANSCRIPTION, _done, _tool, _turn, _vision
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -59,13 +66,13 @@ async def api(make_client) -> AsyncClient:
 async def test_an_api_parse_is_checked_and_returns_the_reading_copy(
     api, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision())
+    respx.post(KANO_CHAT_URL).mock(side_effect=paper_upstream())
     agent = respx.post(MESSAGES_URL).mock(
         side_effect=[
-            _turn(
+            agent_turn(
                 [
-                    _tool("t1", "join_pages", page=2),
-                    _tool(
+                    tool_use("t1", "join_pages", page=2),
+                    tool_use(
                         "t2",
                         "str_replace",
                         old_str="The **key idea is simple.",
@@ -73,7 +80,7 @@ async def test_an_api_parse_is_checked_and_returns_the_reading_copy(
                     ),
                 ]
             ),
-            _done(),
+            agent_done(),
         ]
     )
     accepted = await v1_parse(api, documents["mixed_pdf"])
@@ -113,7 +120,7 @@ async def test_an_api_parse_is_checked_and_returns_the_reading_copy(
 async def test_with_the_check_switched_off_the_transcription_is_returned(
     api, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision())
+    respx.post(KANO_CHAT_URL).mock(side_effect=paper_upstream())
     off = await api.put(
         "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
     )

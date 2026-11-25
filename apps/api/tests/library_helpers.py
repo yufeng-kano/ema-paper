@@ -1,18 +1,21 @@
 """Requests the Files library tests make the same way: an account whose uploads are parsed,
-an upload, a markdown document written through the editor's route, and a commit that fails
-once."""
+an upload, a document's row and its retry, a markdown document written through the editor's
+route, an image inserted into one, a move to the Trash, and a commit that fails once."""
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import httpx
 import pytest
 from httpx import AsyncClient
+from PIL import Image
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.conftest import CSRF_HEADERS, convert_on_upload, sign_in
+from tests.helpers import FALLBACK
 
 
 async def ready_to_parse(client: AsyncClient) -> None:
@@ -20,6 +23,14 @@ async def ready_to_parse(client: AsyncClient) -> None:
     image uploaded on the Files page is parsed."""
     await sign_in(client)
     await convert_on_upload(client)
+
+
+async def parsing_client(make_client, **settings) -> AsyncClient:
+    """A client `ready_to_parse` on a deployment that names `FALLBACK`, the model a retry
+    may send failed pages to."""
+    client = make_client(**{"parse_fallback_model": FALLBACK, **settings})
+    await ready_to_parse(client)
+    return client
 
 
 async def upload(
@@ -85,6 +96,49 @@ async def written_document(
     assert created.status_code == 201, created.text
     await write_content(client, created.json()["id"], text)
     return created.json()
+
+
+async def library_row(client: AsyncClient, document_id: int) -> dict:
+    """The document's row as the Files listing shows it."""
+    documents = (await client.get("/api/library")).json()["documents"]
+    return next(row for row in documents if row["id"] == document_id)
+
+
+async def retry_parse(client: AsyncClient, document_id: int, **body) -> httpx.Response:
+    """The Files page's retry of the document's failed pages."""
+    return await client.post(
+        f"/api/library/documents/{document_id}/retry", json=body, headers=CSRF_HEADERS
+    )
+
+
+def image_bytes(image_format: str, size: tuple[int, int] = (40, 30), mode: str = "RGB") -> bytes:
+    """A small one-colour image in `image_format`, translucent in an `RGBA` mode."""
+    buffer = io.BytesIO()
+    Image.new(mode, size, (200, 40, 40) if mode == "RGB" else (200, 40, 40, 128)).save(
+        buffer, format=image_format
+    )
+    return buffer.getvalue()
+
+
+async def insert_image(
+    client: AsyncClient,
+    document_id: int | str,
+    data: bytes,
+    name: str = "shot.png",
+    media_type: str = "image/png",
+) -> httpx.Response:
+    """The editor's insert of an image into the document."""
+    return await client.post(
+        "/api/library/images",
+        files={"file": (name, data, media_type)},
+        data={"document_id": str(document_id)},
+        headers=CSRF_HEADERS,
+    )
+
+
+async def trash(client: AsyncClient, kind: str, row_id: int) -> httpx.Response:
+    """A document or a folder (`kind`: `documents` or `folders`) moved to the Trash."""
+    return await client.post(f"/api/library/{kind}/{row_id}/trash", headers=CSRF_HEADERS)
 
 
 def fail_next_commit(monkeypatch: pytest.MonkeyPatch, *, landed: bool) -> dict[str, bool]:

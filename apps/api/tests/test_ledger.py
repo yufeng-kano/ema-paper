@@ -33,7 +33,6 @@ from tests.billing_helpers import (
     image_job,
     make_user,
     running_turns,
-    settings_with,
 )
 from tests.chat_helpers import (
     MESSAGES_URL,
@@ -49,6 +48,7 @@ from tests.conftest import (
     CSRF_HEADERS,
     PRO_PLANS_JSON,
     TEST_MODEL_PRICES,
+    base_settings,
     grant_plan,
     postgres_only,
     sign_in,
@@ -62,7 +62,7 @@ from tests.library_helpers import ready_to_parse, upload_png
 # serializes the two transactions with or without them.
 @postgres_only
 async def test_two_parses_racing_for_the_last_credits(sessionmaker) -> None:
-    settings = settings_with(free_credits_per_period=3)
+    settings = base_settings(free_credits_per_period=3)
     user_id = await make_user(sessionmaker)
     started = asyncio.Barrier(2)
 
@@ -95,7 +95,7 @@ async def test_two_parses_racing_for_the_last_credits(sessionmaker) -> None:
 
 
 async def test_settlement_is_idempotent_and_a_release_restores_the_balance(sessionmaker) -> None:
-    settings = settings_with(free_credits_per_period=10)
+    settings = base_settings(free_credits_per_period=10)
     user_id = await make_user(sessionmaker)
     async with sessionmaker() as db:
         kept = image_job(user_id, status="running", page_count=3)
@@ -131,7 +131,7 @@ async def test_settlement_is_idempotent_and_a_release_restores_the_balance(sessi
 
 
 async def test_a_chat_overdraft_is_not_carried_into_the_next_period(sessionmaker) -> None:
-    settings = settings_with(free_credits_per_period=1, credit_usd="0.001")
+    settings = base_settings(free_credits_per_period=1, credit_usd="0.001")
     user_id = await make_user(sessionmaker)
     _, [turn_id], _ = await running_turns(sessionmaker, settings, user_id, settle=False)
     # A second send needs the minimum balance: one credit is left, so it may go.
@@ -184,15 +184,15 @@ async def test_a_chat_overdraft_is_not_carried_into_the_next_period(sessionmaker
 async def test_a_plan_change_raises_the_grant_and_never_lowers_it(sessionmaker) -> None:
     user_id = await make_user(sessionmaker)
     async with sessionmaker() as db:
-        row, _ = await ledger.period_row(db, settings_with(free_credits_per_period=150), user_id)
+        row, _ = await ledger.period_row(db, base_settings(free_credits_per_period=150), user_id)
         assert row.granted == 150
-        row, _ = await ledger.period_row(db, settings_with(free_credits_per_period=200), user_id)
+        row, _ = await ledger.period_row(db, base_settings(free_credits_per_period=200), user_id)
         assert row.granted == 200
-        row, _ = await ledger.period_row(db, settings_with(free_credits_per_period=100), user_id)
+        row, _ = await ledger.period_row(db, base_settings(free_credits_per_period=100), user_id)
         assert row.granted == 200
         await db.commit()
     async with sessionmaker() as db:
-        balance = await ledger.read_balance(db, settings_with(free_credits_per_period=100), user_id)
+        balance = await ledger.read_balance(db, base_settings(free_credits_per_period=100), user_id)
     assert balance.granted == 200
 
 
@@ -200,7 +200,7 @@ async def test_the_balances_of_many_accounts_read_as_each_account_alone(sessionm
     """One read for a page of accounts — no rows, a period in use, a subscription, granted
     days, packs — gives what each account's own read gives, the used period's row found
     whatever time zone the database answers its start in."""
-    settings = settings_with(kano_pay_plans_json=PRO_PLANS_JSON)
+    settings = base_settings(kano_pay_plans_json=PRO_PLANS_JSON)
     now = utcnow()
     async with sessionmaker() as db:
         users = [user_row(f"many-{n}@example.test") for n in range(4)]
@@ -519,7 +519,7 @@ async def test_a_turn_queued_before_the_workspace_filled_fails_storage_full(make
 async def test_a_turn_the_worker_fails_closes_its_entry(sessionmaker) -> None:
     """docs/billing.md § A chat turn: `fail_turn` — a shutdown, a restart, an escaped
     error — settles what the turn was charged, as the runner's own finish does."""
-    settings = settings_with(free_credits_per_period=10, credit_usd="0.001")
+    settings = base_settings(free_credits_per_period=10, credit_usd="0.001")
     user_id = await make_user(sessionmaker)
     _, [turn_id], _ = await running_turns(sessionmaker, settings, user_id)
     async with sessionmaker() as db:
@@ -537,7 +537,7 @@ async def test_a_turn_the_worker_fails_closes_its_entry(sessionmaker) -> None:
 async def test_a_deleted_conversation_leaves_its_entries_in_the_ledger(sessionmaker) -> None:
     """docs/billing.md § The ledger: the record outlives the thread it was charged for;
     the period's `spent` and the entries keep agreeing."""
-    settings = settings_with(free_credits_per_period=10, credit_usd="0.001")
+    settings = base_settings(free_credits_per_period=10, credit_usd="0.001")
     user_id = await make_user(sessionmaker)
     conversation_id, [turn_id], _ = await running_turns(sessionmaker, settings, user_id)
     async with sessionmaker() as db:

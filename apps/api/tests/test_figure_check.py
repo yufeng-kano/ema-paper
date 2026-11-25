@@ -263,11 +263,7 @@ def _sent(body: dict) -> tuple[str, Image.Image]:
 
 
 async def _parse_image(client: AsyncClient, sessionmaker, path: Path) -> str:
-    accepted = await client.post(
-        "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "image/png")},
-        data={"model": PARSE_MODEL},
-    )
+    accepted = await v1_parse(client, path, media_type="image/png", model=PARSE_MODEL)
     assert accepted.status_code == 202, accepted.text
     await drain_queue(client, sessionmaker)
     return accepted.json()["job_id"]
@@ -432,11 +428,7 @@ async def test_a_job_queued_before_the_check_runs_without_it(
     upstream = Upstream(CHART)
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     path = _page(tmp_path / "chart.png", PLOT, TITLE)
-    accepted = await api_client.post(
-        "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "image/png")},
-        data={"model": PARSE_MODEL},
-    )
+    accepted = await v1_parse(api_client, path, media_type="image/png", model=PARSE_MODEL)
     job_id = accepted.json()["job_id"]
     async with sessionmaker() as db:
         await db.execute(

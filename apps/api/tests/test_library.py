@@ -7,7 +7,6 @@ upload here is left queued, except where a test runs its parse, which a respx st
 
 from __future__ import annotations
 
-import asyncio
 import os
 import uuid
 from pathlib import Path
@@ -19,12 +18,10 @@ from httpx import AsyncClient
 from sqlalchemy import select, update
 
 from sightread.db.models import Document, Job, JobPage, Result
-from sightread.jobs.queue import claim_next_job
-from sightread.jobs.runner import run_job
 from sightread.workspace import safe_io
 from sightread.workspace.filing import DOCUMENT_NAME_MAX, clean_name, free_name
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL, postgres_only
-from tests.helpers import account_client, post_folder, read_library, staged_uploads
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL, postgres_only, sign_in
+from tests.helpers import account_client, drain_queue, post_folder, read_library, staged_uploads
 from tests.library_helpers import fail_next_commit, ready_to_parse, upload, upload_png
 
 
@@ -44,10 +41,6 @@ async def _parse_next(client: AsyncClient) -> None:
         "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
     )
     assert off.status_code == 200, off.text
-    settings = client.app.state.settings
-    async with client.app.state.sessionmaker() as db:
-        claimed = await claim_next_job(db, settings.max_jobs_per_user)
-    assert claimed is not None
     router = respx.mock(assert_all_called=False)
     router.post(KANO_CHAT_URL).mock(
         return_value=httpx.Response(
@@ -59,7 +52,8 @@ async def _parse_next(client: AsyncClient) -> None:
         )
     )
     with router:
-        await run_job(client.app.state.sessionmaker, settings, claimed, asyncio.Semaphore(2))
+        claimed = await drain_queue(client, client.app.state.sessionmaker)
+    assert claimed is not None
     async with client.app.state.sessionmaker() as db:
         assert (await db.get(Job, claimed)).status == "succeeded"
 
@@ -240,7 +234,7 @@ async def test_a_retried_upload_does_not_buy_a_second_parse(
         assert Path(job.source_path).is_file()
 
 
-async def test_a_body_past_the_cap_is_refused_while_it_streams(make_client, documents) -> None:
+async def test_a_body_past_the_cap_is_refused_while_it_streams(make_client) -> None:
     # No `Content-Length` to reject up front: the parser spools file parts to disk as they
     # arrive, so the cap has to bite on the stream itself.
     client = make_client(upload_max_bytes=1024)
@@ -468,12 +462,37 @@ async def test_the_library_is_signed_in_only(client: AsyncClient) -> None:
     assert (await client.get("/api/library")).status_code == 401
 
 
-async def test_me_carries_the_upload_limits(library) -> None:
-    limits = (await library.get("/api/me")).json()["limits"]
-    assert limits["upload_max_bytes"] > 0
-    assert "application/pdf" in limits["accepted_media_types"]
-    assert "image/png" in limits["accepted_media_types"]
-    assert limits["trash_retention_days"] == 30
+# Each limit `/api/me` reads off a setting: (that setting, a value no default has).
+LIBRARY_LIMITS = {
+    "upload_max_bytes": ("upload_max_bytes", 7_000_001),
+    "file_max_bytes": ("file_max_bytes", 7_000_002),
+    "markdown_max_bytes": ("content_max_bytes", 70_003),
+    "image_max_bytes": ("document_image_max_bytes", 700_004),
+    "prompt_max_chars": ("system_prompt_max_chars", 7_005),
+    "trash_retention_days": ("trash_retention_days", 17),
+}
+
+
+async def test_me_carries_the_library_limits(make_client) -> None:
+    """The Files page, the editor and the prompt dialogs read their limits from the server's
+    own settings (docs/api.md § Limits)."""
+    client = await sign_in(make_client(**dict(LIBRARY_LIMITS.values())))
+    limits = (await client.get("/api/me")).json()["limits"]
+    assert {key: limits[key] for key in LIBRARY_LIMITS} == {
+        key: value for key, (_, value) in LIBRARY_LIMITS.items()
+    }
+    assert {"application/pdf", "image/png", "text/markdown"} <= set(limits["accepted_media_types"])
+    assert {".pdf", ".md", ".markdown"} <= set(limits["accepted_extensions"])
+    assert limits["markdown_media_types"] == ["text/markdown"]
+    assert limits["markdown_extensions"] == [".md", ".markdown"]
+    assert limits["image_media_types"] == [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "image/heic",
+        "image/heif",
+    ]
 
 
 def test_names_are_normalized_before_uniqueness_is_decided() -> None:

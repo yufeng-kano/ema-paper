@@ -17,6 +17,7 @@ from sightread.agents import skills as skill_defs
 from sightread.agents import subagents as subagent_defs
 from sightread.db.models import Message, Skill, UsageLog
 from sightread.jobs import chat_runner, chat_subagent, chat_tools
+from sightread.routes import extensions
 from tests.chat_helpers import (
     DOC_PATH,
     MESSAGES_URL,
@@ -103,6 +104,34 @@ async def test_the_skills_are_the_builtins_then_the_readers_own(signed_in) -> No
         "translate",
         "zh-summary",
     ]
+
+
+async def test_a_name_taken_after_the_check_is_refused_by_the_constraint(
+    signed_in, monkeypatch
+) -> None:
+    """Two creations of one name at once both pass the check; the constraint decides, and
+    the loser is answered as the check answers (docs/chat.md § Skills)."""
+    made = await signed_in.post(
+        "/api/skills", json={"name": "raced", "body": "x"}, headers=CSRF_HEADERS
+    )
+    assert made.status_code == 201, made.text
+
+    async def unseen(kind, db, user_id, name):
+        return None
+
+    monkeypatch.setattr(extensions, "_row", unseen)
+    raced = await signed_in.post(
+        "/api/skills", json={"name": "raced", "body": "y"}, headers=CSRF_HEADERS
+    )
+    assert raced.status_code == 409, raced.text
+    assert raced.json()["error"]["message"] == "A skill with this name already exists"
+    monkeypatch.undo()
+    [skill] = [
+        row
+        for row in (await signed_in.get("/api/skills")).json()["skills"]
+        if row["name"] == "raced"
+    ]
+    assert skill["body"] == "x"
 
 
 async def test_a_builtin_skill_is_edited_and_restored_never_renamed_or_deleted(

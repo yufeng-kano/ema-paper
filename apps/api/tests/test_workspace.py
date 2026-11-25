@@ -1,20 +1,24 @@
 """The per-user workspace: materialization, revisions, the tree (docs/workspace.md).
 
-Real git in a temporary directory; no database beyond the SQLite fallback.
+Real git in a temporary directory; the SQLite fallback, except the finished-parse row-lock
+test, which needs PostgreSQL.
 """
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import json
 import os
 import shutil
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
-from sightread.db.models import Document, Folder, Job, Result, User
+from sightread.db.models import Document, Folder, Job, User
 from sightread.errors import ApiError
 from sightread.jobs import sweeper
 from sightread.workspace import documents, git, reconcile, safe_io
@@ -29,23 +33,17 @@ from sightread.workspace.layout import (
     sources_dir,
     user_root,
 )
-from tests.conftest import path_settings
-from tests.factories import job_row, user_row
+from sightread.workspace.locks import _backup_lock_path
+from tests.conftest import path_settings, postgres_only
+from tests.factories import filed_parse, user_row
 
 
 async def _seed(db, *, markdown: str = "# Title\n\nBody\n") -> tuple[User, Document]:
+    """An account with one two-page parse filed as `Papers/paper.pdf`."""
     user = user_row("ws@example.com")
     db.add(user)
     await db.flush()
-    folder = Folder(user_id=user.id, parent_id=None, name="Papers")
-    db.add(folder)
-    await db.flush()
-    job = job_row(user.id, size_bytes=10, sha256="a" * 64, model="claude-x", page_count=2)
-    db.add(job)
-    await db.flush()
-    db.add(Result(job_id=job.id, markdown=markdown, pages=[], figures=[], errors=[], meta={}))
-    document = Document(user_id=user.id, folder_id=folder.id, job_id=job.id, name="paper.pdf")
-    db.add(document)
+    document = await filed_parse(db, user.id, markdown=markdown, page_count=2)
     await db.commit()
     return user, document
 
@@ -691,6 +689,82 @@ async def test_a_failed_library_parse_keeps_its_original(sessionmaker, tmp_path)
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
         assert job.status == "failed" and job.source_deleted_at is not None
+
+
+async def _running_library_parse(sessionmaker, settings) -> SimpleNamespace:
+    """A document's parse still running with its upload staged: the document, its job, the
+    upload, the user's workspace, and where the finished parse keeps the upload in the
+    document's directory."""
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        job = await db.get(Job, document.job_id)
+        upload = Path(settings.upload_dir) / f"{job.id}.pdf"
+        upload.parent.mkdir(parents=True, exist_ok=True)
+        upload.write_bytes(b"%PDF-1.4 test")
+        job.source_path = str(upload)
+        job.status = "running"
+        await db.commit()
+    root = user_root(settings.workspaces_dir, user.id)
+    return SimpleNamespace(
+        document_id=document.id,
+        job_id=job.id,
+        upload=upload,
+        root=root,
+        kept=root / "files" / "Papers" / "paper.pdf" / "source.pdf",
+    )
+
+
+@postgres_only
+async def test_a_finished_library_parse_waits_for_the_filing_row_lock(
+    sessionmaker, tmp_path
+) -> None:
+    """Filing takes the job's row lock before it inserts: a finish that waits for it reads
+    the row it filed as a recipient rather than deleting the upload under it (docs/jobs.md
+    § Retention). PostgreSQL only: SQLite takes no row lock."""
+    from sightread.jobs import runner
+
+    settings = path_settings(tmp_path)
+    parse = await _running_library_parse(sessionmaker, settings)
+    async with sessionmaker() as holder:
+        await holder.execute(select(Job.id).where(Job.id == parse.job_id).with_for_update())
+        held = asyncio.create_task(
+            runner._finish(sessionmaker, parse.job_id, status="succeeded", settings=settings)
+        )
+        await asyncio.sleep(0.3)
+        assert not held.done()
+        await holder.rollback()
+    await asyncio.wait_for(held, 10)
+    assert parse.kept.read_bytes() == b"%PDF-1.4 test"
+
+
+async def test_a_finished_library_parse_keeps_its_source_in_one_backup_snapshot(
+    sessionmaker, tmp_path
+) -> None:
+    """The retention exception (docs/jobs.md): the upload moves into the document dir. The
+    terminal rows and the kept original land in one backup snapshot: a backup holding the
+    lock keeps the finish — commit included — out until it is done."""
+    from sightread.jobs import runner
+
+    settings = path_settings(tmp_path)
+    parse = await _running_library_parse(sessionmaker, settings)
+    backup_path = _backup_lock_path(parse.root)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    backup = backup_path.open("a+")
+    fcntl.flock(backup, fcntl.LOCK_EX)
+    finishing = asyncio.create_task(
+        runner._finish(sessionmaker, parse.job_id, status="succeeded", settings=settings)
+    )
+    await asyncio.sleep(0.3)
+    assert not finishing.done()
+    async with sessionmaker() as db:
+        assert (await db.get(Job, parse.job_id)).status == "running"
+    fcntl.flock(backup, fcntl.LOCK_UN)
+    backup.close()
+    await asyncio.wait_for(finishing, 10)
+    assert parse.kept.read_bytes() == b"%PDF-1.4 test"
+    assert not parse.upload.exists()
+    original = documents.original_of(parse.root, parse.document_id)
+    assert original is not None and original.read_bytes() == b"%PDF-1.4 test"
 
 
 async def test_retention_copies_for_its_recipients_when_a_late_row_took_the_upload(

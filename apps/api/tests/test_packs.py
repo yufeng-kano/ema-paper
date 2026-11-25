@@ -40,13 +40,13 @@ from tests.billing_helpers import (
     pay_events,
     purchase_event,
     running_turns,
-    settings_with,
 )
 from tests.conftest import (
     CSRF_HEADERS,
     PAY_APP_ID,
     PAY_SETTINGS,
     PAY_URL,
+    base_settings,
     grant_plan,
     postgres_only,
     sign_in,
@@ -83,8 +83,8 @@ def test_the_packs_configuration_is_validated() -> None:
             parse_packs(raw)
     # Settings read it at start, so a bad value fails the boot, not a purchase.
     with pytest.raises(ValueError, match="KANO_PAY_PACKS_JSON"):
-        settings_with(kano_pay_packs_json='[{"packId": "a", "credits": 0, "validDays": 1}]')
-    assert settings_with(kano_pay_packs_json=PACKS_JSON).packs["credits"].valid_days == 365
+        base_settings(kano_pay_packs_json='[{"packId": "a", "credits": 0, "validDays": 1}]')
+    assert base_settings(kano_pay_packs_json=PACKS_JSON).packs["credits"].valid_days == 365
 
 
 # --- the ledger -------------------------------------------------------------------------
@@ -137,7 +137,7 @@ async def _shares(sessionmaker, entry_id: int) -> dict[str, int]:
 
 
 async def test_a_charge_takes_the_period_first_and_the_packs_by_expiry(sessionmaker) -> None:
-    settings = settings_with(free_credits_per_period=3)
+    settings = base_settings(free_credits_per_period=3)
     user_id = await make_user(sessionmaker)
     later = await _pack(sessionmaker, user_id, credits=5, days_left=30)
     sooner = await _pack(sessionmaker, user_id, credits=5, days_left=10)
@@ -177,7 +177,7 @@ async def test_a_charge_takes_the_period_first_and_the_packs_by_expiry(sessionma
 
 
 async def test_a_release_restores_each_share_and_a_retry_takes_again(sessionmaker) -> None:
-    settings = settings_with(free_credits_per_period=2)
+    settings = base_settings(free_credits_per_period=2)
     user_id = await make_user(sessionmaker)
     first = await _pack(sessionmaker, user_id, credits=5, days_left=300)
     async with sessionmaker() as db:
@@ -218,7 +218,7 @@ async def test_a_release_restores_each_share_and_a_retry_takes_again(sessionmake
 
 
 async def test_a_turn_spills_into_the_packs_before_the_overdraft(sessionmaker) -> None:
-    settings = settings_with(free_credits_per_period=1, credit_usd="0.001")
+    settings = base_settings(free_credits_per_period=1, credit_usd="0.001")
     user_id = await make_user(sessionmaker)
     pack = await _pack(sessionmaker, user_id, credits=4)
     _, [turn_id], [entry_id] = await running_turns(sessionmaker, settings, user_id, settle=False)
@@ -275,7 +275,7 @@ async def test_two_turns_settling_at_once_share_the_period_before_the_pack(sessi
     turn's settlement is open takes only what that one left of the period and spills the
     rest into the pack, instead of both charging the period from the same stale remainder
     (docs/billing.md § The ledger)."""
-    settings = settings_with(free_credits_per_period=10, credit_usd="0.001")
+    settings = base_settings(free_credits_per_period=10, credit_usd="0.001")
     user_id = await make_user(sessionmaker)
     pack = await _pack(sessionmaker, user_id, credits=20)
     _, turn_ids, _ = await running_turns(sessionmaker, settings, user_id, 2, settle=False)
@@ -331,7 +331,7 @@ async def test_two_turns_settling_at_once_share_the_period_before_the_pack(sessi
 
 
 async def test_an_expired_or_refunded_pack_counts_nothing(sessionmaker) -> None:
-    settings = settings_with(free_credits_per_period=0)
+    settings = base_settings(free_credits_per_period=0)
     user_id = await make_user(sessionmaker)
     expired = await _pack(sessionmaker, user_id, credits=5, days_left=-1)
     refunded = await _pack(sessionmaker, user_id, credits=5, status="refunded")

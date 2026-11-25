@@ -7,6 +7,7 @@ reaches the network (docs/testing.md § Cost safety)."""
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -16,7 +17,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import respx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from sightread.agents import chat as chat_agent
 from sightread.billing import ledger
@@ -38,7 +39,7 @@ from tests.chat_helpers import (
     tool_results,
     turn_credits,
 )
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL, convert_on_upload
 
 VISION_MARKDOWN = "## Page one\n\nBody text."
 DONE = ([{"type": "text", "text": "Read."}], "end_turn")
@@ -478,6 +479,49 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
     assert again["output"] == (
         "paper.pdf is a document already: read /workspace/files/paper.pdf/doc.md."
     )
+
+
+@respx.mock
+async def test_the_agents_retry_runs_on_the_parse_model_once_the_jobs_model_is_withdrawn(
+    make_client, documents, monkeypatch
+) -> None:
+    """docs/agents.md § Enqueue rules: the agent's retry names no model, so a failed
+    conversion whose model and fallback the deployment no longer offers runs its failed page
+    on `PARSE_MODEL` with no fallback, as the Files page's retry does."""
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
+    down = True
+    models: list[str] = []
+
+    def vision(request: httpx.Request) -> httpx.Response:
+        models.append(json.loads(request.content)["model"])
+        return httpx.Response(503, json={"error": "down"}) if down else _completion(VISION_MARKDOWN)
+
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision)
+    client, kept = await _kept_paper(make_client, documents)
+    _, (failed,) = await _run(client, {"path": "paper.pdf"})
+    assert failed["is_error"] is True
+    _, job, _ = await _settled(client, kept["id"])
+    async with client.app.state.sessionmaker() as db:
+        await db.execute(
+            update(Job)
+            .where(Job.id == job.id)
+            .values(model="vendor/retired-model", fallback_model="vendor/retired-fallback")
+        )
+        await db.commit()
+
+    down = False
+    models.clear()
+    _, (retried,) = await _run(client, {"path": "paper.pdf", "retry": True})
+    assert retried["is_error"] is False, retried["output"]
+    _, job, shown = await _settled(client, kept["id"])
+    assert (job.status, shown["status"]) == ("succeeded", "succeeded")
+    # The dedup key keeps the job's own model; the run is the deployment's.
+    assert (job.model, job.retry_model, job.fallback_model) == (
+        "vendor/retired-model",
+        PARSE_MODEL,
+        None,
+    )
+    assert models == [PARSE_MODEL]
 
 
 @respx.mock

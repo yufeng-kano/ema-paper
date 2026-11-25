@@ -21,11 +21,8 @@ from sightread.agents import subagents as subagent_defs
 from sightread.agents.chat import TURN_CONTEXT, turn_note
 from sightread.db.models import (
     Conversation,
-    Document,
-    Folder,
     Memory,
     Message,
-    Result,
     User,
 )
 from sightread.jobs import chat_events, chat_memory, chat_runner, chat_subagent, chat_tools
@@ -39,11 +36,12 @@ from tests.chat_helpers import (
     replayed_events,
     round_ctx,
     run_queued_turn,
+    seed_document,
     send,
     stub_messages,
 )
 from tests.conftest import CSRF_HEADERS, postgres_only, sign_in
-from tests.factories import job_row, user_row
+from tests.factories import filed_parse, user_row
 
 
 async def put_chat(client: AsyncClient, **fields):
@@ -56,36 +54,13 @@ async def save_memory(client: AsyncClient, **body) -> dict:
     return created.json()
 
 
-async def another_document(client: AsyncClient, user_id: int, name: str) -> int:
-    """A second document of the reader's, at the library's root."""
-    async with client.app.state.sessionmaker() as db:
-        job = job_row(
-            user_id, filename=name, size_bytes=10, sha256="c" * 64, model="claude-x", page_count=2
-        )
-        db.add(job)
-        await db.flush()
-        db.add(
-            Result(job_id=job.id, markdown="# Other\n", pages=[], figures=[], errors=[], meta={})
-        )
-        document = Document(user_id=user_id, folder_id=None, job_id=job.id, name=name)
-        db.add(document)
-        await db.commit()
-        return document.id
-
-
 async def stranger_rows(client: AsyncClient) -> SimpleNamespace:
     """Another reader with a document, a conversation and a memory of their own."""
     async with client.app.state.sessionmaker() as db:
         stranger = user_row("stranger@example.com")
         db.add(stranger)
         await db.flush()
-        folder = Folder(user_id=stranger.id, parent_id=None, name="Theirs")
-        job = job_row(stranger.id, filename="theirs.pdf", sha256="d" * 64, model="m")
-        db.add_all([folder, job])
-        await db.flush()
-        document = Document(user_id=stranger.id, folder_id=folder.id, job_id=job.id, name="t.pdf")
-        db.add(document)
-        await db.flush()
+        document = await filed_parse(db, stranger.id, name="t.pdf", folder="Theirs")
         conversation = Conversation(
             user_id=stranger.id, document_id=document.id, title="Theirs", session="s"
         )
@@ -690,7 +665,7 @@ async def test_the_instructions_follow_the_prompt_verbatim(chat_client) -> None:
 @respx.mock
 async def test_a_conversation_renders_the_snapshot_its_first_turn_took(chat_client) -> None:
     client = chat_client
-    other = await another_document(client, client.user_id, "other.pdf")
+    other = await seed_document(client, client.user_id, name="other.pdf", folder=None)
     kept = await save_memory(client, kind="term", text="query → 查詢")
     scoped = await save_memory(
         client, kind="document", text="d is 512", document_id=client.document_id

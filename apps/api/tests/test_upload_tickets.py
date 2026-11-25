@@ -77,11 +77,7 @@ async def _failed_parse(client: AsyncClient, sessionmaker, path: Path) -> uuid.U
     respx.post(KANO_CHAT_URL).mock(
         side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     )
-    queued = await client.post(
-        "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "application/pdf")},
-        data={"model": PARSE_MODEL},
-    )
+    queued = await v1_parse(client, path, model=PARSE_MODEL)
     job_id = uuid.UUID(queued.json()["job_id"])
     await drain_queue(client, sessionmaker)
     async with sessionmaker() as db:
@@ -185,24 +181,14 @@ async def test_a_spent_ticket_reads_its_own_job_and_nothing_else(
     assert "event: done" in "\n".join(frames)
 
     # A second job of the same user is off limits: the ticket is bound to one job.
-    other = (
-        await api_client.post(
-            "/v1/parse",
-            files={"file": ("mixed.pdf", documents["mixed_pdf"].read_bytes(), "application/pdf")},
-            data={"model": PARSE_MODEL},
-        )
-    ).json()["job_id"]
+    other = (await v1_parse(api_client, documents["mixed_pdf"], model=PARSE_MODEL)).json()["job_id"]
     stranger_read = await api_client.get(f"/v1/jobs/{other}", headers=bearer(token))
     assert stranger_read.status_code == 401
     assert stranger_read.json()["error"]["message"] == EXPECTED_REJECTION
 
 
 async def test_an_unspent_ticket_cannot_read_a_job(api_client, documents) -> None:
-    accepted = await api_client.post(
-        "/v1/parse",
-        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": PARSE_MODEL},
-    )
+    accepted = await v1_parse(api_client, documents["text_pdf"], model=PARSE_MODEL)
     token = await mint_upload_ticket(api_client)
 
     response = await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}", headers=bearer(token))
@@ -213,11 +199,7 @@ async def test_an_unspent_ticket_cannot_read_a_job(api_client, documents) -> Non
 
 async def test_an_expired_ticket_is_refused_everywhere(api_client, documents) -> None:
     expired = await mint_upload_ticket(api_client, ttl_seconds=-60)
-    accepted = await api_client.post(
-        "/v1/parse",
-        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": PARSE_MODEL},
-    )
+    accepted = await v1_parse(api_client, documents["text_pdf"], model=PARSE_MODEL)
 
     upload = await v1_parse(api_client, documents["mixed_pdf"], expired)
     read = await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}", headers=bearer(expired))
@@ -274,11 +256,7 @@ async def test_a_dedup_hit_binds_the_ticket_to_the_cached_job(
     api_client, sessionmaker, documents
 ) -> None:
     respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
-    first = await api_client.post(
-        "/v1/parse",
-        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": PARSE_MODEL},
-    )
+    first = await v1_parse(api_client, documents["text_pdf"], model=PARSE_MODEL)
     job_id = first.json()["job_id"]
     await drain_queue(api_client, sessionmaker)
     upstream_calls = respx.calls.call_count
@@ -307,11 +285,7 @@ async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads
 ) -> None:
     respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
     settings = api_client.app.state.settings
-    first = await api_client.post(
-        "/v1/parse",
-        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": PARSE_MODEL},
-    )
+    first = await v1_parse(api_client, documents["text_pdf"], model=PARSE_MODEL)
     job_id = uuid.UUID(first.json()["job_id"])
     await drain_queue(api_client, sessionmaker)
     # Past its retention, kept only by a file of the same original.
@@ -386,11 +360,7 @@ async def test_two_kept_uploads_of_a_cached_parse_racing_on_one_ticket_keep_one_
     the loser's copy with it."""
     respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
     settings = api_client.app.state.settings
-    first = await api_client.post(
-        "/v1/parse",
-        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": PARSE_MODEL},
-    )
+    first = await v1_parse(api_client, documents["text_pdf"], model=PARSE_MODEL)
     assert first.status_code == 202, first.text
     await drain_queue(api_client, sessionmaker)
     before = staged_uploads(api_client)
@@ -424,11 +394,7 @@ async def test_a_kept_upload_joining_a_parse_on_a_ticket_spent_meanwhile_changes
     flight and spends it first. The kept upload's join is the 401: its copy goes and the
     job is not marked as keeping its original."""
     settings = api_client.app.state.settings
-    queued = await api_client.post(
-        "/v1/parse",
-        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": PARSE_MODEL},
-    )
+    queued = await v1_parse(api_client, documents["text_pdf"], model=PARSE_MODEL)
     job_id = uuid.UUID(queued.json()["job_id"])
     token = await mint_upload_ticket(api_client)
     async with sessionmaker() as late, sessionmaker() as early:

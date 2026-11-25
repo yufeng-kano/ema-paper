@@ -1,6 +1,6 @@
-"""What the billing tests share: settings built without an app, the rows they charge
-against, the plans they configure, the shape of a printed code, and a Kano Pay that only
-exists inside respx (docs/billing.md § Kano Pay)."""
+"""What the billing tests share: the rows they charge against, the plans they configure, the
+shape of a printed code, and a Kano Pay that only exists inside respx (docs/billing.md § Kano
+Pay)."""
 
 from __future__ import annotations
 
@@ -33,26 +33,10 @@ from tests.conftest import (
     PAY_URL,
     PAY_WEBHOOK_SECRET,
     PRO_PLANS_JSON,
-    TEST_MODEL_PRICES,
-    TEST_SECRET_KEY,
 )
 from tests.factories import job_row, user_row
 
 # --- settings, plans and rows -------------------------------------------------------------
-
-
-def settings_with(**overrides) -> Settings:
-    """Settings for the ledger driven without an app, every test model priced."""
-    return Settings(
-        **{
-            "app_env": "local",
-            "auth_dev_mode": True,
-            "secret_key": TEST_SECRET_KEY,
-            "database_url": "sqlite+aiosqlite://",
-            "model_prices_json": TEST_MODEL_PRICES,
-            **overrides,
-        }
-    )
 
 
 PRO_PLANS = {"kano_pay_plans_json": PRO_PLANS_JSON}

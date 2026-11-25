@@ -36,7 +36,8 @@ from tests.chat_helpers import (
     turn_credits,
 )
 from tests.conftest import PARSE_MODEL, TEST_MODEL_PRICES
-from tests.test_document_images import _image
+from tests.helpers import staged_uploads
+from tests.library_helpers import image_bytes
 
 LINE = re.compile(r"!\[\]\(figures/(img-[0-9a-f]{16}\.(?:png|jpg))\)")
 NO_DOCUMENT = "give the doc.md or notes.md of one of the user's documents."
@@ -104,13 +105,14 @@ async def test_a_chart_and_a_kept_picture_become_images_of_the_document(chat_cli
     them; each call answers the line to write. The tool writes no text, leaves the agent's
     file where it was, and costs nothing beyond the turn's tokens."""
     client = chat_client
-    settings = client.app.state.settings
     root = await _workspace(client)
     before = await _markdown(client)
-    chart = _image("PNG")
+    chart = image_bytes("PNG")
     (root / ".cache").mkdir(exist_ok=True)
     (root / ".cache" / "loss.png").write_bytes(chart)
-    await keep_file(client, "photo.jpg", _image("JPEG"), "image/jpeg", await papers_folder(client))
+    await keep_file(
+        client, "photo.jpg", image_bytes("JPEG"), "image/jpeg", await papers_folder(client)
+    )
     conversation_id = await new_conversation(client)
     first, second = await _turn(
         client,
@@ -138,7 +140,7 @@ async def test_a_chart_and_a_kept_picture_become_images_of_the_document(chat_cli
     # The agent's file stays; nothing staged is left behind; no text was written.
     assert (root / ".cache" / "loss.png").read_bytes() == chart
     assert (root / "files" / "Papers" / "photo.jpg").is_file()
-    assert list(Path(settings.upload_dir).iterdir()) == []
+    assert staged_uploads(client) == []
     assert await _markdown(client) == before
     assert await turn_credits(client, conversation_id) == ("succeeded", 1)
 
@@ -150,11 +152,10 @@ async def test_insert_image_refuses_what_it_cannot_keep(chat_client) -> None:
     whose `.meta.json` the shell wrote to name a real document — each answer an error, and
     nothing is stored."""
     client = chat_client
-    settings = client.app.state.settings
     root = await _workspace(client)
     cache = root / ".cache"
     (cache / "forged").mkdir(parents=True)
-    (cache / "loss.png").write_bytes(_image("PNG"))
+    (cache / "loss.png").write_bytes(image_bytes("PNG"))
     (cache / "notes.txt").write_text("not a picture")
     (cache / "link.png").symlink_to(cache / "loss.png")
     (cache / "forged" / ".meta.json").write_text(json.dumps({"document_id": client.document_id}))
@@ -184,7 +185,7 @@ async def test_insert_image_refuses_what_it_cannot_keep(chat_client) -> None:
     ]
     assert not (images_dir(root) / str(client.document_id)).exists()
     assert not (root / "files" / "Papers" / "paper.pdf" / "figures").exists()
-    assert list(Path(settings.upload_dir).iterdir()) == []
+    assert staged_uploads(client) == []
 
 
 @respx.mock

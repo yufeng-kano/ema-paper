@@ -126,10 +126,8 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
 async def test_parse_an_image(api_client, sessionmaker, documents) -> None:
     respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
 
-    accepted = await api_client.post(
-        "/v1/parse",
-        files={"file": ("tiny.png", documents["wide_png"].read_bytes(), "image/png")},
-        data={"model": PARSE_MODEL},
+    accepted = await v1_parse(
+        api_client, documents["wide_png"], media_type="image/png", model=PARSE_MODEL
     )
     assert accepted.status_code == 202, accepted.text
     job_id = accepted.json()["job_id"]

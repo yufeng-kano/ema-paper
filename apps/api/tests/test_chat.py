@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import io
 import json
 import shutil
@@ -33,13 +32,11 @@ from sightread.db.models import (
     ChatTurn,
     Conversation,
     Document,
-    Job,
     Message,
     UsageLog,
 )
 from sightread.errors import ApiError
 from sightread.jobs import chat_events, chat_runner, chat_tools
-from sightread.jobs import runner as parse_runner
 from sightread.jobs.events import open_listener
 from sightread.jobs.queue import (
     ORPHAN_REVISION_MESSAGE,
@@ -63,7 +60,6 @@ from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git, safe_io
 from sightread.workspace.layout import sources_dir
 from sightread.workspace.locks import (
-    _backup_lock_path,
     mark_writing,
     read_writing,
     workspace_lock,
@@ -92,8 +88,7 @@ from tests.conftest import (
     postgres_only,
     sign_in,
 )
-from tests.factories import user_row
-from tests.test_workspace import _seed
+from tests.factories import filed_parse, user_row
 
 
 def _paper_history(client: AsyncClient) -> list[git.Revision]:
@@ -437,76 +432,6 @@ def test_truncate() -> None:
     assert "omitted" in chat_tools.truncate(text, 200)
     # A cap of nothing is nothing, never `text[-0:]`, the whole text.
     assert chat_tools.truncate(text, 0) == ""
-
-
-async def _running_library_parse(client: AsyncClient) -> SimpleNamespace:
-    """A document's parse still running with its upload staged: the document, its job, the
-    upload, and where the finished parse keeps it in the document's directory."""
-    settings = client.app.state.settings
-    document_id = await seed_document(client, client.user_id)
-    async with client.app.state.sessionmaker() as db:
-        job = await db.get(Job, (await db.get(Document, document_id)).job_id)
-        upload = Path(settings.upload_dir) / f"{job.id}.pdf"
-        upload.parent.mkdir(parents=True, exist_ok=True)
-        upload.write_bytes(b"%PDF-1.4 test")
-        job.source_path = str(upload)
-        job.status = "running"
-        await db.commit()
-        return SimpleNamespace(
-            document_id=document_id,
-            job_id=job.id,
-            upload=upload,
-            kept=client.root / "files" / "Papers" / "paper.pdf" / "source.pdf",
-        )
-
-
-@postgres_only
-async def test_a_finished_library_parse_waits_for_the_filing_row_lock(signed_in) -> None:
-    """Filing takes the job's row lock before it inserts: a finish that waits for it reads
-    the row it filed as a recipient rather than deleting the upload under it (docs/jobs.md
-    § Retention). PostgreSQL only: SQLite takes no row lock."""
-    settings = signed_in.app.state.settings
-    sessionmaker = signed_in.app.state.sessionmaker
-    parse = await _running_library_parse(signed_in)
-    async with sessionmaker() as holder:
-        await holder.execute(select(Job.id).where(Job.id == parse.job_id).with_for_update())
-        held = asyncio.create_task(
-            parse_runner._finish(sessionmaker, parse.job_id, status="succeeded", settings=settings)
-        )
-        await asyncio.sleep(0.3)
-        assert not held.done()
-        await holder.rollback()
-    await asyncio.wait_for(held, 10)
-    assert parse.kept.read_bytes() == b"%PDF-1.4 test"
-
-
-async def test_a_finished_library_parse_keeps_its_source_in_one_backup_snapshot(
-    signed_in,
-) -> None:
-    """The retention exception (docs/jobs.md): the upload moves into the document dir. The
-    terminal rows and the kept original land in one backup snapshot: a backup holding the
-    lock keeps the finish — commit included — out until it is done."""
-    settings = signed_in.app.state.settings
-    sessionmaker = signed_in.app.state.sessionmaker
-    parse = await _running_library_parse(signed_in)
-    backup_path = _backup_lock_path(signed_in.root)
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
-    backup = backup_path.open("a+")
-    fcntl.flock(backup, fcntl.LOCK_EX)
-    finishing = asyncio.create_task(
-        parse_runner._finish(sessionmaker, parse.job_id, status="succeeded", settings=settings)
-    )
-    await asyncio.sleep(0.3)
-    assert not finishing.done()
-    async with sessionmaker() as db:
-        assert (await db.get(Job, parse.job_id)).status == "running"
-    fcntl.flock(backup, fcntl.LOCK_UN)
-    backup.close()
-    await asyncio.wait_for(finishing, 10)
-    assert parse.kept.read_bytes() == b"%PDF-1.4 test"
-    assert not parse.upload.exists()
-    original = workspace_documents.original_of(signed_in.root, parse.document_id)
-    assert original is not None and original.read_bytes() == b"%PDF-1.4 test"
 
 
 async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, documents) -> None:
@@ -2175,7 +2100,11 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
 ) -> None:
     settings = path_settings(tmp_path, sandbox_url="http://sandbox:8100", sandbox_token="t")
     async with sessionmaker() as db:
-        user, document = await _seed(db)
+        user = user_row("ws@example.com")
+        db.add(user)
+        await db.flush()
+        document = await filed_parse(db, user.id)
+        await db.commit()
         paths = await workspace_documents.materialize_document(db, settings, document)
 
     class Shell:
@@ -2290,7 +2219,11 @@ async def test_a_shell_command_stands_marked_as_writing_for_its_whole_run(
 ) -> None:
     settings = path_settings(tmp_path)
     async with sessionmaker() as db:
-        user, document = await _seed(db)
+        user = user_row("ws@example.com")
+        db.add(user)
+        await db.flush()
+        document = await filed_parse(db, user.id)
+        await db.commit()
         paths = await workspace_documents.materialize_document(db, settings, document)
     seen: list[bool] = []
 

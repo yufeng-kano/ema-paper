@@ -47,10 +47,9 @@ from tests.billing_helpers import (
     make_user,
     notify,
     paid_subscription,
-    settings_with,
     subscription_event,
 )
-from tests.conftest import CSRF_HEADERS, PAY_SETTINGS, grant_plan, sign_in
+from tests.conftest import CSRF_HEADERS, PAY_SETTINGS, base_settings, grant_plan, sign_in
 
 REDEEM = "/api/billing/redeem"
 
@@ -264,7 +263,7 @@ async def test_a_code_that_is_unknown_disabled_or_past_its_date_is_refused(
 
 
 async def test_refused_attempts_are_capped_per_window(sessionmaker) -> None:
-    settings = settings_with(redeem_max_failures=3, redeem_failure_window_seconds=3600)
+    settings = base_settings(redeem_max_failures=3, redeem_failure_window_seconds=3600)
     user_id = await make_user(sessionmaker)
     now = datetime(2026, 10, 27, 12, tzinfo=UTC)
     async with sessionmaker() as db:

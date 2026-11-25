@@ -18,13 +18,14 @@ from sqlalchemy import select
 
 from sightread.auth.api_keys import create_api_key
 from sightread.db.models import Job, utcnow
+from tests.billing_helpers import add_parses
 from tests.conftest import PARSE_MODEL, api_key_client
-from tests.factories import job_row, user_row
+from tests.factories import user_row
 from tests.helpers import staged_uploads, v1_parse
 
 
 async def test_a_corrupt_pdf_is_rejected_before_a_job_exists(
-    client: AsyncClient, sessionmaker, documents
+    client: AsyncClient, documents
 ) -> None:
     await api_key_client(client)
     response = await v1_parse(client, documents["corrupt_pdf"])
@@ -67,11 +68,7 @@ async def test_an_unsupported_media_type_is_rejected(client: AsyncClient, tmp_pa
     document = tmp_path / "notes.txt"
     document.write_text("plain text")
 
-    response = await client.post(
-        "/v1/parse",
-        files={"file": (document.name, document.read_bytes(), "text/plain")},
-        data={"model": PARSE_MODEL},
-    )
+    response = await v1_parse(client, document, media_type="text/plain", model=PARSE_MODEL)
     assert response.status_code == 400
 
 
@@ -136,22 +133,7 @@ async def test_the_per_user_running_cap_returns_429(
     await api_key_client(client)
     user_id = client.user_id
 
-    async with sessionmaker() as db:
-        for index in range(2):
-            db.add(
-                job_row(
-                    user_id,
-                    filename="busy.pdf",
-                    size_bytes=10,
-                    sha256=str(index) * 64,
-                    pages_spec="",
-                    model=PARSE_MODEL,
-                    pipeline_version=1,
-                    status="running",
-                    started_at=utcnow(),
-                )
-            )
-        await db.commit()
+    await add_parses(sessionmaker, user_id, 2, status="running", started_at=utcnow())
 
     response = await v1_parse(client, documents["text_pdf"])
 
@@ -184,7 +166,7 @@ async def test_the_json_base64_fallback_creates_the_same_job(
     assert Path(job.source_path).exists()
 
 
-async def test_broken_base64_is_rejected(client: AsyncClient, documents) -> None:
+async def test_broken_base64_is_rejected(client: AsyncClient) -> None:
     await api_key_client(client)
     response = await client.post(
         "/v1/parse", json={"source": "not base64 at all!!", "model": PARSE_MODEL}
@@ -198,10 +180,7 @@ async def test_a_job_runs_on_the_deployments_parse_model(
     """No model in the request: the deployment's parse model, never a stored pick
     (docs/agents.md § Enqueue rules)."""
     await api_key_client(client)
-    response = await client.post(
-        "/v1/parse",
-        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-    )
+    response = await v1_parse(client, documents["text_pdf"])
 
     assert response.status_code == 202, response.text
     async with sessionmaker() as db:

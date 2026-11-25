@@ -29,8 +29,8 @@ from tests.admin_helpers import (
     last_audit_id,
     owner_client,
 )
-from tests.billing_helpers import TWO_PLANS_JSON, settings_with
-from tests.conftest import CSRF_HEADERS, grant_plan
+from tests.billing_helpers import TWO_PLANS_JSON
+from tests.conftest import CSRF_HEADERS, base_settings, grant_plan
 from tests.factories import job_row
 
 PLANS = {"kano_pay_plans_json": TWO_PLANS_JSON}
@@ -768,4 +768,4 @@ def test_the_grant_limits_are_validated() -> None:
         {"admin_grant_valid_days": 31, "admin_grant_max_days": 30},
     ):
         with pytest.raises(ValueError, match="ADMIN_GRANT_"):
-            settings_with(**overrides)
+            base_settings(**overrides)

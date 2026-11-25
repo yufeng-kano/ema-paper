@@ -13,17 +13,14 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
-from httpx import AsyncClient
 from PIL import Image
 from sqlalchemy import select, update
 
 from sightread.auth.sessions import SESSION_COOKIE
 from sightread.billing import ledger
 from sightread.db.models import CreditPeriod, Document, Job, JobPage, UsageLog
-from sightread.jobs.intake import retry_library_parse
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
-from sightread.workspace.locks import workspace_lock
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL
 from tests.helpers import (
     FALLBACK,
@@ -35,36 +32,18 @@ from tests.helpers import (
     drain_queue,
     staged_uploads,
 )
-from tests.library_helpers import fail_next_commit, ready_to_parse, upload_file
-
-
-async def _library(make_client, **overrides) -> AsyncClient:
-    """A signed-in client whose Files uploads are parsed, on a deployment that names
-    `FALLBACK`, the model a retry may send failed pages to."""
-    client = make_client(**{"parse_fallback_model": FALLBACK, **overrides})
-    await ready_to_parse(client)
-    return client
-
-
-@pytest.fixture
-async def library(make_client) -> AsyncClient:
-    return await _library(make_client)
-
-
-async def _row(client: AsyncClient, document_id: int) -> dict:
-    documents = (await client.get("/api/library")).json()["documents"]
-    return next(row for row in documents if row["id"] == document_id)
-
-
-async def _retry(client: AsyncClient, document_id: int, **body) -> httpx.Response:
-    return await client.post(
-        f"/api/library/documents/{document_id}/retry", json=body, headers=CSRF_HEADERS
-    )
+from tests.library_helpers import (
+    fail_next_commit,
+    library_row,
+    parsing_client,
+    retry_parse,
+    upload_file,
+)
 
 
 async def _with_fallback(make_client, fallback: str | None, auto_fallback: bool):
     """A library on a deployment that names `fallback`, the reader's switch set."""
-    client = await _library(make_client, parse_fallback_model=fallback or "")
+    client = await parsing_client(make_client, parse_fallback_model=fallback or "")
     switched = await client.put(
         "/api/agents/parse/settings", json={"auto_fallback": auto_fallback}, headers=CSRF_HEADERS
     )
@@ -77,47 +56,47 @@ async def _with_fallback(make_client, fallback: str | None, auto_fallback: bool)
 
 @respx.mock
 async def test_a_retry_sends_only_the_failed_pages_and_keeps_the_rest(
-    library, sessionmaker, documents
+    parse_library, sessionmaker, documents
 ) -> None:
     upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    await drain_queue(library, sessionmaker)
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    await drain_queue(parse_library, sessionmaker)
 
     # One page failed, so the document failed: nothing to open, and the row says how many
     # pages a retry would send.
-    row = await _row(library, uploaded["id"])
+    row = await library_row(parse_library, uploaded["id"])
     assert (row["status"], row["failed_pages"]) == ("failed", 1)
     assert row["error"] == "1 of 3 pages failed (page 2: upstream call failed)"
-    result = await library.get(f"/api/library/documents/{uploaded['id']}/result")
+    result = await parse_library.get(f"/api/library/documents/{uploaded['id']}/result")
     assert result.status_code == 404
-    pages = (await library.get(f"/api/library/documents/{uploaded['id']}/pages")).json()
+    pages = (await parse_library.get(f"/api/library/documents/{uploaded['id']}/pages")).json()
     assert pages["pages"] == [
         {"page": 1, "status": "succeeded", "reason": None, "model": PARSE_MODEL},
         {"page": 2, "status": "failed", "reason": "upstream call failed", "model": PARSE_MODEL},
         {"page": 3, "status": "succeeded", "reason": None, "model": PARSE_MODEL},
     ]
     # A failed attempt's crops are discarded with it.
-    figures = Path(library.app.state.settings.figures_dir) / uploaded["job_id"]
+    figures = Path(parse_library.app.state.settings.figures_dir) / uploaded["job_id"]
     assert not figures.exists()
 
     upstream.calls.clear()
-    retried = await _retry(library, uploaded["id"], model=FALLBACK)
+    retried = await retry_parse(parse_library, uploaded["id"], model=FALLBACK)
     assert retried.status_code == 202, retried.text
     assert retried.json() == {"job_id": uploaded["job_id"], "status": "queued"}
-    row = await _row(library, uploaded["id"])
+    row = await library_row(parse_library, uploaded["id"])
     assert (row["status"], row["pages_done"], row["error"], row["failed_pages"]) == (
         "queued",
         2,
         None,
         None,
     )
-    await drain_queue(library, sessionmaker)
+    await drain_queue(parse_library, sessionmaker)
 
     # Only the failed page went upstream, to the model the retry named.
     assert upstream.calls == [(FALLBACK, 2)]
-    assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
-    result = (await library.get(f"/api/library/documents/{uploaded['id']}/result")).json()
+    assert (await library_row(parse_library, uploaded["id"]))["status"] == "succeeded"
+    result = (await parse_library.get(f"/api/library/documents/{uploaded['id']}/result")).json()
     assert [page["model"] for page in result["pages"]] == [PARSE_MODEL, FALLBACK, PARSE_MODEL]
     assert result["errors"] == []
     assert result["markdown"].count("<!-- page:") == 3
@@ -125,10 +104,10 @@ async def test_a_retry_sends_only_the_failed_pages_and_keeps_the_rest(
     for page_no in (1, 2, 3):
         assert (figures / f"p{page_no}_0_0_1000_1000.png").is_file()
     # The copy the retry ran on went with its terminal state; the original stays.
-    assert staged_uploads(library) == []
+    assert staged_uploads(parse_library) == []
     async with sessionmaker() as db:
         document = await db.get(Document, uploaded["id"])
-        root = user_root(library.app.state.settings.workspaces_dir, document.user_id)
+        root = user_root(parse_library.app.state.settings.workspaces_dir, document.user_id)
         usage = (
             await db.execute(
                 select(UsageLog.model).where(UsageLog.job_id == uuid.UUID(uploaded["job_id"]))
@@ -147,7 +126,7 @@ async def test_a_retry_takes_the_credits_back_and_the_document_is_charged_once(
     reserves them again — refused 402, with nothing requeued, when the balance cannot
     cover them — so a job that keeps failing costs nothing and the run that succeeds is
     the one charge."""
-    client = await _library(make_client, free_credits_per_period=3)
+    client = await parsing_client(make_client, free_credits_per_period=3)
     respx.post(KANO_CHAT_URL).mock(
         side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     )
@@ -159,30 +138,30 @@ async def test_a_retry_takes_the_credits_back_and_the_document_is_charged_once(
             await db.execute(update(CreditPeriod).values(spent=credits))
             await db.commit()
 
-    assert (await _row(client, uploaded["id"]))["status"] == "failed"
+    assert (await library_row(client, uploaded["id"]))["status"] == "failed"
     assert await credits_spent(client) == 0
     # A retry on the same model takes the three pages' credits back; failing again, it
     # releases them again.
-    assert (await _retry(client, uploaded["id"])).status_code == 202
+    assert (await retry_parse(client, uploaded["id"])).status_code == 202
     assert await credits_spent(client) == 3
     await drain_queue(client, sessionmaker)
-    assert (await _row(client, uploaded["id"]))["status"] == "failed"
+    assert (await library_row(client, uploaded["id"]))["status"] == "failed"
     assert await credits_spent(client) == 0
 
     # With one credit spent elsewhere the balance cannot cover the parse: refused, and the
     # job, its credits and the upload directory are as they were.
     await spend(1)
-    refused = await _retry(client, uploaded["id"], model=FALLBACK)
+    refused = await retry_parse(client, uploaded["id"], model=FALLBACK)
     assert refused.status_code == 402, refused.text
     assert (refused.json()["error"]["need"], refused.json()["error"]["remaining"]) == (3, 2)
-    assert (await _row(client, uploaded["id"]))["status"] == "failed"
+    assert (await library_row(client, uploaded["id"]))["status"] == "failed"
     assert await credits_spent(client) == 1
     assert staged_uploads(client) == []
 
     await spend(0)
-    assert (await _retry(client, uploaded["id"], model=FALLBACK)).status_code == 202
+    assert (await retry_parse(client, uploaded["id"], model=FALLBACK)).status_code == 202
     await drain_queue(client, sessionmaker)
-    assert (await _row(client, uploaded["id"]))["status"] == "succeeded"
+    assert (await library_row(client, uploaded["id"]))["status"] == "succeeded"
     job_id = uuid.UUID(uploaded["job_id"])
     async with sessionmaker() as db:
         assert await ledger.credits_by_job(db, [job_id]) == {job_id: 3}
@@ -191,43 +170,43 @@ async def test_a_retry_takes_the_credits_back_and_the_document_is_charged_once(
 
 @respx.mock
 async def test_only_a_failed_parse_with_its_original_can_be_retried(
-    library, make_client, sessionmaker, documents
+    parse_library, make_client, sessionmaker, documents
 ) -> None:
     respx.post(KANO_CHAT_URL).mock(side_effect=Upstream({}))
-    uploaded = await upload_file(library, documents["png"], "image/png")
+    uploaded = await upload_file(parse_library, documents["png"], "image/png")
     # Queued, then succeeded: neither has failed pages to send.
-    assert (await _retry(library, uploaded["id"])).status_code == 409
-    await drain_queue(library, sessionmaker)
-    assert (await _retry(library, uploaded["id"])).status_code == 409
+    assert (await retry_parse(parse_library, uploaded["id"])).status_code == 409
+    await drain_queue(parse_library, sessionmaker)
+    assert (await retry_parse(parse_library, uploaded["id"])).status_code == 409
 
     async with sessionmaker() as db:
         job = await db.get(Job, uuid.UUID(uploaded["job_id"]))
         job.status = "failed"
-        root = user_root(library.app.state.settings.workspaces_dir, job.user_id)
+        root = user_root(parse_library.app.state.settings.workspaces_dir, job.user_id)
         await db.commit()
     # Another account's document is not there at all.
     stranger = await account_client(make_client)
-    assert (await _retry(stranger, uploaded["id"])).status_code == 404
+    assert (await retry_parse(stranger, uploaded["id"])).status_code == 404
     assert (await stranger.get(f"/api/library/documents/{uploaded['id']}/pages")).status_code == 404
     # A failed parse whose original is gone has nothing to parse again.
     original = original_of(root, uploaded["id"])
     assert original is not None
     original.unlink()
-    refused = await _retry(library, uploaded["id"])
+    refused = await retry_parse(parse_library, uploaded["id"])
     assert refused.status_code == 409
     assert "upload the file again" in refused.text
     # A markdown document has no parse at all.
-    written = await library.post(
+    written = await parse_library.post(
         "/api/library/documents/new", json={"name": "notes"}, headers=CSRF_HEADERS
     )
     assert written.status_code == 201, written.text
-    assert (await _retry(library, written.json()["id"])).status_code == 404
-    assert (await _row(library, written.json()["id"]))["failed_pages"] is None
+    assert (await retry_parse(parse_library, written.json()["id"])).status_code == 404
+    assert (await library_row(parse_library, written.json()["id"]))["failed_pages"] is None
 
 
 @respx.mock
 async def test_a_failed_parse_in_the_trash_is_retried_only_once_it_is_put_back(
-    library, sessionmaker, documents
+    parse_library, sessionmaker, documents
 ) -> None:
     """A file in the Trash is not opened or parsed again (docs/api.md): its pages, their
     pictures and the retry answer 404 until Put Back. Every answer that carries the file
@@ -235,48 +214,48 @@ async def test_a_failed_parse_in_the_trash_is_retried_only_once_it_is_put_back(
     respx.post(KANO_CHAT_URL).mock(
         side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     )
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    await drain_queue(library, sessionmaker)
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    await drain_queue(parse_library, sessionmaker)
     document_id = uploaded["id"]
 
-    trashed = await library.post(
+    trashed = await parse_library.post(
         f"/api/library/documents/{document_id}/trash", headers=CSRF_HEADERS
     )
     assert trashed.status_code == 200, trashed.text
     assert trashed.json()["failed_pages"] == 1
-    trash = (await library.get("/api/library")).json()["trash"]["documents"]
+    trash = (await parse_library.get("/api/library")).json()["trash"]["documents"]
     assert [(row["id"], row["failed_pages"]) for row in trash] == [(document_id, 1)]
     for path in ("pages", "pages/2/image"):
-        answer = await library.get(f"/api/library/documents/{document_id}/{path}")
+        answer = await parse_library.get(f"/api/library/documents/{document_id}/{path}")
         assert answer.status_code == 404, path
-    assert (await _retry(library, document_id)).status_code == 404
+    assert (await retry_parse(parse_library, document_id)).status_code == 404
 
-    restored = await library.post(
+    restored = await parse_library.post(
         f"/api/library/documents/{document_id}/restore", headers=CSRF_HEADERS
     )
     assert restored.status_code == 200, restored.text
     assert restored.json()["failed_pages"] == 1
-    assert (await _retry(library, document_id, model=FALLBACK)).status_code == 202
-    await drain_queue(library, sessionmaker)
-    assert (await _row(library, document_id))["status"] == "succeeded"
+    assert (await retry_parse(parse_library, document_id, model=FALLBACK)).status_code == 202
+    await drain_queue(parse_library, sessionmaker)
+    assert (await library_row(parse_library, document_id))["status"] == "succeeded"
 
 
 @respx.mock
 @pytest.mark.parametrize("landed", [True, False])
 async def test_a_retry_whose_commit_raised_keeps_its_copy_only_if_it_landed(
-    library, sessionmaker, documents, monkeypatch, landed
+    parse_library, sessionmaker, documents, monkeypatch, landed
 ) -> None:
     respx.post(KANO_CHAT_URL).mock(
         side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     )
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    await drain_queue(library, sessionmaker)
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    await drain_queue(parse_library, sessionmaker)
 
     fail_next_commit(monkeypatch, landed=landed)
-    response = await _retry(library, uploaded["id"])
+    response = await retry_parse(parse_library, uploaded["id"])
     async with sessionmaker() as db:
         job = await db.get(Job, uuid.UUID(uploaded["job_id"]))
-    copies = list(Path(library.app.state.settings.upload_dir).glob(f"{job.id}.retry-*"))
+    copies = list(Path(parse_library.app.state.settings.upload_dir).glob(f"{job.id}.retry-*"))
     if landed:
         # The acknowledgement was lost, not the retry: it stands, on its copy.
         assert response.status_code == 202, response.text
@@ -293,14 +272,14 @@ async def test_a_retry_whose_commit_raised_keeps_its_copy_only_if_it_landed(
 
 @respx.mock
 async def test_a_page_already_transcribed_is_not_sent_again(
-    library, sessionmaker, documents
+    parse_library, sessionmaker, documents
 ) -> None:
     """A requeued attempt — a shutdown, a dead worker — keeps the pages it finished: the
     next one transcribes only the rest, and crops the kept ones again
     (docs/jobs.md § Queue)."""
     upstream = Upstream({})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    uploaded = await upload_file(library, documents["mixed_pdf"])
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
     async with sessionmaker() as db:
         job_id = uuid.UUID(uploaded["job_id"])
         db.add_all(
@@ -318,12 +297,12 @@ async def test_a_page_already_transcribed_is_not_sent_again(
         )
         await db.execute(update(Job).where(Job.id == job_id).values(pages_done=2))
         await db.commit()
-    await drain_queue(library, sessionmaker)
+    await drain_queue(parse_library, sessionmaker)
 
     assert upstream.calls == [(PARSE_MODEL, 2)]
-    result = (await library.get(f"/api/library/documents/{uploaded['id']}/result")).json()
+    result = (await parse_library.get(f"/api/library/documents/{uploaded['id']}/result")).json()
     assert result["markdown"].count("Body text.") == 3
-    figures = Path(library.app.state.settings.figures_dir) / uploaded["job_id"]
+    figures = Path(parse_library.app.state.settings.figures_dir) / uploaded["job_id"]
     for page_no in (1, 2, 3):
         assert (figures / f"p{page_no}_0_0_1000_1000.png").is_file()
 
@@ -337,12 +316,12 @@ async def test_a_blocked_page_goes_to_the_fallback_when_it_is_switched_on(
 ) -> None:
     upstream = Upstream({(PARSE_MODEL, 1): lambda: completion("", "content_filter")})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    library = await _with_fallback(make_client, FALLBACK, True)
-    uploaded = await upload_file(library, documents["png"], "image/png")
-    await drain_queue(library, sessionmaker)
+    parse_library = await _with_fallback(make_client, FALLBACK, True)
+    uploaded = await upload_file(parse_library, documents["png"], "image/png")
+    await drain_queue(parse_library, sessionmaker)
 
     assert upstream.calls == [(PARSE_MODEL, 1), (FALLBACK, 1)]
-    result = (await library.get(f"/api/library/documents/{uploaded['id']}/result")).json()
+    result = (await parse_library.get(f"/api/library/documents/{uploaded['id']}/result")).json()
     assert [page["model"] for page in result["pages"]] == [FALLBACK]
     async with sessionmaker() as db:
         job = await db.get(Job, uuid.UUID(uploaded["job_id"]))
@@ -371,12 +350,12 @@ async def test_a_page_the_model_stopped_fails_the_job_after_one_call(
 ) -> None:
     upstream = Upstream({(PARSE_MODEL, 1): lambda: completion("half a page", finish_reason)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    library = await _with_fallback(make_client, *settings)
-    uploaded = await upload_file(library, documents["png"], "image/png")
-    await drain_queue(library, sessionmaker)
+    parse_library = await _with_fallback(make_client, *settings)
+    uploaded = await upload_file(parse_library, documents["png"], "image/png")
+    await drain_queue(parse_library, sessionmaker)
 
     assert upstream.calls == [(PARSE_MODEL, 1)]
-    row = await _row(library, uploaded["id"])
+    row = await library_row(parse_library, uploaded["id"])
     assert (row["status"], row["error"]) == ("failed", f"1 of 1 pages failed (page 1: {reason})")
     async with sessionmaker() as db:
         billed = (
@@ -398,12 +377,12 @@ async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
         }
     )
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    library = await _with_fallback(make_client, FALLBACK, True)
-    uploaded = await upload_file(library, documents["png"], "image/png")
-    await drain_queue(library, sessionmaker)
+    parse_library = await _with_fallback(make_client, FALLBACK, True)
+    uploaded = await upload_file(parse_library, documents["png"], "image/png")
+    await drain_queue(parse_library, sessionmaker)
 
     assert upstream.calls == [(PARSE_MODEL, 1), (FALLBACK, 1)]
-    row = await _row(library, uploaded["id"])
+    row = await library_row(parse_library, uploaded["id"])
     assert (row["status"], row["error"]) == ("failed", "the upstream rejected the operator's key")
     async with sessionmaker() as db:
         billed = (
@@ -419,11 +398,11 @@ async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
 
 
 async def test_the_fallback_switch_is_the_readers_and_its_model_the_deployments(
-    library, make_client
+    parse_library, make_client
 ) -> None:
     """The switch is the reader's; the fallback model is the deployment's, a fact
     (docs/api.md § GET /api/agents)."""
-    saved = await library.put(
+    saved = await parse_library.put(
         "/api/agents/parse/settings", json={"auto_fallback": True}, headers=CSRF_HEADERS
     )
     assert (saved.json()["fallback_model"], saved.json()["auto_fallback"]) == (FALLBACK, True)
@@ -440,20 +419,22 @@ async def test_the_fallback_switch_is_the_readers_and_its_model_the_deployments(
 
 
 async def test_a_page_of_the_original_is_drawn_small_for_the_retry_dialog(
-    library, sessionmaker, documents
+    parse_library, documents
 ) -> None:
-    uploaded = await upload_file(library, documents["mixed_pdf"])
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
     # The upload is the job's until it runs; the second row of the same bytes keeps its
     # own original at once (docs/workspace.md § Layout).
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    response = await library.get(f"/api/library/documents/{uploaded['id']}/pages/2/image")
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    response = await parse_library.get(f"/api/library/documents/{uploaded['id']}/pages/2/image")
     assert response.status_code == 200, response.text
     assert response.headers["content-type"] == "image/png"
     assert response.headers["cache-control"] == "private, no-store"
     with Image.open(io.BytesIO(response.content)) as drawn:
-        assert max(drawn.size) <= library.app.state.settings.page_preview_long_edge
+        assert max(drawn.size) <= parse_library.app.state.settings.page_preview_long_edge
     for page in (0, 4):
-        missing = await library.get(f"/api/library/documents/{uploaded['id']}/pages/{page}/image")
+        missing = await parse_library.get(
+            f"/api/library/documents/{uploaded['id']}/pages/{page}/image"
+        )
         assert missing.status_code == 404
 
 
@@ -461,19 +442,17 @@ async def test_a_page_of_the_original_is_drawn_small_for_the_retry_dialog(
 
 
 @respx.mock
-@pytest.mark.parametrize("door", ["route", "agent"])
 async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
-    library, sessionmaker, documents, door
+    parse_library, sessionmaker, documents
 ) -> None:
     """A retry is an enqueue (docs/agents.md § Enqueue rules): one that names no model, of
     a job whose model and fallback the deployment no longer offers, runs on `PARSE_MODEL`
     with no fallback, so a page it blocks fails rather than go to a withdrawn model. The
-    Files route and the chat agent's `convert_file`, which calls `retry_library_parse`
-    with no model, alike."""
+    chat agent's `convert_file` retry is tested through a turn (tests/test_chat_convert.py)."""
     upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    await drain_queue(library, sessionmaker)
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    await drain_queue(parse_library, sessionmaker)
     job_id = uuid.UUID(uploaded["job_id"])
     async with sessionmaker() as db:
         await db.execute(
@@ -485,15 +464,8 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
 
     upstream.calls.clear()
     upstream.answers[(PARSE_MODEL, 2)] = lambda: completion("", "content_filter")
-    if door == "route":
-        retried = await _retry(library, uploaded["id"])
-        assert retried.status_code == 202, retried.text
-    else:
-        settings = library.app.state.settings
-        async with sessionmaker() as db:
-            row = await db.get(Document, uploaded["id"])
-            async with workspace_lock(user_root(settings.workspaces_dir, row.user_id)):
-                await retry_library_parse(db, settings, user_id=row.user_id, row=row)
+    retried = await retry_parse(parse_library, uploaded["id"])
+    assert retried.status_code == 202, retried.text
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
     # The dedup key keeps the job's own model; the run is the deployment's.
@@ -503,10 +475,10 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
         None,
     )
     assert job.check_model in (None, PARSE_MODEL)
-    await drain_queue(library, sessionmaker)
+    await drain_queue(parse_library, sessionmaker)
 
     assert upstream.calls == [(PARSE_MODEL, 2)]
-    row = await _row(library, uploaded["id"])
+    row = await library_row(parse_library, uploaded["id"])
     assert (row["status"], row["error"]) == ("failed", "1 of 3 pages failed (page 2: blocked)")
 
 
@@ -514,44 +486,44 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
 async def test_a_retry_naming_no_model_keeps_the_jobs_own_while_it_is_offered(
     make_client, sessionmaker, documents
 ) -> None:
-    library = await _with_fallback(make_client, FALLBACK, True)
+    parse_library = await _with_fallback(make_client, FALLBACK, True)
     upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    await drain_queue(library, sessionmaker)
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    await drain_queue(parse_library, sessionmaker)
 
     upstream.calls.clear()
     upstream.answers.clear()
-    assert (await _retry(library, uploaded["id"])).status_code == 202
+    assert (await retry_parse(parse_library, uploaded["id"])).status_code == 202
     async with sessionmaker() as db:
         job = await db.get(Job, uuid.UUID(uploaded["job_id"]))
     assert (job.model, job.retry_model, job.fallback_model) == (PARSE_MODEL, None, FALLBACK)
-    await drain_queue(library, sessionmaker)
+    await drain_queue(parse_library, sessionmaker)
     assert upstream.calls == [(PARSE_MODEL, 2)]
-    assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
+    assert (await library_row(parse_library, uploaded["id"]))["status"] == "succeeded"
 
 
 @respx.mock
 async def test_a_retry_on_a_deployment_with_no_parse_model_is_refused_and_reserves_nothing(
-    library, make_client, sessionmaker, documents
+    parse_library, make_client, sessionmaker, documents
 ) -> None:
     respx.post(KANO_CHAT_URL).mock(
         side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     )
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    await drain_queue(library, sessionmaker)
-    assert await credits_spent(library) == 0
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    await drain_queue(parse_library, sessionmaker)
+    assert await credits_spent(parse_library) == 0
 
     # The same account, on the deployment once it names no parse model.
     bare = make_client(
-        workspaces_dir=library.app.state.settings.workspaces_dir,
+        workspaces_dir=parse_library.app.state.settings.workspaces_dir,
         parse_model="",
         parse_fallback_model="",
     )
-    bare.cookies.set(SESSION_COOKIE, library.cookies.get(SESSION_COOKIE))
-    refused = await _retry(bare, uploaded["id"])
+    bare.cookies.set(SESSION_COOKIE, parse_library.cookies.get(SESSION_COOKIE))
+    refused = await retry_parse(bare, uploaded["id"])
     assert refused.status_code == 503, refused.text
     assert refused.json()["error"]["message"] == "No parse model is configured on this deployment"
-    assert (await _row(library, uploaded["id"]))["status"] == "failed"
-    assert await credits_spent(library) == 0
-    assert staged_uploads(library) == []
+    assert (await library_row(parse_library, uploaded["id"]))["status"] == "failed"
+    assert await credits_spent(parse_library) == 0
+    assert staged_uploads(parse_library) == []

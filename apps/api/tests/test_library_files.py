@@ -343,8 +343,6 @@ async def test_a_file_the_plan_cannot_hold_is_refused_before_or_after_its_bytes(
 async def test_a_file_past_the_cap_is_refused_while_it_streams(make_client, documents) -> None:
     client = make_client(file_max_bytes=1024)
     root = (await sign_in(client)).root
-    limits = (await client.get("/api/me")).json()["limits"]
-    assert limits["file_max_bytes"] == 1024
 
     declared = await upload(client, "big.bin", b"x" * 4096, OCTET)
     assert declared.status_code == 413, declared.text

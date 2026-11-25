@@ -23,7 +23,7 @@ from tests.conftest import (
     PARSE_MODEL,
     api_key_client,
 )
-from tests.helpers import FALLBACK, drain_queue, stub_connection
+from tests.helpers import FALLBACK, drain_queue, stub_connection, v1_parse
 
 # What Kano Proxy's catalog lists: two of the three offered chat models, and more.
 MODELS_PAYLOAD = {
@@ -195,11 +195,7 @@ async def test_unknown_agents_are_refused(signed_in) -> None:
 
 
 async def _parse(client: AsyncClient, documents, **data) -> httpx.Response:
-    return await client.post(
-        "/v1/parse",
-        files={"file": ("tiny.png", documents["png"].read_bytes(), "image/png")},
-        data=data,
-    )
+    return await v1_parse(client, documents["png"], media_type="image/png", **data)
 
 
 async def test_a_request_model_must_be_one_of_the_parse_agents(

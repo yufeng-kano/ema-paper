@@ -29,6 +29,7 @@ from tests.chat_helpers import (
 )
 from tests.conftest import CSRF_HEADERS, sign_in
 from tests.factories import user_row
+from tests.helpers import staged_uploads
 
 
 def waiting(client: AsyncClient) -> list[Path]:
@@ -198,9 +199,7 @@ async def test_a_pdf_is_read_only_to_its_text_cap(make_client, tmp_path) -> None
     assert len(prepared) == 300 + len(attachment_prep.PDF_TEXT_CUT) == created.json()["chars"]
     # The prepared text is all that is left: nothing was staged beside it.
     assert len(waiting(client)) == 1
-    assert [entry.name for entry in Path(client.app.state.settings.upload_dir).iterdir()] == [
-        waiting(client)[0].name
-    ]
+    assert staged_uploads(client) == [waiting(client)[0].name]
 
 
 async def test_the_attachment_route_streams_past_the_json_body_cap(make_client) -> None:

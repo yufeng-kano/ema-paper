@@ -11,7 +11,6 @@ import uuid
 import httpx
 import pytest
 import respx
-from httpx import AsyncClient
 from sqlalchemy import select
 
 from sightread.agents import CHECK
@@ -22,7 +21,16 @@ from sightread.jobs.check import CheckFailed, run_check
 from sightread.parsing import joins
 from sightread.routes.library import document_payload
 from sightread.upstream.anthropic import ChatUsage
-from tests.chat_helpers import MESSAGES_URL, assistant_turn, sse
+from tests.chat_helpers import MESSAGES_URL, sse
+from tests.check_helpers import (
+    PAGES,
+    READING,
+    TRANSCRIPTION,
+    agent_done,
+    agent_turn,
+    paper_upstream,
+    tool_use,
+)
 from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_CHAT_URL, PARSE_MODEL, TEST_SECRET_KEY
 from tests.helpers import (
     FALLBACK,
@@ -33,50 +41,13 @@ from tests.helpers import (
     stub_connection,
     v1_parse,
 )
-from tests.library_helpers import upload_file
-from tests.test_retry_failed_pages import _library, _retry, _row
-
-# Three pages a vision model might send back for a paper: a sentence the first page break
-# cuts before a capital, a bold run left open, and a word the second break hyphenates.
-PAGES = {
-    1: "## Introduction\n\nWe evaluate on the",
-    2: "Atari benchmark. The **key idea is simple.\n\nOur method is experi-",
-    3: "mental and works well.",
-}
-TRANSCRIPTION = (
-    "<!-- page: 1 -->\n## Introduction\n\nWe evaluate on the\n\n"
-    "<!-- page: 2 -->\nAtari benchmark. The **key idea is simple.\n\nOur method is experi-\n\n"
-    "<!-- page: 3 -->\nmental and works well."
-)
-# The agent's join and its fix, over the rules' own join of the hyphenated word.
-READING = (
-    "<!-- page: 1 -->\n## Introduction\n\nWe evaluate on the Atari benchmark. "
-    "The **key idea** is simple.\n\n"
-    "<!-- page: 2 -->\nOur method is experi-mental and works well.\n\n"
-    "<!-- page: 3 -->"
-)
+from tests.library_helpers import library_row, parsing_client, retry_parse, upload_file
 
 
 def _pages(markdown: str) -> list[joins.Page]:
     lead, pages = joins.split_pages(markdown)
     assert lead == ""
     return pages
-
-
-def _turn(blocks: list[dict], stop_reason: str = "tool_use") -> httpx.Response:
-    return httpx.Response(
-        200,
-        content=assistant_turn(blocks, stop_reason, model="claude-opus-5-5"),
-        headers={"content-type": "text/event-stream"},
-    )
-
-
-def _tool(call_id: str, name: str, **tool_input) -> dict:
-    return {"type": "tool_use", "id": call_id, "name": name, "input": tool_input}
-
-
-def _done() -> httpx.Response:
-    return _turn([{"type": "text", "text": "Done."}], "end_turn")
 
 
 def _settings(**overrides) -> Settings:
@@ -332,20 +303,20 @@ async def test_a_document_with_no_spot_costs_nothing() -> None:
 async def test_the_agent_joins_and_fixes_through_its_tools() -> None:
     route = respx.post(MESSAGES_URL).mock(
         side_effect=[
-            _turn(
+            agent_turn(
                 [
-                    _tool("t1", "join_pages", page=2),
-                    _tool(
+                    tool_use("t1", "join_pages", page=2),
+                    tool_use(
                         "t2",
                         "str_replace",
                         old_str="The **key idea is simple.",
                         new_str="The **key idea** is simple.",
                     ),
-                    _tool("t3", "str_replace", old_str="Atari", new_str="ATARI"),
-                    _tool("t4", "read_page", page=2),
+                    tool_use("t3", "str_replace", old_str="Atari", new_str="ATARI"),
+                    tool_use("t4", "read_page", page=2),
                 ]
             ),
-            _done(),
+            agent_done(),
         ]
     )
     outcome, billed = await _check(TRANSCRIPTION)
@@ -378,8 +349,8 @@ async def test_the_agent_joins_and_fixes_through_its_tools() -> None:
 @pytest.mark.parametrize(
     ("answer", "reason"),
     [
-        (lambda: _turn([{"type": "text", "text": "I can't."}], "refusal"), "blocked"),
-        (lambda: _turn([{"type": "text", "text": "Half an"}], "max_tokens"), "cut off"),
+        (lambda: agent_turn([{"type": "text", "text": "I can't."}], "refusal"), "blocked"),
+        (lambda: agent_turn([{"type": "text", "text": "Half an"}], "max_tokens"), "cut off"),
         (lambda: httpx.Response(402), "payment"),
         (lambda: httpx.Response(401), "the upstream rejected the operator's key"),
         (lambda: httpx.Response(400), "upstream call failed"),
@@ -410,7 +381,7 @@ def _cut(error: str) -> httpx.Response:
 @respx.mock
 async def test_a_call_cut_short_is_billed_and_retried(monkeypatch) -> None:
     monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
-    respx.post(MESSAGES_URL).mock(side_effect=[_cut("overloaded_error"), _done()])
+    respx.post(MESSAGES_URL).mock(side_effect=[_cut("overloaded_error"), agent_done()])
     _, billed = await _check(TRANSCRIPTION)
     # The broken attempt with what it reported, its cost unknown; then the finished call.
     assert len(billed) == 2
@@ -431,7 +402,7 @@ async def test_a_call_that_breaks_for_good_is_billed_before_the_check_fails() ->
 @respx.mock
 async def test_an_agent_still_working_at_the_cap_fails() -> None:
     route = respx.post(MESSAGES_URL).mock(
-        side_effect=lambda request: _turn([_tool("t1", "read_page", page=1)])
+        side_effect=lambda request: agent_turn([tool_use("t1", "read_page", page=1)])
     )
     with pytest.raises(CheckFailed) as failed:
         await _check(TRANSCRIPTION, check_max_calls=3)
@@ -441,7 +412,7 @@ async def test_an_agent_still_working_at_the_cap_fails() -> None:
 
 @respx.mock
 async def test_the_spots_past_the_cap_stay_as_they_are() -> None:
-    route = respx.post(MESSAGES_URL).mock(side_effect=lambda request: _done())
+    route = respx.post(MESSAGES_URL).mock(side_effect=lambda request: agent_done())
     await _check(TRANSCRIPTION, check_spots_max=1)
     spots = json.loads(route.calls[0].request.content)["messages"][0]["content"]
     assert spots.startswith("1 places need a decision")
@@ -451,26 +422,15 @@ async def test_the_spots_past_the_cap_stay_as_they_are() -> None:
 # --- a Files upload -------------------------------------------------------------------------
 
 
-@pytest.fixture
-async def library(make_client) -> AsyncClient:
-    return await _library(make_client)
-
-
-def _vision() -> Upstream:
-    return Upstream(
-        {(PARSE_MODEL, page): (lambda text=text: completion(text)) for page, text in PAGES.items()}
-    )
-
-
 @respx.mock
-async def test_a_files_upload_opens_checked(library, sessionmaker, documents) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision())
+async def test_a_files_upload_opens_checked(parse_library, sessionmaker, documents) -> None:
+    respx.post(KANO_CHAT_URL).mock(side_effect=paper_upstream())
     agent = respx.post(MESSAGES_URL).mock(
         side_effect=[
-            _turn(
+            agent_turn(
                 [
-                    _tool("t1", "join_pages", page=2),
-                    _tool(
+                    tool_use("t1", "join_pages", page=2),
+                    tool_use(
                         "t2",
                         "str_replace",
                         old_str="The **key idea is simple.",
@@ -478,10 +438,10 @@ async def test_a_files_upload_opens_checked(library, sessionmaker, documents) ->
                     ),
                 ]
             ),
-            _done(),
+            agent_done(),
         ]
     )
-    uploaded = await upload_file(library, documents["mixed_pdf"])
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
     job = await job_by_id(sessionmaker, uploaded["job_id"])
     # Snapshotted at the upload: no model of its own is the parse's, and the default prompt.
     assert (job.check_model, job.check_effort, job.check_prompt) == (
@@ -489,9 +449,9 @@ async def test_a_files_upload_opens_checked(library, sessionmaker, documents) ->
         "medium",
         CHECK.default_prompt_template,
     )
-    await drain_queue(library, sessionmaker)
+    await drain_queue(parse_library, sessionmaker)
 
-    assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
+    assert (await library_row(parse_library, uploaded["id"]))["status"] == "succeeded"
     async with sessionmaker() as db:
         result = await db.get(Result, uuid.UUID(uploaded["job_id"]))
         usage = (
@@ -503,44 +463,44 @@ async def test_a_files_upload_opens_checked(library, sessionmaker, documents) ->
     assert len(agent.calls) == 2
     assert [(row.job_id, row.model) for row in usage] == [(job.id, PARSE_MODEL)] * 2
 
-    content = await library.get(f"/api/library/documents/{uploaded['id']}/content")
+    content = await parse_library.get(f"/api/library/documents/{uploaded['id']}/content")
     assert content.status_code == 200, content.text
     assert content.json()["markdown"] == READING
-    baseline = library.root / ".sightread" / "results" / uploaded["job_id"] / "result.md"
+    baseline = parse_library.root / ".sightread" / "results" / uploaded["job_id"] / "result.md"
     assert baseline.read_text() == TRANSCRIPTION
     # The result route reads the transcription.
-    api_result = await library.get(f"/api/library/documents/{uploaded['id']}/result")
+    api_result = await parse_library.get(f"/api/library/documents/{uploaded['id']}/result")
     assert api_result.json()["markdown"] == TRANSCRIPTION
 
 
 @respx.mock
 async def test_a_failed_check_fails_the_job_and_its_retry_checks_again(
-    library, sessionmaker, documents
+    parse_library, sessionmaker, documents
 ) -> None:
-    vision = _vision()
+    vision = paper_upstream()
     respx.post(KANO_CHAT_URL).mock(side_effect=vision)
     agent = respx.post(MESSAGES_URL).mock(
-        side_effect=[_turn([{"type": "text", "text": "No."}], "refusal"), _done()]
+        side_effect=[agent_turn([{"type": "text", "text": "No."}], "refusal"), agent_done()]
     )
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    await drain_queue(library, sessionmaker)
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    await drain_queue(parse_library, sessionmaker)
 
     # Every page converted, and still nothing opens: the check failed.
-    row = await _row(library, uploaded["id"])
+    row = await library_row(parse_library, uploaded["id"])
     assert (row["status"], row["failed_pages"], row["checking"]) == ("failed", 0, False)
     assert row["error"] == "the format check failed (blocked)"
     assert (
-        await library.get(f"/api/library/documents/{uploaded['id']}/content")
+        await parse_library.get(f"/api/library/documents/{uploaded['id']}/content")
     ).status_code == 409
     assert len(vision.calls) == 3
 
     # The retry sends no page to a model: it assembles the kept pages and checks again.
-    retried = await _retry(library, uploaded["id"])
+    retried = await retry_parse(parse_library, uploaded["id"])
     assert retried.status_code == 202, retried.text
-    await drain_queue(library, sessionmaker)
+    await drain_queue(parse_library, sessionmaker)
     assert len(vision.calls) == 3
     assert len(agent.calls) == 2
-    assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
+    assert (await library_row(parse_library, uploaded["id"]))["status"] == "succeeded"
     async with sessionmaker() as db:
         result = await db.get(Result, uuid.UUID(uploaded["job_id"]))
     # The agent ended its turn at once: the rules' own join only.
@@ -552,33 +512,35 @@ async def test_a_failed_check_fails_the_job_and_its_retry_checks_again(
 
 @respx.mock
 async def test_a_retry_takes_the_check_settings_of_its_moment(
-    library, sessionmaker, documents
+    parse_library, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision())
+    respx.post(KANO_CHAT_URL).mock(side_effect=paper_upstream())
     respx.post(MESSAGES_URL).mock(side_effect=lambda request: httpx.Response(402))
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    await drain_queue(library, sessionmaker)
-    assert (await _row(library, uploaded["id"]))["error"] == "the format check failed (payment)"
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    await drain_queue(parse_library, sessionmaker)
+    assert (await library_row(parse_library, uploaded["id"]))[
+        "error"
+    ] == "the format check failed (payment)"
 
     # Switched off since: the retry runs unchecked, and the document opens on the
     # transcription.
-    off = await library.put(
+    off = await parse_library.put(
         "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
     )
     assert off.status_code == 200, off.text
-    assert (await _retry(library, uploaded["id"])).status_code == 202
+    assert (await retry_parse(parse_library, uploaded["id"])).status_code == 202
     assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model is None
-    await drain_queue(library, sessionmaker)
+    await drain_queue(parse_library, sessionmaker)
     async with sessionmaker() as db:
         result = await db.get(Result, uuid.UUID(uploaded["job_id"]))
     assert (result.reading_markdown, "check" in result.meta) == (None, False)
-    content = await library.get(f"/api/library/documents/{uploaded['id']}/content")
+    content = await parse_library.get(f"/api/library/documents/{uploaded['id']}/content")
     assert content.json()["markdown"] == TRANSCRIPTION
 
 
 @respx.mock
 async def test_a_retry_checks_on_the_model_it_names_when_the_check_has_none(
-    library, sessionmaker, documents
+    parse_library, sessionmaker, documents
 ) -> None:
     respx.post(KANO_CHAT_URL).mock(
         side_effect=Upstream(
@@ -590,27 +552,27 @@ async def test_a_retry_checks_on_the_model_it_names_when_the_check_has_none(
             }
         )
     )
-    agent = respx.post(MESSAGES_URL).mock(side_effect=lambda request: _done())
-    uploaded = await upload_file(library, documents["mixed_pdf"])
-    await drain_queue(library, sessionmaker)
-    row = await _row(library, uploaded["id"])
+    agent = respx.post(MESSAGES_URL).mock(side_effect=lambda request: agent_done())
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
+    await drain_queue(parse_library, sessionmaker)
+    row = await library_row(parse_library, uploaded["id"])
     assert row["error"] == "1 of 3 pages failed (page 2: blocked)"
     assert not agent.called
 
     # The page goes to another model, and the check, with no model of its own, follows it:
     # the model that blocked the page is not sent its text again.
-    assert (await _retry(library, uploaded["id"], model=FALLBACK)).status_code == 202
+    assert (await retry_parse(parse_library, uploaded["id"], model=FALLBACK)).status_code == 202
     assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model == FALLBACK
-    await drain_queue(library, sessionmaker)
-    assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
+    await drain_queue(parse_library, sessionmaker)
+    assert (await library_row(parse_library, uploaded["id"]))["status"] == "succeeded"
     assert [json.loads(call.request.content)["model"] for call in agent.calls] == [FALLBACK]
 
 
 async def test_the_check_takes_its_own_settings(make_client, sessionmaker, documents) -> None:
     """Its model is the deployment's `CHECK_MODEL`; the effort and the instructions are
     the reader's (docs/agents.md § Enqueue rules)."""
-    library = await _library(make_client, check_model="claude-code/claude-haiku-5-5")
-    saved = await library.put(
+    parse_library = await parsing_client(make_client, check_model="claude-code/claude-haiku-5-5")
+    saved = await parse_library.put(
         "/api/agents/check/settings",
         json={"effort": "low", "instructions": "Use $."},
         headers=CSRF_HEADERS,
@@ -618,7 +580,7 @@ async def test_the_check_takes_its_own_settings(make_client, sessionmaker, docum
     assert saved.status_code == 200, saved.text
     assert saved.json()["auto_check"] is True
     assert saved.json()["model"] == "claude-code/claude-haiku-5-5"
-    uploaded = await upload_file(library, documents["mixed_pdf"])
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
     job = await job_by_id(sessionmaker, uploaded["job_id"])
     assert (job.check_model, job.check_effort) == ("claude-code/claude-haiku-5-5", "low")
     assert job.check_prompt == check_agent.system_prompt(CHECK.default_prompt_template, "Use $.")
@@ -626,23 +588,23 @@ async def test_the_check_takes_its_own_settings(make_client, sessionmaker, docum
 
 
 async def test_no_check_when_switched_off_and_an_api_parse_checked_as_an_upload(
-    library, sessionmaker, documents
+    parse_library, sessionmaker, documents
 ) -> None:
-    off = await library.put(
+    off = await parse_library.put(
         "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
     )
     assert off.status_code == 200, off.text
-    uploaded = await upload_file(library, documents["mixed_pdf"])
+    uploaded = await upload_file(parse_library, documents["mixed_pdf"])
     assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model is None
 
     # An API parse — the connector's too — is checked as a Files upload is (docs/parsing.md
     # § Format check); test_data_plane_parity.py reads it back.
-    on = await library.put(
+    on = await parse_library.put(
         "/api/agents/check/settings", json={"auto_check": True}, headers=CSRF_HEADERS
     )
     assert on.status_code == 200, on.text
-    created = await library.post("/api/keys", json={"name": "api"}, headers=CSRF_HEADERS)
-    accepted = await v1_parse(library, documents["text_pdf"], created.json()["key"])
+    created = await parse_library.post("/api/keys", json={"name": "api"}, headers=CSRF_HEADERS)
+    accepted = await v1_parse(parse_library, documents["text_pdf"], created.json()["key"])
     assert accepted.status_code == 202, accepted.text
     assert (await job_by_id(sessionmaker, accepted.json()["job_id"])).check_model == PARSE_MODEL
 
@@ -662,13 +624,17 @@ def test_checking_is_a_running_parse_past_its_last_page_with_a_check() -> None:
 # --- the settings ---------------------------------------------------------------------------
 
 
-async def test_each_agent_takes_only_its_own_settings(library) -> None:
-    agents = {agent["name"]: agent for agent in (await library.get("/api/agents")).json()["agents"]}
+async def test_each_agent_takes_only_its_own_settings(parse_library) -> None:
+    agents = {
+        agent["name"]: agent for agent in (await parse_library.get("/api/agents")).json()["agents"]
+    }
     assert agents["check"]["settings"]["auto_check"] is True
     assert agents["check"]["default_prompt"] == CHECK.default_prompt_template
 
     async def put(agent: str, **body) -> httpx.Response:
-        return await library.put(f"/api/agents/{agent}/settings", json=body, headers=CSRF_HEADERS)
+        return await parse_library.put(
+            f"/api/agents/{agent}/settings", json=body, headers=CSRF_HEADERS
+        )
 
     assert (await put("check", instructions="Formulas in $")).status_code == 200
     assert (await put("chat", instructions="Answer briefly")).status_code == 200

@@ -91,12 +91,18 @@ async def mint_upload_ticket(
 
 
 async def v1_parse(
-    client: AsyncClient, path: Path, token: str | None = None, **fields
+    client: AsyncClient,
+    path: Path,
+    token: str | None = None,
+    *,
+    media_type: str = "application/pdf",
+    **fields,
 ) -> httpx.Response:
-    """`POST /v1/parse` with the client's API key, or with an upload ticket."""
+    """`POST /v1/parse` of the file at `path` with the client's API key, or with an upload
+    ticket."""
     return await client.post(
         "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "application/pdf")},
+        files={"file": (path.name, path.read_bytes(), media_type)},
         data=fields,
         headers=bearer(token) if token is not None else {},
     )

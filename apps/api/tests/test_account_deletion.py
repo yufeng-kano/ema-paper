@@ -65,8 +65,7 @@ from tests.conftest import (
 )
 from tests.factories import job_row
 from tests.helpers import account_client
-from tests.library_helpers import upload, write_content
-from tests.test_document_images import _image, _insert
+from tests.library_helpers import image_bytes, insert_image, upload, write_content
 
 SANDBOX_URL = "http://sandbox.test"
 # Every table keyed by the user that the footprint below writes.
@@ -114,7 +113,7 @@ async def _footprint(client: AsyncClient) -> dict:
     ).status_code == 201
     note = (await upload(client, "note.md", b"# Note\n")).json()
     await write_content(client, note["id"], "# Note, edited\n")
-    assert (await _insert(client, note["id"], _image("PNG"))).status_code == 201
+    assert (await insert_image(client, note["id"], image_bytes("PNG"))).status_code == 201
     period_start = utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     async with client.app.state.sessionmaker() as db:
         parsed = await _job(db, uid)

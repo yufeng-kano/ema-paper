@@ -27,6 +27,7 @@ import contextlib
 import json
 import os
 from collections.abc import AsyncIterator, Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -36,7 +37,7 @@ import respx
 from httpx import ASGITransport, AsyncClient
 
 from sightread.config import Settings, get_settings
-from sightread.db.models import WORKER_GENERATION_SEQ, Base
+from sightread.db.models import WORKER_GENERATION_SEQ, Base, Subscription
 from sightread.db.session import create_engine, create_sessionmaker
 from sightread.jobs.chat_tools import ImageView
 from sightread.main import create_app
@@ -88,7 +89,6 @@ TEST_MODEL_PRICES = json.dumps(
         for model in (
             "claude-code/claude-opus-5-5",
             "claude-code/claude-opus-5",
-            "claude-code/claude-fallback-9",
             "claude-code/claude-haiku-5-5",
             "claude-opus-5-5",
             "codex/gpt-5.5",
@@ -100,6 +100,27 @@ TEST_MODEL_PRICES = json.dumps(
         )
     }
 )
+
+
+def base_settings(**overrides) -> Settings:
+    """The settings every test deployment starts from: local, the dev login on, Kano Proxy at
+    `KANO_BASE` with the operator's key and `PARSE_MODEL`, and every test model priced."""
+    return Settings(
+        **{
+            "app_env": "local",
+            "auth_dev_mode": True,
+            "secret_key": TEST_SECRET_KEY,
+            "database_url": "sqlite+aiosqlite://",
+            "kano_proxy_base_url": KANO_BASE,
+            "kano_proxy_api_key": KANO_API_KEY,
+            "parse_model": PARSE_MODEL,
+            # Every model a test turn runs on is priced, as the deployment requires of its
+            # offered models (docs/billing.md § Models): a flat list price so the credits a
+            # test sees are predictable. Tests of the arithmetic set their own.
+            "model_prices_json": TEST_MODEL_PRICES,
+            **overrides,
+        }
+    )
 
 
 def path_settings(tmp_path: Path, **overrides) -> Settings:
@@ -184,23 +205,11 @@ async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., Asy
     opened: list[AsyncClient] = []
 
     def _make(**overrides) -> AsyncClient:
-        settings = Settings(
+        settings = base_settings(
             **{
-                "app_env": "local",
-                "auth_dev_mode": True,
-                "secret_key": TEST_SECRET_KEY,
-                "database_url": "sqlite+aiosqlite://",
                 "upload_dir": str(tmp_path / "uploads"),
                 "figures_dir": str(tmp_path / "figures"),
                 "workspaces_dir": str(tmp_path / "workspaces"),
-                "kano_proxy_base_url": KANO_BASE,
-                "kano_proxy_api_key": KANO_API_KEY,
-                "parse_model": PARSE_MODEL,
-                # Every model a test turn runs on is priced, as the deployment requires
-                # of its offered models (docs/billing.md § Models): a flat list price so
-                # the credits a test sees are predictable. Tests of the arithmetic set
-                # their own.
-                "model_prices_json": TEST_MODEL_PRICES,
                 **overrides,
             }
         )
@@ -229,6 +238,15 @@ async def chat_client(make_client) -> AsyncClient:
     from tests.chat_helpers import chatting_client
 
     return await chatting_client(make_client())
+
+
+@pytest_asyncio.fixture
+async def parse_library(make_client) -> AsyncClient:
+    """Signed in, Files uploads parsed, `FALLBACK` named (tests/library_helpers.py)."""
+    # Imported here: library_helpers imports this module.
+    from tests.library_helpers import parsing_client
+
+    return await parsing_client(make_client)
 
 
 @pytest.fixture(autouse=True)
@@ -345,10 +363,6 @@ PAY_SETTINGS = {
 async def grant_plan(sessionmaker, user_id: int, plan_id: str = "pro", *, version: int = 1):
     """A subscription row as the webhook would write it: the user is on `plan_id` for a
     period around now (docs/billing.md § Periods)."""
-    from datetime import UTC, datetime, timedelta
-
-    from sightread.db.models import Subscription
-
     now = datetime.now(UTC)
     async with sessionmaker() as db:
         db.add(

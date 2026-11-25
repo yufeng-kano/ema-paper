@@ -201,8 +201,3 @@ async def test_the_agents_payload_names_the_parse_models_convention(signed_in, m
     after = (await client.get("/api/agents")).json()["agents"][0]
     assert after["settings"]["model"] == "anthropic/claude-sonnet-4-5"
     assert after["bbox"] == {"family": "claude", "format": "xyxy_px"}
-
-
-async def test_me_carries_the_prompt_cap(signed_in) -> None:
-    limits = (await signed_in.get("/api/me")).json()["limits"]
-    assert limits["prompt_max_chars"] == signed_in.app.state.settings.system_prompt_max_chars

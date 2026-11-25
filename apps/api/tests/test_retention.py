@@ -52,9 +52,14 @@ from tests.helpers import (
     staged_uploads,
     vision_stub,
 )
-from tests.library_helpers import upload, write_content, written_document
-from tests.test_document_images import _image, _insert
-from tests.test_library_trash import _trash
+from tests.library_helpers import (
+    image_bytes,
+    insert_image,
+    trash,
+    upload,
+    write_content,
+    written_document,
+)
 
 
 async def _age(client: AsyncClient, model: type, row_id: int, *, days: float) -> None:
@@ -79,7 +84,7 @@ async def test_the_trash_deletes_for_good_what_it_kept_past_its_time(writer) -> 
     # Uploads keep originals; the edits give each a directory, so a Trash entry.
     old = (await upload(writer, "old.md", b"# Old\n")).json()
     await write_content(writer, old["id"], "# Old, edited\n")
-    assert (await _insert(writer, old["id"], _image("PNG"))).status_code == 201
+    assert (await insert_image(writer, old["id"], image_bytes("PNG"))).status_code == 201
     box = await post_folder(writer, "Box")
     inner = await post_folder(writer, "Inner", box["id"])
     boxed = (await upload(writer, "boxed.md", b"# Boxed\n", folder_id=inner["id"])).json()
@@ -88,7 +93,7 @@ async def test_the_trash_deletes_for_good_what_it_kept_past_its_time(writer) -> 
     await write_content(writer, young["id"], "# Young, edited\n")
     stays = await written_document(writer, "stays.md", None, "# Stays\n")
     for kind, row in (("documents", old), ("folders", box), ("documents", young)):
-        assert (await _trash(writer, kind, row["id"])).status_code == 200
+        assert (await trash(writer, kind, row["id"])).status_code == 200
     assert sorted(path.name for path in trash_root(writer.root).iterdir()) == [
         f"document-{old['id']}",
         f"document-{young['id']}",
@@ -134,7 +139,7 @@ async def test_a_trash_with_a_conversation_still_answering_waits_while_the_other
     mine = (await upload(writer, "mine.md", b"# Mine\n")).json()
     theirs = (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
     for client, row in ((writer, mine), (stranger, theirs)):
-        assert (await _trash(client, "documents", row["id"])).status_code == 200
+        assert (await trash(client, "documents", row["id"])).status_code == 200
         await _age(client, Document, row["id"], days=40)
     # A turn about the trashed file still running: deleting it now would pull the rows
     # and the directory from under the worker.
@@ -172,7 +177,7 @@ async def test_a_trash_with_a_conversation_still_answering_waits_while_the_other
 async def test_a_trash_retention_of_zero_never_empties_the_trash(writer) -> None:
     writer.app.state.settings.trash_retention_days = 0
     kept = (await upload(writer, "kept.md", b"# Kept\n")).json()
-    assert (await _trash(writer, "documents", kept["id"])).status_code == 200
+    assert (await trash(writer, "documents", kept["id"])).status_code == 200
     await _age(writer, Document, kept["id"], days=3650)
 
     assert await _expire(writer) == 0

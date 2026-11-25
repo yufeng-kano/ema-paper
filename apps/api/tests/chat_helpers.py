@@ -17,11 +17,11 @@ from httpx import AsyncClient
 from sqlalchemy import update
 
 from sightread.agents import chat as chat_agent
-from sightread.db.models import ChatTurn, Conversation, Document, Folder, Result
+from sightread.db.models import ChatTurn, Conversation
 from sightread.jobs import chat_runner, chat_versions
 from sightread.jobs.queue import claim_next_turn
 from tests.conftest import CSRF_HEADERS, KANO_BASE, sign_in
-from tests.factories import job_row
+from tests.factories import filed_parse
 
 MESSAGES_URL = f"{KANO_BASE}/anthropic/v1/messages"
 # The seeded document's text, and where the shell sees it.
@@ -53,18 +53,11 @@ def assistant_turn(
     )
 
 
-async def seed_document(client: AsyncClient, user_id: int) -> int:
-    """A finished parse filed in the library, with a result to materialize."""
+async def seed_document(client: AsyncClient, user_id: int, **fields) -> int:
+    """A finished parse of `MARKDOWN` filed in the library, `paper.pdf` in `Papers` unless
+    `fields` say otherwise (`factories.filed_parse`); its id."""
     async with client.app.state.sessionmaker() as db:
-        folder = Folder(user_id=user_id, parent_id=None, name="Papers")
-        db.add(folder)
-        await db.flush()
-        job = job_row(user_id, size_bytes=10, sha256="b" * 64, model="claude-x")
-        db.add(job)
-        await db.flush()
-        db.add(Result(job_id=job.id, markdown=MARKDOWN, pages=[], figures=[], errors=[], meta={}))
-        document = Document(user_id=user_id, folder_id=folder.id, job_id=job.id, name="paper.pdf")
-        db.add(document)
+        document = await filed_parse(db, user_id, **{"markdown": MARKDOWN, **fields})
         await db.commit()
         return document.id
 
