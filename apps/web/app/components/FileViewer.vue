@@ -11,7 +11,7 @@
  * and Download.
  */
 import type { ComponentPublicInstance } from 'vue'
-import { documentFileUrl, type LibraryDocument } from '~/lib/api'
+import { documentFileUrl, readDocumentFileHead, type LibraryDocument } from '~/lib/api'
 import { formatBytes, formatShortDateTime } from '~/lib/format'
 import { documentGlyph, filePreview } from '~/lib/library'
 import type { MenuFact, MenuItem, Point } from '~/lib/menu'
@@ -55,15 +55,9 @@ const textError = ref<string | null>(null)
 
 async function readText() {
   try {
-    const response = await fetch(url.value, {
-      headers: { Range: `bytes=0-${TEXT_PREVIEW_MAX - 1}` },
-      credentials: 'same-origin',
-    })
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-    textCut.value = response.status === 206 && (props.document.size_bytes ?? 0) > TEXT_PREVIEW_MAX
-    text.value = await response.text()
+    const head = await readDocumentFileHead(props.document.id, TEXT_PREVIEW_MAX)
+    textCut.value = head.partial && (props.document.size_bytes ?? 0) > TEXT_PREVIEW_MAX
+    text.value = head.text
   } catch (error) {
     textError.value = await resolve(error)
   }

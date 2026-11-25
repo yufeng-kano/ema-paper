@@ -11,7 +11,7 @@
  * local dev sign-in exists (the probe the sign-in page makes) it signs in through that
  * instead and stays on the page, which then reads again.
  */
-import { devLogin, isDevLoginAvailable, logout } from '~/lib/api'
+import { devLogin, isDevLoginAvailable, loginUrl, logout } from '~/lib/api'
 import { formatCount } from '~/lib/format'
 import { keepAfterSignIn } from '~/lib/settings'
 
@@ -49,7 +49,7 @@ async function signInAgain() {
     // A full-page navigation: the backend owns the redirect flow, and it returns to the
     // sign-in page, which goes on to the kept path. Still pending until the page goes.
     keepAfterSignIn(back)
-    window.location.assign(`/api/auth/login?locale=${encodeURIComponent(locale.value)}`)
+    window.location.assign(loginUrl(locale.value))
     return
   }
   try {

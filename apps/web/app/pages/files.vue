@@ -46,7 +46,9 @@ import {
   updateFolder,
   uploadDocument,
   creditsRefusalOf,
+  documentFiguresBase,
   documentFileUrl,
+  documentImagesBase,
   documentOriginalUrl,
   putDocumentView,
   type CreditsRefusal,
@@ -3183,8 +3185,8 @@ useBuildHold(
       :result="results.get(openDocument.id) ?? null"
       :pending="!results.has(openDocument.id) && loadingResults.has(openDocument.id)"
       :error-message="resultErrors.get(openDocument.id) ?? null"
-      :figure-base="openDocument.kind === 'markdown' ? null : `/api/library/documents/${openDocument.id}/figures`"
-      :image-base="`/api/library/documents/${openDocument.id}/images`"
+      :figure-base="openDocument.kind === 'markdown' ? null : documentFiguresBase(openDocument.id)"
+      :image-base="documentImagesBase(openDocument.id)"
       :document-id="openConverted ? openDocument.id : null"
       :markdown-document="openDocument.kind === 'markdown'"
       :initial-block="linkedBlock?.id === openDocument.id ? linkedBlock.anchor : null"

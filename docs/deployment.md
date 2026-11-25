@@ -14,7 +14,7 @@ The two *full stacks* are standalone: each is complete and readable on its own a
 - So `docker logs -f ema-paper-worker` and `docker exec -it ema-paper-api sh` are one command on a laptop and on the server, instead of depending on a generated `-1` suffix that also moves when the checkout directory is renamed.
 - The cost, stated once: a container name is unique per host, so the local and production stacks cannot run side by side (bring one `down` first), and no service can be `--scale`d. Neither is something this stack does: it is one server, one instance of each service.
 
-**The project name is pinned too** (`name: ema-paper` in both full stacks). Compose would otherwise take it from the checkout directory, and the named volumes (`ema-paper_pgdata`, `ema-paper_figures`, …) and the default network are prefixed with it: a renamed checkout would come up on fresh, empty volumes beside its own data.
+**The project name is pinned too** (`name: ema-paper` in both full stacks). Compose would otherwise take it from the checkout directory, and the named volumes (`ema-paper_pgdata`, `ema-paper_figures`, …) and the default network are prefixed with it: a renamed checkout would come up on fresh, empty volumes beside its own data. An install whose containers are named `sightread-*` ran on files without the pin and moves its data first ([self-hosting.md](./self-hosting.md) § Keep it running).
 
 ### `docker-compose.yaml` — local
 
@@ -84,7 +84,7 @@ The rules of a pass:
 
 Restore is all three of one stamp:
 
-- `pg_restore -d sightread backups/<stamp>/sightread.dump`.
+- The dump, with `worker` and `api` stopped (`docker compose -f … stop worker api`): `docker compose -f … exec -T backup sh -c 'dropdb "$PGDATABASE" && createdb "$PGDATABASE" && pg_restore -d "$PGDATABASE" /backups/<stamp>/sightread.dump'`, the database the service's environment names, its `/backups` being `./backups`.
 - The figures archive untarred back into the volume: `tar -xzf figures.tar.gz -C /data` inside a container mounting it.
 - The workspaces archive untarred into `WORKSPACES_HOST_DIR`: `tar -xzf workspaces.tar.gz --strip-components=1 -C <WORKSPACES_HOST_DIR>`. This restores into the directory whatever its name, since the archive's entries start with `workspaces/`.
 

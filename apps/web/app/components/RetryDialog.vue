@@ -16,6 +16,7 @@
 import {
   CHECK_AGENT,
   creditsRefusalOf,
+  documentPageImageUrl,
   getDocumentPages,
   PARSE_AGENT,
   retryDocument,
@@ -155,7 +156,7 @@ async function retry() {
           <img
             v-if="!broken.has(page.page)"
             class="page-image"
-            :src="`/api/library/documents/${document.id}/pages/${page.page}/image`"
+            :src="documentPageImageUrl(document.id, page.page)"
             :alt="t('files.retry.pageImage', { n: page.page })"
             loading="lazy"
             decoding="async"

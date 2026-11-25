@@ -211,5 +211,5 @@ ema-paper/
 ### Web
 
 - Pages and components stay thin: a rule that can be pure is a framework-free module in `app/lib/` with a vitest test, and shared reactive state is a composable.
-- All API access goes through the one typed client, `app/lib/api.ts`.
+- All API access goes through the one typed client, `app/lib/api.ts`. Every request is one of its functions, and every API URL the browser requests itself — an `<img>` or `<video>` source, a link or navigation, the `EventSource` of a conversation's stream — comes from one of its URL builders.
 - The console's permission logic is the pure `app/lib/admin.ts`, so it is tested without a DOM; the console reads permissions from `useAdminConsole` only.

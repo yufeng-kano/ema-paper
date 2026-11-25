@@ -997,6 +997,12 @@ export function deleteAccount(): Promise<void> {
   return request<undefined>('DELETE', '/api/account')
 }
 
+/** Where *Sign in with Google* leads: the OIDC flow, which returns the visitor to
+ *  `WEB_URL/<locale>` (docs/auth.md § 1). A navigation, never a `fetch`. */
+export function loginUrl(locale: string): string {
+  return `/api/auth/login?locale=${encodeURIComponent(locale)}`
+}
+
 export function devLogin(): Promise<{ user: { id: number; email: string } }> {
   return request('POST', '/api/auth/dev-login')
 }
@@ -1299,7 +1305,8 @@ export function getDocumentPages(id: number): Promise<{ pages: DocumentPage[] }>
 }
 
 /** A failed parse back on the queue for the pages it is missing, on `model` — null runs
- *  them on the job's own (docs/jobs.md § Retrying failed pages). */
+ *  them on the job's own while the deployment offers it, else on `PARSE_MODEL`
+ *  (docs/jobs.md § Retrying failed pages). */
 export function retryDocument(id: number, model: string | null): Promise<{ job_id: string; status: JobStatus }> {
   return request('POST', `/api/library/documents/${id}/retry`, { model })
 }
@@ -1332,11 +1339,42 @@ export function documentFileUrl(id: number, download = false): string {
   return `/api/library/documents/${id}/file${download ? '?download=1' : ''}`
 }
 
+/** The head of a file as text, for its plain-text preview: a Range read of its first
+ *  `bytes`, `partial` when the answer is a 206. A failed answer throws. */
+export async function readDocumentFileHead(id: number, bytes: number): Promise<{ text: string; partial: boolean }> {
+  const response = await fetch(documentFileUrl(id), {
+    headers: { Range: `bytes=0-${bytes - 1}` },
+    credentials: 'same-origin',
+  })
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`)
+  }
+  return { text: await response.text(), partial: response.status === 206 }
+}
+
 /** A parsed document's original, inline, for the Original view — as a save with
  *  `download`, a failed parse's *Download original* (docs/api.md
  *  § `GET /api/library/documents/{id}/original`). */
 export function documentOriginalUrl(id: number, download = false): string {
   return `/api/library/documents/${id}/original${download ? '?download=1' : ''}`
+}
+
+/** One page of a document's original as an image, for an `<img>` (docs/api.md
+ *  § `GET /api/library/documents/{id}/pages/{page}/image`). */
+export function documentPageImageUrl(id: number, page: number): string {
+  return `/api/library/documents/${id}/pages/${page}/image`
+}
+
+/** The prefix of a parsed document's figure crops, `/{page}/{bbox}` under it (docs/api.md
+ *  § `GET /api/library/documents/{id}/figures/{page}/{ymin},{xmin},{ymax},{xmax}`). */
+export function documentFiguresBase(id: number): string {
+  return `/api/library/documents/${id}/figures`
+}
+
+/** The prefix of a document's inserted images, `/{name}` under it (docs/api.md
+ *  § `GET /api/library/documents/{id}/images/{name}`). */
+export function documentImagesBase(id: number): string {
+  return `/api/library/documents/${id}/images`
 }
 
 /** The view the reader switched a document to, remembered for its next opening

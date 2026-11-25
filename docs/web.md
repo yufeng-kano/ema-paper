@@ -2521,7 +2521,7 @@ So while a text field inside the viewer has focus — the block editor, the note
   - **Parts outside a page's first load:**
     - on `/files`, the result viewer and the Agent card's chat (`ResultViewer`, `ChatPanel`);
     - in the signed-in layout — `/files` and every `/admin` page alike — the settings dialog's Agent section, the only part with the rich editor (TipTap/ProseMirror, KaTeX), its own chunk (`LazySettingsAgentSection` in `SettingsDialog.vue`).
-  - Each such part is fetched at idle once its page has mounted (`requestIdleCallback` with a 3 s timeout; a 1.5 s `setTimeout` where the browser has none, Safari), so it opens at once later. Every signed-in page still downloads the editor's chunk, after the load rather than with it.
+  - Each such part is fetched at idle once its page has mounted (`useIdleWarmUp`: `requestIdleCallback` with a 3 s timeout; a 1.5 s `setTimeout` where the browser has none, Safari), so it opens at once later. Every signed-in page still downloads the editor's chunk, after the load rather than with it.
   - **A warm-up that fails runs the build check** (`$buildUpdate.check()`), which reloads onto the new build under the page's holds, a non-empty upload queue kept. Nuxt's chunk-error reload covers only a chunk that fails during a route navigation — opening Settings is a query push — so without this a lazy part whose chunk a deploy has since replaced would render nothing.
 - **The browser tab title is the site name (`app.name`) on every page,** set once in `app.vue`. Authed pages do not set per-page titles, so the tab reads "Ema Paper" across tab switches. The public pages override it with their SEO titles.
 - **i18n:** every user-visible string goes through the catalog; en and zh-TW ship together.

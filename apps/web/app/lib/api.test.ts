@@ -14,8 +14,10 @@ import {
   isDevLoginAvailable,
   listAdminAudit,
   listAdminCodes,
+  loginUrl,
   putAgentSettings,
   putDocumentContent,
+  readDocumentFileHead,
   removeAdminGroupMember,
   revertRevision,
   sendMessage,
@@ -196,6 +198,30 @@ describe('workspace and chat routes', () => {
 
   it('builds the event stream URL from the last seen sequence', () => {
     expect(conversationEventsUrl(3, 41)).toBe('/api/conversations/3/events?after=41')
+  })
+})
+
+describe('a file preview', () => {
+  it('reads a file’s head with a Range on the session cookie, a 206 as partial', async () => {
+    const fetchMock = stubFetch(new Response('abc', { status: 206 }))
+
+    await expect(readDocumentFileHead(7, 3)).resolves.toEqual({ text: 'abc', partial: true })
+    expect(fetchMock).toHaveBeenCalledWith('/api/library/documents/7/file', expect.anything())
+    expect(lastInit(fetchMock).credentials).toBe('same-origin')
+    expect(headersOf(fetchMock).Range).toBe('bytes=0-2')
+  })
+
+  it('throws on a failed answer', async () => {
+    stubFetch(new Response('', { status: 404 }))
+
+    await expect(readDocumentFileHead(7, 3)).rejects.toThrow('HTTP 404')
+  })
+})
+
+describe('loginUrl', () => {
+  it('leads sign-in to the OIDC flow with the locale escaped', () => {
+    expect(loginUrl('zh-TW')).toBe('/api/auth/login?locale=zh-TW')
+    expect(loginUrl('a&b')).toBe('/api/auth/login?locale=a%26b')
   })
 })
 
