@@ -188,6 +188,7 @@ ema-paper/
 ### The workspace and the sandbox
 
 - `workspace/` is the only package that touches `WORKSPACES_DIR`: everything else reaches a user's files through its functions, because every open there goes through `safe_io.py`, which follows no link a shell could have planted.
+- The one exception is a document's original, kept outside the mount where no command reaches: `jobs/intake.py` copies it for a retry and reads it for a re-convert, at the path `original_of` answers.
 - `workspace/` is the only package that runs git.
 - `sandbox/client.py` is the only module that calls the sandbox runner.
 - The runner (`apps/sandbox`) is the only process with the Docker socket.
@@ -195,14 +196,16 @@ ema-paper/
 
 ### Agents, the queue and billing
 
-- `agents/` defines agents and nothing else: no HTTP, no database; the runners and the settings consume its definitions ([agents.md](./agents.md)).
-- `jobs/queue.py` is the only module that knows the queue is PostgreSQL: the claim, the requeue and the worker lock.
+- `agents/` defines agents: no HTTP, no database; the runners and the settings consume its definitions ([agents.md](./agents.md)).
+- The one file it writes is the resized copy of a page's render that `agents/bbox.py` sends a model whose box convention needs that size; the runner deletes it after the call (`PreparedImage.cleanup`).
+- `jobs/queue.py` is the only module that knows the queue is PostgreSQL: the claim, the requeue, the worker lock and the lock that keeps a user's queued work from being claimed.
 - `billing/plans.py` and `billing/credits.py` are pure: no HTTP, no database session; the rows and the clock are passed in.
 - `billing/pay.py` is the only writer of `subscriptions`, from Kano Pay's canonical answer, never from a notification's body.
 
 ### The operator console
 
 - `admin/` is the only package that decides a console permission or writes `groups`, `group_members`, `audit_log` and `runtime_settings`; `routes/admin.py` is thin over it.
+- A route that puts another area's field into its payload asks `Operator.can` (`admin/deps.py`), never the permission list itself.
 - The Google callback and the dev login call `join_owner_group` in `admin/groups.py` for the owner join.
 - Every console mutation writes its audit row through `admin/audit.py`, in the caller's transaction, before the route's one commit, so neither exists without the other.
 - Nothing outside `admin/` compares a group's name: a group counts by its permissions and its `builtin` flag.

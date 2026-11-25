@@ -400,12 +400,18 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             user_id,
             swept_originals,
         )
-    swept_images = await asyncio.to_thread(sweep_orphaned_images, root, live_ids)
-    if swept_images:
+    swept_folders, swept_copies = await asyncio.to_thread(sweep_orphaned_images, root, live_ids)
+    if swept_folders:
         logger.warning(
-            "reconcile for user %d: removed the images of %d document(s) whose rows are gone",
+            "reconcile for user %d: removed %d image folder(s) whose document rows are gone",
             user_id,
-            swept_images,
+            swept_folders,
+        )
+    if swept_copies:
+        logger.warning(
+            "reconcile for user %d: removed %d image staging cop(ies) a dead writer left",
+            user_id,
+            swept_copies,
         )
     swept_staging = await asyncio.to_thread(sweep_staged_uploads, root)
     if swept_staging:

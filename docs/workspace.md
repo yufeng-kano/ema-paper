@@ -168,6 +168,7 @@ An optional caption, on the next line
   - The image route serves the stored file, never the shell's copy.
 - **It goes with the document.**
   - The images are deleted with the row (and swept with the originals when a delete died before its cleanup).
+  - The same sweep removes an image's staging copy (`.tmp-img-<hash>.<ext>` in a live document's image directory) that a writer which crashed between its copy and its rename left behind, under the same lock. A stored image's name never carries that prefix, so none is taken.
   - They count against the quota.
   - Nothing removes an image the text no longer names: a revert or an undo can bring the line back, and the line must still show its picture.
 - **Only these names are images.** The viewer reads a line as an image only when it names `figures/img-` and sixteen hex digits with `.png` or `.jpg`. A URL is never one, so a document — an agent's edit included — cannot make the reader's browser fetch anything from anywhere else.

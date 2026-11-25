@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from sqlalchemy import Row, func, select
 from sqlalchemy.exc import InvalidRequestError
@@ -816,6 +817,27 @@ def original_of(root: Path, document_id: int) -> Path | None:
     return None
 
 
+def open_capped_original(source: Path, max_bytes: int) -> int | None:
+    """A descriptor on the original `original_of` answered, kept outside the mount — the
+    service's own directory, which no command reaches (docs/workspace.md § Layout) — by a
+    plain open that follows nothing. None when it is gone; `safe_io.UnsafeEntry` when it is
+    no plain file, `safe_io.EntryTooLarge` past `max_bytes`."""
+    try:
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise safe_io.UnsafeEntry(f"{source} is not a plain file")
+        if info.st_size > max_bytes:
+            raise safe_io.EntryTooLarge(f"{source} is larger than {max_bytes} bytes")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def unfiled_upload(job: Job) -> Path | None:
     """A finished parse's upload while its original is still being filed: the worker files
     it after the terminal commit, the sweep when that failed (docs/jobs.md § Retention).
@@ -1152,13 +1174,28 @@ async def keep_image(
             raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
 
 
-def image_of(root: Path, document_id: int, name: str) -> Path | None:
-    """The stored image `name` of a document, or None: only a name the store makes, only a
-    plain file."""
+def open_image(root: Path, document_id: int, name: str) -> BinaryIO | None:
+    """The stored image `name` of a document open for reading, kept outside the mount
+    beside the originals (docs/workspace.md § Inserted images) and opened by a plain open
+    that follows nothing. None for a name the store never makes, or when the image is
+    gone or no plain file."""
     if not IMAGE_NAME.fullmatch(name):
         return None
-    image = images_dir(root) / str(document_id) / name
-    return image if image.is_file() and not image.is_symlink() else None
+    try:
+        fd = os.open(
+            images_dir(root) / str(document_id) / name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _discard_adopted(root: Path, document_id: int, directory: Path) -> None:
@@ -1945,19 +1982,31 @@ def sweep_orphaned_originals(root: Path, live_ids: Collection[int]) -> int:
     return swept
 
 
-def sweep_orphaned_images(root: Path, live_ids: Collection[int]) -> int:
+def sweep_orphaned_images(root: Path, live_ids: Collection[int]) -> tuple[int, int]:
     """The images of documents whose rows are gone, as `sweep_orphaned_originals` takes
-    their originals, under the same lock."""
+    their originals, under the same lock; in a live document's directory, the staging
+    copies (`.tmp-img-<hash>.<ext>`) a writer died with before its rename. Every writer of
+    a stored image holds that lock, so no staging copy is still being written, and a
+    stored image's name never carries the prefix. Returns how many directories of gone
+    rows and how many staging copies it removed."""
     directory = images_dir(root)
     if not directory.is_dir():
-        return 0
-    swept = 0
+        return 0, 0
+    folders = staging = 0
     for entry in directory.iterdir():
-        if not entry.name.isdigit() or int(entry.name) in live_ids:
+        if not entry.name.isdigit():
             continue
-        shutil.rmtree(entry, ignore_errors=True)
-        swept += 1
-    return swept
+        if int(entry.name) not in live_ids:
+            shutil.rmtree(entry, ignore_errors=True)
+            folders += 1
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        for image in entry.iterdir():
+            if image.name.startswith(STAGING_PREFIX) and not image.is_dir():
+                image.unlink(missing_ok=True)
+                staging += 1
+    return folders, staging
 
 
 def sweep_aside(root: Path, keep: Collection[str] = ()) -> int:

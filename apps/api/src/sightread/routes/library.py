@@ -33,6 +33,7 @@ from starlette.concurrency import iterate_in_threadpool
 from ..agents import PARSE
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger
+from ..body_limit import is_multipart
 from ..db.models import (
     DOCUMENT_VIEWS,
     FILE_KIND,
@@ -737,7 +738,7 @@ async def upload_document(
     # A primitive copy: a retry inside `insert_named` follows a rollback, which expires
     # the row behind `user`, and an expired attribute cannot be loaded here.
     user_id = user.id
-    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+    if not is_multipart(request.headers.get("content-type", "")):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     # Cheap rejection before a byte is read: the largest body any kind may send — the
     # largest of the three caps, which a deployment may order as it likes; each kind's own
@@ -1385,8 +1386,8 @@ async def document_page_image(
 
 class ModelChoice(BaseModel):
     """The model a parse runs on, its padding stripped. None or a blank name is the
-    default: a retry sends the failed pages to the job's own model, a re-convert runs on
-    the parse agent's."""
+    default: a retry sends the failed pages to the job's own model while the deployment
+    offers it, else to `PARSE_MODEL`; a re-convert runs on the parse agent's."""
 
     model: str | None = Field(default=None, max_length=255)
 
@@ -1514,7 +1515,7 @@ IMAGE_CAP_NAME = "DOCUMENT_IMAGE_MAX_BYTES"
 async def upload_image(request: Request, user: SessionUser, db: DbSession, settings: AppSettings):
     """An image for a document's text: kept as the document's, its path answered for the
     markdown line the caller writes (docs/api.md)."""
-    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+    if not is_multipart(request.headers.get("content-type", "")):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     cap = settings.document_image_max_bytes
     # Bounded before the parser spools a byte, as an attachment's body is.
@@ -1556,18 +1557,14 @@ async def document_image(
 ):
     row = await live_text_document(db, user.id, document_id)
     root = user_root(settings.workspaces_dir, row.user_id)
-    image = workspace_documents.image_of(root, row.id, name)
-    if image is None:
+    handle = workspace_documents.open_image(root, row.id, name)
+    if handle is None:
         raise ApiError(404, "invalid_request", "No such image")
-    try:
-        handle = image.open("rb")
-    except OSError as exc:
-        raise ApiError(404, "invalid_request", "No such image") from exc
     size = os.fstat(handle.fileno()).st_size
     # Never cached, as a crop is not: a cached image would outlive a sign-out.
     return StreamingResponse(
         iterate_in_threadpool(crop_chunks(handle)),
-        media_type=workspace_documents.IMAGE_SUFFIX_MEDIA[image.suffix],
+        media_type=workspace_documents.IMAGE_SUFFIX_MEDIA[Path(name).suffix],
         headers={"Cache-Control": "private, no-store", "Content-Length": str(size)},
     )
 

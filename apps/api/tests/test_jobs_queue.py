@@ -435,8 +435,8 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(
         await db.commit()
         job_id, done_id = job.id, done.id
     settings = path_settings(tmp_path)
-    await fail_job(sessionmaker, settings, job_id, "internal error")
-    await fail_job(sessionmaker, settings, done_id, "internal error")
+    await fail_job(sessionmaker, settings, job_id)
+    await fail_job(sessionmaker, settings, done_id)
     async with sessionmaker() as db:
         failed = await db.get(Job, job_id)
         assert (failed.status, failed.error) == ("failed", "internal error")
@@ -621,12 +621,12 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
         assert (row.pages_done, row.status, row.worker_generation) == (0, "running", fresh)
         assert await counts(db) == (0, 1)
         assert await requeue_job(db, job_id, stale) is False
-    await fail_job(sessionmaker, settings, job_id, "internal error", stale)
+    await fail_job(sessionmaker, settings, job_id, stale)
     async with sessionmaker() as db:
         assert (await db.get(Job, job_id)).status == "running"
     # The owner's writes land.
     await _record_page(sessionmaker, job, outcome, fresh)
-    await fail_job(sessionmaker, settings, job_id, "internal error", fresh)
+    await fail_job(sessionmaker, settings, job_id, fresh)
     async with sessionmaker() as db:
         row = await db.get(Job, job_id)
         assert (row.pages_done, row.status, row.error) == (1, "failed", "internal error")

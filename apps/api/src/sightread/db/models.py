@@ -221,7 +221,8 @@ class Job(Base):
     prompt: Mapped[str] = mapped_column(Text)
     prompt_sha256: Mapped[str] = mapped_column(String(64), default="", server_default="")
     # The fallback a blocked page goes to, snapshotted at enqueue while the agent's
-    # `auto_fallback` was on; NULL otherwise (docs/parsing.md § Fallback model).
+    # `auto_fallback` was on, cleared by a retry once the deployment no longer offers it;
+    # NULL otherwise (docs/parsing.md § Fallback model).
     fallback_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # The model a retry runs the remaining pages on; NULL is `model` (docs/jobs.md
     # § Retrying failed pages). Neither is part of the dedup key.

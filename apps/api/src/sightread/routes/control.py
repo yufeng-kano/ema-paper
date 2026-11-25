@@ -58,7 +58,7 @@ from ..db.session import commit_or_conflict
 from ..errors import ApiError
 from ..jobs import chat_memory, chat_runner
 from ..jobs.intake import PDF_MEDIA_TYPE
-from ..jobs.queue import count_active_turns
+from ..jobs.queue import count_active_turns, lock_queued_work
 from ..jobs.sweeper import discard_account
 from ..parsing.attachments import ATTACHMENT_EXTENSIONS
 from ..parsing.images import ACCEPTED_IMAGE_TYPES
@@ -357,20 +357,9 @@ async def delete_account(
             await db.commit()
             raise ApiError(409, "checkout_open", "A checkout you started can still be paid")
 
-        # Queued work is locked, so the claims' SKIP LOCKED passes it by, and goes with
-        # the account; running work would go on writing files and usage as it goes.
-        await db.execute(
-            select(Job.id).where(Job.user_id == user_id, Job.status == "queued").with_for_update()
-        )
-        await db.execute(
-            select(ChatTurn.id)
-            .where(
-                ChatTurn.user_id == user_id,
-                ChatTurn.status == "queued",
-                ChatTurn.finished_at.is_(None),
-            )
-            .with_for_update()
-        )
+        # Queued work is locked, so no claim starts it, and goes with the account;
+        # running work would go on writing files and usage as it goes.
+        await lock_queued_work(db, user_id)
         running_job = await db.scalar(
             select(Job.id).where(Job.user_id == user_id, Job.status == "running").limit(1)
         )

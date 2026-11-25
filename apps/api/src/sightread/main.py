@@ -33,8 +33,9 @@ from .routes import (
 )
 from .runtime_settings import RuntimeSettings
 
-# Signed cookie holding only the transient OIDC state/PKCE verifier during a login
-# round trip. The durable credential is the server-side session row.
+# Signed cookie holding the transient state of a sign-in or a connector consent: the
+# OIDC state and PKCE verifier, the page and locale the sign-in returns to, and the
+# consent token. The durable credential is the server-side session row.
 OIDC_STATE_COOKIE = "sr_oidc"
 OIDC_STATE_MAX_AGE_SECONDS = 600
 

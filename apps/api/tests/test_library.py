@@ -817,3 +817,33 @@ async def test_a_filing_whose_commit_rolled_back_leaves_no_file_behind(
     # The retry lands under the name the lost row would have had.
     filed = await upload(library, "notes.md", b"# Notes\n", "text/markdown")
     assert filed.status_code == 201 and filed.json()["name"] == "notes.md"
+
+
+async def test_the_upload_routes_read_a_multipart_label_in_any_letter_case(
+    library, documents
+) -> None:
+    """MIME types ignore case, as the body-limit middleware reads them: a
+    `Multipart/Form-Data` body on the Files upload, an inserted image and a chat attachment
+    is read as the form, and a body that is no form is still refused."""
+    created = await library.post(
+        "/api/library/documents/new", json={"name": "Draft"}, headers=CSRF_HEADERS
+    )
+    assert created.status_code == 201, created.text
+    uploads = {
+        "/api/library/documents": ({"file": ("notes.md", b"# Notes\n", "text/markdown")}, {}),
+        "/api/library/images": (
+            {"file": ("shot.png", documents["png"].read_bytes(), "image/png")},
+            {"document_id": str(created.json()["id"])},
+        ),
+        "/api/attachments": ({"file": ("notes.txt", b"Plain notes.\n", "text/plain")}, {}),
+    }
+    for route, (files, data) in uploads.items():
+        form = httpx.Request("POST", "http://test", files=files, data=data)
+        label = form.headers["content-type"].replace("multipart/form-data", "Multipart/Form-Data")
+        answer = await library.post(
+            route, content=form.read(), headers={**CSRF_HEADERS, "Content-Type": label}
+        )
+        assert answer.status_code == 201, (route, answer.text)
+        refused = await library.post(route, json={"file": "notes"}, headers=CSRF_HEADERS)
+        assert refused.status_code == 400, (route, refused.text)
+        assert refused.json()["error"]["message"] == "The upload must be multipart/form-data"

@@ -2083,7 +2083,7 @@ async def _drive_parse(ctx: TurnContext, job_id: uuid.UUID) -> Job | None:
             # never requeued, since the parse ran and billed (docs/jobs.md § Queue).
             logger.error("job %s raised past its runner", job_id, exc_info=run.exception())
             try:
-                await fail_job(ctx.sessionmaker, settings, job_id, "internal error", ctx.generation)
+                await fail_job(ctx.sessionmaker, settings, job_id, ctx.generation)
             except Exception:  # the next worker start requeues what stays running
                 logger.exception("could not fail job %s", job_id)
             continue

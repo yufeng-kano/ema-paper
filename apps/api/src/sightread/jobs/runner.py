@@ -765,7 +765,10 @@ async def _log_usage(
     sessionmaker: async_sessionmaker[AsyncSession], job: Job, usage: list[tuple[str, Usage]]
 ) -> None:
     """Calls a page billed, logged ahead of the page itself — unfenced, as `_record_page`
-    logs them."""
+    logs them. Calls that carried no usage (rate limited, refused for payment) open no
+    session."""
+    if not usage:
+        return
     async with sessionmaker() as db:
         db.add_all(_usage_rows(job, usage))
         await db.commit()
@@ -794,14 +797,13 @@ async def fail_job(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     job_id: uuid.UUID,
-    error: str,
     generation: int | None = None,
 ) -> None:
     """A job whose task raised past `run_job` (a database error while the terminal state
-    was being written, say): failed, never requeued — the parse ran and billed the user's
-    credits, and a fault of ours is no reason to run it again. A job no longer `running` (its
-    result committed before what raised), or no longer this worker's (docs/jobs.md
-    § Queue), is left as it is. A library row keeps its original here too."""
+    was being written, say): failed with `internal error`, never requeued — the parse ran
+    and billed the user's credits, and a fault of ours is no reason to run it again. A job
+    no longer `running` (its result committed before what raised), or no longer this
+    worker's (docs/jobs.md § Queue), is left as it is. A library row keeps its original here too."""
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
         if job is None or job.status != "running":
@@ -813,7 +815,7 @@ async def fail_job(
             sessionmaker,
             job_id,
             status="failed",
-            error=error,
+            error="internal error",
             settings=settings,
             generation=generation,
         )

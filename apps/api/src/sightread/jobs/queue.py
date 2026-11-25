@@ -515,13 +515,19 @@ def owned_by(generation: int | None) -> list[ColumnElement[bool]]:
 WORKER_LOCK_KEY = 7_312_024_001
 
 
+def has_worker_lock(engine: AsyncEngine) -> bool:
+    """Whether the database keeps a worker lock: PostgreSQL. The SQLite fallback has none,
+    and one worker is assumed."""
+    return engine.dialect.name == "postgresql"
+
+
 async def try_worker_lock(engine: AsyncEngine) -> AsyncConnection | None:
     """One worker per deployment, enforced: the connection that holds the session-level
     advisory lock, or None while another worker holds it. The recovery at start treats
     every `running` row as a dead worker's, which is only true of a singleton; a second
     worker process waits for the lock rather than taking the first one's jobs back
-    (docs/jobs.md). Not PostgreSQL (the SQLite fallback): no lock, one worker assumed."""
-    if engine.dialect.name != "postgresql":
+    (docs/jobs.md). Without a worker lock to take (`has_worker_lock`): None."""
+    if not has_worker_lock(engine):
         return None
     connection = await engine.connect()
     try:
@@ -876,6 +882,24 @@ async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUI
     )
     await db.commit()
     return turn_id if updated.rowcount == 1 else None
+
+
+async def lock_queued_work(db: AsyncSession, user_id: int) -> None:
+    """Lock the user's queued jobs and turns in the caller's transaction: the claims'
+    SKIP LOCKED passes them by until it ends, so none starts while the caller decides
+    their fate (an account deletion takes them with the account)."""
+    await db.execute(
+        select(Job.id).where(Job.user_id == user_id, Job.status == "queued").with_for_update()
+    )
+    await db.execute(
+        select(ChatTurn.id)
+        .where(
+            ChatTurn.user_id == user_id,
+            ChatTurn.status == "queued",
+            ChatTurn.finished_at.is_(None),
+        )
+        .with_for_update()
+    )
 
 
 async def fail_orphaned_turns(

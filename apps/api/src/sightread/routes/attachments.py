@@ -21,6 +21,7 @@ from fastapi import APIRouter, Request, Response, status
 from sqlalchemy import delete, func, select
 
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
+from ..body_limit import is_multipart
 from ..db.models import ChatAttachment, utcnow
 from ..errors import ApiError
 from ..jobs.intake import store_upload, upload_chunks
@@ -82,7 +83,7 @@ async def upload_attachment(
     request: Request, user: SessionUser, db: DbSession, settings: AppSettings
 ):
     user_id = user.id
-    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+    if not is_multipart(request.headers.get("content-type", "")):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     # A cheap refusal before a byte is read; the count under the user's lock below, once the
     # file is prepared, is the one that holds (docs/api.md).

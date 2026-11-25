@@ -159,6 +159,23 @@ async def test_an_image_needs_the_callers_document_and_the_csrf_header(writer, m
     assert absent.status_code == 404
 
 
+async def test_the_image_route_serves_only_a_plain_file(writer) -> None:
+    document_id = await _document(writer)
+    inserted = await _insert(writer, document_id, _image("PNG"))
+    assert inserted.status_code == 201, inserted.text
+    store = images_dir(writer.root) / str(document_id)
+    stored = store / inserted.json()["path"].removeprefix("figures/")
+    # A link under a name the store makes is never followed, nor a directory read.
+    link = store / f"img-{'3' * 16}.png"
+    link.symlink_to(stored)
+    (store / f"img-{'4' * 16}.png").mkdir()
+    for name in (link.name, f"img-{'4' * 16}.png"):
+        response = await writer.get(f"/api/library/documents/{document_id}/images/{name}")
+        assert response.status_code == 404, name
+    served = await writer.get(f"/api/library/documents/{document_id}/images/{stored.name}")
+    assert served.status_code == 200
+
+
 async def test_an_image_goes_into_a_parsed_document_and_comes_back_when_removed(
     writer,
 ) -> None:
@@ -188,7 +205,7 @@ async def test_the_images_of_rows_that_are_gone_are_swept(writer) -> None:
     orphan = images_dir(writer.root) / "999"
     orphan.mkdir()
     (orphan / f"img-{'1' * 16}.png").write_bytes(b"left behind")
-    assert sweep_orphaned_images(writer.root, {live}) == 1
+    assert sweep_orphaned_images(writer.root, {live}) == (1, 0)
     assert not orphan.exists()
     assert (images_dir(writer.root) / str(live)).is_dir()
 
@@ -232,3 +249,19 @@ async def test_me_lists_what_an_image_may_be(writer) -> None:
         "image/heif",
     ]
     assert limits["image_max_bytes"] == writer.app.state.settings.document_image_max_bytes
+
+
+async def test_a_staging_copy_a_dead_writer_left_is_swept_and_the_live_image_kept(writer) -> None:
+    document_id = await _document(writer)
+    inserted = await _insert(writer, document_id, _image("PNG"))
+    assert inserted.status_code == 201, inserted.text
+    store = images_dir(writer.root) / str(document_id)
+    live = store / inserted.json()["path"].removeprefix("figures/")
+    staged = store / f".tmp-img-{'2' * 16}.png"
+    staged.write_bytes(b"cut off before its rename")
+
+    assert sweep_orphaned_images(writer.root, {document_id}) == (0, 1)
+    assert not staged.exists()
+    assert live.is_file()
+    assert sweep_orphaned_images(writer.root, {document_id}) == (0, 0)
+    assert live.is_file()

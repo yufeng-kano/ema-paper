@@ -32,6 +32,7 @@ from .jobs.queue import (
     claim_next_turn,
     fail_orphaned_turns,
     fail_turn,
+    has_worker_lock,
     next_worker_generation,
     recover_unsettled_commands,
     release_worker_lock,
@@ -101,7 +102,7 @@ async def run_worker(stop: asyncio.Event) -> None:
     # the one being replaced in a rolling restart releases it as it stops.
     lock = None
     while lock is None and not stop.is_set():
-        if engine.dialect.name != "postgresql":
+        if not has_worker_lock(engine):
             break
         lock = await try_worker_lock(engine)
         if lock is None:
@@ -312,7 +313,7 @@ async def run_worker(stop: asyncio.Event) -> None:
                 # its user's cap. Failed, not requeued: the parse ran and billed.
                 logger.error("job %s raised past its runner", job_id, exc_info=ran.exception())
                 try:
-                    await fail_job(sessionmaker, snapshot, job_id, "internal error", generation)
+                    await fail_job(sessionmaker, snapshot, job_id, generation)
                 except Exception:  # the next start requeues what stays running
                     logger.exception("could not fail job %s", job_id)
     finally:

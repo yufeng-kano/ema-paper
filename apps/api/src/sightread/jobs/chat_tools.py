@@ -15,7 +15,6 @@ import io
 import math
 import os
 import shlex
-import stat
 import tempfile
 import warnings
 from dataclasses import dataclass, field
@@ -30,7 +29,13 @@ from ..parsing.images import JPEG_QUALITY, flatten_rgb
 from ..parsing.markdown import clean_bbox
 from ..sandbox.client import SandboxClient, SandboxRejected, SandboxUnavailable
 from ..workspace import git, safe_io
-from ..workspace.documents import IMAGE_FORMATS, MARKDOWN_KIND, DocumentPaths, original_of
+from ..workspace.documents import (
+    IMAGE_FORMATS,
+    MARKDOWN_KIND,
+    DocumentPaths,
+    open_capped_original,
+    original_of,
+)
 from ..workspace.layout import (
     CACHE_DIR,
     FIGURES_DIR,
@@ -759,26 +764,6 @@ def _model_image(
         )
 
 
-def _open_source(source: Path, max_bytes: int) -> int | None:
-    """A descriptor on the original kept outside the mount — the service's own directory,
-    which no command reaches (docs/workspace.md § Layout) — by a plain open that follows
-    nothing. None when it is gone."""
-    try:
-        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except FileNotFoundError:
-        return None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise safe_io.UnsafeEntry(f"{source} is not a plain file")
-        if info.st_size > max_bytes:
-            raise safe_io.EntryTooLarge(f"{source} is larger than {max_bytes} bytes")
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
 async def view_page(
     paths: DocumentPaths,
     tool_input: dict,
@@ -849,7 +834,7 @@ async def original_page_png(
     # Poppler gets the file as a descriptor opened without following anything, not as a
     # path it would resolve again (docs/workspace.md § Revisions).
     try:
-        fd = _open_source(source, max_bytes)
+        fd = open_capped_original(source, max_bytes)
     except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
         raise PageUnavailable("the original file could not be opened") from None
     if fd is None:

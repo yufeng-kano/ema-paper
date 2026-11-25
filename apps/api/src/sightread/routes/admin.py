@@ -294,7 +294,7 @@ async def get_user(
         )
     ).all()
     member_of = None
-    if "groups.read" in operator.permissions:
+    if operator.can("groups.read"):
         member_of = [
             {"id": group_id, "name": name, "builtin": builtin}
             for group_id, name, builtin in (
@@ -705,7 +705,7 @@ async def overview(operator: JobsReader, db: DbSession, settings: AppSettings):
     totals = (await db.execute(select(*USAGE_FIGURES).where(UsageLog.created_at >= today))).one()
     accounts = await db.scalar(select(func.count()).select_from(User))
     newest = None
-    if "audit.read" in operator.permissions:
+    if operator.can("audit.read"):
         newest = await _audit_page(
             db, page=1, size=min(OVERVIEW_AUDIT_RECORDS, settings.admin_page_size), area=None, q=""
         )
@@ -775,7 +775,7 @@ async def list_jobs(
     counts = dict((await db.execute(select(Job.status, func.count()).group_by(Job.status))).all())
     worker = await queue.worker_status(db)
     # An account's address is the users area's to show; without it the page names the id.
-    emails = "users.read" in operator.permissions
+    emails = operator.can("users.read")
     return {
         "items": [_job_payload(job, email if emails else None, worker) for job, email in rows],
         "total": total,
@@ -796,7 +796,7 @@ async def requeue_stuck_job(
     await db.commit()
     email = (
         await db.scalar(select(User.email).where(User.id == job.user_id))
-        if "users.read" in operator.permissions
+        if operator.can("users.read")
         else None
     )
     return _job_payload(job, email, worker)

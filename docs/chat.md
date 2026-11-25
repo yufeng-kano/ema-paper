@@ -1241,6 +1241,7 @@ The stored message is the record: an attached image is replayed like a page a to
 
 - **An early close.** A streamed response that ends without its `message_stop` — the connection closed after a `stop_reason` arrived but before the message was complete — is an early close, retried as transient, never stored or acted on.
 - **A retry.** A model call that fails transiently is retried. The deltas of the abandoned attempt are already in the stream, so a `retry` event marks the restart. The thread drops what the abandoned attempt streamed — everything since that round's last tool result — and keeps the rounds before it. The stored history never holds the abandoned attempt.
+- **A rate limit.** A 429 is retried after the upstream's own `Retry-After` when it sends one in whole seconds (followed as sent, not capped), else after exponential backoff, as a parse's is ([parsing.md](./parsing.md) § Upstream usage).
 - **A line past the cap.** A stream line is refused the moment its end is found past `UPSTREAM_SSE_LINE_MAX_BYTES`, or when it outgrows the cap without an end, never held or yielded first.
 - **A broken stream.** A stream whose blocks arrive out of order, or whose deltas or stops name a block that never started, is refused as broken and the call fails, rather than an answer with pieces missing being stored as complete.
 - **An upstream error.** An error the upstream reports is stored on the turn by its type alone (`The upstream reported an error (rate_limit_error)`); the provider's message text, which may echo request content, is never kept or shown.
