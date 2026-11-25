@@ -552,7 +552,7 @@ function refusalText(refusal: AttachmentRefusal): string {
     case 'type':
       return t('chat.attachmentUnsupported')
     case 'size':
-      return t('chat.attachmentTooLarge', { size: formatBytes(refusal.max, locale.value) })
+      return t('chat.attachmentTooLarge', { size: formatBytes(refusal.max, locale.value, { limit: true }) })
     case 'count':
       return t('chat.attachmentTooMany', { count: refusal.max })
   }

@@ -166,7 +166,7 @@ function onMoreSelect(key: string) {
         <div v-else class="text-pane">
           <pre class="text mono">{{ text }}</pre>
           <p v-if="textCut" class="text-cut">
-            {{ t('viewer.file.textCut', { size: formatBytes(TEXT_PREVIEW_MAX, locale) }) }}
+            {{ t('viewer.file.textCut', { size: formatBytes(TEXT_PREVIEW_MAX, locale, { limit: true }) }) }}
           </p>
         </div>
       </template>

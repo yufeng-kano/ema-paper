@@ -506,6 +506,8 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - UI and table text is 14px; secondary text 12–13px in `--muted`; the reader's prose has its own two sizes (§ Result viewer).
   - Labels are sentence case: nothing is set in tracked capitals.
   - Every figure carries `font-variant-numeric: tabular-nums`.
+  - A size is printed 1000-based in the page's locale (`formatBytes` in `app/lib/format.ts`), rounded to the nearest: *2.4 MB*, *512 MB*.
+    - A limit — a cap, a quota, a cut — is rounded down at the precision shown, so every file within the label is within the limit: the 20 MiB attachment cap reads *20.9 MB*, never *21 MB*.
 - **Geometry**: continuous rounded corners, concentric where one shape holds another.
   - `--radius-xs` 4px: a key cap, a highlight.
   - `--radius-sm` 6px: a gutter control in the document.

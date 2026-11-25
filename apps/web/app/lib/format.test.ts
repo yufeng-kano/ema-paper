@@ -9,6 +9,20 @@ describe('formatBytes', () => {
     expect(formatBytes(2_400_000, 'en')).toBe('2.4 MB')
     expect(formatBytes(10, 'en')).toBe('10 byte')
   })
+
+  it('rounds a limit down at the precision shown, so no file within the label is over it', () => {
+    expect(formatBytes(20_971_520, 'en', { limit: true })).toBe('20.9 MB')
+    expect(formatBytes(20_971_520, 'zh-TW', { limit: true })).toBe('20.9 MB')
+    expect(formatBytes(8_388_608, 'en', { limit: true })).toBe('8.3 MB')
+    // A round limit reads as it is.
+    expect(formatBytes(128_000_000, 'en', { limit: true })).toBe('128 MB')
+    expect(formatBytes(2_000_000_000, 'en', { limit: true })).toBe('2 GB')
+  })
+
+  it('rounds a size to the nearest', () => {
+    expect(formatBytes(20_971_520, 'zh-TW')).toBe('21 MB')
+    expect(formatBytes(8_388_608, 'en')).toBe('8.4 MB')
+  })
 })
 
 describe('formatMinorAmount', () => {

@@ -117,7 +117,7 @@ function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
           {{
             t('admin.users.storageUsed', {
               used: formatBytes(detail.storage.bytes, locale),
-              quota: formatBytes(detail.storage.quota_bytes, locale),
+              quota: formatBytes(detail.storage.quota_bytes, locale, { limit: true }),
             })
           }}
         </p>

@@ -176,6 +176,7 @@ export default {
     headTitle: 'API keys',
     listTitle: 'Active keys',
     activeCount: '{count} active',
+    keyCount: '{count} keys',
     nameLabel: 'Key name',
     create: 'Create key',
     createdTitle: 'Your new key',

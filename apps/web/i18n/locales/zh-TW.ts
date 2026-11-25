@@ -174,6 +174,7 @@ export default {
     headTitle: 'API 金鑰',
     listTitle: '使用中的金鑰',
     activeCount: '{count} 組使用中',
+    keyCount: '{count} 組金鑰',
     nameLabel: '金鑰名稱',
     create: '建立金鑰',
     createdTitle: '新金鑰',

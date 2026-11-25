@@ -109,6 +109,7 @@ async function confirmRevoke() {
     <div class="region">
       <UiPanel ref="keysPanel" :title="t('keys.listTitle')">
         <template #meta>
+          <span v-if="data">{{ t('keys.keyCount', { count: data.keys.length }) }}</span>
           <UiButton
             variant="ghost"
             size="xs"

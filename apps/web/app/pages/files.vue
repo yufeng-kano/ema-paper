@@ -700,7 +700,7 @@ function rejected(file: File): string | null {
   if (!cap || file.size <= cap.bytes) {
     return null
   }
-  const limit = formatBytes(cap.bytes, locale.value)
+  const limit = formatBytes(cap.bytes, locale.value, { limit: true })
   return t(cap.as === 'file' ? 'files.tooLargeFile' : 'files.tooLarge', { name: file.name, limit })
 }
 

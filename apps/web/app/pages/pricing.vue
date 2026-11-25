@@ -124,7 +124,7 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
             <p class="for">{{ t('pricing.freeFor') }}</p>
             <ul class="gives">
               <li>{{ t('pricing.creditsPerMonth', { n: formatCount(catalog.free.credits, locale) }, catalog.free.credits) }}</li>
-              <li>{{ t('pricing.storageKept', { size: formatBytes(catalog.free.storage_bytes, locale) }) }}</li>
+              <li>{{ t('pricing.storageKept', { size: formatBytes(catalog.free.storage_bytes, locale, { limit: true }) }) }}</li>
               <li>{{ t('pricing.jobsAtOnce', { n: formatCount(catalog.free.max_jobs, locale) }, catalog.free.max_jobs) }}</li>
               <li>{{ t('pricing.api') }}</li>
               <li>{{ catalog.free.sandbox ? t('pricing.chatSandbox') : t('pricing.chatNoSandbox') }}</li>
@@ -151,7 +151,7 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
               <ul class="gives">
                 <li>{{ t('pricing.creditsPerCycle', { n: formatCount(plan.credits, locale), cycle: cycleOf(plan) }, plan.credits) }}</li>
                 <li v-if="pack">{{ t('pricing.topUpGives') }}</li>
-                <li>{{ t('pricing.storageKept', { size: formatBytes(plan.storage_bytes, locale) }) }}</li>
+                <li>{{ t('pricing.storageKept', { size: formatBytes(plan.storage_bytes, locale, { limit: true }) }) }}</li>
                 <li>{{ t('pricing.jobsAtOnce', { n: formatCount(plan.max_jobs, locale) }, plan.max_jobs) }}</li>
                 <li>{{ t('pricing.api') }}</li>
                 <li>{{ plan.sandbox ? t('pricing.chatSandbox') : t('pricing.chatNoSandbox') }}</li>

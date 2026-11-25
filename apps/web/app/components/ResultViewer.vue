@@ -4176,7 +4176,7 @@ async function uploadImage(file: File): Promise<string | null> {
     return null
   }
   if (cap !== undefined && file.size > cap) {
-    showNote(t('viewer.imageTooLarge', { size: formatBytes(cap, locale.value) }), false)
+    showNote(t('viewer.imageTooLarge', { size: formatBytes(cap, locale.value, { limit: true }) }), false)
     return null
   }
   try {

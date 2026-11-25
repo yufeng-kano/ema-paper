@@ -58,7 +58,7 @@ const planGives = computed(() => {
   }
   return [
     t('usage.planCredits', { n: formatCount(plan.credits, locale.value) }, plan.credits),
-    t('usage.planStorage', { size: formatBytes(plan.storage_bytes, locale.value) }),
+    t('usage.planStorage', { size: formatBytes(plan.storage_bytes, locale.value, { limit: true }) }),
     t('usage.planJobs', { n: formatCount(plan.max_jobs, locale.value) }, plan.max_jobs),
     plan.sandbox ? t('usage.planSandbox') : t('usage.planNoSandbox'),
   ].join(' · ')
@@ -321,7 +321,7 @@ async function runSandboxAction(action: () => Promise<void>) {
               {{
                 t('usage.storageOf', {
                   used: formatBytes(sandbox.workspace.bytes, locale),
-                  quota: formatBytes(sandbox.workspace.quota_bytes, locale),
+                  quota: formatBytes(sandbox.workspace.quota_bytes, locale, { limit: true }),
                 })
               }}
             </p>

@@ -2424,7 +2424,7 @@ onBeforeUnmount(() => {
             : storage
               ? t('chat.blockedStorage', {
                   used: formatBytes(storage.bytes, locale),
-                  quota: formatBytes(storage.quota, locale),
+                  quota: formatBytes(storage.quota, locale, { limit: true }),
                 })
               : t('chat.blockedStorageBare')
         }}
@@ -2493,7 +2493,7 @@ onBeforeUnmount(() => {
     <div v-if="dragging" class="drop-zone" aria-hidden="true">
       <p class="drop-title">{{ dragging === 'rows' ? t('chat.dropRows') : t('chat.dropToAttach') }}</p>
       <p v-if="dragging === 'files' && maxAttachmentBytes" class="drop-kinds">
-        {{ t('chat.dropKinds', { size: formatBytes(maxAttachmentBytes, locale) }) }}
+        {{ t('chat.dropKinds', { size: formatBytes(maxAttachmentBytes, locale, { limit: true }) }) }}
       </p>
     </div>
 

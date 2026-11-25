@@ -63,10 +63,14 @@ export function formatCount(value: number, locale: string): string {
  * A file's size in the reader's own locale. 1000-based, because the unit names `Intl`
  * prints ("kB", "MB") are the 1000-based ones — pairing them with 1024 steps would label
  * 1024 bytes "1 kB" and be wrong by the width of the mismatch.
+ *
+ * A size rounds to the nearest. A `limit` — a cap, a quota, a cut — rounds down at the
+ * precision shown, so every file within the label is within the limit: 20 MiB reads
+ * "20.9 MB", where the nearest, "21 MB", would refuse a 20.99 MB file it seems to allow.
  */
 const BYTE_UNITS = ['byte', 'kilobyte', 'megabyte', 'gigabyte'] as const
 
-export function formatBytes(bytes: number, locale: string): string {
+export function formatBytes(bytes: number, locale: string, options: { limit?: boolean } = {}): string {
   let value = Math.max(0, bytes)
   let step = 0
   while (value >= 1000 && step < BYTE_UNITS.length - 1) {
@@ -79,5 +83,6 @@ export function formatBytes(bytes: number, locale: string): string {
     unitDisplay: 'short',
     // Whole bytes, and one decimal only where it says something: 1.4 MB, but 240 MB.
     maximumFractionDigits: step === 0 || value >= 100 ? 0 : 1,
+    roundingMode: options.limit ? 'floor' : 'halfExpand',
   }).format(value)
 }

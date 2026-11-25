@@ -49,7 +49,7 @@ const note = computed(() => {
   }
   if (key === 'FREE_STORAGE_BYTES') {
     return t('admin.settings.notes.FREE_STORAGE_BYTES', {
-      size: formatBytes(props.ceilings.WORKSPACE_QUOTA_BYTES, locale.value),
+      size: formatBytes(props.ceilings.WORKSPACE_QUOTA_BYTES, locale.value, { limit: true }),
     })
   }
   if (key === 'FREE_MAX_JOBS') {
@@ -72,7 +72,7 @@ const raw = computed(() => isJsonSetting(props.setting.key) && !prices.value && 
 const bytes = computed(() => {
   const value = Number(props.setting.value)
   return props.setting.key === 'FREE_STORAGE_BYTES' && Number.isSafeInteger(value)
-    ? formatBytes(value, locale.value)
+    ? formatBytes(value, locale.value, { limit: true })
     : null
 })
 
@@ -96,7 +96,7 @@ const planColumns = computed<TableColumn<PlanRow>[]>(() => [
     key: 'storage',
     header: t('admin.settings.plans.storage'),
     numeric: true,
-    value: (row) => formatBytes(row.storageBytes, locale.value),
+    value: (row) => formatBytes(row.storageBytes, locale.value, { limit: true }),
   },
   {
     key: 'jobs',
