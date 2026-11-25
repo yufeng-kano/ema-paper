@@ -25,9 +25,7 @@ from tests.conftest import (
     KANO_API_KEY,
     KANO_CHAT_URL,
     PARSE_MODEL,
-    TEST_DATABASE_URL,
     api_key_client,
-    postgres_only,
 )
 from tests.helpers import completion, drain_queue, staged_uploads, v1_parse, vision_stub
 
@@ -488,14 +486,13 @@ async def test_events_replay_the_final_state_of_a_terminal_job(
     assert payload["markdown"]
 
 
-@postgres_only
 @respx.mock
 async def test_the_event_stream_follows_a_job_it_is_already_watching(
     make_client, sessionmaker, documents
 ) -> None:
-    """The LISTEN/NOTIFY wakeup path, which only exists on PostgreSQL."""
+    """The LISTEN/NOTIFY wakeup path."""
     respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
-    client = await api_key_client(make_client(database_url=TEST_DATABASE_URL))
+    client = await api_key_client(make_client())
     job_id = (await v1_parse(client, documents["text_pdf"])).json()["job_id"]
 
     async def collect() -> list[str]:

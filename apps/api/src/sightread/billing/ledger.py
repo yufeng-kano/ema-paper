@@ -241,8 +241,8 @@ async def read_balances(
         )
         for user_id in user_ids
     }
-    # Keyed by the user alone, never by `period_start`: SQLite answers it naive, and the
-    # primary key holds one row per user and period.
+    # Keyed by the user alone: the query asks for one period per user, and the primary key
+    # holds one row per user and period.
     periods = {
         row.user_id: row
         for row in await db.scalars(

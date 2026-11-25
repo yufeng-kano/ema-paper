@@ -1,8 +1,4 @@
-"""Queue behaviour: page specs, dedup lookup, claiming and the retention sweeper.
-
-The `SKIP LOCKED` claim can only be exercised on PostgreSQL, so those tests skip unless
-`TEST_DATABASE_URL` points at one (docs/testing.md).
-"""
+"""Queue behaviour: page specs, dedup lookup, claiming and the retention sweeper."""
 
 from __future__ import annotations
 
@@ -29,7 +25,7 @@ from sightread.jobs.queue import (
 )
 from sightread.jobs.sweeper import sweep_uploads
 from sightread.upstream.client import PageTranscription, Usage
-from tests.conftest import path_settings, postgres_only
+from tests.conftest import path_settings
 from tests.factories import user_row
 
 JOB_DEFAULTS = {
@@ -281,7 +277,6 @@ async def test_requeue_keeps_the_pages_that_succeeded(sessionmaker, tmp_path) ->
         assert (done.status, done.pages_done) == ("succeeded", 3)
 
 
-@postgres_only
 async def test_one_worker_holds_the_worker_lock_at_a_time(sessionmaker) -> None:
     from sightread.jobs.queue import release_worker_lock, try_worker_lock
 
@@ -386,8 +381,6 @@ async def test_after_a_turn_the_worker_requeues_only_its_own_jobs_left_running(
         await db.commit()
         left_id, foreign_id = left.id, foreign.id
     async with sessionmaker() as db:
-        # Each taken after the last claim: the SQLite fallback counts from the highest
-        # generation on record (docs/jobs.md § Queue).
         other = await next_worker_generation(db)
         assert await claim_job(db, foreign_id, other)
         live = await next_worker_generation(db)
@@ -445,7 +438,6 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(
         assert (await db.get(Job, done_id)).status == "succeeded"
 
 
-@postgres_only
 async def test_two_claimers_never_take_the_same_job(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
@@ -560,7 +552,6 @@ async def test_a_job_of_a_user_with_an_orphaned_turn_is_not_claimed(sessionmaker
         assert await claim_next_job(db, 2, {user.id + 1000}) == job.id
 
 
-@postgres_only
 async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker, tmp_path) -> None:
     """A worker that lost the worker lock goes on for seconds; the replacement has
     requeued and claimed its job by then, and nothing the stale one writes may land —

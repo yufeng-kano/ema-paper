@@ -32,7 +32,6 @@ from .jobs.queue import (
     claim_next_turn,
     fail_orphaned_turns,
     fail_turn,
-    has_worker_lock,
     next_worker_generation,
     recover_unsettled_commands,
     release_worker_lock,
@@ -102,24 +101,18 @@ async def run_worker(stop: asyncio.Event) -> None:
     # the one being replaced in a rolling restart releases it as it stops.
     lock = None
     while lock is None and not stop.is_set():
-        if not has_worker_lock(engine):
-            break
         lock = await try_worker_lock(engine)
         if lock is None:
             logger.warning("another worker holds the worker lock; waiting for it")
             await pause(stop, WORKER_LOCK_RETRY_SECONDS)
-    if stop.is_set():
+    if lock is None or stop.is_set():
         if lock is not None:
             await release_worker_lock(lock)
         await engine.dispose()
         return
     # The lock is the session's: lost with it, so the worker stops — and the loop below
     # cancels the job or turn in flight — rather than run on beside a replacement.
-    lock_watch = (
-        asyncio.create_task(watch_worker_lock(lock, stop, WORKER_LOCK_PING_SECONDS))
-        if lock is not None
-        else None
-    )
+    lock_watch = asyncio.create_task(watch_worker_lock(lock, stop, WORKER_LOCK_PING_SECONDS))
     sessionmaker = create_sessionmaker(engine)
     # `.env`'s settings with the database's overrides on top, read again every
     # RUNTIME_SETTINGS_CACHE_SECONDS: each claim takes a snapshot, and the job or turn it
@@ -321,11 +314,9 @@ async def run_worker(stop: asyncio.Event) -> None:
         for task in background:
             task.cancel()
         await asyncio.gather(*background, return_exceptions=True)
-        if lock_watch is not None:
-            lock_watch.cancel()
-            await asyncio.gather(lock_watch, return_exceptions=True)
-        if lock is not None:
-            await release_worker_lock(lock)
+        lock_watch.cancel()
+        await asyncio.gather(lock_watch, return_exceptions=True)
+        await release_worker_lock(lock)
         await engine.dispose()
 
 

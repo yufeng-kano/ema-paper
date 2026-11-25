@@ -193,8 +193,7 @@ async def change(
     never a copy taken before."""
     if key not in OVERRIDABLE:
         raise ApiError(422, "invalid_request", f"key: one of {', '.join(OVERRIDABLE)}")
-    if db.get_bind().dialect.name == "postgresql":
-        await db.execute(sql("SELECT pg_advisory_xact_lock(:key)"), {"key": SETTINGS_LOCK_KEY})
+    await db.execute(sql("SELECT pg_advisory_xact_lock(:key)"), {"key": SETTINGS_LOCK_KEY})
     rows = {
         row.key: row
         for row in (

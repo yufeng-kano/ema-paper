@@ -20,7 +20,7 @@ from sqlalchemy import select, update
 from sightread.db.models import Document, Job, JobPage, Result
 from sightread.workspace import safe_io
 from sightread.workspace.filing import DOCUMENT_NAME_MAX, clean_name, free_name
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL, postgres_only, sign_in
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL, sign_in
 from tests.helpers import account_client, drain_queue, post_folder, read_library, staged_uploads
 from tests.library_helpers import fail_next_commit, ready_to_parse, upload, upload_png
 
@@ -563,7 +563,6 @@ async def test_an_upload_named_only_by_separators_is_filed_as_upload(library, do
     assert created.json()["name"] == "upload"
 
 
-@postgres_only  # only PostgreSQL is asked for an isolation level
 async def test_the_library_read_reuses_the_request_session_for_its_snapshot(library) -> None:
     import warnings
 
@@ -716,7 +715,6 @@ async def test_a_created_folder_is_a_directory_at_once(make_client) -> None:
     }
 
 
-@postgres_only  # the foreign key only fails on PostgreSQL
 async def test_a_parent_deleted_during_the_insert_is_a_404_not_a_500(
     library, sessionmaker, monkeypatch
 ) -> None:

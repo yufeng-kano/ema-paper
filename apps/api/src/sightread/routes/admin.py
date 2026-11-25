@@ -709,10 +709,7 @@ async def overview(operator: JobsReader, db: DbSession, settings: AppSettings):
         newest = await _audit_page(
             db, page=1, size=min(OVERVIEW_AUDIT_RECORDS, settings.admin_page_size), area=None, q=""
         )
-    # Unknown off PostgreSQL, where no lock says whether a worker runs.
-    stuck = None
-    if worker.state != "unknown":
-        stuck = sum(queue.job_is_stuck(job, worker) for job in running)
+    stuck = sum(queue.job_is_stuck(job, worker) for job in running)
     # Every database read is done, so one that failed has answered without asking a catalog;
     # and the session's connection goes back to the pool before the probes, so a slow
     # upstream holds none. The two run together, each bounded by ADMIN_PROBE_TIMEOUT_SECONDS
@@ -821,7 +818,7 @@ async def usage(
             f"The range spans more than {settings.admin_usage_max_days} days",
         )
     # Aware UTC bounds (the column refuses naive ones); the database session is pinned to
-    # UTC, so `date()` is the UTC day on PostgreSQL and SQLite alike.
+    # UTC, so `date()` is the UTC day.
     window = (
         UsageLog.created_at >= datetime.combine(first, time.min, UTC),
         UsageLog.created_at <= datetime.combine(last, time.max, UTC),
@@ -839,9 +836,8 @@ async def usage(
     return {
         "from": first,
         "to": last,
-        # PostgreSQL answers a date, SQLite a string.
         "rows": [
-            {"date": str(row[0])[:10], "model": row[1], **usage_totals(row[2:])} for row in rows
+            {"date": row[0].isoformat(), "model": row[1], **usage_totals(row[2:])} for row in rows
         ],
         "totals": usage_totals(totals),
     }

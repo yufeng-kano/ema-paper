@@ -74,7 +74,7 @@ const services = computed<ServiceRow[]>(() => {
     {
       key: 'worker',
       name: t('admin.overview.worker'),
-      tone: worker.state === 'running' ? 'ok' : worker.state === 'stopped' ? 'danger' : 'neutral',
+      tone: worker.state === 'running' ? 'ok' : 'danger',
       state: states(worker.state),
       line:
         worker.state === 'running'
@@ -84,9 +84,7 @@ const services = computed<ServiceRow[]>(() => {
                 generation: worker.generation,
                 time: worker.since ? formatShortDateTime(worker.since, locale.value) : '—',
               })
-          : worker.state === 'stopped'
-            ? t('admin.overview.workerStopped')
-            : t('admin.overview.workerUnknownLine'),
+          : t('admin.overview.workerStopped'),
       fact: worker.state === 'running' ? t('admin.overview.holdsLock') : null,
     },
     {
@@ -200,8 +198,7 @@ function usageRowAttrs(row: UsageRow): Record<string, unknown> {
             <p class="tile-label">{{ t('admin.overview.running') }}</p>
             <p class="tile-value tabular">{{ count(data.jobs.running) }}</p>
             <p class="tile-foot">
-              <template v-if="data.jobs.stuck === null">{{ t('admin.overview.workerUnknown') }}</template>
-              <template v-else-if="data.jobs.stuck > 0">
+              <template v-if="data.jobs.stuck > 0">
                 <span class="stuck">{{ t('admin.overview.stuck', { n: count(data.jobs.stuck) }) }}</span>
                 ·
                 <NuxtLink :to="localePath({ path: '/admin/jobs', query: { status: 'running' } })">

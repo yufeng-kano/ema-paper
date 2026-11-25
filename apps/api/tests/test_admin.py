@@ -35,7 +35,7 @@ from tests.admin_helpers import (
     last_audit_id,
     owner_client,
 )
-from tests.conftest import CSRF_HEADERS, postgres_only
+from tests.conftest import CSRF_HEADERS
 from tests.connector_helpers import oauth_connected
 from tests.helpers import mint_upload_ticket
 
@@ -385,7 +385,6 @@ async def test_taking_an_address_out_of_owner_emails_revokes_nothing(make_client
     assert (await later.get("/api/admin/me")).json()["permissions"] == list(ALL_PERMISSIONS)
 
 
-@postgres_only
 async def test_owner_sign_ins_at_once_never_fail(make_client, monkeypatch) -> None:
     """Two different owners on a database with no built-in group race to create it, and
     the same owner twice races to join: each sign-in succeeds, one group, one membership
@@ -843,7 +842,7 @@ async def _owner_count(client: AsyncClient, builtin: int) -> int:
 
 
 async def _until_a_request_waits_on_a_lock(client: AsyncClient) -> None:
-    """Until another connection of this database waits on a lock (PostgreSQL)."""
+    """Until another connection of this database waits on a lock."""
     for _ in range(250):
         async with client.app.state.sessionmaker() as probe:
             waiting = await probe.scalar(
@@ -858,7 +857,6 @@ async def _until_a_request_waits_on_a_lock(client: AsyncClient) -> None:
     raise AssertionError("no request waited on the lock")
 
 
-@postgres_only
 async def test_two_owners_removing_each_other_at_once_leave_one(make_client) -> None:
     """The second removal runs under the group's row lock after the first, and reads its
     operator's permissions there: removed by the first, they hold nothing any more."""
@@ -876,7 +874,6 @@ async def test_two_owners_removing_each_other_at_once_leave_one(make_client) -> 
     assert await _owner_count(first, builtin) == 1
 
 
-@postgres_only
 async def test_an_owner_removing_the_other_and_themselves_at_once_stays(make_client) -> None:
     """The members are counted under the group's row lock, so the second removal sees the
     first: the group keeps its last member."""
@@ -894,7 +891,6 @@ async def test_an_owner_removing_the_other_and_themselves_at_once_stays(make_cli
     assert await _owner_count(first, builtin) == 1
 
 
-@postgres_only
 async def test_an_owner_removed_while_their_request_waits_holds_nothing_when_it_runs(
     make_client,
 ) -> None:
@@ -927,7 +923,6 @@ async def test_an_owner_removed_while_their_request_waits_holds_nothing_when_it_
     assert await audit_rows(first, start) == []
 
 
-@postgres_only
 async def test_adding_an_account_mid_sign_in_neither_waits_nor_deadlocks(make_client) -> None:
     """A Google sign-in updates its account's row and inserts a session that references it,
     then waits on the owner group's row lock; adding that account to the owner group holds
@@ -1283,7 +1278,6 @@ async def test_console_mutations_require_the_custom_header(
 # --- deleting an account --------------------------------------------------------------
 
 
-@postgres_only
 async def test_deleting_an_account_takes_its_memberships_and_keeps_its_records(make_client) -> None:
     owner = await owner_client(make_client)
     member = await account_client(make_client, "member@example.test")

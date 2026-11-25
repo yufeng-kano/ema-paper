@@ -19,7 +19,6 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import (
     ColumnElement,
-    LargeBinary,
     Text,
     bindparam,
     cast,
@@ -108,37 +107,6 @@ CLAIM_SQL = text(
       FOR UPDATE SKIP LOCKED LIMIT 1
     )
     RETURNING id
-    """
-).bindparams(
-    bindparam("excluded_users", expanding=True), bindparam("paid_statuses", expanding=True)
-)
-
-# SQLite has neither SKIP LOCKED nor row locks. The fallback keeps the whole test suite
-# runnable with no services; the guarded UPDATE still makes a double claim impossible.
-CLAIM_SQL_SQLITE_SELECT = text(
-    """
-    SELECT j.id FROM jobs j
-    WHERE j.status = 'queued'
-      AND j.user_id NOT IN :excluded_users
-      AND (
-        SELECT count(*) FROM jobs running
-        WHERE running.user_id = j.user_id AND running.status = 'running'
-      ) < MIN(
-        :max_jobs_per_user,
-        COALESCE(
-          (
-            SELECT json_extract(:plan_jobs, '$."' || s.plan_id || '"') FROM subscriptions s
-            WHERE s.user_id = j.user_id AND s.status IN :paid_statuses
-              AND s.period_start <= :now AND :now < s.period_end
-          ),
-          (
-            SELECT json_extract(:plan_jobs, '$."' || g.plan_id || '"') FROM plan_grants g
-            WHERE g.user_id = j.user_id AND g.period_end IS NOT NULL AND :now < g.period_end
-          ),
-          :free_max_jobs
-        )
-      )
-    ORDER BY j.created_at LIMIT 1
     """
 ).bindparams(
     bindparam("excluded_users", expanding=True), bindparam("paid_statuses", expanding=True)
@@ -277,11 +245,8 @@ async def hold_dedup_key(db: AsyncSession, **key) -> None:
 
     Keyed on a hash of the dedup key, so it only ever blocks a request that was about to
     parse the same document for the same account; a hash collision costs two unrelated
-    uploads a few milliseconds and nothing else. PostgreSQL only, like the claim query: the
-    SQLite fallback runs one process at a time and has nothing to serialize.
+    uploads a few milliseconds and nothing else.
     """
-    if db.get_bind().dialect.name != "postgresql":
-        return
     fingerprint = "\x1f".join(f"{name}={value!r}" for name, value in sorted(key.items()))
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:fingerprint))"),
@@ -459,22 +424,9 @@ async def claim_next_job(
         "free_max_jobs": max_jobs_per_user if free_max_jobs is None else free_max_jobs,
         "now": utcnow(),
     }
-    if db.get_bind().dialect.name == "postgresql":
-        claimed = (await db.execute(CLAIM_SQL, params)).scalar_one_or_none()
-        await db.commit()
-        return claimed
-
-    candidate = (await db.execute(CLAIM_SQL_SQLITE_SELECT, params)).scalar_one_or_none()
-    if candidate is None:
-        return None
-    job_id = uuid.UUID(str(candidate))
-    updated = await db.execute(
-        update(Job)
-        .where(Job.id == job_id, Job.status == "queued")
-        .values(status="running", started_at=utcnow(), worker_generation=generation)
-    )
+    claimed = (await db.execute(CLAIM_SQL, params)).scalar_one_or_none()
     await db.commit()
-    return job_id if updated.rowcount == 1 else None
+    return claimed
 
 
 async def claim_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None) -> bool:
@@ -495,15 +447,11 @@ async def claim_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None)
 
 async def next_worker_generation(db: AsyncSession) -> int:
     """The generation a worker takes with the worker lock and writes on every job it
-    claims (docs/jobs.md § Queue). PostgreSQL: the next value of a sequence, so no two
-    workers ever hold one generation — the stale one keeps making paid calls for the
-    seconds before it notices its lock is gone, and the replacement has requeued and
-    claimed its job by then. The SQLite fallback runs one worker: past the highest on
-    record."""
-    if db.get_bind().dialect.name == "postgresql":
-        return int((await db.execute(select(WORKER_GENERATION_SEQ.next_value()))).scalar_one())
-    highest = (await db.execute(select(func.max(Job.worker_generation)))).scalar_one()
-    return int(highest or 0) + 1
+    claims (docs/jobs.md § Queue): the next value of a sequence, so no two workers ever
+    hold one generation — the stale one keeps making paid calls for the seconds before it
+    notices its lock is gone, and the replacement has requeued and claimed its job by
+    then."""
+    return int((await db.execute(select(WORKER_GENERATION_SEQ.next_value()))).scalar_one())
 
 
 def owned_by(generation: int | None) -> list[ColumnElement[bool]]:
@@ -515,20 +463,12 @@ def owned_by(generation: int | None) -> list[ColumnElement[bool]]:
 WORKER_LOCK_KEY = 7_312_024_001
 
 
-def has_worker_lock(engine: AsyncEngine) -> bool:
-    """Whether the database keeps a worker lock: PostgreSQL. The SQLite fallback has none,
-    and one worker is assumed."""
-    return engine.dialect.name == "postgresql"
-
-
 async def try_worker_lock(engine: AsyncEngine) -> AsyncConnection | None:
     """One worker per deployment, enforced: the connection that holds the session-level
     advisory lock, or None while another worker holds it. The recovery at start treats
     every `running` row as a dead worker's, which is only true of a singleton; a second
     worker process waits for the lock rather than taking the first one's jobs back
-    (docs/jobs.md). Without a worker lock to take (`has_worker_lock`): None."""
-    if not has_worker_lock(engine):
-        return None
+    (docs/jobs.md)."""
     connection = await engine.connect()
     try:
         # Autocommit: a session-level lock outlives transactions, and a connection
@@ -584,8 +524,7 @@ WORKER_LOCK_OBJID = WORKER_LOCK_KEY & 0xFFFF_FFFF
 class WorkerStatus:
     """Whether a worker runs, as the worker lock says (docs/jobs.md § Queue): `running`
     while a session holds it — `since` that session's start, `generation` the live
-    generation, None before any worker took one — `stopped` while none does, and
-    `unknown` off PostgreSQL, which has no lock to read."""
+    generation, None before any worker took one — and `stopped` while none does."""
 
     state: str
     since: datetime | None = None
@@ -598,8 +537,6 @@ async def worker_status(db: AsyncSession) -> WorkerStatus:
     worker down would hold the lock itself, and a session lock left on a pooled API
     connection would keep every worker from starting — and never `nextval`, which would
     use a generation up."""
-    if db.get_bind().dialect.name != "postgresql":
-        return WorkerStatus("unknown")
     holder = (
         await db.execute(
             text(
@@ -627,10 +564,9 @@ def job_is_stuck(job: Job, worker: WorkerStatus) -> bool:
     """A `running` job no live worker drives: the worker is stopped, or runs with another
     generation than the job's — a job a dead or stale worker left, which only a worker's
     start-up or the console puts back (docs/jobs.md § Queue). Never one the live worker
-    runs, and nothing while the worker's state is unknown."""
+    runs."""
     return job.status == "running" and (
-        worker.state == "stopped"
-        or (worker.state == "running" and job.worker_generation != worker.generation)
+        worker.state == "stopped" or job.worker_generation != worker.generation
     )
 
 
@@ -754,20 +690,6 @@ CLAIM_TURN_SQL = text(
     """
 )
 
-CLAIM_TURN_SQL_SQLITE_SELECT = text(
-    """
-    SELECT t.id FROM chat_turns t
-    WHERE t.status = 'queued'
-      AND (
-        SELECT count(*) FROM chat_turns running
-        WHERE running.user_id = t.user_id
-          AND running.status <> 'queued' AND running.finished_at IS NULL
-      ) < :max_turns_per_user
-    ORDER BY t.created_at LIMIT 1
-    """
-)
-
-
 # What the reader is told, at the send and in the turn alike, once a conversation's
 # stored history is past `CHAT_HISTORY_MAX_BYTES` (docs/chat.md § History is append-only).
 HISTORY_FULL = (
@@ -794,12 +716,7 @@ async def history_bytes(
     `path`, the turns of the branch being measured, only their rows and the rows of no
     turn, which precede every turn (docs/chat.md § History is append-only, *An edited
     message starts a version*)."""
-    as_text = cast(Message.content, Text)
-    size = (
-        func.octet_length(as_text)
-        if db.get_bind().dialect.name == "postgresql"
-        else func.length(cast(as_text, LargeBinary))
-    )
+    size = func.octet_length(cast(Message.content, Text))
     query = select(func.coalesce(func.sum(size), 0)).where(
         Message.conversation_id == conversation_id
     )
@@ -862,26 +779,11 @@ async def enqueue_turn(
 
 async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUID | None:
     """Claim the oldest queued turn whose user is under the running cap, or None."""
-    if db.get_bind().dialect.name == "postgresql":
-        claimed = (
-            await db.execute(CLAIM_TURN_SQL, {"max_turns_per_user": max_turns_per_user})
-        ).scalar_one_or_none()
-        await db.commit()
-        return claimed
-
-    candidate = (
-        await db.execute(CLAIM_TURN_SQL_SQLITE_SELECT, {"max_turns_per_user": max_turns_per_user})
+    claimed = (
+        await db.execute(CLAIM_TURN_SQL, {"max_turns_per_user": max_turns_per_user})
     ).scalar_one_or_none()
-    if candidate is None:
-        return None
-    turn_id = uuid.UUID(str(candidate))
-    updated = await db.execute(
-        update(ChatTurn)
-        .where(ChatTurn.id == turn_id, ChatTurn.status == "queued")
-        .values(status="running")
-    )
     await db.commit()
-    return turn_id if updated.rowcount == 1 else None
+    return claimed
 
 
 async def lock_queued_work(db: AsyncSession, user_id: int) -> None:

@@ -1699,7 +1699,6 @@ export default {
       running: '執行中',
       stuck: '{n} 個卡住',
       noneStuck: '沒有卡住的工作',
-      workerUnknown: '無法得知 worker 狀態',
       seeJobs: '看工作',
       failed: '{n} 小時內失敗',
       lastFailed: '上一次 {time}',
@@ -1714,7 +1713,6 @@ export default {
       states: {
         running: '運作中',
         stopped: '已停止',
-        unknown: '未知',
         ok: '連線正常',
         unconfigured: '未設定',
         failed: '無法連線',
@@ -1722,7 +1720,6 @@ export default {
       workerSince: '世代 {generation} · {time} 起',
       workerNoGeneration: '還沒取得世代 · {time} 起',
       workerStopped: '沒有 worker 持有佇列鎖，工作會等到有 worker 啟動。',
-      workerUnknownLine: '只有 PostgreSQL 能看出 worker 是否在運作。',
       holdsLock: '持有佇列鎖',
       proxyModels: '目錄有 {n} 個模型，{priced} 個有定價',
       proxyUnconfigured: '沒有設定 KANO_PROXY_BASE_URL 與金鑰，無法呼叫模型。',
@@ -1747,7 +1744,6 @@ export default {
       workerRunning: 'Worker 運作中，世代 {generation}',
       workerRunningNoGeneration: 'Worker 運作中',
       workerStopped: 'Worker 已停止',
-      workerUnknown: '無法得知 worker 狀態',
       filter: '狀態',
       all: '全部',
       statuses: {
@@ -1772,7 +1768,6 @@ export default {
       refusals: {
         not_running: '這個工作已經不在執行中，沒有需要放回的。',
         not_stuck: '運作中的 worker 正在處理這個工作，不能放回佇列。',
-        worker_unknown: '這裡無法得知 worker 是否在運作，所以不能放回任何工作。',
       },
       gone: '這個工作已經不存在。',
       hint: '只有沒有 worker 在處理的執行中工作，才能放回佇列。這裡不會顯示檔名或文件內容。',

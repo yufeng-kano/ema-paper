@@ -37,7 +37,6 @@ from tests.conftest import (
     KANO_API_KEY,
     KANO_MODELS_URL,
     PAY_SETTINGS,
-    postgres_only,
 )
 from tests.factories import job_row
 
@@ -96,14 +95,6 @@ def test_the_probe_timeout_the_usage_range_and_the_failed_window_are_validated()
 # --- whether the worker runs ----------------------------------------------------------
 
 
-async def test_off_postgresql_the_worker_state_is_unknown(sessionmaker) -> None:
-    if sessionmaker.kw["bind"].dialect.name == "postgresql":
-        pytest.skip("the SQLite fallback has no lock to read")
-    async with sessionmaker() as db:
-        assert await queue.worker_status(db) == queue.WorkerStatus("unknown")
-
-
-@postgres_only
 async def test_the_worker_runs_while_another_session_holds_its_lock(sessionmaker) -> None:
     engine = sessionmaker.kw["bind"]
     async with sessionmaker() as db:
@@ -127,7 +118,6 @@ async def test_the_worker_runs_while_another_session_holds_its_lock(sessionmaker
         assert (await queue.worker_status(db)).state == "stopped"
 
 
-@postgres_only
 async def test_another_lock_with_the_same_halves_is_not_the_worker(sessionmaker) -> None:
     """`pg_advisory_lock(1, objid)` lists the same `classid` and `objid` as the worker's
     bigint lock, with `objsubid` 2: it is somebody else's."""
@@ -287,22 +277,6 @@ async def test_only_a_running_job_is_requeued(make_client, monkeypatch, status: 
     assert await audit_rows(owner, start) == []
 
 
-async def test_nothing_is_requeued_while_the_worker_state_is_unknown(
-    make_client, monkeypatch
-) -> None:
-    owner = await owner_client(make_client)
-    job = await _job(owner, owner.user_id, status="running", worker_generation=1)
-    _worker(monkeypatch, "unknown")
-    start = await last_audit_id(owner)
-
-    response = await _requeue(owner, job.id)
-    assert response.status_code == 409
-    assert error_of(response)["reason"] == "worker_unknown"
-    async with owner.app.state.sessionmaker() as db:
-        assert (await db.get(Job, job.id)).status == "running"
-    assert await audit_rows(owner, start) == []
-
-
 async def test_an_unknown_or_malformed_job_id_is_refused(make_client) -> None:
     owner = await owner_client(make_client)
     start = await last_audit_id(owner)
@@ -313,7 +287,6 @@ async def test_an_unknown_or_malformed_job_id_is_refused(make_client) -> None:
     assert await audit_rows(owner, start) == []
 
 
-@postgres_only
 async def test_requeue_reads_the_real_worker_lock(make_client) -> None:
     owner = await owner_client(make_client)
     sessionmaker = owner.app.state.sessionmaker
@@ -437,7 +410,7 @@ async def test_the_jobs_list_pages_filters_and_shows_no_content(make_client) -> 
     assert (body["total"], body["page"], body["page_size"]) == (4, 1, 2)
     assert [item["id"] for item in body["items"]] == [str(jobs[3].id), str(jobs[2].id)]
     assert body["counts"] == {"queued": 1, "running": 1, "succeeded": 1, "failed": 1}
-    assert body["worker"]["state"] in ("unknown", "stopped")
+    assert body["worker"]["state"] == "stopped"
     second = (await owner.get("/api/admin/jobs?page=2")).json()
     assert [item["id"] for item in second["items"]] == [str(jobs[1].id), str(jobs[0].id)]
     failed = second["items"][0]
@@ -475,9 +448,6 @@ async def test_a_running_job_is_marked_stuck_by_the_worker_state(make_client, mo
     _worker(monkeypatch, "running", 4)
     [stale] = (await owner.get("/api/admin/jobs")).json()["items"]
     assert stale["stuck"] is True
-    _worker(monkeypatch, "unknown")
-    [unknown] = (await owner.get("/api/admin/jobs")).json()["items"]
-    assert unknown["stuck"] is False
 
 
 # --- usage ----------------------------------------------------------------------------
@@ -638,12 +608,6 @@ async def test_the_overview_counts_jobs_and_todays_usage(make_client, monkeypatc
     assert (totals["calls"], totals["prompt_tokens"], totals["completion_tokens"]) == (3, 11, 2)
     assert (totals["cost"], totals["estimated_cost"], totals["unpriced_calls"]) == (0.25, 0.5, 1)
 
-    _worker(monkeypatch, "unknown")
-    unknown = (await owner.get("/api/admin/overview")).json()
-    assert (unknown["jobs"]["stuck"], unknown["worker"]) == (
-        None,
-        {"state": "unknown", "since": None, "generation": None},
-    )
     _worker(monkeypatch, "stopped")
     assert (await owner.get("/api/admin/overview")).json()["jobs"]["stuck"] == 2
 

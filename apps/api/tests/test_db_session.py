@@ -8,24 +8,21 @@ from sqlalchemy import text as sql
 from sqlalchemy.exc import DBAPIError
 
 from sightread.db.models import User
-from sightread.db.session import commit_or_conflict, create_engine
+from sightread.db.session import commit_or_conflict
 from sightread.errors import ApiError
 from tests.factories import user_row
 
 
-async def test_a_failed_statement_never_carries_the_readers_text(tmp_path) -> None:
+async def test_a_failed_statement_never_carries_the_readers_text(sessionmaker) -> None:
     """The engine hides bound values, so a database error logged with its traceback cannot
-    write a memory's text — or instructions, or a message — into the log."""
-    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'hidden.db'}")
-    try:
-        async with engine.connect() as connection:
-            with pytest.raises(DBAPIError) as failed:
-                await connection.execute(
-                    sql("insert into no_such_table (text) values (:text)"),
-                    {"text": "the reader reads with a screen reader"},
-                )
-    finally:
-        await engine.dispose()
+    write a memory's text — or instructions, or a message — into the log. The fixture's
+    engine is the app's own (`create_engine`)."""
+    async with sessionmaker.kw["bind"].connect() as connection:
+        with pytest.raises(DBAPIError) as failed:
+            await connection.execute(
+                sql("insert into no_such_table (text) values (:text)"),
+                {"text": "the reader reads with a screen reader"},
+            )
     assert "screen reader" not in str(failed.value)
 
 

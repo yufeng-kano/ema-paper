@@ -103,9 +103,8 @@ jobs             id UUID PK, user_id FK, agent, kind pdf|image, filename, media_
                  INDEX (user_id, agent, sha256, model, pages_spec, prompt_sha256,
                         pipeline_version)
                         WHERE status='succeeded'                             -- dedup
-                 SEQUENCE worker_generation_seq   -- PostgreSQL; one value per worker start
-                                                  -- (jobs.md § Queue). The SQLite fallback
-                                                  -- takes the highest on record plus one
+                 SEQUENCE worker_generation_seq   -- one value per worker start
+                                                  -- (jobs.md § Queue)
 job_pages        (job_id FK, page_no) PK, method NULL, status, error NULL,
                  markdown TEXT NULL,              -- the page's transcription, written as
                                                   -- the page finishes; what the partial
@@ -496,7 +495,7 @@ runtime_settings key VARCHAR(64) PK,              -- one of the thirteen keys th
 ## Migrations
 
 - **The chain starts at one baseline.** `4449f68533c0` (`baseline`, no `down_revision`) creates the schema production carries at that revision: every table, column, default, constraint and index, under the name production gives it.
-  - It also creates what autogenerate cannot see: the `worker_generation_seq` sequence (PostgreSQL only) and one row, the built-in group `owner` (`builtin` true, an empty permission list, no members; [admin.md](./admin.md) § Groups).
+  - It also creates what autogenerate cannot see: the `worker_generation_seq` sequence and one row, the built-in group `owner` (`builtin` true, an empty permission list, no members; [admin.md](./admin.md) § Groups).
   - Its downgrade drops all of it.
   - The revisions after it form one line, each revising the one before it, and bring that schema to the tables above. The last is the chain's one head.
   - `alembic upgrade head` runs the revisions a database lacks when it is at `4449f68533c0` or a later revision of the chain, and the whole chain on an empty one.
@@ -536,7 +535,7 @@ runtime_settings key VARCHAR(64) PK,              -- one of the thirteen keys th
 
 **The console's tables say who may do what, and what was done; the permissions themselves are code.**
 
-- `groups.permissions` is a JSON list rather than an array type, because the SQLite fallback the tests run on has none.
+- `groups.permissions` is a JSON list (`jsonb`).
   - It is normalized before it is written and read whole; no query looks inside it.
   - The strings it may hold are `ALL_PERMISSIONS` ([admin.md](./admin.md) § Permissions), so a new permission needs no migration.
 - One group carries `builtin`, which the code checks instead of a name.

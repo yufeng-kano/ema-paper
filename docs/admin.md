@@ -376,7 +376,6 @@ It is read from PostgreSQL's lock table, never by trying the lock ([jobs.md](./j
 |-------|------|---------|
 | `running` | such a row exists | the holder's connection start and the live generation (below) |
 | `stopped` | no such row | — |
-| `unknown` | off PostgreSQL — the SQLite fallback | — |
 
 - **The holder's connection start** is `pg_stat_activity.backend_start`, about when the worker started.
 - **The live generation** is the last value `worker_generation_seq` handed out, read without taking one; null before any worker took one.
@@ -395,8 +394,7 @@ A stuck job is a `running` one that no live worker drives: the worker is `stoppe
 
 1. The job exists — else **404**.
 2. It is `running` — else **409** `admin_conflict`, `not_running`. A queued job waits its turn, a finished one stays as it ended, and a failed parse is its reader's to retry ([jobs.md](./jobs.md) § Retrying failed pages).
-3. The worker's state can be read — else **409** `admin_conflict`, `worker_unknown`.
-4. The live worker does not drive it — else **409** `admin_conflict`, `not_stuck`.
+3. The live worker does not drive it — else **409** `admin_conflict`, `not_stuck`.
 
 Then, still under the lock, it does what a worker's start-up does to an orphan:
 
@@ -662,7 +660,6 @@ The settings an operator changes most — the models, their prices, the credit r
 - **`GET /api/admin/overview`** answers `{day, accounts, jobs: {queued, running, stuck, oldest_queued_at, failed, failed_hours, last_failed_at}, worker: <worker>, usage: {models: [{model, …<figures>}], totals: <figures>}, connections: {kano_proxy: {state, message, models, priced, parse_model}, kano_pay: {state, message, checkout_enabled, plans, packs}}, audit?: [<entry>]}` (§ Overview, jobs and usage).
   - `day` is today's UTC date, the day `usage` covers so far; `usage` lists its models in order of name.
   - `oldest_queued_at` is the earliest `created_at` of the queued jobs, null with none.
-  - `stuck` is null while the worker's state is `unknown`.
   - `failed` counts the jobs that failed in the last `failed_hours` (`ADMIN_FAILED_WINDOW_HOURS`, 24).
   - A connection's `state` is `ok`, `unconfigured` or `failed`. Its figures are null unless `ok`, and its `message` is null unless `failed`.
   - `audit` holds the newest records — ten, or `ADMIN_PAGE_SIZE` when that is fewer — as the audit list gives them. It is present only for a caller who also holds `audit.read`.
@@ -671,7 +668,7 @@ The settings an operator changes most — the models, their prices, the credit r
   - Beside the page: `counts: {queued, running, succeeded, failed}`, which counts every job on record whatever the filter, and `worker: <worker>`.
 - **`POST /api/admin/jobs/{id}/requeue`** answers `<job>`, back in the queue (§ Overview, jobs and usage).
   - **404** for no such job.
-  - **409** `admin_conflict`: `not_running`, `worker_unknown` or `not_stuck`.
+  - **409** `admin_conflict`: `not_running` or `not_stuck`.
 - **`GET /api/admin/usage`** answers `{from, to, rows: [{date, model, …<figures>}], totals: <figures>}`.
   - `from` and `to` are UTC dates (`YYYY-MM-DD`), both required and both included.
   - `from` is not after `to`, and the range is at most `ADMIN_USAGE_MAX_DAYS` days; **422** otherwise.
@@ -771,7 +768,7 @@ The settings an operator changes most — the models, their prices, the credit r
   - `error`: a failed job's `jobs.error`.
   - `stuck`: whether a requeue would take it (§ Overview, jobs and usage).
 - `<worker>` = `{state, since, generation}`
-  - `state`: `running`, `stopped` or `unknown`.
+  - `state`: `running` or `stopped`.
   - `since`: the lock holder's connection start.
   - `generation`: the live generation.
   - `since` and `generation` are both null unless `running`; `generation` is also null before any worker took one.
@@ -830,7 +827,6 @@ Within a route the checks run in this order, after § Signing in's:
 | `plan_conflict` | days of another plan than the account's bank holds |
 | `request_reused` | a credit grant's `request_id` that another account's pack has |
 | `not_running` | a requeue of a job that is not running |
-| `worker_unknown` | a requeue while the worker's state cannot be read |
 | `not_stuck` | a requeue of a job the live worker drives |
 | `impact` | a settings change that takes away what accounts have, sent without `confirm: true`; `impact` beside it |
 
@@ -917,14 +913,14 @@ Within a route the checks run in this order, after § Signing in's:
   - The large title *Overview* with *{date} (UTC) · {n} accounts · updated {time}* beside it — the UTC day the figures count, the accounts, and when the page last read them.
   - Four tiles:
     - *Queued*: its count over *Oldest created {duration} ago*, or *Nothing waiting*. The duration is the oldest queued job's age, from `oldest_queued_at`, which a retry or a requeue does not reset, so not how long it has waited.
-    - *Running*: over *{n} stuck · See jobs* (to the Jobs page filtered on running), *None stuck* or, off PostgreSQL, *Worker state unknown*.
+    - *Running*: over *{n} stuck · See jobs* (to the Jobs page filtered on running) or *None stuck*.
     - *Failed in the last {n} hours* (`failed_hours`; *Failed in the last hour* for 1): over *Last at {time} · See jobs* (filtered on failed) or *None*.
     - *Model cost today*: the estimate in US$, over *{calls} calls · {tokens} tokens*.
   - Then *Services*, one gray box of three rows. Each row holds its name, its state as a status dot with its word, one muted line, and a fact at the right:
 
     | Row | States | Muted line | Fact at the right |
     |---|---|---|---|
-    | *Worker* | *Running*, *Stopped*, *Unknown* | the generation and since when | *Holds the queue lock* |
+    | *Worker* | *Running*, *Stopped* | the generation and since when | *Holds the queue lock* |
     | *Kano Proxy* | *Connected*, *Not configured*, *Can't connect* | the catalog's models and how many are priced; failed, the client's message as it is | *Parse model {model}* |
     | *Kano Pay* | *Connected*, *Not configured*, *Can't connect* | the plans and packs on sale; failed, the client's message as it is | *Checkout open* or *Checkout closed* |
 
@@ -1034,7 +1030,7 @@ Within a route the checks run in this order, after § Signing in's:
     - The CSV names its fields — `credits`, `valid_days`, `plan_id`, `days` — rather than one `amount` that would mean credits on one row and days on the next and lose a plan code's plan.
 - **Jobs** (`/admin/jobs`, `jobs.read`).
   - The toolbar holds the status filter at the left — a segmented *All · Queued {n} · Running {n} · Failed {n} · Done*, the counts the API's (`status` in the query) — and *Refresh* at the right.
-  - The large title *Jobs* with *{total} jobs on record · {worker}* beside it, the worker as *Worker running, generation {g}*, *Worker stopped* or *Worker state unknown*.
+  - The large title *Jobs* with *{total} jobs on record · {worker}* beside it, the worker as *Worker running, generation {g}* or *Worker stopped*.
   - The table's columns:
     - *Time*: when it was created, in the reader's local date and time.
     - *Account*: its address, or *Account {id}* without `users.read`.
@@ -1044,7 +1040,7 @@ Within a route the checks run in this order, after § Signing in's:
     - *Failure reason*: a failed job's `error` as it is, in muted text, cut to the column with the whole of it in the cell's tooltip.
     - With `jobs.write`, *Requeue* (secondary, small) on a row the answer says is stuck and on no other.
   - *Requeue* asks first — *Requeue this job?*, that it goes back to the queue keeping its finished pages, that its failed and unfinished pages run again, and are paid for again, once a worker claims it.
-  - A refusal (`not_running`, `not_stuck`, `worker_unknown`, a job gone) is said in the dialog in the catalog's words, the list read again behind it.
+  - A refusal (`not_running`, `not_stuck`, a job gone) is said in the dialog in the catalog's words, the list read again behind it.
   - Under the table one muted line — *Only a running job no live worker drives can be requeued. File names and document content are never shown here.* — and the pager.
   - *No jobs*, or *No jobs with this status*, when empty.
 - **Usage** (`/admin/usage`, `jobs.read`).
@@ -1215,7 +1211,7 @@ Unit tests on the existing fixtures, stubbed HTTP, no call to Google, Kano Proxy
   - Each escalation rule 403: ticking and unticking a permission not held; ticking a held one on a group with a permission not held; adding to and removing from a group with a permission not held; deleting such a group; adding by account id without `users.read`.
   - A group or member id past 2,147,483,647 422.
   - A permission list sent without `based_on` 422, and one edited from a list no longer stored 409 `stale`, with nothing written.
-  - On PostgreSQL: an owner removed while their own change to the owner group waits on its row lock is refused 403 once it runs; adding an account to the owner group while that account's sign-in is mid-transaction neither waits for the sign-in nor deadlocks with it.
+  - An owner removed while their own change to the owner group waits on its row lock is refused 403 once it runs; adding an account to the owner group while that account's sign-in is mid-transaction neither waits for the sign-in nor deadlocks with it.
 - The log:
   - Every mutation writes exactly one row with its actor, permission, action, target, `before`, `after` and address; one that changes nothing writes none.
   - No row holds an address or a name.
@@ -1232,9 +1228,9 @@ Unit tests on the existing fixtures, stubbed HTTP, no call to Google, Kano Proxy
   - The caps, an unknown plan, `free`, a bad `request_id` and a long `reason` 422; 403 without `users.write`.
   - Each grant's record exact, `reason` stored only there.
 - The worker and requeue:
-  - On PostgreSQL the worker's state is `running`, with the live generation, while another connection holds the worker lock, and `stopped` once it lets go; reading it never takes the lock. Off PostgreSQL it is `unknown`.
+  - The worker's state is `running`, with the live generation, while another connection holds the worker lock, and `stopped` once it lets go; reading it never takes the lock.
   - A stuck job — the worker stopped, or running with another generation — goes back `queued`: its succeeded pages kept and `pages_done` their count, its failed pages and its crops gone, its credits still reserved, and one `jobs.requeue` record.
-  - Refused with nothing changed or recorded: a queued, a succeeded and a failed job 409 `not_running`; the live worker's own `not_stuck`; any job off PostgreSQL `worker_unknown`; an unknown one 404.
+  - Refused with nothing changed or recorded: a queued, a succeeded and a failed job 409 `not_running`; the live worker's own `not_stuck`; an unknown one 404.
   - 403 `permission_denied` with `jobs.read` alone.
 - The jobs list:
   - Newest first, paged, filtered by status (another value 422), the counts beside it whatever the filter.
@@ -1251,8 +1247,8 @@ Unit tests on the existing fixtures, stubbed HTTP, no call to Google, Kano Proxy
   - Kano Proxy and Kano Pay, against stubs: `ok` with what they listed; `unconfigured` with no request made; `failed` — an error status, an unreachable host, an error the client does not expect. The key in no answer, and the overview still 200.
   - `audit` present with `audit.read` and absent without it: the ten newest records, and no more than `ADMIN_PAGE_SIZE`.
   - 403 `permission_denied` without `jobs.read`.
-- Deleting an account (PostgreSQL): its memberships go, its audit rows stay with `actor_id` NULL, and deleting the last owner's account is not refused and leaves the owner group empty.
-- The migration (PostgreSQL, `tests/test_migrations.py`): on the upgraded head a second built-in group and a taken group name are refused; deleting a user cascades `group_members` and sets `added_by`, `audit_log.actor_id` and `runtime_settings.updated_by` NULL.
+- Deleting an account: its memberships go, its audit rows stay with `actor_id` NULL, and deleting the last owner's account is not refused and leaves the owner group empty.
+- The migration (`tests/test_migrations.py`): on the upgraded head a second built-in group and a taken group name are refused; deleting a user cascades `group_members` and sets `added_by`, `audit_log.actor_id` and `runtime_settings.updated_by` NULL.
 - Redeem codes:
   - A batch created answers 201 with its codes in plaintext, once, written by `create_codes` with one `codes.create` record of its amounts and ids.
   - The list shows them masked — the prefix and the first group, none of a code too short to keep eight characters hidden. Newest first; a plan code whose plan is gone `plan_missing` and out of the active ones; `status` and `q` filtering by label; paged, with its summary.

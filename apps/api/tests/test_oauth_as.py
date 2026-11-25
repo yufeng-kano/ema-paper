@@ -20,7 +20,7 @@ from sqlalchemy import select, text
 from sightread.auth.crypto import hash_token
 from sightread.db.models import OAuthGrant, utcnow
 from sightread.routes.oauth import MARK
-from tests.conftest import CSRF_HEADERS, mcp_running, postgres_only
+from tests.conftest import CSRF_HEADERS, mcp_running
 from tests.connector_helpers import (
     CHALLENGE,
     CONSENT_TOKEN_RE,
@@ -288,7 +288,7 @@ def test_the_consent_page_mark_is_the_favicon() -> None:
 
 
 async def _until_two_requests_wait_on_a_lock(sessionmaker) -> None:
-    """Until two other connections of this database wait on a lock (PostgreSQL)."""
+    """Until two other connections of this database wait on a lock."""
     for _ in range(250):
         async with sessionmaker() as probe:
             waiting = await probe.scalar(
@@ -303,7 +303,6 @@ async def _until_two_requests_wait_on_a_lock(sessionmaker) -> None:
     raise AssertionError("the two requests never waited on the lock")
 
 
-@postgres_only
 @pytest.mark.parametrize("grant", ["code", "refresh"])
 async def test_two_redemptions_at_once_issue_one_token_pair(
     client: AsyncClient, sessionmaker, grant: str

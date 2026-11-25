@@ -1,19 +1,15 @@
 """Shared test fixtures.
 
-Database: set `TEST_DATABASE_URL` to run the suite against a real PostgreSQL. It is the
-only variable read here (never the app's `DATABASE_URL`). A run drops and re-creates every
-table in the database it names, once, and empties every table before each test, so it
-must name a database of its own, never the app's. On the compose server, for example,
-create one once:
+Database: the suite runs on the PostgreSQL database `TEST_DATABASE_URL` names, and refuses
+to start without one. It is the only variable read here (never the app's `DATABASE_URL`).
+A run drops and re-creates every table in that database, once, and empties every table
+before each test, so it must name a database of its own, never the app's. On the compose
+server, for example, create one once (docs/testing.md):
 
     docker compose up -d pg
     docker compose exec pg createdb -U sightread sightread_test
     TEST_DATABASE_URL=postgresql+asyncpg://sightread:sightread@127.0.0.1:5432/sightread_test \
         uv run pytest
-
-Without it the suite falls back to a throwaway SQLite file so `uv run pytest` works with
-no services and no network. The models carry SQLite variants for the two PostgreSQL-only
-types (JSONB and timestamptz) precisely so this fallback stays honest.
 
 Settings: no test reads a setting from the caller's environment. Every variable that names
 a `Settings` field is removed before each test, so an exported `.env` changes nothing;
@@ -78,9 +74,19 @@ KANO_API_KEY = "sk-kano-proxy-test-not-a-real-one"
 PARSE_MODEL = "vendor/vision-model"
 CATALOG_MODELS = "claude-code/claude-opus-5-5,codex/gpt-5.5,vendor/chat-model"
 
-TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
-POSTGRES = (TEST_DATABASE_URL or "").startswith("postgresql")
-postgres_only = pytest.mark.skipif(not POSTGRES, reason="needs TEST_DATABASE_URL on PostgreSQL")
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """No database, no run: one line that says how to name one, before anything is
+    collected."""
+    if not TEST_DATABASE_URL.startswith("postgresql+asyncpg://"):
+        raise pytest.UsageError(
+            "the api tests need a PostgreSQL test database: set TEST_DATABASE_URL, e.g. "
+            "TEST_DATABASE_URL=postgresql+asyncpg://sightread:sightread@127.0.0.1:5432/"
+            "sightread_test uv run pytest (docs/testing.md)"
+        )
+
 
 # USD per 1M tokens, every kind alike, for the models the tests chat on.
 TEST_MODEL_PRICES = json.dumps(
@@ -110,7 +116,7 @@ def base_settings(**overrides) -> Settings:
             "app_env": "local",
             "auth_dev_mode": True,
             "secret_key": TEST_SECRET_KEY,
-            "database_url": "sqlite+aiosqlite://",
+            "database_url": TEST_DATABASE_URL,
             "kano_proxy_base_url": KANO_BASE,
             "kano_proxy_api_key": KANO_API_KEY,
             "parse_model": PARSE_MODEL,
@@ -163,34 +169,27 @@ async def _rebuild_schema(url: str, *, create: bool) -> None:
 
 
 @pytest.fixture(scope="session")
-def postgres_schema() -> Iterator[None]:
-    """On PostgreSQL the schema is made once per run, from a clean database, and dropped at
-    its end; `sessionmaker` empties it before each test."""
-    if not POSTGRES:
-        yield
-        return
+def database_schema() -> Iterator[None]:
+    """The schema, made once per run from a clean database and dropped at its end;
+    `sessionmaker` empties it before each test."""
     asyncio.run(_rebuild_schema(TEST_DATABASE_URL, create=True))
     yield
     asyncio.run(_rebuild_schema(TEST_DATABASE_URL, create=False))
 
 
 @pytest_asyncio.fixture
-async def sessionmaker(postgres_schema, tmp_path):
-    """A database no earlier test has written to. On PostgreSQL every table is truncated
-    and every sequence restarted before the test, so ids count from 1 as on a fresh schema;
-    on SQLite the schema is made in a new file under `tmp_path`."""
-    # The app's own engine factory, so a PostgreSQL run has production's session settings.
-    engine = create_engine(TEST_DATABASE_URL or f"sqlite+aiosqlite:///{tmp_path}/test.db")
+async def sessionmaker(database_schema):
+    """A database no earlier test has written to: every table is truncated and every
+    sequence restarted before the test, so ids count from 1 as on a fresh schema."""
+    # The app's own engine factory, so the tests have production's session settings.
+    engine = create_engine(TEST_DATABASE_URL)
     async with engine.begin() as connection:
-        if POSTGRES:
-            quote = engine.dialect.identifier_preparer.quote
-            tables = ", ".join(quote(table.name) for table in Base.metadata.sorted_tables)
-            await connection.exec_driver_sql(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")
-            await connection.exec_driver_sql(
-                f"ALTER SEQUENCE {quote(WORKER_GENERATION_SEQ.name)} RESTART"
-            )
-        else:
-            await connection.run_sync(Base.metadata.create_all)
+        quote = engine.dialect.identifier_preparer.quote
+        tables = ", ".join(quote(table.name) for table in Base.metadata.sorted_tables)
+        await connection.exec_driver_sql(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")
+        await connection.exec_driver_sql(
+            f"ALTER SEQUENCE {quote(WORKER_GENERATION_SEQ.name)} RESTART"
+        )
     yield create_sessionmaker(engine)
     await engine.dispose()
 
@@ -199,8 +198,8 @@ async def sessionmaker(postgres_schema, tmp_path):
 async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., AsyncClient]]:
     """Build a client for an app with the given settings overrides.
 
-    The app's sessionmaker is injected directly, so no lifespan and no live database are
-    needed. `https://` base URL so the `Secure` session cookie is stored by httpx.
+    The app's sessionmaker is injected directly, so no lifespan is needed. `https://` base
+    URL so the `Secure` session cookie is stored by httpx.
     """
     opened: list[AsyncClient] = []
 

@@ -41,7 +41,6 @@ from tests.conftest import (
     KANO_CHAT_URL,
     PARSE_MODEL,
     convert_on_upload,
-    postgres_only,
 )
 from tests.factories import job_row, user_row
 from tests.helpers import (
@@ -237,7 +236,6 @@ def _leave_files(settings, root: Path, job_id: uuid.UUID) -> list[Path]:
     return paths
 
 
-@postgres_only
 async def test_a_parse_no_file_keeps_is_deleted_after_its_retention(
     writer, make_client, tmp_path
 ) -> None:
@@ -389,7 +387,6 @@ async def test_the_dedup_cache_never_answers_with_a_parse_about_to_be_deleted(
         assert (await find_cached_job(db, retention_days=0, **_key(user.id, "1" * 64))).id == late
 
 
-@postgres_only
 @respx.mock
 async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
     writer, documents, monkeypatch

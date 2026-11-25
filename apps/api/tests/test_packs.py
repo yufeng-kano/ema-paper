@@ -48,7 +48,6 @@ from tests.conftest import (
     PAY_URL,
     base_settings,
     grant_plan,
-    postgres_only,
     sign_in,
 )
 
@@ -267,9 +266,6 @@ async def test_a_turn_spills_into_the_packs_before_the_overdraft(sessionmaker) -
     assert (refused.value.need, refused.value.remaining) == (1, 0)
 
 
-# Row locks only block on PostgreSQL; on SQLite the database-wide write lock
-# serializes the two transactions with or without them.
-@postgres_only
 async def test_two_turns_settling_at_once_share_the_period_before_the_pack(sessionmaker) -> None:
     """The period row is locked before its balance is read: a turn settling while another
     turn's settlement is open takes only what that one left of the period and spills the

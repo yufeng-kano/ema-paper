@@ -35,7 +35,7 @@ from tests.chat_helpers import (
     turns_of,
     write_file,
 )
-from tests.conftest import CSRF_HEADERS, postgres_only
+from tests.conftest import CSRF_HEADERS
 from tests.factories import user_row
 
 LIBRARY_PROMPT_START = "You are the library agent inside Ema Paper"
@@ -808,7 +808,6 @@ async def test_the_idle_pass_compacts_a_library_conversation(chat_client) -> Non
     assert (await conversation_row(client, conversation_id)).compacted_message_id is not None
 
 
-@postgres_only  # the foreign key cascades only on PostgreSQL
 @respx.mock
 async def test_deleting_a_document_leaves_the_library_conversations(chat_client) -> None:
     """The document's conversations go with it; a library conversation, about none, stays

@@ -1,7 +1,6 @@
 """The per-user workspace: materialization, revisions, the tree (docs/workspace.md).
 
-Real git in a temporary directory; the SQLite fallback, except the finished-parse row-lock
-test, which needs PostgreSQL.
+Real git in a temporary directory.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from sightread.workspace.layout import (
     user_root,
 )
 from sightread.workspace.locks import _backup_lock_path
-from tests.conftest import path_settings, postgres_only
+from tests.conftest import path_settings
 from tests.factories import filed_parse, user_row
 
 
@@ -714,13 +713,12 @@ async def _running_library_parse(sessionmaker, settings) -> SimpleNamespace:
     )
 
 
-@postgres_only
 async def test_a_finished_library_parse_waits_for_the_filing_row_lock(
     sessionmaker, tmp_path
 ) -> None:
     """Filing takes the job's row lock before it inserts: a finish that waits for it reads
     the row it filed as a recipient rather than deleting the upload under it (docs/jobs.md
-    § Retention). PostgreSQL only: SQLite takes no row lock."""
+    § Retention)."""
     from sightread.jobs import runner
 
     settings = path_settings(tmp_path)

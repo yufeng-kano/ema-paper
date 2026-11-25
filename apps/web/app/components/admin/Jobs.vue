@@ -55,8 +55,8 @@ const onRecord = computed(() => {
 
 const workerLine = computed(() => {
   const worker = data.value?.worker
-  if (!worker || worker.state === 'unknown') {
-    return t('admin.jobs.workerUnknown')
+  if (!worker) {
+    return ''
   }
   if (worker.state === 'stopped') {
     return t('admin.jobs.workerStopped')

@@ -60,7 +60,6 @@ from tests.conftest import (
     PAY_SETTINGS,
     convert_on_upload,
     grant_plan,
-    postgres_only,
     sign_in,
 )
 from tests.factories import job_row
@@ -230,7 +229,6 @@ async def _owned_rows(client: AsyncClient, user_id: int) -> dict[str, int]:
     return counts
 
 
-@postgres_only
 async def test_deleting_the_account_removes_every_row_and_file_of_it(make_client) -> None:
     account = await sign_in(make_client())
     stranger = await account_client(make_client)
@@ -399,7 +397,6 @@ async def test_without_pay_the_stored_subscription_decides(make_client) -> None:
     assert (await _delete(account)).status_code == 204
 
 
-@postgres_only
 async def test_running_work_refuses_and_queued_work_goes_with_the_account(make_client) -> None:
     account = await sign_in(make_client())
     uid = account.user_id
@@ -455,7 +452,6 @@ async def test_running_work_refuses_and_queued_work_goes_with_the_account(make_c
         assert (await db.execute(select(ChatTurn))).all() == []
 
 
-@postgres_only
 async def test_a_queued_parse_takes_its_upload_with_the_account(make_client, documents) -> None:
     account = await sign_in(make_client())
     await convert_on_upload(account)

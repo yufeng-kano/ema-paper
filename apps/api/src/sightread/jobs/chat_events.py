@@ -51,7 +51,7 @@ async def append(db: AsyncSession, conversation_id: int, turn_id, event: str, da
     """Add one event to the session and queue the wake-up, without committing: for a
     caller that must publish the event in the same transaction as a status change."""
     # The conversation's row, held until the caller commits: two tools finishing at once
-    # must not both take `max(seq) + 1` (PostgreSQL; SQLite writes one at a time).
+    # must not both take `max(seq) + 1`.
     await db.execute(
         select(Conversation.id).where(Conversation.id == conversation_id).with_for_update()
     )

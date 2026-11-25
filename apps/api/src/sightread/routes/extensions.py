@@ -290,8 +290,8 @@ async def _create(
     name = _checked_name(sent["name"])
     _refuse_reserved(kind, name)
     # The user's row, held until the create commits: two creations near the cap must
-    # not both count below it (PostgreSQL; the SQLite fallback runs one request at a
-    # time), the same lock the turn cap takes (docs/chat.md § Conversations).
+    # not both count below it, the same lock the turn cap takes (docs/chat.md
+    # § Conversations).
     await lock_user(db, user.id)
     taken = f"A {kind.noun} with this name already exists"
     if await _row(kind, db, user.id, name) is not None:

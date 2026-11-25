@@ -1,8 +1,6 @@
 """SQLAlchemy models — the schema described in docs/database.md.
 
-All timestamps are `timestamptz` holding UTC. JSON payload columns are `JSONB` on
-PostgreSQL (the only supported production database) with a plain `JSON` variant so the
-test suite can also run against SQLite when no PostgreSQL is available.
+All timestamps are `timestamptz` holding UTC. JSON payload columns are `JSONB`.
 """
 
 from __future__ import annotations
@@ -12,7 +10,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
-    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -32,15 +29,9 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
-JSON_COLUMN = JSONB().with_variant(JSON(), "sqlite")
-
 
 class UtcDateTime(TypeDecorator):
-    """`timestamptz` that always hands Python an aware UTC datetime.
-
-    PostgreSQL already does this; the decorator keeps the SQLite test fallback honest,
-    since SQLite drops the offset and would otherwise return naive datetimes.
-    """
+    """`timestamptz` that refuses a naive datetime and writes an aware one as UTC."""
 
     impl = DateTime(timezone=True)
     cache_ok = True
@@ -51,11 +42,6 @@ class UtcDateTime(TypeDecorator):
         if value.tzinfo is None:
             raise ValueError("naive datetime written to a timestamptz column")
         return value.astimezone(UTC)
-
-    def process_result_value(self, value: datetime | None, dialect) -> datetime | None:
-        if value is None:
-            return None
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 TIMESTAMPTZ = UtcDateTime()
@@ -195,7 +181,6 @@ class Job(Base):
             "prompt_sha256",
             "pipeline_version",
             postgresql_where=text("status = 'succeeded'"),
-            sqlite_where=text("status = 'succeeded'"),
         ),
     )
 
@@ -251,8 +236,7 @@ class Job(Base):
 
 
 # One value per worker start, taken with the worker lock (docs/jobs.md § Queue). On the
-# metadata so `create_all` makes it where the dialect has sequences; the SQLite fallback
-# counts from the highest generation on record instead.
+# metadata so `create_all` makes it with the tables.
 WORKER_GENERATION_SEQ = Sequence("worker_generation_seq", metadata=Base.metadata)
 
 
@@ -275,7 +259,7 @@ class JobPage(Base):
     # The figure check's status of each box the page's markdown holds, keyed
     # "ymin,xmin,ymax,xmax"; NULL on failed pages and pages parsed without the check
     # (docs/parsing.md § Figure check).
-    figures: Mapped[dict | None] = mapped_column(JSON_COLUMN, nullable=True)
+    figures: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class Result(Base):
@@ -289,10 +273,10 @@ class Result(Base):
         ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
     )
     markdown: Mapped[str] = mapped_column(Text)
-    pages: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
-    figures: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
-    errors: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
-    meta: Mapped[dict] = mapped_column(JSON_COLUMN, default=dict)
+    pages: Mapped[list] = mapped_column(JSONB, default=list)
+    figures: Mapped[list] = mapped_column(JSONB, default=list)
+    errors: Mapped[list] = mapped_column(JSONB, default=list)
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
     # The checked copy a library document's doc.md starts from; NULL when the parse was
     # not checked (docs/parsing.md § Format check).
     reading_markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -318,7 +302,6 @@ class Folder(Base):
             "name",
             unique=True,
             postgresql_where=text("trashed_at IS NULL"),
-            sqlite_where=text("trashed_at IS NULL"),
         ),
         # The root level needs its own index: NULLs are distinct to a unique index, so
         # the one above would happily allow two root folders called "Invoices"
@@ -329,14 +312,12 @@ class Folder(Base):
             "name",
             unique=True,
             postgresql_where=text("parent_id IS NULL AND trashed_at IS NULL"),
-            sqlite_where=text("parent_id IS NULL AND trashed_at IS NULL"),
         ),
         # What the Trash's expiry reads (docs/workspace.md § The Trash).
         Index(
             "ix_folders_trashed_at",
             "trashed_at",
             postgresql_where=text("trashed_at IS NOT NULL"),
-            sqlite_where=text("trashed_at IS NOT NULL"),
         ),
         # What a folder delete's cascade to its subfolders reads: the unique indexes above
         # lead with user_id and skip the Trash, so they cannot serve it (docs/database.md).
@@ -344,7 +325,6 @@ class Folder(Base):
             "ix_folders_parent_id",
             "parent_id",
             postgresql_where=text("parent_id IS NOT NULL"),
-            sqlite_where=text("parent_id IS NOT NULL"),
         ),
     )
 
@@ -385,7 +365,6 @@ class Document(Base):
             "name",
             unique=True,
             postgresql_where=text("trashed_at IS NULL"),
-            sqlite_where=text("trashed_at IS NULL"),
         ),
         Index(
             "uq_documents_root_name",
@@ -393,7 +372,6 @@ class Document(Base):
             "name",
             unique=True,
             postgresql_where=text("folder_id IS NULL AND trashed_at IS NULL"),
-            sqlite_where=text("folder_id IS NULL AND trashed_at IS NULL"),
         ),
         Index("ix_documents_user_created", "user_id", "created_at"),
         # What a folder delete's cascade to its documents reads (docs/database.md).
@@ -401,7 +379,6 @@ class Document(Base):
             "ix_documents_folder_id",
             "folder_id",
             postgresql_where=text("folder_id IS NOT NULL"),
-            sqlite_where=text("folder_id IS NOT NULL"),
         ),
         # The parse retention's keep rule and a job delete's cascade read it
         # (docs/jobs.md § Retention).
@@ -410,13 +387,11 @@ class Document(Base):
             "ix_documents_reconvert_job_id",
             "reconvert_job_id",
             postgresql_where=text("reconvert_job_id IS NOT NULL"),
-            sqlite_where=text("reconvert_job_id IS NOT NULL"),
         ),
         Index(
             "ix_documents_trashed_at",
             "trashed_at",
             postgresql_where=text("trashed_at IS NOT NULL"),
-            sqlite_where=text("trashed_at IS NOT NULL"),
         ),
     )
 
@@ -470,7 +445,6 @@ class UsageLog(Base):
             "ix_usage_log_turn_id",
             "turn_id",
             postgresql_where=text("turn_id IS NOT NULL"),
-            sqlite_where=text("turn_id IS NOT NULL"),
         ),
         # An unknown cost is NULL and only an unknown cost is: a call nobody priced must
         # never be summed as a free one (docs/database.md).
@@ -518,14 +492,12 @@ class Conversation(Base):
             "user_id",
             "updated_at",
             postgresql_where=text("document_id IS NULL"),
-            sqlite_where=text("document_id IS NULL"),
         ),
         # What the idle compaction pass reads (docs/chat.md § Compaction).
         Index(
             "ix_conversations_cache_warm_until",
             "cache_warm_until",
             postgresql_where=text("cache_warm_until IS NOT NULL"),
-            sqlite_where=text("cache_warm_until IS NOT NULL"),
         ),
         # What the settings page counts when a price would be removed (docs/admin.md
         # § Settings).
@@ -546,7 +518,7 @@ class Conversation(Base):
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # The ids of the memories its first turn loaded, in the order they are rendered; NULL
     # until a turn took the snapshot (docs/chat.md § Memory).
-    memory_ids: Mapped[list | None] = mapped_column(JSON_COLUMN, nullable=True)
+    memory_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # The snapshot of the agent's memory file its first turn took, taken again by a
     # compaction; NULL until a turn took one, '' for a file that was empty or missing
     # (docs/chat.md § Memory, *The memory file*).
@@ -653,14 +625,13 @@ class Message(Base):
             "ix_messages_turn_id",
             "turn_id",
             postgresql_where=text("turn_id IS NOT NULL"),
-            sqlite_where=text("turn_id IS NOT NULL"),
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
     role: Mapped[str] = mapped_column(String(16))  # user | assistant
-    content: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
+    content: Mapped[list] = mapped_column(JSONB, default=list)
     turn_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("chat_turns.id", ondelete="SET NULL"), nullable=True
     )
@@ -682,7 +653,7 @@ class ChatEvent(Base):
     turn_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_turns.id", ondelete="CASCADE"))
     seq: Mapped[int] = mapped_column(Integer)
     event: Mapped[str] = mapped_column(String(32))
-    data: Mapped[dict] = mapped_column(JSON_COLUMN, default=dict)
+    data: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 
@@ -725,7 +696,7 @@ class Subagent(Base):
     writes: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     # A subset of the subagent tools (agents/chat.py), in their canonical order; `bash`
     # only with `writes`.
-    tools: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
+    tools: Mapped[list] = mapped_column(JSONB, default=list)
     prompt: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
@@ -746,13 +717,11 @@ class Memory(Base):
             "ix_memories_document_id",
             "document_id",
             postgresql_where=text("document_id IS NOT NULL"),
-            sqlite_where=text("document_id IS NOT NULL"),
         ),
         Index(
             "ix_memories_conversation_id",
             "conversation_id",
             postgresql_where=text("conversation_id IS NOT NULL"),
-            sqlite_where=text("conversation_id IS NOT NULL"),
         ),
         CheckConstraint(
             "kind IN ('term', 'preference', 'about', 'document')", name="ck_memories_kind"
@@ -818,14 +787,12 @@ class UploadTicket(Base):
             "ix_upload_tickets_job_id",
             "job_id",
             postgresql_where=text("job_id IS NOT NULL"),
-            sqlite_where=text("job_id IS NOT NULL"),
         ),
         # What a folder delete's SET NULL reads (docs/database.md).
         Index(
             "ix_upload_tickets_folder_id",
             "folder_id",
             postgresql_where=text("folder_id IS NOT NULL"),
-            sqlite_where=text("folder_id IS NOT NULL"),
         ),
     )
 
@@ -879,7 +846,7 @@ class OAuthClient(Base):
 
     client_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     client_name: Mapped[str] = mapped_column(String(255))
-    redirect_uris: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
+    redirect_uris: Mapped[list] = mapped_column(JSONB, default=list)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 
@@ -1179,7 +1146,6 @@ class Group(Base):
             "builtin",
             unique=True,
             postgresql_where=text("builtin"),
-            sqlite_where=text("builtin"),
         ),
     )
 
@@ -1187,7 +1153,7 @@ class Group(Base):
     name: Mapped[str] = mapped_column(String(32))
     # Normalized permission strings in `ALL_PERMISSIONS` order (docs/admin.md
     # § Permissions); a JSON column, so it is reassigned whole, never mutated in place.
-    permissions: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
+    permissions: Mapped[list] = mapped_column(JSONB, default=list)
     builtin: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
@@ -1225,10 +1191,7 @@ class AuditLog(Base):
         Index("ix_audit_log_target", "target_type", "target_id"),
     )
 
-    # BIGINT on PostgreSQL; SQLite numbers a row only through an INTEGER primary key.
-    id: Mapped[int] = mapped_column(
-        BigInteger().with_variant(Integer(), "sqlite"), primary_key=True
-    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     # The record outlives the account that made the change.
     actor_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -1241,12 +1204,8 @@ class AuditLog(Base):
     target_id: Mapped[str] = mapped_column(String(64))
     # A side with nothing is SQL NULL (docs/admin.md § The audit log): `none_as_null`, or a
     # JSON column writes Python None as the JSON value `null`.
-    before: Mapped[dict | None] = mapped_column(
-        JSONB(none_as_null=True).with_variant(JSON(none_as_null=True), "sqlite"), nullable=True
-    )
-    after: Mapped[dict | None] = mapped_column(
-        JSONB(none_as_null=True).with_variant(JSON(none_as_null=True), "sqlite"), nullable=True
-    )
+    before: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    after: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
@@ -1259,7 +1218,7 @@ class RuntimeSetting(Base):
     __tablename__ = "runtime_settings"
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
-    value: Mapped[str] = mapped_column(JSON_COLUMN)
+    value: Mapped[str] = mapped_column(JSONB)
     # Who stored it; NULL once that account is deleted.
     updated_by: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True

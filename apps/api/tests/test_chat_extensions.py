@@ -31,7 +31,7 @@ from tests.chat_helpers import (
     streamed,
     stub_messages,
 )
-from tests.conftest import CSRF_HEADERS, postgres_only, sign_in
+from tests.conftest import CSRF_HEADERS, sign_in
 
 
 def fake_pages(monkeypatch) -> list[int]:
@@ -911,9 +911,6 @@ async def test_a_subagent_that_spends_the_balance_stops_and_the_turn_answers(
     assert (billing["period"]["spent"], billing["period"]["remaining"]) == (7, -3)
 
 
-# Two calls of one round emit events at the same moment; only PostgreSQL's row lock
-# serializes their sequence numbers (jobs/chat_events.py).
-@postgres_only
 @respx.mock
 async def test_a_write_waiting_when_a_subagent_spends_the_balance_is_not_started(
     make_client, monkeypatch

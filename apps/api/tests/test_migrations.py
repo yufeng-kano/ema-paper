@@ -1,7 +1,6 @@
 """The migration chain, run as real upgrades (docs/database.md § Migrations, docs/testing.md
-§ Backend). PostgreSQL only — the chain is PostgreSQL DDL — so this module skips unless
-`TEST_DATABASE_URL` points at one (tests/conftest.py). Each test gets its own scratch
-databases on that server, dropped afterwards.
+§ Backend). Each test gets its own scratch databases on the `TEST_DATABASE_URL` server
+(tests/conftest.py), dropped afterwards.
 
 A migration that rewrites existing rows adds its upgrade test here: upgrade a scratch
 database to the revision before it, write synthetic existing rows, upgrade, and check what
@@ -27,9 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sightread.db.models import Base
-from tests.conftest import TEST_DATABASE_URL, postgres_only
-
-pytestmark = postgres_only
+from tests.conftest import TEST_DATABASE_URL
 
 API_DIR = Path(__file__).resolve().parents[1]
 ALEMBIC_TIMEOUT_SECONDS = 300
