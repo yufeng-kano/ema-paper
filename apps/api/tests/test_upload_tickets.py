@@ -1,7 +1,7 @@
 """Upload tickets end to end (docs/auth.md § 5): one upload, then reads of that one job.
 
-No upstream traffic here either — the worker runs against the stubbed Kano Proxy from
-`test_parse_end_to_end` (docs/testing.md § Cost safety).
+No upstream traffic here either — the worker runs against the stubbed Kano Proxy of
+`tests/helpers` (docs/testing.md § Cost safety).
 """
 
 from __future__ import annotations
@@ -26,9 +26,16 @@ from sightread.errors import ApiError
 from sightread.jobs.intake import Submission, file_chunks, submit_parse
 from sightread.jobs.sweeper import purge_parses
 from tests.conftest import KANO_CHAT_URL, PARSE_MODEL, mcp_running, postgres_only
-from tests.helpers import bearer, credits_spent, staged_uploads
-from tests.test_parse_end_to_end import _drain_queue, _vision_stub
-from tests.test_retry_failed_pages import Upstream
+from tests.helpers import (
+    Upstream,
+    bearer,
+    credits_spent,
+    drain_queue,
+    mint_upload_ticket,
+    staged_uploads,
+    v1_parse,
+    vision_stub,
+)
 
 # The copy is part of the contract: it is the agent's only recovery hint (docs/auth.md § 5).
 EXPECTED_REJECTION = (
@@ -36,26 +43,6 @@ EXPECTED_REJECTION = (
     "ticket. Re-uploading the same file joins its parse while it runs and returns it once "
     "it has succeeded; a failed parse is resumed with the retry command."
 )
-
-
-async def _mint(client: AsyncClient, sessionmaker, ttl_seconds: int | None = None) -> str:
-    """A ticket for the client's user, minted straight through the shared module."""
-    settings = client.app.state.settings
-    if ttl_seconds is not None:
-        settings = settings.model_copy(update={"upload_ticket_ttl_seconds": ttl_seconds})
-    async with sessionmaker() as db:
-        user = (await db.execute(select(User))).scalars().one()
-        _, token = await upload_tickets.mint(db, settings, user)
-    return token
-
-
-async def _upload(client: AsyncClient, token: str, path: Path, **fields) -> httpx.Response:
-    return await client.post(
-        "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "application/pdf")},
-        data={"model": PARSE_MODEL, **fields},
-        headers={"Authorization": f"Bearer {token}"},
-    )
 
 
 async def _submit(
@@ -96,7 +83,7 @@ async def _failed_parse(client: AsyncClient, sessionmaker, path: Path) -> uuid.U
         data={"model": PARSE_MODEL},
     )
     job_id = uuid.UUID(queued.json()["job_id"])
-    await _drain_queue(client, sessionmaker)
+    await drain_queue(client, sessionmaker)
     async with sessionmaker() as db:
         assert (await db.get(Job, job_id)).status == "failed"
     assert staged_uploads(client) == []
@@ -111,9 +98,9 @@ async def _stored_ticket(sessionmaker) -> UploadTicket:
 async def test_a_ticket_uploads_once_and_binds_to_the_job_it_created(
     api_client, sessionmaker, documents
 ) -> None:
-    token = await _mint(api_client, sessionmaker)
+    token = await mint_upload_ticket(api_client)
 
-    accepted = await _upload(api_client, token, documents["text_pdf"])
+    accepted = await v1_parse(api_client, documents["text_pdf"], token)
 
     assert accepted.status_code == 202, accepted.text
     ticket = await _stored_ticket(sessionmaker)
@@ -126,10 +113,10 @@ async def test_last_resolves_a_spent_ticket_to_its_own_job(
     api_client, sessionmaker, documents
 ) -> None:
     """The `last` aliases behind the MCP curl commands (docs/api.md § GET /v1/jobs/last*)."""
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    token = await _mint(api_client, sessionmaker)
-    job_id = (await _upload(api_client, token, documents["text_pdf"])).json()["job_id"]
-    await _drain_queue(api_client, sessionmaker)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
+    token = await mint_upload_ticket(api_client)
+    job_id = (await v1_parse(api_client, documents["text_pdf"], token)).json()["job_id"]
+    await drain_queue(api_client, sessionmaker)
 
     status = await api_client.get("/v1/jobs/last", headers=bearer(token))
     assert status.status_code == 200
@@ -149,23 +136,21 @@ async def test_last_resolves_a_spent_ticket_to_its_own_job(
     assert refused.status_code == 400
 
 
-async def test_last_with_an_unspent_ticket_says_it_has_started_no_parse(
-    api_client, sessionmaker
-) -> None:
+async def test_last_with_an_unspent_ticket_says_it_has_started_no_parse(api_client) -> None:
     # Not the expired copy: that would send the agent to mint again for an upload that was
     # refused, or never sent, while this ticket can still upload (docs/auth.md § 5).
-    token = await _mint(api_client, sessionmaker)
+    token = await mint_upload_ticket(api_client)
     for path in ("/v1/jobs/last", "/v1/jobs/last/result.md", "/v1/jobs/last/figures/1/0,0,9,9"):
         response = await api_client.get(path, headers=bearer(token))
         assert response.status_code == 409, path
         assert "has not started a parse" in response.json()["error"]["message"]
 
 
-async def test_a_spent_ticket_cannot_upload_again(api_client, sessionmaker, documents) -> None:
-    token = await _mint(api_client, sessionmaker)
-    assert (await _upload(api_client, token, documents["text_pdf"])).status_code == 202
+async def test_a_spent_ticket_cannot_upload_again(api_client, documents) -> None:
+    token = await mint_upload_ticket(api_client)
+    assert (await v1_parse(api_client, documents["text_pdf"], token)).status_code == 202
 
-    refused = await _upload(api_client, token, documents["mixed_pdf"])
+    refused = await v1_parse(api_client, documents["mixed_pdf"], token)
 
     assert refused.status_code == 401
     assert refused.json()["error"]["type"] == "auth"
@@ -177,10 +162,10 @@ async def test_a_spent_ticket_cannot_upload_again(api_client, sessionmaker, docu
 async def test_a_spent_ticket_reads_its_own_job_and_nothing_else(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    token = await _mint(api_client, sessionmaker)
-    job_id = (await _upload(api_client, token, documents["text_pdf"])).json()["job_id"]
-    await _drain_queue(api_client, sessionmaker)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
+    token = await mint_upload_ticket(api_client)
+    job_id = (await v1_parse(api_client, documents["text_pdf"], token)).json()["job_id"]
+    await drain_queue(api_client, sessionmaker)
 
     status = await api_client.get(f"/v1/jobs/{job_id}", headers=bearer(token))
     result = await api_client.get(f"/v1/jobs/{job_id}/result", headers=bearer(token))
@@ -212,13 +197,13 @@ async def test_a_spent_ticket_reads_its_own_job_and_nothing_else(
     assert stranger_read.json()["error"]["message"] == EXPECTED_REJECTION
 
 
-async def test_an_unspent_ticket_cannot_read_a_job(api_client, sessionmaker, documents) -> None:
+async def test_an_unspent_ticket_cannot_read_a_job(api_client, documents) -> None:
     accepted = await api_client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
         data={"model": PARSE_MODEL},
     )
-    token = await _mint(api_client, sessionmaker)
+    token = await mint_upload_ticket(api_client)
 
     response = await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}", headers=bearer(token))
 
@@ -226,15 +211,15 @@ async def test_an_unspent_ticket_cannot_read_a_job(api_client, sessionmaker, doc
     assert response.json()["error"]["message"] == EXPECTED_REJECTION
 
 
-async def test_an_expired_ticket_is_refused_everywhere(api_client, sessionmaker, documents) -> None:
-    expired = await _mint(api_client, sessionmaker, ttl_seconds=-60)
+async def test_an_expired_ticket_is_refused_everywhere(api_client, documents) -> None:
+    expired = await mint_upload_ticket(api_client, ttl_seconds=-60)
     accepted = await api_client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
         data={"model": PARSE_MODEL},
     )
 
-    upload = await _upload(api_client, expired, documents["mixed_pdf"])
+    upload = await v1_parse(api_client, documents["mixed_pdf"], expired)
     read = await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}", headers=bearer(expired))
 
     assert upload.status_code == 401
@@ -243,14 +228,14 @@ async def test_an_expired_ticket_is_refused_everywhere(api_client, sessionmaker,
 
 
 async def test_an_unknown_ticket_is_refused(api_client, documents) -> None:
-    response = await _upload(api_client, "srt_not-a-real-ticket", documents["text_pdf"])
+    response = await v1_parse(api_client, documents["text_pdf"], "srt_not-a-real-ticket")
 
     assert response.status_code == 401
     assert response.json()["error"]["message"] == EXPECTED_REJECTION
 
 
-async def test_a_ticket_is_not_a_credential_anywhere_else(api_client, sessionmaker) -> None:
-    token = await _mint(api_client, sessionmaker)
+async def test_a_ticket_is_not_a_credential_anywhere_else(api_client) -> None:
+    token = await mint_upload_ticket(api_client)
 
     models = await api_client.get("/v1/models", headers=bearer(token))
     async with mcp_running(api_client):
@@ -269,7 +254,7 @@ async def test_a_ticket_is_not_a_credential_anywhere_else(api_client, sessionmak
 async def test_an_upload_that_fails_before_a_job_exists_keeps_the_ticket(
     api_client, sessionmaker, documents
 ) -> None:
-    token = await _mint(api_client, sessionmaker)
+    token = await mint_upload_ticket(api_client)
 
     refused = await api_client.post(
         "/v1/parse",
@@ -280,7 +265,7 @@ async def test_an_upload_that_fails_before_a_job_exists_keeps_the_ticket(
     assert (await _stored_ticket(sessionmaker)).spent_at is None
 
     # Still worth exactly one upload.
-    assert (await _upload(api_client, token, documents["text_pdf"])).status_code == 202
+    assert (await v1_parse(api_client, documents["text_pdf"], token)).status_code == 202
     assert (await _stored_ticket(sessionmaker)).spent_at is not None
 
 
@@ -288,18 +273,18 @@ async def test_an_upload_that_fails_before_a_job_exists_keeps_the_ticket(
 async def test_a_dedup_hit_binds_the_ticket_to_the_cached_job(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
     first = await api_client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
         data={"model": PARSE_MODEL},
     )
     job_id = first.json()["job_id"]
-    await _drain_queue(api_client, sessionmaker)
+    await drain_queue(api_client, sessionmaker)
     upstream_calls = respx.calls.call_count
 
-    token = await _mint(api_client, sessionmaker)
-    cached = await _upload(api_client, token, documents["text_pdf"])
+    token = await mint_upload_ticket(api_client)
+    cached = await v1_parse(api_client, documents["text_pdf"], token)
 
     assert cached.status_code == 200
     assert cached.json()["meta"]["cached"] is True
@@ -320,7 +305,7 @@ async def test_a_dedup_hit_binds_the_ticket_to_the_cached_job(
 async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads_it(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
     settings = api_client.app.state.settings
     first = await api_client.post(
         "/v1/parse",
@@ -328,7 +313,7 @@ async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads
         data={"model": PARSE_MODEL},
     )
     job_id = uuid.UUID(first.json()["job_id"])
-    await _drain_queue(api_client, sessionmaker)
+    await drain_queue(api_client, sessionmaker)
     # Past its retention, kept only by a file of the same original.
     async with sessionmaker() as db:
         user = (await db.execute(select(User))).scalars().one()
@@ -339,8 +324,8 @@ async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads
         )
         db.add(Document(user_id=user.id, job_id=job_id, name="text.pdf"))
         await db.commit()
-    token = await _mint(api_client, sessionmaker)
-    cached = await _upload(api_client, token, documents["text_pdf"])
+    token = await mint_upload_ticket(api_client)
+    cached = await v1_parse(api_client, documents["text_pdf"], token)
     assert cached.status_code == 200, cached.text
     assert cached.json()["meta"]["cached"] is True
 
@@ -368,7 +353,7 @@ async def test_two_uploads_racing_on_one_ticket_start_one_parse(
     """Both requests passed auth on the unspent ticket before either committed: one starts
     a parse, the other is the 401 and leaves nothing behind (docs/auth.md § 5)."""
     settings = api_client.app.state.settings
-    token = await _mint(api_client, sessionmaker)
+    token = await mint_upload_ticket(api_client)
     authenticated = asyncio.Barrier(2)
 
     async def upload(path: Path) -> Submission:
@@ -399,7 +384,7 @@ async def test_two_kept_uploads_of_a_cached_parse_racing_on_one_ticket_keep_one_
 ) -> None:
     """A cache hit that keeps originals keeps its fresh copy for its own row; the 401 takes
     the loser's copy with it."""
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
     settings = api_client.app.state.settings
     first = await api_client.post(
         "/v1/parse",
@@ -407,9 +392,9 @@ async def test_two_kept_uploads_of_a_cached_parse_racing_on_one_ticket_keep_one_
         data={"model": PARSE_MODEL},
     )
     assert first.status_code == 202, first.text
-    await _drain_queue(api_client, sessionmaker)
+    await drain_queue(api_client, sessionmaker)
     before = staged_uploads(api_client)
-    token = await _mint(api_client, sessionmaker)
+    token = await mint_upload_ticket(api_client)
     authenticated = asyncio.Barrier(2)
 
     async def upload() -> Submission:
@@ -445,7 +430,7 @@ async def test_a_kept_upload_joining_a_parse_on_a_ticket_spent_meanwhile_changes
         data={"model": PARSE_MODEL},
     )
     job_id = uuid.UUID(queued.json()["job_id"])
-    token = await _mint(api_client, sessionmaker)
+    token = await mint_upload_ticket(api_client)
     async with sessionmaker() as late, sessionmaker() as early:
         stale, user = await upload_tickets.resolve(late, token)
         ticket, owner = await upload_tickets.resolve(early, token)
@@ -480,7 +465,7 @@ async def test_two_retries_racing_on_one_ticket_put_the_parse_back_once(
     401: one requeue, its credits taken back once, one copy under the job's name."""
     settings = api_client.app.state.settings
     job_id = await _failed_parse(api_client, sessionmaker, documents["mixed_pdf"])
-    token = await _mint(api_client, sessionmaker)
+    token = await mint_upload_ticket(api_client)
     authenticated = asyncio.Barrier(2)
 
     async def retry() -> Submission:
@@ -510,7 +495,7 @@ async def test_a_retry_on_a_ticket_spent_meanwhile_leaves_the_parse_failed(
     back: the 401 removes the copy and the parse stays failed, its credits released."""
     settings = api_client.app.state.settings
     job_id = await _failed_parse(api_client, sessionmaker, documents["mixed_pdf"])
-    token = await _mint(api_client, sessionmaker)
+    token = await mint_upload_ticket(api_client)
     async with sessionmaker() as late, sessionmaker() as early:
         stale, user = await upload_tickets.resolve(late, token)
         ticket, owner = await upload_tickets.resolve(early, token)

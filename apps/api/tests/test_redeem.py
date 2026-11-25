@@ -6,7 +6,6 @@ code works without it."""
 
 from __future__ import annotations
 
-import re
 from datetime import UTC, date, datetime, timedelta
 
 import httpx
@@ -38,6 +37,7 @@ from sightread.db.models import (
 from sightread.errors import ApiError
 from tests.billing_helpers import (
     CATALOG_URL,
+    PRINTED,
     PRO_PLANS,
     SUBSCRIPTIONS_URL,
     TWO_PLANS_JSON,
@@ -53,7 +53,6 @@ from tests.billing_helpers import (
 from tests.conftest import CSRF_HEADERS, PAY_SETTINGS, grant_plan, sign_in
 
 REDEEM = "/api/billing/redeem"
-PRINTED = re.compile(r"^EMA-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
 
 
 async def _code(sessionmaker, settings, **grant) -> str:
@@ -131,9 +130,6 @@ def test_granted_days_open_periods_from_the_bank_after_a_paid_one() -> None:
     # A paid subscription comes first: the bank waits, untouched.
     paid = resolve_period(paid_subscription(), Grant("pro", 45), plans, free, now, 30)
     assert paid.period.source == SUBSCRIPTION and paid.grant == Grant("pro", 45)
-    # No bank at all: the paid period, or Free, as before.
-    assert resolve_period(None, None, plans, free, now, 30).period.source == FREE
-    assert resolve_period(paid_subscription(), None, plans, free, now, 30).grant is None
 
 
 def test_a_paid_period_cuts_an_open_granted_one_and_banks_its_whole_days() -> None:

@@ -20,6 +20,7 @@ from sightread.auth.upload_tickets import TICKET_PREFIX
 from sightread.db.models import UploadTicket, User, utcnow
 from tests.conftest import api_key_client, mcp_running
 from tests.connector_helpers import mcp_session, tool_payload
+from tests.helpers import FALLBACK
 
 
 async def _mint(session: ClientSession) -> dict:
@@ -227,7 +228,7 @@ async def test_an_invalid_token_never_reaches_a_tool(api_client: AsyncClient) ->
 async def test_the_models_listed_are_the_parse_agents_with_the_fallback_second(make_client) -> None:
     # The connector cannot read `GET /v1/models` with its ticket, so the tool hands over
     # the ids `-F model=` takes — the fallback a retry sends a blocked page to among them.
-    client = await api_key_client(make_client(parse_fallback_model="vendor/fallback-model"))
+    client = await api_key_client(make_client(parse_fallback_model=FALLBACK))
     async with mcp_running(client), mcp_session(client) as session:
         payload = await _mint(session)
-    assert payload["models"] == [client.app.state.settings.parse_model, "vendor/fallback-model"]
+    assert payload["models"] == [client.app.state.settings.parse_model, FALLBACK]

@@ -18,15 +18,13 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select, update
 
-from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Job, JobPage, Result
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from sightread.workspace import safe_io
 from sightread.workspace.filing import DOCUMENT_NAME_MAX, clean_name, free_name
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL, postgres_only
-from tests.factories import user_row
-from tests.helpers import post_folder, read_library
+from tests.helpers import account_client, post_folder, read_library, staged_uploads
 from tests.library_helpers import fail_next_commit, ready_to_parse, upload, upload_png
 
 
@@ -267,8 +265,7 @@ async def test_a_body_past_the_cap_is_refused_while_it_streams(make_client, docu
     )
 
     assert response.status_code == 413
-    upload_dir = Path(client.app.state.settings.upload_dir)
-    assert not upload_dir.exists() or list(upload_dir.iterdir()) == []
+    assert staged_uploads(client) == []
 
 
 async def test_moving_a_file_onto_a_taken_name_is_suffixed(library, documents) -> None:
@@ -426,22 +423,11 @@ async def test_a_documents_stored_figure_crop_is_served(library, tmp_path, docum
 # --- ownership and CSRF ---------------------------------------------------------------
 
 
-async def test_another_accounts_library_is_invisible(
-    library, make_client, sessionmaker, documents
-) -> None:
+async def test_another_accounts_library_is_invisible(library, make_client, documents) -> None:
     folder = await post_folder(library, "Invoices")
     document = (await upload_png(library, documents)).json()
 
-    stranger = make_client()
-    async with sessionmaker() as db:
-        other = user_row("stranger@example.com")
-        db.add(other)
-        await db.flush()
-        token = await create_session(db, other)
-        await db.commit()
-    # No domain: `http.cookiejar` rewrites a dotless host to "testserver.local", and a
-    # domain-scoped cookie then never matches the request it was set for.
-    stranger.cookies.set(SESSION_COOKIE, token)
+    stranger = await account_client(make_client)
 
     assert (await stranger.get("/api/library")).json() == {
         "folders": [],
@@ -756,8 +742,7 @@ async def test_an_upload_the_quota_refuses_files_nothing(make_client, documents)
     # The second upload of the same bytes keeps its own copy, so the workspace holds
     # something the quota can be measured against.
     assert (await upload_png(library, documents)).status_code == 201
-    uploads = Path(library.app.state.settings.upload_dir)
-    kept = sorted(path.name for path in uploads.iterdir())
+    kept = staged_uploads(library)
     library.app.state.settings.workspace_quota_bytes = 1
     refused = await upload_png(library, documents)
     assert refused.status_code == 409, refused.text
@@ -765,7 +750,7 @@ async def test_an_upload_the_quota_refuses_files_nothing(make_client, documents)
     assert sorted(names) == ["tiny (2).png", "tiny.png"]
     # The refused upload is gone from the upload directory; the parse's own stays for
     # the worker.
-    assert sorted(path.name for path in uploads.iterdir()) == kept
+    assert staged_uploads(library) == kept
 
 
 async def test_a_retry_after_a_failed_finish_does_not_buy_a_second_parse(

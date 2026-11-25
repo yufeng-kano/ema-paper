@@ -16,7 +16,6 @@ import httpx
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Folder, Job
 from sightread.jobs import chat_tools, sweeper
 from sightread.workspace import documents as workspace_documents
@@ -25,8 +24,7 @@ from sightread.workspace.documents import original_of
 from sightread.workspace.layout import sources_dir, trash_root
 from sightread.workspace.reconcile import reconcile_user
 from tests.conftest import CSRF_HEADERS, image_view, sign_in
-from tests.factories import user_row
-from tests.helpers import post_folder, read_library
+from tests.helpers import account_client, post_folder, read_library
 from tests.library_helpers import upload
 
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -192,14 +190,7 @@ async def test_the_file_route_is_the_owners_and_a_documents_is_not_a_file(
     created = await _kept(writer, "notes.txt", b"mine", "text/plain")
     markdown = (await upload(writer, "notes.md", b"# Notes\n", "text/markdown")).json()
     assert (await writer.get(f"/api/library/documents/{markdown['id']}/file")).status_code == 404
-    stranger = make_client()
-    async with writer.app.state.sessionmaker() as db:
-        other = user_row("stranger@example.com")
-        db.add(other)
-        await db.flush()
-        token = await create_session(db, other)
-        await db.commit()
-    stranger.cookies.set(SESSION_COOKIE, token)
+    stranger = await account_client(make_client)
     assert (await stranger.get(f"/api/library/documents/{created['id']}/file")).status_code == 404
     signed_out = make_client()
     assert (await signed_out.get(f"/api/library/documents/{created['id']}/file")).status_code == 401

@@ -21,9 +21,9 @@ from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
 from sightread.workspace.documents import original_of
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL
-from tests.library_helpers import fail_next_commit
-from tests.test_parse_end_to_end import _completion, _drain_queue
-from tests.test_retry_failed_pages import FALLBACK, Upstream, _library, _retry, _row, _upload
+from tests.helpers import FALLBACK, Upstream, completion, drain_queue
+from tests.library_helpers import fail_next_commit, upload_file
+from tests.test_retry_failed_pages import _library, _retry, _row
 
 # What the re-convert's model answers for every page. Its figure takes the whole page, as
 # the first parse's does, so the figure check asks no model (docs/parsing.md § Figure check).
@@ -43,7 +43,7 @@ async def library(make_client) -> AsyncClient:
 def _upstream(**failing: int) -> Upstream:
     """The first parse on PARSE_MODEL, the re-convert on FALLBACK; `fallback_fails=N` makes
     FALLBACK refuse page N."""
-    answers = {(FALLBACK, page): (lambda: _completion(RECONVERTED)) for page in (1, 2, 3)}
+    answers = {(FALLBACK, page): (lambda: completion(RECONVERTED)) for page in (1, 2, 3)}
     if "fallback_fails" in failing:
         answers[(FALLBACK, failing["fallback_fails"])] = lambda: httpx.Response(400)
     return Upstream(answers)
@@ -76,8 +76,8 @@ async def _baseline(sessionmaker, job_id: str) -> str:
 
 async def _parsed(client: AsyncClient, sessionmaker, documents) -> dict:
     """An uploaded PDF whose parse succeeded."""
-    uploaded = await _upload(client, documents["mixed_pdf"])
-    await _drain_queue(client, sessionmaker)
+    uploaded = await upload_file(client, documents["mixed_pdf"])
+    await drain_queue(client, sessionmaker)
     assert (await _row(client, uploaded["id"]))["status"] == "succeeded"
     return uploaded
 
@@ -140,7 +140,7 @@ async def test_the_document_keeps_its_version_until_the_new_parse_succeeds(
     assert (await _reconvert(library, uploaded["id"])).status_code == 409
     assert (await _dismiss(library, uploaded["id"])).status_code == 409
 
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
 
     # Every page ran again on the model named, none answered from the cache.
     assert sorted(upstream.calls) == [(FALLBACK, 1), (FALLBACK, 2), (FALLBACK, 3)]
@@ -191,7 +191,7 @@ async def test_a_failed_reconvert_leaves_the_document_and_is_retried_or_dismisse
     started = await _reconvert(library, uploaded["id"], model=FALLBACK)
     assert started.status_code == 202, started.text
     new_job = started.json()["job_id"]
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
 
     # The document keeps its version, and the row says the re-convert failed.
     row = await _row(library, uploaded["id"])
@@ -216,7 +216,7 @@ async def test_a_failed_reconvert_leaves_the_document_and_is_retried_or_dismisse
     retried = await _retry(library, uploaded["id"], model=PARSE_MODEL)
     assert retried.status_code == 202, retried.text
     assert retried.json()["job_id"] == new_job
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     row = await _row(library, uploaded["id"])
     assert (row["job_id"], row["status"], row["reconvert"]) == (new_job, "succeeded", None)
     assert (await _content(library, uploaded["id"]))["markdown"] == await _baseline(
@@ -226,7 +226,7 @@ async def test_a_failed_reconvert_leaves_the_document_and_is_retried_or_dismisse
     # A second one that fails is dismissed: the pointer clears, the parse row stays.
     respx.post(KANO_CHAT_URL).mock(side_effect=_upstream(fallback_fails=1))
     failed = (await _reconvert(library, uploaded["id"], model=FALLBACK)).json()["job_id"]
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     assert (await _row(library, uploaded["id"]))["reconvert"]["status"] == "failed"
     assert (await _dismiss(library, uploaded["id"])).status_code == 204
     row = await _row(library, uploaded["id"])
@@ -241,7 +241,7 @@ async def test_a_failed_reconvert_gives_way_to_a_new_one(library, sessionmaker, 
     respx.post(KANO_CHAT_URL).mock(side_effect=_upstream(fallback_fails=3))
     uploaded = await _parsed(library, sessionmaker, documents)
     failed = (await _reconvert(library, uploaded["id"], model=FALLBACK)).json()["job_id"]
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
 
     again = await _reconvert(library, uploaded["id"], model=PARSE_MODEL)
     assert again.status_code == 202, again.text
@@ -265,16 +265,16 @@ async def test_only_a_parsed_document_with_its_original_is_reconverted(
     assert (await _reconvert(library, markdown.json()["id"])).status_code == 404
 
     # A parse on its way is waited for, a failed one is retried instead.
-    uploaded = await _upload(library, documents["mixed_pdf"])
+    uploaded = await upload_file(library, documents["mixed_pdf"])
     assert (await _reconvert(library, uploaded["id"])).status_code == 409
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     assert (await _row(library, uploaded["id"]))["status"] == "failed"
     assert (await _reconvert(library, uploaded["id"])).status_code == 409
 
     # A document that kept no original is uploaded again.
     respx.post(KANO_CHAT_URL).mock(side_effect=_upstream())
     assert (await _retry(library, uploaded["id"])).status_code == 202
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     original_of(library.root, uploaded["id"]).unlink()
     refused = await _reconvert(library, uploaded["id"])
     assert refused.status_code == 409
@@ -295,7 +295,7 @@ async def test_a_document_in_the_trash_keeps_its_version(library, sessionmaker, 
     )
     assert trashed.status_code == 200, trashed.text
 
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
 
     async with sessionmaker() as db:
         row = await db.get(Document, uploaded["id"])
@@ -320,7 +320,7 @@ async def test_a_reconvert_the_worker_did_not_take_is_taken_by_the_next_read(
     new_job = (await _reconvert(library, uploaded["id"], model=FALLBACK)).json()["job_id"]
 
     monkeypatch.setattr("sightread.jobs.runner.take_reconvert", _not_taken)
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     row = await _row(library, uploaded["id"])
     assert (row["job_id"], row["reconvert"]["status"]) == (uploaded["job_id"], "succeeded")
 
@@ -342,7 +342,7 @@ async def test_a_swap_whose_commit_fails_leaves_the_files_ahead_for_the_next_tak
     await _content(library, uploaded["id"])
     new_job = (await _reconvert(library, uploaded["id"], model=FALLBACK)).json()["job_id"]
     monkeypatch.setattr("sightread.jobs.runner.take_reconvert", _not_taken)
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     monkeypatch.undo()
 
     settings = library.app.state.settings
@@ -377,7 +377,7 @@ async def test_a_swap_that_cannot_be_written_leaves_the_document_as_it_was_and_r
     before = await _content(library, uploaded["id"])
     new_job = (await _reconvert(library, uploaded["id"], model=FALLBACK)).json()["job_id"]
     monkeypatch.setattr("sightread.jobs.runner.take_reconvert", _not_taken)
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     monkeypatch.undo()
 
     # The disk fills between the two files the swap writes.
@@ -425,7 +425,7 @@ async def test_a_figure_from_before_a_reconvert_keeps_its_crop(
         crop_path(figures_dir, uuid.UUID(uploaded["job_id"]), 1, (0, 0, 1000, 1000)).read_bytes()
     )
     (await _reconvert(library, uploaded["id"], model=FALLBACK)).raise_for_status()
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     assert (await _row(library, uploaded["id"]))["job_id"] != uploaded["job_id"]
 
     base = f"/api/library/documents/{uploaded['id']}/figures"
@@ -456,7 +456,7 @@ async def test_a_reconvert_takes_the_earlier_parse_copies_out_of_the_directory(
         (view / crop.name).write_bytes(kept.read_bytes())
     (view / rewritten.name).write_bytes(b"the agent's own picture")
     (await _reconvert(library, uploaded["id"], model=FALLBACK)).raise_for_status()
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     assert (await _row(library, uploaded["id"]))["job_id"] != uploaded["job_id"]
     # The new parse's crops are in the directory, the earlier parse's copy is not — the
     # quota would count it, no longer the document's parse — and what a command wrote

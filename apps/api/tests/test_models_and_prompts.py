@@ -23,10 +23,7 @@ from tests.conftest import (
     PARSE_MODEL,
     api_key_client,
 )
-from tests.helpers import stub_connection
-from tests.test_parse_end_to_end import _drain_queue
-
-FALLBACK = "vendor/fallback-model"
+from tests.helpers import FALLBACK, drain_queue, stub_connection
 
 # What Kano Proxy's catalog lists: two of the three offered chat models, and more.
 MODELS_PAYLOAD = {
@@ -259,7 +256,7 @@ async def test_a_job_with_no_endpoint_snapshot_never_runs_on_kano_proxy(
         await db.commit()
 
     for attempt in ("queued", "retried"):
-        assert await _drain_queue(client, sessionmaker) == job_id, attempt
+        assert await drain_queue(client, sessionmaker) == job_id, attempt
 
         status = (await client.get(f"/v1/jobs/{job_id}")).json()
         assert (status["status"], status["error"]) == ("failed", gone), attempt
@@ -300,7 +297,7 @@ async def test_a_queued_job_reconciles_its_endpoint_snapshot_at_claim_time(
 
     # The worker restarted on the moved origin.
     worker = make_client(kano_proxy_base_url=moved_base)
-    assert await _drain_queue(worker, sessionmaker) == job_id
+    assert await drain_queue(worker, sessionmaker) == job_id
 
     assert moved_chat.called
     assert moved_chat.calls[0].request.headers["authorization"] == f"Bearer {KANO_API_KEY}"

@@ -1,12 +1,13 @@
 """What the billing tests share: settings built without an app, the rows they charge
-against, the plans they configure, and a Kano Pay that only exists inside respx
-(docs/billing.md § Kano Pay)."""
+against, the plans they configure, the shape of a printed code, and a Kano Pay that only
+exists inside respx (docs/billing.md § Kano Pay)."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
+import re
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -73,6 +74,9 @@ TWO_PLANS_JSON = json.dumps(
         },
     ]
 )
+
+# A redeem code as the console and the CLI print it (docs/billing.md § Redeem codes).
+PRINTED = re.compile(r"^EMA-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
 
 
 async def make_user(sessionmaker, name: str = "ledger") -> int:

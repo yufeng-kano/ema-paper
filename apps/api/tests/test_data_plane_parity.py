@@ -27,12 +27,20 @@ from tests.conftest import (
     api_key_client,
     convert_on_upload,
 )
-from tests.helpers import bearer, credits_spent, job_by_id, staged_uploads, v1_parse
+from tests.helpers import (
+    FALLBACK,
+    Upstream,
+    bearer,
+    credits_spent,
+    drain_queue,
+    job_by_id,
+    mint_upload_ticket,
+    staged_uploads,
+    v1_parse,
+    vision_stub,
+)
+from tests.library_helpers import upload_file
 from tests.test_format_check import READING, TRANSCRIPTION, _done, _tool, _turn, _vision
-from tests.test_parse_end_to_end import _drain_queue, _vision_stub
-from tests.test_retry_failed_pages import FALLBACK, Upstream
-from tests.test_retry_failed_pages import _upload as _library_upload
-from tests.test_upload_tickets import _mint
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -72,7 +80,7 @@ async def test_an_api_parse_is_checked_and_returns_the_reading_copy(
     assert accepted.status_code == 202, accepted.text
     job_id = accepted.json()["job_id"]
     assert (await job_by_id(sessionmaker, job_id)).check_model == PARSE_MODEL
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     assert len(agent.calls) == 2
 
     # What the web reader opens, not the page-by-page transcription.
@@ -90,7 +98,7 @@ async def test_an_api_parse_is_checked_and_returns_the_reading_copy(
 
     # The connector's path: a ticket's upload of the same file is the cached parse, and its
     # `last` reads land the same reading copy.
-    token = await _mint(api, sessionmaker)
+    token = await mint_upload_ticket(api)
     cached = await v1_parse(api, documents["mixed_pdf"], token)
     assert cached.status_code == 200, cached.text
     assert (cached.json()["markdown"], cached.json()["meta"]["cached"]) == (READING, True)
@@ -114,7 +122,7 @@ async def test_with_the_check_switched_off_the_transcription_is_returned(
     accepted = await v1_parse(api, documents["mixed_pdf"])
     job_id = accepted.json()["job_id"]
     assert (await job_by_id(sessionmaker, job_id)).check_model is None
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
 
     assert (await api.get(f"/v1/jobs/{job_id}/result.md")).text == TRANSCRIPTION
     assert "check" not in (await api.get(f"/v1/jobs/{job_id}/result")).json()["meta"]
@@ -127,11 +135,11 @@ async def test_with_the_check_switched_off_the_transcription_is_returned(
 async def test_a_figure_is_served_as_the_crop_the_web_reader_shows(
     api, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    token = await _mint(api, sessionmaker)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
+    token = await mint_upload_ticket(api)
     accepted = await v1_parse(api, documents["mixed_pdf"], token)
     job_id = accepted.json()["job_id"]
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     stored = Path(api.app.state.settings.figures_dir) / job_id / "p2_0_0_1000_1000.png"
 
     # By the ticket's `last`, as the connector's figures command fetches it.
@@ -162,9 +170,9 @@ async def test_a_failed_parse_is_retried_by_sending_its_file_again(
 ) -> None:
     upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    first = await _mint(api, sessionmaker)
+    first = await mint_upload_ticket(api)
     job_id = (await v1_parse(api, documents["mixed_pdf"], first)).json()["job_id"]
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
 
     # Final, not pending: the read says the parse failed and why.
     missing = await api.get("/v1/jobs/last/result.md", headers=bearer(first))
@@ -175,7 +183,7 @@ async def test_a_failed_parse_is_retried_by_sending_its_file_again(
     assert await credits_spent(api) == 0
 
     upstream.calls.clear()
-    second = await _mint(api, sessionmaker)
+    second = await mint_upload_ticket(api)
     # Another selection of pages is another parse: nothing to retry. A flag that is no
     # bool is refused rather than read as false, which would start a full parse.
     other = await v1_parse(api, documents["mixed_pdf"], second, retry="true", pages="1-2")
@@ -200,13 +208,13 @@ async def test_a_failed_parse_is_retried_by_sending_its_file_again(
     assert await credits_spent(api) == 3
 
     # Sent once more while it waits: the same retry, joined — nothing reserved twice.
-    third = await _mint(api, sessionmaker)
+    third = await mint_upload_ticket(api)
     again = await v1_parse(api, documents["mixed_pdf"], third, retry="true", model=FALLBACK)
     assert again.json() == {"job_id": job_id, "status": "queued"}
     assert await credits_spent(api) == 3
     assert len(staged_uploads(api)) == 1
 
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     # Only the failed page went upstream, to the model the retry named.
     assert upstream.calls == [(FALLBACK, 2)]
     result = (await api.get("/v1/jobs/last/result", headers=bearer(second))).json()
@@ -224,7 +232,7 @@ async def test_a_retry_with_nothing_to_retry_is_refused_and_spends_nothing(
     respx.post(KANO_CHAT_URL).mock(
         side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     )
-    token = await _mint(api, sessionmaker)
+    token = await mint_upload_ticket(api)
 
     nothing = await v1_parse(api, documents["mixed_pdf"], token, retry="true")
     assert nothing.status_code == 409, nothing.text
@@ -250,13 +258,13 @@ async def test_a_retry_the_balance_cannot_cover_is_refused_and_changes_nothing(
         side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     )
     job_id = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     # The failure gave its credits back; a one-page parse takes one of the three.
     assert (await v1_parse(api, documents["text_pdf"])).status_code == 202
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     assert await credits_spent(api) == 1
 
-    token = await _mint(api, sessionmaker)
+    token = await mint_upload_ticket(api)
     refused = await v1_parse(api, documents["mixed_pdf"], token, retry="true")
     assert refused.status_code == 402, refused.text
     assert (refused.json()["error"]["need"], refused.json()["error"]["remaining"]) == (3, 2)
@@ -275,7 +283,7 @@ async def test_a_retry_after_the_file_parsed_again_answers_that_parse(
     upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     failed = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     # Past the in-flight window, so the file sent again is a parse of its own.
     async with sessionmaker() as db:
         await db.execute(
@@ -286,13 +294,13 @@ async def test_a_retry_after_the_file_parsed_again_answers_that_parse(
         await db.commit()
     upstream.answers.clear()
     parsed = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     assert parsed != failed
     assert await credits_spent(api) == 3
     upstream.calls.clear()
 
     # The newer parse answers: the older failure is neither run nor billed again.
-    token = await _mint(api, sessionmaker)
+    token = await mint_upload_ticket(api)
     retried = await v1_parse(api, documents["mixed_pdf"], token, retry="true")
     assert retried.status_code == 202, retried.text
     assert retried.json() == {"job_id": parsed, "status": "succeeded"}
@@ -310,7 +318,7 @@ async def test_a_retry_after_the_file_parsed_in_files_answers_that_parse(
     upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     failed = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     async with sessionmaker() as db:
         await db.execute(
             update(Job)
@@ -320,14 +328,14 @@ async def test_a_retry_after_the_file_parsed_in_files_answers_that_parse(
         await db.commit()
     upstream.answers.clear()
     await convert_on_upload(api)
-    filed = await _library_upload(api, documents["mixed_pdf"])
-    await _drain_queue(api, sessionmaker)
+    filed = await upload_file(api, documents["mixed_pdf"])
+    await drain_queue(api, sessionmaker)
     assert (await job_by_id(sessionmaker, filed["job_id"])).status == "succeeded"
     assert await credits_spent(api) == 3
     upstream.calls.clear()
 
     # The Files upload is the newest parse of the file: the retry is answered with it.
-    token = await _mint(api, sessionmaker)
+    token = await mint_upload_ticket(api)
     retried = await v1_parse(api, documents["mixed_pdf"], token, retry="true")
     assert retried.json() == {"job_id": filed["job_id"], "status": "succeeded"}
     assert (await job_by_id(sessionmaker, failed)).status == "failed"
@@ -339,7 +347,7 @@ async def test_a_retry_after_the_file_parsed_in_files_answers_that_parse(
 
 @respx.mock
 async def test_the_same_file_again_joins_the_parse_in_flight(api, sessionmaker, documents) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
     first = await v1_parse(api, documents["mixed_pdf"])
     assert first.status_code == 202, first.text
     job_id = first.json()["job_id"]
@@ -347,7 +355,7 @@ async def test_the_same_file_again_joins_the_parse_in_flight(api, sessionmaker, 
 
     # A command the shell cut off, run again with a fresh ticket: the same parse, bound to
     # the ticket, no second reservation.
-    token = await _mint(api, sessionmaker)
+    token = await mint_upload_ticket(api)
     joined = await v1_parse(api, documents["mixed_pdf"], token)
     assert joined.json() == {"job_id": job_id, "status": "queued"}
     assert (await api.get("/v1/jobs/last", headers=bearer(token))).json()["job_id"] == job_id
@@ -365,7 +373,7 @@ async def test_the_same_file_again_joins_the_parse_in_flight(api, sessionmaker, 
     async with sessionmaker() as db:
         await db.execute(update(Job).where(Job.id.in_(in_flight)).values(status="running"))
         await db.commit()
-    again = await v1_parse(api, documents["mixed_pdf"], await _mint(api, sessionmaker))
+    again = await v1_parse(api, documents["mixed_pdf"], await mint_upload_ticket(api))
     assert again.status_code == 202, again.text
     assert uuid.UUID(again.json()["job_id"]) in in_flight
     capped = await v1_parse(api, documents["text_pdf"])
@@ -392,10 +400,10 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     if filed:
         await convert_on_upload(api)
-        job_id = (await _library_upload(api, documents["mixed_pdf"]))["job_id"]
+        job_id = (await upload_file(api, documents["mixed_pdf"]))["job_id"]
     else:
         job_id = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     async with sessionmaker() as db:
         await db.execute(
             update(Job)
@@ -416,6 +424,6 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
         None,
         PARSE_MODEL,
     )
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     assert upstream.calls == [(PARSE_MODEL, 2)]
     assert (await job_by_id(sessionmaker, job_id)).status == "succeeded"

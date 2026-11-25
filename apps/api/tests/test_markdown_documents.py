@@ -21,7 +21,7 @@ from sightread.workspace import git
 from sightread.workspace.documents import original_of
 from tests.chat_helpers import MESSAGES_URL, assistant_turn, run_queued_turn
 from tests.conftest import CSRF_HEADERS, sign_in
-from tests.helpers import post_folder
+from tests.helpers import post_folder, staged_uploads
 from tests.library_helpers import new_document, upload
 
 
@@ -62,7 +62,7 @@ async def test_an_uploaded_md_is_a_document_with_no_parse(writer) -> None:
     assert original is not None and original.name == f"{document['id']}.md"
     assert original.read_bytes() == raw
     # The staged upload is gone once it is kept.
-    assert list(Path(writer.app.state.settings.upload_dir).iterdir()) == []
+    assert staged_uploads(writer) == []
 
     content = await writer.get(f"/api/library/documents/{document['id']}/content")
     assert content.status_code == 200, content.text
@@ -99,7 +99,6 @@ async def test_a_markdown_type_alone_is_enough(writer) -> None:
 
 async def test_a_markdown_upload_must_be_utf8_text_under_the_content_cap(make_client) -> None:
     client = await sign_in(make_client(content_max_bytes=64))
-    uploads = Path(client.app.state.settings.upload_dir)
 
     latin1 = await upload(client, "notes.md", "café\n".encode("latin-1"))
     assert latin1.status_code == 400, latin1.text
@@ -108,7 +107,7 @@ async def test_a_markdown_upload_must_be_utf8_text_under_the_content_cap(make_cl
     assert "CONTENT_MAX_BYTES" in too_large.json()["error"]["message"]
 
     assert (await client.get("/api/library")).json()["documents"] == []
-    assert list(uploads.iterdir()) == []
+    assert staged_uploads(client) == []
     # A character split across the reader's slices is still UTF-8.
     assert (await upload(client, "notes.md", "é" * 32)).status_code == 201
 
@@ -122,7 +121,7 @@ async def test_an_upload_the_quota_refuses_files_nothing(writer) -> None:
     assert [row["name"] for row in (await writer.get("/api/library")).json()["documents"]] == [
         "notes.md"
     ]
-    assert list(Path(writer.app.state.settings.upload_dir).iterdir()) == []
+    assert staged_uploads(writer) == []
     # Nothing kept under the id of the row that is gone.
     sources = writer.root.parent / ".repos" / f"{writer.user_id}.sources"
     assert sorted(path.name for path in sources.iterdir()) == [f"{first.json()['id']}.md"]

@@ -103,12 +103,13 @@ TEST_MODEL_PRICES = json.dumps(
 
 
 def path_settings(tmp_path: Path, **overrides) -> Settings:
-    """Settings for code driven without an app: its workspaces and figures under
+    """Settings for code driven without an app: its uploads, workspaces and figures under
     `tmp_path`, Kano Proxy at `KANO_BASE`."""
     return Settings(
         **{
             "app_env": "local",
             "secret_key": TEST_SECRET_KEY,
+            "upload_dir": str(tmp_path / "uploads"),
             "workspaces_dir": str(tmp_path / "workspaces"),
             "figures_dir": str(tmp_path / "figures"),
             "kano_proxy_base_url": KANO_BASE,
@@ -297,8 +298,7 @@ async def writer(make_client) -> AsyncClient:
 async def api_key_client(client: AsyncClient) -> AsyncClient:
     """Sign `client` in as the dev user and send a fresh API key of theirs on every
     request; its session cookie stays, for the routes a key does not open."""
-    response = await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    assert response.status_code == 200, response.text
+    await sign_in(client)
     created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
     client.headers["Authorization"] = f"Bearer {created.json()['key']}"
     return client

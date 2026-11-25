@@ -3,7 +3,8 @@
 before anything is made; the ticket filing there as a Files upload does, the original
 kept, spent only by the filing; a file parsed without a folder filed from that parse with
 nothing charged; no twin; every page; a filed parse that failed retried where it is, on a
-ticket that files nothing. The vision upstream is stubbed (docs/testing.md § Cost safety).
+ticket that files nothing, and refused when only the Trash names it. The vision upstream is
+stubbed (docs/testing.md § Cost safety).
 """
 
 from __future__ import annotations
@@ -16,18 +17,25 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from sightread.auth import upload_tickets
 from sightread.auth.crypto import hash_token
-from sightread.db.models import Document, Job, UploadTicket, User
+from sightread.db.models import Document, Job, UploadTicket
 from sightread.errors import ApiError
 from sightread.jobs.intake import retry_filed_parse
 from sightread.workspace import documents as workspace_documents
-from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL, api_key_client, mcp_running
 from tests.connector_helpers import mcp_session, tool_payload
-from tests.helpers import bearer, credits_spent, staged_uploads, v1_parse
-from tests.test_parse_end_to_end import _drain_queue, _vision_stub
-from tests.test_retry_failed_pages import FALLBACK, Upstream
+from tests.helpers import (
+    FALLBACK,
+    Upstream,
+    bearer,
+    credits_spent,
+    drain_queue,
+    mint_upload_ticket,
+    post_folder,
+    staged_uploads,
+    v1_parse,
+    vision_stub,
+)
 
 
 @pytest.fixture
@@ -39,38 +47,7 @@ async def api(make_client) -> AsyncClient:
         "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
     )
     assert off.status_code == 200, off.text
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     return client
-
-
-async def _folder(client: AsyncClient, name: str, parent_id: int | None = None) -> int:
-    made = await client.post(
-        "/api/library/folders",
-        json={"name": name, "parent_id": parent_id},
-        headers=CSRF_HEADERS,
-    )
-    assert made.status_code == 201, made.text
-    return made.json()["id"]
-
-
-async def _mint(
-    client: AsyncClient,
-    sessionmaker,
-    *,
-    into_library: bool = False,
-    folder_id: int | None = None,
-) -> str:
-    async with sessionmaker() as db:
-        user = (await db.execute(select(User))).scalars().one()
-        _, token = await upload_tickets.mint(
-            db,
-            client.app.state.settings,
-            user,
-            into_library=into_library,
-            folder_id=folder_id,
-        )
-    return token
 
 
 async def _documents(sessionmaker) -> list[Document]:
@@ -91,8 +68,8 @@ async def _ticket(sessionmaker, token: str) -> UploadTicket:
 
 
 async def test_the_parse_tool_files_into_a_folder_as_listed_or_made(api, sessionmaker) -> None:
-    dl = await _folder(api, "DL")
-    dino = await _folder(api, "DINO", dl)
+    dl = (await post_folder(api, "DL"))["id"]
+    dino = (await post_folder(api, "DINO", dl))["id"]
     made = await api.post(
         "/api/library/documents/new", json={"name": "Reading list"}, headers=CSRF_HEADERS
     )
@@ -174,9 +151,9 @@ async def test_a_parse_the_mint_rate_refuses_makes_no_folder(make_client) -> Non
 async def test_a_filing_ticket_files_the_parse_as_a_files_upload(
     api, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    dino = await _folder(api, "DINO")
-    token = await _mint(api, sessionmaker, into_library=True, folder_id=dino)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
+    dino = (await post_folder(api, "DINO"))["id"]
+    token = await mint_upload_ticket(api, into_library=True, folder_id=dino)
 
     accepted = await v1_parse(api, documents["text_pdf"], token)
     assert accepted.status_code == 202, accepted.text
@@ -193,7 +170,7 @@ async def test_a_filing_ticket_files_the_parse_as_a_files_upload(
     ticket = await _ticket(sessionmaker, token)
     assert (str(ticket.job_id), ticket.spent_at is not None) == (job_id, True)
 
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     # The worker filed the upload as the document's original, as for a Files upload.
     assert workspace_documents.original_of(api.root, document_id) is not None
     assert staged_uploads(api) == []
@@ -209,15 +186,15 @@ async def test_a_filing_ticket_files_the_parse_as_a_files_upload(
 async def test_a_file_parsed_without_a_folder_is_filed_from_that_parse_once(
     api, sessionmaker, documents
 ) -> None:
-    route = respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    plain = await _mint(api, sessionmaker)
+    route = respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
+    plain = await mint_upload_ticket(api)
     job_id = (await v1_parse(api, documents["mixed_pdf"], plain)).json()["job_id"]
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     assert await _documents(sessionmaker) == []
     calls, spent = len(route.calls), await credits_spent(api)
 
-    papers = await _folder(api, "Papers")
-    filing = await _mint(api, sessionmaker, into_library=True, folder_id=papers)
+    papers = (await post_folder(api, "Papers"))["id"]
+    filing = await mint_upload_ticket(api, into_library=True, folder_id=papers)
     cached = await v1_parse(api, documents["mixed_pdf"], filing)
     assert cached.status_code == 200, cached.text
     assert cached.json()["meta"]["cached"] is True
@@ -235,7 +212,7 @@ async def test_a_file_parsed_without_a_folder_is_filed_from_that_parse_once(
     again = await v1_parse(
         api,
         documents["mixed_pdf"],
-        await _mint(api, sessionmaker, into_library=True, folder_id=papers),
+        await mint_upload_ticket(api, into_library=True, folder_id=papers),
     )
     assert again.status_code == 200, again.text
     assert again.json()["document_id"] == document_id
@@ -243,7 +220,7 @@ async def test_a_file_parsed_without_a_folder_is_filed_from_that_parse_once(
     assert staged_uploads(api) == []
     # Another folder is another place to keep it: a second entry of the same parse.
     other = await v1_parse(
-        api, documents["mixed_pdf"], await _mint(api, sessionmaker, into_library=True)
+        api, documents["mixed_pdf"], await mint_upload_ticket(api, into_library=True)
     )
     assert other.status_code == 200, other.text
     assert other.json()["document_id"] != document_id
@@ -254,16 +231,16 @@ async def test_a_file_parsed_without_a_folder_is_filed_from_that_parse_once(
 async def test_a_filing_refused_after_a_cache_hit_leaves_the_ticket_unspent(
     api, sessionmaker, documents, monkeypatch
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    await v1_parse(api, documents["text_pdf"], await _mint(api, sessionmaker))
-    await _drain_queue(api, sessionmaker)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
+    await v1_parse(api, documents["text_pdf"], await mint_upload_ticket(api))
+    await drain_queue(api, sessionmaker)
 
     async def full(*args, **kwargs) -> None:
         raise ApiError(409, "storage_full", "The workspace is at its quota; free some space first")
 
     # The quota the filing checks when it keeps the original, after the cache answered.
     monkeypatch.setattr(workspace_documents, "ensure_within_quota", full)
-    filing = await _mint(api, sessionmaker, into_library=True)
+    filing = await mint_upload_ticket(api, into_library=True)
     refused = await v1_parse(api, documents["text_pdf"], filing)
     assert refused.status_code == 409, refused.text
     assert refused.json()["error"]["type"] == "storage_full"
@@ -279,8 +256,8 @@ async def test_a_filing_refused_after_a_cache_hit_leaves_the_ticket_unspent(
 async def test_a_filing_refuses_pages_a_folder_field_and_a_trashed_destination(
     api, sessionmaker, documents
 ) -> None:
-    papers = await _folder(api, "Papers")
-    token = await _mint(api, sessionmaker, into_library=True, folder_id=papers)
+    papers = (await post_folder(api, "Papers"))["id"]
+    token = await mint_upload_ticket(api, into_library=True, folder_id=papers)
 
     pages = await v1_parse(api, documents["mixed_pdf"], token, pages="1-2")
     assert pages.status_code == 400, pages.text
@@ -308,7 +285,7 @@ async def test_a_filing_refuses_pages_a_folder_field_and_a_trashed_destination(
 
 @respx.mock
 async def test_an_api_key_files_with_the_folder_field(api, sessionmaker, documents) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
     accepted = await v1_parse(api, documents["text_pdf"], folder="Papers/2026")
     assert accepted.status_code == 202, accepted.text
     (row,) = await _documents(sessionmaker)
@@ -332,17 +309,17 @@ async def test_a_filed_parse_that_failed_is_retried_where_it_is(
 ) -> None:
     upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    filing = await _mint(api, sessionmaker, into_library=True)
+    filing = await mint_upload_ticket(api, into_library=True)
     accepted = await v1_parse(api, documents["mixed_pdf"], filing)
     job_id, document_id = accepted.json()["job_id"], accepted.json()["document_id"]
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     async with sessionmaker() as db:
         assert (await db.get(Job, uuid.UUID(job_id))).status == "failed"
     # A failed parse's row keeps its original, which the retry runs on.
     assert workspace_documents.original_of(api.root, document_id) is not None
 
     upstream.calls.clear()
-    token = await _mint(api, sessionmaker)
+    token = await mint_upload_ticket(api)
     retried = await v1_parse(api, documents["mixed_pdf"], token, retry="true", model=FALLBACK)
     assert retried.status_code == 202, retried.text
     assert retried.json() == {"job_id": job_id, "status": "queued"}
@@ -356,7 +333,7 @@ async def test_a_filed_parse_that_failed_is_retried_where_it_is(
 
     # A retry that read the parse as failed before this one put it back is answered with
     # it, as it stands, its ticket spent on it; nothing is queued twice.
-    second = await _mint(api, sessionmaker)
+    second = await mint_upload_ticket(api)
     second_id = (await _ticket(sessionmaker, second)).id
     async with sessionmaker() as db:
         answered = await retry_filed_parse(
@@ -372,8 +349,37 @@ async def test_a_filed_parse_that_failed_is_retried_where_it_is(
     assert (str(late.job_id), late.spent_at is not None) == (job_id, True)
     assert [name.split(".retry-")[0] for name in staged_uploads(api)] == [job_id]
 
-    await _drain_queue(api, sessionmaker)
+    await drain_queue(api, sessionmaker)
     assert upstream.calls == [(FALLBACK, 2)]
     landed = await api.get("/v1/jobs/last/result.md", headers=bearer(token))
     assert landed.status_code == 200, landed.text
     assert [entry.id for entry in await _documents(sessionmaker)] == [document_id]
+
+
+@respx.mock
+async def test_a_retry_of_a_parse_only_the_trash_names_is_refused(
+    api, sessionmaker, documents
+) -> None:
+    upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
+    respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
+    filing = await mint_upload_ticket(api, into_library=True)
+    accepted = await v1_parse(api, documents["mixed_pdf"], filing)
+    job_id, document_id = accepted.json()["job_id"], accepted.json()["document_id"]
+    await drain_queue(api, sessionmaker)
+    async with sessionmaker() as db:
+        assert (await db.get(Job, uuid.UUID(job_id))).status == "failed"
+    trashed = await api.post(f"/api/library/documents/{document_id}/trash", headers=CSRF_HEADERS)
+    assert trashed.status_code == 200, trashed.text
+
+    # The parse is the reader's, in the Trash: the data plane spends and queues nothing.
+    upstream.calls.clear()
+    token = await mint_upload_ticket(api)
+    refused = await v1_parse(api, documents["mixed_pdf"], token, retry="true")
+    assert refused.status_code == 409, refused.text
+    assert "retry it from the Files page" in refused.json()["error"]["message"]
+    ticket = await _ticket(sessionmaker, token)
+    assert (ticket.spent_at, ticket.job_id) == (None, None)
+    async with sessionmaker() as db:
+        assert (await db.get(Job, uuid.UUID(job_id))).status == "failed"
+    assert staged_uploads(api) == []
+    assert upstream.calls == []

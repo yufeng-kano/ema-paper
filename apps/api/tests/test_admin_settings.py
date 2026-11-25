@@ -55,6 +55,7 @@ from tests.chat_helpers import MESSAGES_URL, assistant_turn, seed_document
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_API_KEY,
+    PARSE_MODEL,
     PAY_SETTINGS,
     PRO_PLANS_JSON,
     TEST_MODEL_PRICES,
@@ -74,7 +75,7 @@ def _base(**overrides) -> Settings:
             "app_env": "local",
             "secret_key": TEST_SECRET_KEY,
             "kano_proxy_api_key": KANO_API_KEY,
-            "parse_model": "vendor/vision-model",
+            "parse_model": PARSE_MODEL,
             "model_prices_json": TEST_MODEL_PRICES,
             **overrides,
         }

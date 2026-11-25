@@ -64,9 +64,9 @@ from tests.conftest import (
     sign_in,
 )
 from tests.factories import job_row
+from tests.helpers import account_client
 from tests.library_helpers import upload, write_content
 from tests.test_document_images import _image, _insert
-from tests.test_retention import _stranger
 
 SANDBOX_URL = "http://sandbox.test"
 # Every table keyed by the user that the footprint below writes.
@@ -234,7 +234,7 @@ async def _owned_rows(client: AsyncClient, user_id: int) -> dict[str, int]:
 @postgres_only
 async def test_deleting_the_account_removes_every_row_and_file_of_it(make_client) -> None:
     account = await sign_in(make_client())
-    stranger = await _stranger(make_client)
+    stranger = await account_client(make_client)
     theirs = (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
     await write_content(stranger, theirs["id"], "# Theirs, edited\n")
     owned = await _footprint(account)
@@ -312,7 +312,7 @@ async def test_pay_unreachable_refuses_only_an_account_with_a_subscription_on_re
     make_client,
 ) -> None:
     account = await sign_in(make_client(**PAY_SETTINGS))
-    stranger = await _stranger(make_client, **PAY_SETTINGS)
+    stranger = await account_client(make_client, **PAY_SETTINGS)
     await grant_plan(account.app.state.sessionmaker, account.user_id)
     respx.get(url__startswith=SUBSCRIPTIONS_URL).mock(side_effect=httpx.ConnectError("down"))
 
@@ -350,7 +350,7 @@ async def test_a_renewal_written_while_the_request_waited_still_refuses(make_cli
 @respx.mock
 async def test_a_checkout_that_can_still_be_paid_refuses_until_it_cannot(make_client) -> None:
     account = await sign_in(make_client(**PAY_SETTINGS))
-    lapsed = await _stranger(make_client, **PAY_SETTINGS)
+    lapsed = await account_client(make_client, **PAY_SETTINGS)
     lifetime = account.app.state.settings.kano_pay_checkout_lifetime_seconds
     fetch = respx.get(url__startswith=SUBSCRIPTIONS_URL).mock(
         return_value=httpx.Response(200, json={"subscription": None})
@@ -495,7 +495,7 @@ async def test_the_sweep_finishes_a_deletion_whose_files_the_request_left(
     account = await sign_in(make_client())
     owned = await _footprint(account)
     settings = account.app.state.settings
-    stranger = await _stranger(make_client)
+    stranger = await account_client(make_client)
     (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
 
     async def failing(*args, **kwargs):

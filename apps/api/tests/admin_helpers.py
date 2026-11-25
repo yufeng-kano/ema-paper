@@ -4,14 +4,12 @@ log and of an error answer."""
 
 from __future__ import annotations
 
-import uuid
-
 from httpx import AsyncClient, Response
 from sqlalchemy import func, select
 
-from sightread.auth.sessions import SESSION_COOKIE, create_session
-from sightread.db.models import AuditLog, User
+from sightread.db.models import AuditLog
 from tests.conftest import CSRF_HEADERS, sign_in
+from tests.helpers import account_client as other_account
 
 # The dev login signs in as dev@localhost, counted as verified (docs/auth.md § 1).
 OWNERS = "dev@localhost"
@@ -26,17 +24,8 @@ async def owner_client(make_client, **settings) -> AsyncClient:
 async def account_client(
     make_client, email: str, name: str | None = None, **settings
 ) -> AsyncClient:
-    """Another account, signed in on its own client, in no group."""
-    client = make_client(**{"owner_emails": OWNERS, **settings})
-    async with client.app.state.sessionmaker() as db:
-        user = User(google_sub=f"sub-{uuid.uuid4().hex}", email=email, name=name)
-        db.add(user)
-        await db.flush()
-        token = await create_session(db, user)
-        await db.commit()
-        client.user_id = user.id
-    client.cookies.set(SESSION_COOKIE, token)
-    return client
+    """Another account, signed in on its own client of this console, in no group."""
+    return await other_account(make_client, email, name, **{"owner_emails": OWNERS, **settings})
 
 
 async def create_group(owner: AsyncClient, name: str, permissions: list[str]) -> dict:

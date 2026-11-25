@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -29,11 +28,10 @@ from tests.admin_helpers import (
     last_audit_id,
     owner_client,
 )
-from tests.billing_helpers import PRO_PLANS
+from tests.billing_helpers import PRINTED, PRO_PLANS
 from tests.conftest import CSRF_HEADERS, postgres_only
 
 CODES = "/api/admin/codes"
-PRINTED = re.compile(r"^EMA-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
 
 
 async def _create(client, **body) -> dict:

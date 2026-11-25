@@ -16,27 +16,27 @@ from httpx import AsyncClient
 from PIL import Image
 from sqlalchemy import select
 
+from sightread.auth.api_keys import create_api_key
 from sightread.db.models import Job, utcnow
-from tests.conftest import CSRF_HEADERS, PARSE_MODEL, api_key_client
+from tests.conftest import PARSE_MODEL, api_key_client
 from tests.factories import job_row, user_row
-from tests.helpers import v1_upload
+from tests.helpers import staged_uploads, v1_parse
 
 
 async def test_a_corrupt_pdf_is_rejected_before_a_job_exists(
     client: AsyncClient, sessionmaker, documents
 ) -> None:
     await api_key_client(client)
-    response = await v1_upload(client, documents["corrupt_pdf"])
+    response = await v1_parse(client, documents["corrupt_pdf"])
 
     assert response.status_code == 400
     assert "PDF" in response.json()["error"]["message"]
-    upload_dir = Path(client.app.state.settings.upload_dir)
-    assert list(upload_dir.iterdir()) == []
+    assert staged_uploads(client) == []
 
 
 async def test_the_page_cap_is_enforced(make_client, documents) -> None:
     client = await api_key_client(make_client(page_cap=2))
-    response = await v1_upload(client, documents["mixed_pdf"])
+    response = await v1_parse(client, documents["mixed_pdf"])
 
     assert response.status_code == 400
     assert "page cap" in response.json()["error"]["message"]
@@ -47,7 +47,7 @@ async def test_the_size_cap_is_enforced_while_streaming(make_client, documents) 
     # the streaming copy is what has to stop it.
     size = documents["mixed_pdf"].stat().st_size
     client = await api_key_client(make_client(upload_max_bytes=size - 1))
-    response = await v1_upload(client, documents["mixed_pdf"])
+    response = await v1_parse(client, documents["mixed_pdf"])
 
     assert response.status_code == 413
     upload_dir = Path(client.app.state.settings.upload_dir)
@@ -56,11 +56,10 @@ async def test_the_size_cap_is_enforced_while_streaming(make_client, documents) 
 
 async def test_an_oversized_body_is_refused_before_it_is_read(make_client, documents) -> None:
     client = await api_key_client(make_client(upload_max_bytes=64))
-    response = await v1_upload(client, documents["mixed_pdf"])
+    response = await v1_parse(client, documents["mixed_pdf"])
 
     assert response.status_code == 413
-    upload_dir = Path(client.app.state.settings.upload_dir)
-    assert not upload_dir.exists() or list(upload_dir.iterdir()) == []
+    assert staged_uploads(client) == []
 
 
 async def test_an_unsupported_media_type_is_rejected(client: AsyncClient, tmp_path) -> None:
@@ -120,13 +119,12 @@ async def test_an_image_that_does_not_decode_as_an_accepted_one_is_refused(
 
     assert response.status_code == 400
     assert response.json()["error"]["message"] == "The image could not be decoded"
-    upload_dir = Path(client.app.state.settings.upload_dir)
-    assert list(upload_dir.iterdir()) == []
+    assert staged_uploads(client) == []
 
 
 async def test_an_invalid_page_selection_is_rejected(client: AsyncClient, documents) -> None:
     await api_key_client(client)
-    response = await v1_upload(client, documents["mixed_pdf"], pages="4-9")
+    response = await v1_parse(client, documents["mixed_pdf"], pages="4-9")
 
     assert response.status_code == 400
     assert "outside" in response.json()["error"]["message"]
@@ -136,7 +134,7 @@ async def test_the_per_user_running_cap_returns_429(
     client: AsyncClient, sessionmaker, documents
 ) -> None:
     await api_key_client(client)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    user_id = client.user_id
 
     async with sessionmaker() as db:
         for index in range(2):
@@ -155,7 +153,7 @@ async def test_the_per_user_running_cap_returns_429(
             )
         await db.commit()
 
-    response = await v1_upload(client, documents["text_pdf"])
+    response = await v1_parse(client, documents["text_pdf"])
 
     assert response.status_code == 429
     assert response.json()["error"]["type"] == "rate_limit"
@@ -215,20 +213,22 @@ async def test_a_deployment_without_a_parse_model_refuses_every_parse(
     make_client, sessionmaker, documents
 ) -> None:
     client = await api_key_client(make_client(parse_model=""))
-    response = await v1_upload(client, documents["text_pdf"])
+    # Naming a model does not turn the 503 into the 400 for a model not offered.
+    for fields in ({}, {"model": PARSE_MODEL}):
+        response = await v1_parse(client, documents["text_pdf"], **fields)
 
-    assert response.status_code == 503
-    assert response.json()["error"]["message"] == "No parse model is configured on this deployment"
+        assert response.status_code == 503, fields
+        message = response.json()["error"]["message"]
+        assert message == "No parse model is configured on this deployment", fields
     async with sessionmaker() as db:
         assert (await db.execute(select(Job))).scalars().all() == []
-    upload_dir = Path(client.app.state.settings.upload_dir)
-    assert not upload_dir.exists() or list(upload_dir.iterdir()) == []
+    assert staged_uploads(client) == []
 
 
 async def test_a_deployment_without_kano_proxy_refuses_every_parse(make_client, documents) -> None:
     for overrides in ({"kano_proxy_base_url": ""}, {"kano_proxy_api_key": ""}):
         client = await api_key_client(make_client(**overrides))
-        response = await v1_upload(client, documents["text_pdf"])
+        response = await v1_parse(client, documents["text_pdf"])
 
         assert response.status_code == 503, overrides
         assert "not configured" in response.json()["error"]["message"]
@@ -236,15 +236,13 @@ async def test_a_deployment_without_kano_proxy_refuses_every_parse(make_client, 
 
 async def test_jobs_of_other_users_are_invisible(make_client, sessionmaker, documents) -> None:
     owner = await api_key_client(make_client())
-    accepted = await v1_upload(owner, documents["text_pdf"])
+    accepted = await v1_parse(owner, documents["text_pdf"])
     job_id = accepted.json()["job_id"]
 
+    # A second identity: the dev login always signs in the same user, so the other account
+    # is a row of its own with a key made straight through the module.
     stranger = make_client()
-    await stranger.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    # A second identity: the dev login always returns the same user, so use a raw key row.
     async with sessionmaker() as db:
-        from sightread.auth.api_keys import create_api_key
-
         other = user_row("stranger@example.com")
         db.add(other)
         await db.flush()

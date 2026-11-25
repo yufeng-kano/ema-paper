@@ -26,7 +26,7 @@ from sightread.db.models import (
 )
 from sightread.parsing.figures import crop_path
 from sightread.workspace import git
-from sightread.workspace.layout import sources_dir, user_root
+from sightread.workspace.layout import sources_dir
 from tests.conftest import CSRF_HEADERS, api_key_client, mcp_running
 from tests.connector_helpers import (
     CHALLENGE,
@@ -38,6 +38,7 @@ from tests.connector_helpers import (
 )
 from tests.factories import job_row, user_row
 from tests.helpers import bearer
+from tests.library_helpers import new_document
 
 FIGURE = "![fig1](sightread://p1/100,200,300,400)"
 MARKDOWN = f"<!-- page: 1 -->\n# Attention\n\nBody text.\n\n{FIGURE}\nFigure 1: the model.\n"
@@ -47,10 +48,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"crop"
 @pytest.fixture
 async def reader(make_client) -> AsyncClient:
     """A signed-in account holding an API key, with a workspace of its own."""
-    client = await api_key_client(make_client())
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
+    return await api_key_client(make_client())
 
 
 async def _seed_parse(client: AsyncClient, user_id: int, name: str = "paper.pdf") -> int:
@@ -78,11 +76,7 @@ async def _seed_parse(client: AsyncClient, user_id: int, name: str = "paper.pdf"
 
 
 async def _new_markdown(client: AsyncClient, name: str, folder_id: int | None = None) -> int:
-    made = await client.post(
-        "/api/library/documents/new",
-        json={"name": name, "folder_id": folder_id},
-        headers=CSRF_HEADERS,
-    )
+    made = await new_document(client, name, folder_id)
     assert made.status_code == 201, made.text
     return made.json()["id"]
 
@@ -355,7 +349,6 @@ async def test_a_new_grant_reaches_the_library(make_client) -> None:
 
 async def test_list_library_filters_by_folder_and_name(make_client) -> None:
     client = await api_key_client(make_client(mcp_library_list_max_items=1))
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
     paper = await _seed_parse(client, client.user_id)
     await _new_markdown(client, "Draft")
     await _new_markdown(client, "Another draft")

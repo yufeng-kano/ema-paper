@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import io
 import re
-from pathlib import Path
 
 import httpx
 from httpx import AsyncClient
@@ -19,6 +18,7 @@ from sightread.workspace.documents import sweep_orphaned_images
 from sightread.workspace.layout import images_dir
 from tests.chat_helpers import seed_document
 from tests.conftest import CSRF_HEADERS, sign_in
+from tests.helpers import staged_uploads
 from tests.library_helpers import new_document
 
 IMAGE_PATH = re.compile(r"figures/img-[0-9a-f]{16}\.(png|jpg)")
@@ -68,7 +68,7 @@ async def test_an_inserted_image_is_kept_copied_and_served(writer) -> None:
     # The shell sees what the text will name, in the directory history excludes.
     assert (writer.root / "files" / "Draft.md" / "figures" / name).read_bytes() == kept.read_bytes()
     # Nothing staged is left behind.
-    assert list(Path(writer.app.state.settings.upload_dir).iterdir()) == []
+    assert staged_uploads(writer) == []
     # The route writes no text: the line is the caller's.
     content = (await writer.get(f"/api/library/documents/{document_id}/content")).json()
     assert content["markdown"] == ""
@@ -114,7 +114,7 @@ async def test_only_the_accepted_formats_are_decoded(writer) -> None:
     text = await _insert(writer, document_id, b"not an image", "shot.png", "image/png")
     assert text.status_code == 400
     assert not (images_dir(writer.root) / str(document_id)).exists()
-    assert list(Path(writer.app.state.settings.upload_dir).iterdir()) == []
+    assert staged_uploads(writer) == []
 
 
 async def test_an_image_past_its_caps_is_refused(make_client) -> None:
@@ -128,7 +128,7 @@ async def test_an_image_past_its_caps_is_refused(make_client) -> None:
     wide = await _insert(client, document_id, _image("PNG", (100, 20)))
     assert wide.status_code == 400
     assert wide.json()["error"]["message"] == "The image has too many pixels"
-    assert list(Path(client.app.state.settings.upload_dir).iterdir()) == []
+    assert staged_uploads(client) == []
 
 
 async def test_an_image_needs_the_callers_document_and_the_csrf_header(writer, make_client) -> None:

@@ -24,9 +24,17 @@ from sightread.routes.library import document_payload
 from sightread.upstream.anthropic import ChatUsage
 from tests.chat_helpers import MESSAGES_URL, assistant_turn, sse
 from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_CHAT_URL, PARSE_MODEL, TEST_SECRET_KEY
-from tests.helpers import job_by_id, stub_connection, v1_parse
-from tests.test_parse_end_to_end import _completion, _drain_queue
-from tests.test_retry_failed_pages import FALLBACK, Upstream, _library, _retry, _row, _upload
+from tests.helpers import (
+    FALLBACK,
+    Upstream,
+    completion,
+    drain_queue,
+    job_by_id,
+    stub_connection,
+    v1_parse,
+)
+from tests.library_helpers import upload_file
+from tests.test_retry_failed_pages import _library, _retry, _row
 
 # Three pages a vision model might send back for a paper: a sentence the first page break
 # cuts before a capital, a bold run left open, and a word the second break hyphenates.
@@ -450,7 +458,7 @@ async def library(make_client) -> AsyncClient:
 
 def _vision() -> Upstream:
     return Upstream(
-        {(PARSE_MODEL, page): (lambda text=text: _completion(text)) for page, text in PAGES.items()}
+        {(PARSE_MODEL, page): (lambda text=text: completion(text)) for page, text in PAGES.items()}
     )
 
 
@@ -473,7 +481,7 @@ async def test_a_files_upload_opens_checked(library, sessionmaker, documents) ->
             _done(),
         ]
     )
-    uploaded = await _upload(library, documents["mixed_pdf"])
+    uploaded = await upload_file(library, documents["mixed_pdf"])
     job = await job_by_id(sessionmaker, uploaded["job_id"])
     # Snapshotted at the upload: no model of its own is the parse's, and the default prompt.
     assert (job.check_model, job.check_effort, job.check_prompt) == (
@@ -481,7 +489,7 @@ async def test_a_files_upload_opens_checked(library, sessionmaker, documents) ->
         "medium",
         CHECK.default_prompt_template,
     )
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
 
     assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
     async with sessionmaker() as db:
@@ -514,8 +522,8 @@ async def test_a_failed_check_fails_the_job_and_its_retry_checks_again(
     agent = respx.post(MESSAGES_URL).mock(
         side_effect=[_turn([{"type": "text", "text": "No."}], "refusal"), _done()]
     )
-    uploaded = await _upload(library, documents["mixed_pdf"])
-    await _drain_queue(library, sessionmaker)
+    uploaded = await upload_file(library, documents["mixed_pdf"])
+    await drain_queue(library, sessionmaker)
 
     # Every page converted, and still nothing opens: the check failed.
     row = await _row(library, uploaded["id"])
@@ -529,7 +537,7 @@ async def test_a_failed_check_fails_the_job_and_its_retry_checks_again(
     # The retry sends no page to a model: it assembles the kept pages and checks again.
     retried = await _retry(library, uploaded["id"])
     assert retried.status_code == 202, retried.text
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     assert len(vision.calls) == 3
     assert len(agent.calls) == 2
     assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
@@ -548,8 +556,8 @@ async def test_a_retry_takes_the_check_settings_of_its_moment(
 ) -> None:
     respx.post(KANO_CHAT_URL).mock(side_effect=_vision())
     respx.post(MESSAGES_URL).mock(side_effect=lambda request: httpx.Response(402))
-    uploaded = await _upload(library, documents["mixed_pdf"])
-    await _drain_queue(library, sessionmaker)
+    uploaded = await upload_file(library, documents["mixed_pdf"])
+    await drain_queue(library, sessionmaker)
     assert (await _row(library, uploaded["id"]))["error"] == "the format check failed (payment)"
 
     # Switched off since: the retry runs unchecked, and the document opens on the
@@ -560,7 +568,7 @@ async def test_a_retry_takes_the_check_settings_of_its_moment(
     assert off.status_code == 200, off.text
     assert (await _retry(library, uploaded["id"])).status_code == 202
     assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model is None
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     async with sessionmaker() as db:
         result = await db.get(Result, uuid.UUID(uploaded["job_id"]))
     assert (result.reading_markdown, "check" in result.meta) == (None, False)
@@ -575,16 +583,16 @@ async def test_a_retry_checks_on_the_model_it_names_when_the_check_has_none(
     respx.post(KANO_CHAT_URL).mock(
         side_effect=Upstream(
             {
-                (PARSE_MODEL, 1): lambda: _completion(PAGES[1]),
-                (PARSE_MODEL, 2): lambda: _completion("", "content_filter"),
-                (PARSE_MODEL, 3): lambda: _completion(PAGES[3]),
-                (FALLBACK, 2): lambda: _completion(PAGES[2]),
+                (PARSE_MODEL, 1): lambda: completion(PAGES[1]),
+                (PARSE_MODEL, 2): lambda: completion("", "content_filter"),
+                (PARSE_MODEL, 3): lambda: completion(PAGES[3]),
+                (FALLBACK, 2): lambda: completion(PAGES[2]),
             }
         )
     )
     agent = respx.post(MESSAGES_URL).mock(side_effect=lambda request: _done())
-    uploaded = await _upload(library, documents["mixed_pdf"])
-    await _drain_queue(library, sessionmaker)
+    uploaded = await upload_file(library, documents["mixed_pdf"])
+    await drain_queue(library, sessionmaker)
     row = await _row(library, uploaded["id"])
     assert row["error"] == "1 of 3 pages failed (page 2: blocked)"
     assert not agent.called
@@ -593,7 +601,7 @@ async def test_a_retry_checks_on_the_model_it_names_when_the_check_has_none(
     # the model that blocked the page is not sent its text again.
     assert (await _retry(library, uploaded["id"], model=FALLBACK)).status_code == 202
     assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model == FALLBACK
-    await _drain_queue(library, sessionmaker)
+    await drain_queue(library, sessionmaker)
     assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
     assert [json.loads(call.request.content)["model"] for call in agent.calls] == [FALLBACK]
 
@@ -610,7 +618,7 @@ async def test_the_check_takes_its_own_settings(make_client, sessionmaker, docum
     assert saved.status_code == 200, saved.text
     assert saved.json()["auto_check"] is True
     assert saved.json()["model"] == "claude-code/claude-haiku-5-5"
-    uploaded = await _upload(library, documents["mixed_pdf"])
+    uploaded = await upload_file(library, documents["mixed_pdf"])
     job = await job_by_id(sessionmaker, uploaded["job_id"])
     assert (job.check_model, job.check_effort) == ("claude-code/claude-haiku-5-5", "low")
     assert job.check_prompt == check_agent.system_prompt(CHECK.default_prompt_template, "Use $.")
@@ -624,7 +632,7 @@ async def test_no_check_when_switched_off_and_an_api_parse_checked_as_an_upload(
         "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
     )
     assert off.status_code == 200, off.text
-    uploaded = await _upload(library, documents["mixed_pdf"])
+    uploaded = await upload_file(library, documents["mixed_pdf"])
     assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model is None
 
     # An API parse — the connector's too — is checked as a Files upload is (docs/parsing.md

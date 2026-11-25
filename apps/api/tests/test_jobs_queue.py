@@ -434,7 +434,7 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(
         done.status = "succeeded"
         await db.commit()
         job_id, done_id = job.id, done.id
-    settings = path_settings(tmp_path, upload_dir=str(tmp_path / "uploads"))
+    settings = path_settings(tmp_path)
     await fail_job(sessionmaker, settings, job_id, "internal error")
     await fail_job(sessionmaker, settings, done_id, "internal error")
     async with sessionmaker() as db:
@@ -607,7 +607,7 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
             )
         ],
     )
-    settings = path_settings(tmp_path, upload_dir=str(tmp_path / "uploads"))
+    settings = path_settings(tmp_path)
 
     async def counts(db) -> tuple[int, int]:
         pages = select(func.count()).select_from(JobPage).where(JobPage.job_id == job_id)
@@ -703,7 +703,6 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(sessionmaker
     )
     settings = path_settings(
         tmp_path,
-        upload_dir=str(tmp_path / "uploads"),
         # The worker restarted on another origin: the run's first write is the reconcile.
         kano_proxy_base_url="https://moved.test",
         kano_proxy_api_key=KANO_API_KEY,
@@ -765,7 +764,7 @@ async def test_the_crops_are_published_under_the_backup_lock(
     async with sessionmaker() as db:
         db.add(Document(user_id=user.id, folder_id=None, job_id=job_id, name="e.pdf"))
         await db.commit()
-    settings = path_settings(tmp_path, upload_dir=str(tmp_path / "uploads"))
+    settings = path_settings(tmp_path)
     assert await runner._finish(
         sessionmaker, job_id, status="succeeded", settings=settings, publish=publish
     )

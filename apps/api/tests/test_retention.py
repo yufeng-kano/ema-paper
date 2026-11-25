@@ -18,7 +18,6 @@ from sqlalchemy import delete, select, update
 
 from sightread.agents.parse import PIPELINE_VERSION
 from sightread.auth.api_keys import create_api_key
-from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import (
     ChatTurn,
     Conversation,
@@ -35,7 +34,7 @@ from sightread.db.models import (
 from sightread.jobs.queue import find_cached_job
 from sightread.jobs.sweeper import expire_trash, purge_parses
 from sightread.workspace.documents import original_of
-from sightread.workspace.layout import images_dir, results_root, trash_root, user_root
+from sightread.workspace.layout import images_dir, results_root, trash_root
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_BASE,
@@ -45,26 +44,17 @@ from tests.conftest import (
     postgres_only,
 )
 from tests.factories import job_row, user_row
-from tests.helpers import post_folder, read_library
+from tests.helpers import (
+    account_client,
+    drain_queue,
+    post_folder,
+    read_library,
+    staged_uploads,
+    vision_stub,
+)
 from tests.library_helpers import upload, write_content, written_document
 from tests.test_document_images import _image, _insert
 from tests.test_library_trash import _trash
-from tests.test_parse_end_to_end import _drain_queue, _vision_stub
-
-
-async def _stranger(make_client, email: str = "stranger@example.com", **overrides) -> AsyncClient:
-    """A second account on the same deployment, signed in."""
-    client = make_client(**overrides)
-    async with client.app.state.sessionmaker() as db:
-        user = user_row(email)
-        db.add(user)
-        await db.flush()
-        token = await create_session(db, user)
-        await db.commit()
-        client.user_id = user.id
-    client.cookies.set(SESSION_COOKIE, token)
-    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return client
 
 
 async def _age(client: AsyncClient, model: type, row_id: int, *, days: float) -> None:
@@ -140,7 +130,7 @@ async def test_the_trash_deletes_for_good_what_it_kept_past_its_time(writer) -> 
 async def test_a_trash_with_a_conversation_still_answering_waits_while_the_others_empty(
     writer, make_client
 ) -> None:
-    stranger = await _stranger(make_client)
+    stranger = await account_client(make_client)
     mine = (await upload(writer, "mine.md", b"# Mine\n")).json()
     theirs = (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
     for client, row in ((writer, mine), (stranger, theirs)):
@@ -247,7 +237,7 @@ async def test_a_parse_no_file_keeps_is_deleted_after_its_retention(
     writer, make_client, tmp_path
 ) -> None:
     settings = writer.app.state.settings
-    stranger = await _stranger(make_client)
+    stranger = await account_client(make_client)
     period_start = utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     async with writer.app.state.sessionmaker() as db:
         uid = writer.user_id
@@ -401,7 +391,7 @@ async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
 ) -> None:
     from sightread.routes import library
 
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision_stub)
     settings = writer.app.state.settings
     sessionmaker = writer.app.state.sessionmaker
     body = documents["text_pdf"].read_bytes()
@@ -415,7 +405,7 @@ async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
         )
 
     assert (await upload()).status_code == 201
-    await _drain_queue(writer, sessionmaker)
+    await drain_queue(writer, sessionmaker)
     async with sessionmaker() as db:
         await db.execute(
             update(Job).values(
@@ -445,7 +435,7 @@ async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
     )
     async with sessionmaker() as db:
         assert (await db.execute(select(Document))).all() == []
-    assert [path.name for path in Path(settings.upload_dir).iterdir()] == []
+    assert staged_uploads(writer) == []
     # Uploaded again, it parses afresh.
     monkeypatch.undo()
     assert (await upload()).status_code == 201

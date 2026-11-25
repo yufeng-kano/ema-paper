@@ -20,7 +20,6 @@ from sqlalchemy import delete, func, select, text, update
 from sightread.admin.deps import require_permission
 from sightread.admin.groups import join_owner_group
 from sightread.admin.permissions import ALL_PERMISSIONS, normalize
-from sightread.auth import upload_tickets
 from sightread.auth.deps import require_csrf_header
 from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.config import Settings
@@ -38,6 +37,7 @@ from tests.admin_helpers import (
 )
 from tests.conftest import CSRF_HEADERS, postgres_only
 from tests.connector_helpers import oauth_connected
+from tests.helpers import mint_upload_ticket
 
 
 async def _builtin_id(client: AsyncClient) -> int:
@@ -151,14 +151,7 @@ async def _access_token(owner: AsyncClient) -> str:
     return tokens["access_token"]
 
 
-async def _upload_ticket(owner: AsyncClient) -> str:
-    async with owner.app.state.sessionmaker() as db:
-        user = await db.get(User, owner.user_id)
-        _, token = await upload_tickets.mint(db, owner.app.state.settings, user)
-    return token
-
-
-@pytest.mark.parametrize("mint", [_api_key, _access_token, _upload_ticket])
+@pytest.mark.parametrize("mint", [_api_key, _access_token, mint_upload_ticket])
 async def test_an_authorization_header_is_refused_even_beside_a_valid_cookie(
     make_client, mint
 ) -> None:

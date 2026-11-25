@@ -34,8 +34,7 @@ from sightread.parsing.figure_check import (
 )
 from sightread.parsing.figures import CROP_MARGIN, crop_rect
 from tests.conftest import KANO_CHAT_URL, PARSE_MODEL
-from tests.helpers import v1_upload
-from tests.test_parse_end_to_end import _completion, _drain_queue
+from tests.helpers import completion, drain_queue, v1_parse
 
 # A chart's plotted area on a 1000 x 1000 page, and the box a model that boxes only that
 # area draws around it: its crop runs from 292 to 708 on both axes.
@@ -251,9 +250,9 @@ class Upstream:
         if body["messages"][0]["content"][0]["text"].startswith("This page image has"):
             self.checks.append(body)
             answer = self.answers.pop(0)
-            return answer if isinstance(answer, httpx.Response) else _completion(answer)
+            return answer if isinstance(answer, httpx.Response) else completion(answer)
         self.transcriptions += 1
-        return _completion(self.markdown)
+        return completion(self.markdown)
 
 
 def _sent(body: dict) -> tuple[str, Image.Image]:
@@ -270,7 +269,7 @@ async def _parse_image(client: AsyncClient, sessionmaker, path: Path) -> str:
         data={"model": PARSE_MODEL},
     )
     assert accepted.status_code == 202, accepted.text
-    await _drain_queue(client, sessionmaker)
+    await drain_queue(client, sessionmaker)
     return accepted.json()["job_id"]
 
 
@@ -447,7 +446,7 @@ async def test_a_job_queued_before_the_check_runs_without_it(
         )
         await db.commit()
 
-    await _drain_queue(api_client, sessionmaker)
+    await drain_queue(api_client, sessionmaker)
 
     result = (await api_client.get(f"/v1/jobs/{job_id}/result")).json()
     assert result["figures"][0]["bbox"] == [300, 300, 700, 700]
@@ -475,9 +474,9 @@ async def test_a_rendered_pdf_page_is_checked_too(api_client, sessionmaker, tmp_
     upstream = Upstream(CHART, (OK,))
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
 
-    accepted = await v1_upload(api_client, path)
+    accepted = await v1_parse(api_client, path)
     job_id = accepted.json()["job_id"]
-    await _drain_queue(api_client, sessionmaker)
+    await drain_queue(api_client, sessionmaker)
 
     [figure] = (await api_client.get(f"/v1/jobs/{job_id}/result")).json()["figures"]
     assert figure["check"] == "adjusted"
@@ -500,7 +499,7 @@ async def test_a_kept_page_keeps_its_statuses_and_is_not_checked_again(
     margin = "![fig](sightread://p{page}/900,100,980,900)\nFigure: a margin"
     upstream = Upstream(margin.format(page=2))
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    accepted = await v1_upload(api_client, documents["mixed_pdf"])
+    accepted = await v1_parse(api_client, documents["mixed_pdf"])
     job_id = uuid.UUID(accepted.json()["job_id"])
     async with sessionmaker() as db:
         db.add_all(
@@ -520,7 +519,7 @@ async def test_a_kept_page_keeps_its_statuses_and_is_not_checked_again(
         await db.execute(update(Job).where(Job.id == job_id).values(pages_done=2))
         await db.commit()
 
-    await _drain_queue(api_client, sessionmaker)
+    await drain_queue(api_client, sessionmaker)
 
     result = (await api_client.get(f"/v1/jobs/{job_id}/result")).json()
     assert [figure.get("check") for figure in result["figures"]] == [

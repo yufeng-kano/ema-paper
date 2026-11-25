@@ -38,6 +38,13 @@ async def upload(
     )
 
 
+async def upload_file(client: AsyncClient, path: Path, media_type: str = "application/pdf") -> dict:
+    """The file at `path` uploaded to the top level; its payload."""
+    response = await upload(client, path.name, path.read_bytes(), media_type)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
 async def upload_png(
     client: AsyncClient,
     documents: dict[str, Path],
