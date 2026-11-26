@@ -71,9 +71,7 @@ describe('robots.txt', () => {
     const rules = disallowed(robotsTxt(ORIGIN))
     for (const path of [
       '/en/files',
-      '/en/settings/usage',
       '/zh-TW/files',
-      '/zh-TW/settings/keys',
       '/en/admin',
       '/en/admin/groups',
       '/zh-TW/admin',

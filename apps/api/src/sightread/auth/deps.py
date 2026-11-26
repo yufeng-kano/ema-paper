@@ -15,7 +15,7 @@ from ..db.session import db_session
 from ..errors import ApiError
 from . import document_tickets, upload_tickets
 from .api_keys import KEY_PREFIX, resolve_api_key
-from .oauth_as import LIBRARY_SCOPE, resolve_access_token
+from .oauth_as import resolve_access_token
 from .sessions import SESSION_COOKIE, resolve_session
 from .upload_tickets import TICKET_PREFIX
 
@@ -45,35 +45,12 @@ async def require_session_user(request: Request, db: DbSession) -> User:
 SessionUser = Annotated[User, Depends(require_session_user)]
 
 
-# What a connector approved before the `library` scope existed is told (docs/auth.md § 4).
-LIBRARY_SCOPE_MESSAGE = (
-    "This connector was approved before it could read your library: remove it in Claude's "
-    "settings and add it again."
-)
-
-
-@dataclass
-class Bearer:
-    """A durable data-plane credential resolved: its user, and the scopes of an OAuth
-    grant — None for an API key, which carries the account's own rights."""
-
-    user: User
-    scopes: set[str] | None
-
-    @property
-    def library(self) -> bool:
-        """Whether it reaches the library: an API key, or a grant holding `library`
-        (docs/auth.md § 4)."""
-        return self.scopes is None or LIBRARY_SCOPE in self.scopes
-
-
-async def resolve_bearer_identity(db: AsyncSession, credential: str) -> Bearer | None:
+async def resolve_bearer_identity(db: AsyncSession, credential: str) -> User | None:
     """A bearer credential is either a project API key or an OAuth access token.
 
     Both resolve to the same `User`: the connector path and the scripting path differ only
-    in how the credential was obtained and, for a token, in the scopes its grant holds
-    (docs/auth.md § 4). An upload or a document ticket is neither, so it resolves to nobody
-    here.
+    in how the credential was obtained (docs/auth.md § 4). An upload or a document ticket is
+    neither, so it resolves to nobody here.
     """
     if credential.startswith((TICKET_PREFIX, document_tickets.TICKET_PREFIX)):
         # Tickets are ruled out before the API key path can look at one. A ticket
@@ -81,10 +58,8 @@ async def resolve_bearer_identity(db: AsyncSession, credential: str) -> Bearer |
         # job's reads, or one document's routes; `/mcp` and `/v1/models` refuse it.
         return None
     if credential.startswith(KEY_PREFIX):
-        user = await resolve_api_key(db, credential)
-        return None if user is None else Bearer(user=user, scopes=None)
-    resolved = await resolve_access_token(db, credential)
-    return None if resolved is None else Bearer(user=resolved[0], scopes=resolved[1])
+        return await resolve_api_key(db, credential)
+    return await resolve_access_token(db, credential)
 
 
 def bearer_credential(request: Request) -> str | None:
@@ -95,9 +70,8 @@ def bearer_credential(request: Request) -> str | None:
     return credential.strip()
 
 
-async def require_bearer_identity(request: Request, db: AsyncSession) -> Bearer:
-    """Data plane auth: `Authorization: Bearer <API key | OAuth access token>`, with the
-    grant's scopes."""
+async def require_bearer_user(request: Request, db: DbSession) -> User:
+    """Data plane auth: `Authorization: Bearer <API key | OAuth access token>`."""
     credential = bearer_credential(request)
     if credential is None:
         raise ApiError(
@@ -106,27 +80,21 @@ async def require_bearer_identity(request: Request, db: AsyncSession) -> Bearer:
             "Missing bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    identity = await resolve_bearer_identity(db, credential)
-    if identity is None:
+    user = await resolve_bearer_identity(db, credential)
+    if user is None:
         raise ApiError(401, "auth", "Invalid, expired or revoked credential")
-    return identity
+    return user
 
 
-async def require_bearer_user(request: Request, db: DbSession) -> User:
-    """Data plane auth: `Authorization: Bearer <API key | OAuth access token>`."""
-    return (await require_bearer_identity(request, db)).user
+BearerUser = Annotated[User, Depends(require_bearer_user)]
 
 
 @dataclass
 class Uploader:
-    """Who is posting to `/v1/parse`: a durable credential, or one upload ticket. `library`
-    says whether its rights reach the library — an API key, an OAuth token whose grant
-    holds `library`, or a ticket minted under one — for the filing and the retry of a Files
-    document (docs/mcp.md § Filing into Files)."""
+    """Who is posting to `/v1/parse`: a durable credential, or one upload ticket."""
 
     user: User
     ticket: UploadTicket | None = None
-    library: bool = False
 
 
 async def _live_ticket(request: Request, db: AsyncSession) -> tuple[UploadTicket, User]:
@@ -145,12 +113,11 @@ def _presents_ticket(request: Request) -> bool:
 async def require_uploader(request: Request, db: DbSession) -> Uploader:
     """`POST /v1/parse` auth: the data plane bearer, or an unspent upload ticket."""
     if not _presents_ticket(request):
-        identity = await require_bearer_identity(request, db)
-        return Uploader(user=identity.user, library=identity.library)
+        return Uploader(user=await require_bearer_user(request, db))
     ticket, user = await _live_ticket(request, db)
     if ticket.spent_at is not None:
         raise ApiError(401, "auth", upload_tickets.REJECTION_MESSAGE)
-    return Uploader(user=user, ticket=ticket, library=ticket.library_access)
+    return Uploader(user=user, ticket=ticket)
 
 
 UploaderCaller = Annotated[Uploader, Depends(require_uploader)]
@@ -208,31 +175,20 @@ async def require_ticket_job(request: Request, db: DbSession) -> uuid.UUID:
 TicketJobId = Annotated[uuid.UUID, Depends(require_ticket_job)]
 
 
-async def _library_bearer(request: Request, db: AsyncSession) -> User:
-    """The library on the data plane takes a durable credential whose rights reach it: an
-    API key, or an OAuth token whose grant holds `library` (docs/api.md § The library on
-    the data plane)."""
+async def require_library_user(request: Request, db: DbSession) -> User:
+    """The library as a whole on the data plane — its listing, the Trash's, and organizing
+    it — takes a durable credential: an API key or an OAuth token, never a ticket
+    (docs/api.md § The library on the data plane)."""
     credential = bearer_credential(request)
-    if credential is None:
-        raise ApiError(401, "auth", "Missing bearer token", headers={"WWW-Authenticate": "Bearer"})
-    if credential.startswith(document_tickets.TICKET_PREFIX):
+    if credential is not None and credential.startswith(document_tickets.TICKET_PREFIX):
         raise ApiError(
             401,
             "auth",
             "A document ticket reads only its own document; list the library with an API "
-            "key, or with the connector's list_library tool",
+            "key, or with the connector's list_library tool, and organize it with an API "
+            "key or the connector's organizing tools",
         )
-    identity = await resolve_bearer_identity(db, credential)
-    if identity is None:
-        raise ApiError(401, "auth", "Invalid, expired or revoked credential")
-    if not identity.library:
-        raise ApiError(403, "auth", LIBRARY_SCOPE_MESSAGE)
-    return identity.user
-
-
-async def require_library_user(request: Request, db: DbSession) -> User:
-    """`GET /v1/library`: a durable credential with the library in reach, never a ticket."""
-    return await _library_bearer(request, db)
+    return await require_bearer_user(request, db)
 
 
 LibraryUser = Annotated[User, Depends(require_library_user)]
@@ -240,11 +196,11 @@ LibraryUser = Annotated[User, Depends(require_library_user)]
 
 async def _document_caller(request: Request, db: AsyncSession, scope: str) -> User:
     """A `/v1/library/documents/{document_id}*` route: a durable credential, or a document
-    ticket for that one document whose scope covers the route (docs/auth.md § 7). Either
+    ticket for that one document whose scope covers the route (docs/auth.md § 6). Either
     way the route still resolves the document as the caller's own and live."""
     credential = bearer_credential(request)
     if credential is None or not credential.startswith(document_tickets.TICKET_PREFIX):
-        return await _library_bearer(request, db)
+        return await require_bearer_user(request, db)
     resolved = await document_tickets.resolve(db, credential)
     if resolved is None:
         raise ApiError(401, "auth", document_tickets.REJECTION_MESSAGE)
@@ -267,17 +223,6 @@ async def require_document_writer(request: Request, db: DbSession) -> User:
 
 DocumentReader = Annotated[User, Depends(require_document_reader)]
 DocumentWriter = Annotated[User, Depends(require_document_writer)]
-
-
-async def require_reader_user(request: Request, db: DbSession) -> User:
-    """`GET /v1/models` is a safe read, so it accepts either a session cookie or a bearer
-    credential (docs/api.md)."""
-    if request.headers.get("authorization"):
-        return await require_bearer_user(request, db)
-    return await require_session_user(request, db)
-
-
-ReaderUser = Annotated[User, Depends(require_reader_user)]
 
 
 async def require_csrf_header(request: Request) -> None:

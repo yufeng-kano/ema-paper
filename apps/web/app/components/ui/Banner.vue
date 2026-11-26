@@ -1,13 +1,12 @@
 <script setup lang="ts">
 /**
- * Inline message: an error that did not block the page, a save confirmation, the one-time
- * key reveal.
+ * Inline message: an error that did not block the page, the one-time key reveal.
  *
  * Errors and warnings announce themselves (`role="alert"`) since they usually appear in
- * response to something the user just did; neutral and success tones are polite, so a
- * background refresh succeeding does not interrupt a screen reader mid-sentence.
+ * response to something the user just did; the neutral tone is polite, so a background
+ * note does not interrupt a screen reader mid-sentence.
  */
-const props = withDefaults(defineProps<{ tone?: 'neutral' | 'ok' | 'warn' | 'error' }>(), {
+const props = withDefaults(defineProps<{ tone?: 'neutral' | 'warn' | 'error' }>(), {
   tone: 'neutral',
 })
 
@@ -71,10 +70,6 @@ const assertive = computed(() => props.tone === 'error' || props.tone === 'warn'
 /* The one-time key reveal: the loudest note on the page without borrowing the accent. */
 .warn {
   background: var(--rail-active);
-  color: var(--ink);
-}
-
-.ok {
   color: var(--ink);
 }
 </style>

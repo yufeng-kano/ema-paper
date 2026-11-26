@@ -1,8 +1,9 @@
 """Where a user's shell runs (docs/sandbox.md).
 
 `DockerBackend` keeps one container per user — a Kata microVM in production — with the
-user's workspace at `/workspace`, and opens shells in it with `docker exec`. `LocalBackend`
-runs bash in a directory and exists for the test suite alone: it isolates nothing.
+user's workspace at `/workspace`, and opens shells in it with `docker exec`. `Backend`
+holds what does not depend on Docker, which the test suite drives with a bash stand-in of
+its own (tests/local_backend.py) that no setting selects.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Settings
-from .shell import GROUP_CLEANUP, SAFE_PATH, ExecOutcome, ShellSession, supervisor
+from .shell import SAFE_PATH, ExecOutcome, ShellSession, supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,10 @@ class UserSandbox:
     # A stop in progress: a kill inside the VM that fails then leaves the removal to it
     # rather than starting a second one (docs/sandbox.md § The runner).
     stopping: bool = False
+    # A VM this runner removed with no start since: the idle sweep does not ask Docker
+    # about it again. Never set from an inspection: Docker reports a VM it is still
+    # creating or starting as not running, or as absent. Cleared by every `ensure_running`.
+    known_stopped: bool = False
 
 
 class Backend:
@@ -84,14 +89,14 @@ class Backend:
 
     def on_timeout(self, user_id: int) -> Callable[..., Awaitable[None]] | None:
         """What kills a timed-out command where it runs; None when closing the host-side
-        process is enough (the local backend). Called with the supervisor's `pid` as the
-        VM numbers it, and `locked=True` when the caller already holds the sandbox lock."""
+        process is enough. Called with the supervisor's `pid` as the VM numbers it, and
+        `locked=True` when the caller already holds the sandbox lock."""
         return None
 
     def cleanup(self) -> str:
         """What the supervisor runs after every command to end what the command left
-        running (docs/sandbox.md § The runner): the shell's process group, by default."""
-        return GROUP_CLEANUP
+        running (docs/sandbox.md § The runner)."""
+        raise NotImplementedError
 
     async def stop_vm(self, sandbox: UserSandbox) -> bool:
         """Remove the VM; True when the removal itself succeeded."""
@@ -243,11 +248,16 @@ class Backend:
             sandbox.stopping = False
         sandbox.sessions.clear()
         sandbox.session_used.clear()
-        if not await self.stop_vm(sandbox) and not await self.is_gone(sandbox.user_id):
+        removed = await self.stop_vm(sandbox)
+        if not removed and not await self.is_gone(sandbox.user_id):
             sandbox.unstoppable = True
+            sandbox.known_stopped = False  # the sweep keeps retrying the removal
             logger.error("sandbox of user %d cannot be stopped; refusing commands", sandbox.user_id)
             raise RuntimeError("the sandbox VM could not be stopped")
         sandbox.started_at = None
+        # Only a removal that succeeded rules out a VM still coming up; one Docker merely
+        # reports not running is left to the sweep, which asks again.
+        sandbox.known_stopped = removed
 
     def _idle(self, sandbox: UserSandbox) -> bool:
         if any(shell.busy for shell in sandbox.sessions.values()):
@@ -267,8 +277,10 @@ class Backend:
         """Stop every VM idle past the configured window; returns how many."""
         stopped = 0
         for user_id, sandbox in list(self._users.items()):
-            if not self._idle(sandbox) or sandbox.lock.locked():
+            if sandbox.known_stopped or not self._idle(sandbox) or sandbox.lock.locked():
                 continue
+            # Not running now is no reason to stop asking: a `docker run` that timed out
+            # leaves the daemon still creating and starting the VM.
             try:
                 if not await self.is_running(user_id):
                     continue
@@ -296,7 +308,7 @@ def _now() -> str:
 # --- docker ---------------------------------------------------------------------------------
 
 
-async def _docker(*args: str, timeout: float = 120.0) -> tuple[int, str]:
+async def _docker(*args: str, timeout: float) -> tuple[int, str]:
     process = await asyncio.create_subprocess_exec(
         DOCKER,
         *args,
@@ -312,7 +324,7 @@ async def _docker(*args: str, timeout: float = 120.0) -> tuple[int, str]:
     return process.returncode or 0, out.decode("utf-8", errors="replace")
 
 
-CONTAINER_PREFIX = "sightread-sandbox-"
+CONTAINER_PREFIX = "ema-paper-sandbox-"
 
 # What runs as pid 1 in the VM: an init that reaps. A command's leftovers the sweep kills
 # are reparented to pid 1 and would sit there as zombies, against the VM's pid limit, if
@@ -512,8 +524,9 @@ class DockerBackend(Backend):
                     out.strip(),
                 )
             elif network != "none":
-                # One a runner before the IPv6 rule started on the network: it starts
-                # again without IPv6 on its next command.
+                # An adopted VM this runner has not checked: one that still holds an
+                # IPv6 address is stopped, and starts again without IPv6 on its next
+                # command.
                 code, out = await _docker(
                     "exec", self.container(user_id), "/bin/sh", "-c", NO_IPV6, timeout=30
                 )
@@ -530,35 +543,41 @@ class DockerBackend(Backend):
         if self._users:
             logger.info("adopted %d running sandboxes", len(self._users))
 
+    async def _running(self, user_id: int) -> tuple[bool | None, str]:
+        """Whether Docker reports the VM up — False for one stopped or absent, None when
+        it cannot say — and what it answered. Docker's own "no such object" is a positive
+        absence; anything else that fails (the daemon away, a timeout) is unknown."""
+        code, out = await _docker(
+            "inspect", "-f", "{{.State.Running}}", self.container(user_id), timeout=20
+        )
+        if code == 0:
+            return out.strip() == "true", out
+        if "No such object" in out or "No such container" in out:
+            return False, out
+        return None, out
+
     async def is_running(self, user_id: int) -> bool:
         """Whether the VM is up, from Docker itself; an inspection that fails for any
         reason but the VM's absence (the daemon away, a timeout) raises rather than
         answering stopped, so a status is never a usable sandbox nothing can start."""
-        code, out = await _docker(
-            "inspect", "-f", "{{.State.Running}}", self.container(user_id), timeout=20
-        )
-        if code == 0:
-            return out.strip() == "true"
-        if "No such object" in out or "No such container" in out:
-            return False
-        raise RuntimeError(f"could not inspect the sandbox VM: {out.strip()}")
+        running, out = await self._running(user_id)
+        if running is None:
+            raise RuntimeError(f"could not inspect the sandbox VM: {out.strip()}")
+        return running
 
     async def is_gone(self, user_id: int) -> bool:
-        code, out = await _docker(
-            "inspect", "-f", "{{.State.Running}}", self.container(user_id), timeout=20
-        )
-        if code == 0:
-            return out.strip() != "true"
-        # Docker's own "no such object" is a positive absence; anything else (the daemon
-        # away, a timeout) is unknown.
-        return "No such object" in out or "No such container" in out
+        running, _ = await self._running(user_id)
+        return running is False
 
     async def ensure_running(self, sandbox: UserSandbox) -> None:
+        sandbox.known_stopped = False
+        name = self.container(sandbox.user_id)
         if await self.is_running(sandbox.user_id):
             if sandbox.started_at is None:
-                sandbox.started_at = time.monotonic()
+                # Running, yet neither started to completion nor adopted here: a start
+                # whose `docker run` timed out and that the daemon finished after it.
+                await self._after_start(sandbox, name)
             return
-        name = self.container(sandbox.user_id)
         # A stopped container of a previous run is removed rather than restarted: the
         # image may have moved on, and nothing of value lives outside /workspace.
         settings = self.settings
@@ -622,7 +641,14 @@ class DockerBackend(Backend):
         if code != 0:
             logger.error("could not start sandbox for user %d: %s", sandbox.user_id, out.strip())
             raise RuntimeError("the sandbox VM could not be started")
-        if settings.sandbox_network != "none":
+        await self._after_start(sandbox, name)
+
+    async def _after_start(self, sandbox: UserSandbox, name: str) -> None:
+        """Check a VM just come up and make it usable: on the network, one that holds an
+        IPv6 address is removed and the start fails; then the VM counts as started and
+        gets its default environment (docs/sandbox.md § Network, § The image). Under the
+        sandbox lock, which `exec` holds around `ensure_running`."""
+        if self.settings.sandbox_network != "none":
             code, out = await _docker("exec", name, "/bin/sh", "-c", NO_IPV6, timeout=30)
             if code != 0:
                 # A VM whose kernel kept IPv6 could reach the host: never used. It goes
@@ -718,37 +744,3 @@ class DockerBackend(Backend):
         if code != 0:
             logger.warning("could not remove sandbox of user %d: %s", sandbox.user_id, out.strip())
         return code == 0
-
-
-# --- local (tests only) ---------------------------------------------------------------------
-
-
-class LocalBackend(Backend):
-    """bash in the workspace directory. No isolation whatsoever — never deployed."""
-
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self._running: set[int] = set()
-
-    async def is_running(self, user_id: int) -> bool:
-        return user_id in self._running
-
-    async def ensure_running(self, sandbox: UserSandbox) -> None:
-        workspace = self.workspace(sandbox.user_id)
-        await asyncio.to_thread(lambda: (workspace / CACHE_DIR).mkdir(parents=True, exist_ok=True))
-        if sandbox.user_id not in self._running:
-            self._running.add(sandbox.user_id)
-            sandbox.started_at = time.monotonic()
-
-    def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
-        return ["sh", "-c", supervisor(self.cleanup())], str(self.workspace(user_id))
-
-    async def stop_vm(self, sandbox: UserSandbox) -> bool:
-        self._running.discard(sandbox.user_id)
-        return True
-
-
-def build_backend(settings: Settings) -> Backend:
-    if settings.sandbox_backend == "local":
-        return LocalBackend(settings)
-    return DockerBackend(settings)

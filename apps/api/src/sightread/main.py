@@ -33,8 +33,9 @@ from .routes import (
 )
 from .runtime_settings import RuntimeSettings
 
-# Signed cookie holding only the transient OIDC state/PKCE verifier during a login
-# round trip. The durable credential is the server-side session row.
+# Signed cookie holding the transient state of a sign-in or a connector consent: the
+# OIDC state and PKCE verifier, the page and locale the sign-in returns to, and the
+# consent token. The durable credential is the server-side session row.
 OIDC_STATE_COOKIE = "sr_oidc"
 OIDC_STATE_MAX_AGE_SECONDS = 600
 
@@ -46,7 +47,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         # `create_engine` does not connect, so startup succeeds without a live database.
         engine = create_engine(settings.database_url)
-        app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)
         try:
             # The MCP session manager owns the task group every streamable-HTTP request
@@ -72,7 +72,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # (docs/api.md § Limits).
     app.state.preview_slots = asyncio.Semaphore(max(1, settings.page_preview_renders))
 
-    # Before the session layer, so an oversized body is refused before anything reads it.
+    # Inside the session layer, which reads no body: an oversized body is refused before
+    # any route reads it.
     app.add_middleware(
         BodyLimitMiddleware,
         max_bytes=settings.json_body_max_bytes,

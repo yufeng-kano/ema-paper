@@ -8,7 +8,7 @@
  *
  * Component styles live with their components (`app/components/ui/*.vue`). This file holds
  * only what has no component to belong to: the token blocks, the document reset, and the
- * four utilities (`.sr-only`, `.mono`, `.tabular`, `.eyebrow`) any of them may need.
+ * three utilities (`.sr-only`, `.mono`, `.tabular`) any of them may need.
  *
  * Light and dark are both first-class: every color token below is one `light-dark()` pair,
  * resolved by `color-scheme` — the system's choice, or the one the reader pinned in the
@@ -67,11 +67,6 @@
   --accent-tint: light-dark(rgb(0 113 227 / 12%), rgb(10 132 255 / 22%));
   /* The faint top highlight a filled system button carries. */
   --accent-highlight: rgb(255 255 255 / 18%);
-  /* The brand mark's two blues, top and bottom: the light accent's, in both appearances,
-     because the mark is a logo, not a control — the same as public/favicon.svg and the
-     consent page draw it, so the tab and the page show one icon. */
-  --mark-top: #4799eb;
-  --mark-bottom: #0071e3;
 
   /* --- Color: status ------------------------------------------------------
      Apple's status hues, each a dot beside a word, never the only signal. The danger red is
@@ -147,13 +142,9 @@
   --glass-blur: blur(24px) saturate(180%);
   --glass-highlight: light-dark(rgb(255 255 255 / 85%), rgb(255 255 255 / 10%));
   --glass-edge: light-dark(rgb(0 0 0 / 12%), rgb(255 255 255 / 14%));
-  --glass-shadow: light-dark(rgb(0 0 0 / 8%), rgb(0 0 0 / 40%));
   --pane-edge: light-dark(rgb(0 0 0 / 8%), rgb(255 255 255 / 10%));
-  --pane-shadow: light-dark(rgb(0 0 0 / 10%), rgb(0 0 0 / 45%));
-  --shadow-glass:
-    inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--glass-edge), 0 4px 14px var(--glass-shadow);
-  --shadow-pane:
-    inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--pane-edge), 0 14px 40px var(--pane-shadow);
+  --shadow-glass: inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--glass-edge);
+  --shadow-pane: inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--pane-edge);
 
   /* --- The context menu ---------------------------------------------------
      The platform's menu: opaque, so nothing under it reads through its rows; hairlined and
@@ -176,7 +167,6 @@
   --space-6: 24px;
   --space-7: 28px;
   --space-8: 32px;
-  --space-9: 36px;
   --space-10: 40px;
   --space-11: 44px;
   --space-12: 48px;
@@ -193,8 +183,6 @@
   --radius-xl: 20px;
   --radius-card: 28px;
   --radius-full: 999px;
-  /* The brand mark, an app icon's squircle at the sidebar's size. */
-  --radius-mark: 8px;
   --radius-menu: 12px;
   --radius-menu-item: 7px;
   /* The agent panel's composer field. */
@@ -203,7 +191,6 @@
   /* --- Type ---------------------------------------------------------------
      The system font, at the sizes Apple's own web apps use: 14px for UI and table text,
      12–13px for what is secondary, 11px the smallest thing that ships. */
-  --text-3xs: 10px;
   --text-2xs: 11px;
   --text-xs: 12px;
   --text-sm: 14px;
@@ -224,7 +211,6 @@
   --display-xl: 34px;
   --display-2xl: 40px;
   --display-3xl: 48px;
-  --display-4xl: 56px;
 
   --weight-normal: 400;
   --weight-medium: 500;
@@ -244,13 +230,12 @@
   --duration-slow: 240ms;
 
   /* --- Layout --------------------------------------------------------------
-     Five control heights, every one of them a token: 44px for a toolbar control, 36px for
-     a primary control, 34px for the sign-in dev button, 30px for small buttons and nav
-     items, 26px for a row's button and a gutter control. A button beside an input must be
-     the same box, and per-control padding is what makes those drift apart. */
+     Four control heights, every one of them a token: 44px for a toolbar control, 36px for
+     a primary control, 30px for small buttons and nav items, 26px for a row's button and a
+     gutter control. A button beside an input must be the same box, and per-control
+     padding is what makes those drift apart. */
   --control-height-lg: 44px;
   --control-height: 36px;
-  --control-height-md: 34px;
   --control-height-sm: 30px;
   --control-height-xs: 26px;
 
@@ -265,7 +250,6 @@
      one component, but the rhythm is a system decision, so it is set here. */
   --row-height: 40px;
   --row-height-tight: 34px;
-  --cell-y: 10px;
   --cell-y-tight: 7px;
   --cell-x: var(--space-3);
   /* Below this a table would wrap its cells, which breaks the row rhythm; it scrolls
@@ -285,7 +269,6 @@
 @media (pointer: coarse) {
   :root {
     --control-height: 44px;
-    --control-height-md: 44px;
     --control-height-sm: 38px;
     --control-height-xs: 32px;
     --row-height: 44px;
@@ -387,10 +370,61 @@ a {
   background-clip: content-box;
 }
 
+/* --- Column grip ----------------------------------------------------------
+   The grip that resizes a card (docs/web.md § Column widths; `useColumnGrip`), the result
+   viewer's and the Files page's Agent card's alike; each host sets the grip's own box in its
+   layout. Hovered, it shows only the cursor. The pill in its middle is drawn while it is
+   dragged or holds keyboard focus — with the focus ring every control has — and always on a
+   touch screen, which has no cursor to tell it by. */
+
+.column-grip {
+  position: relative;
+  z-index: 1;
+  border-radius: var(--radius-full);
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.column-grip::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 5px;
+  height: 40px;
+  border-radius: var(--radius-full);
+  background: var(--grip);
+  opacity: 0;
+  transform: translate(-50%, -50%);
+  transition:
+    background var(--duration-fast) var(--ease),
+    height var(--duration-fast) var(--ease);
+}
+
+.column-grip.dragging::after,
+.column-grip:focus-visible::after {
+  height: 56px;
+  background: var(--grip-active);
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .column-grip::after {
+    opacity: 1;
+  }
+}
+
+/* A grip's drag: the column-resize cursor wherever the pointer goes until it is released, over
+   a link, the text or the other card alike. The class is on <html>. */
+:root.col-resizing,
+:root.col-resizing * {
+  cursor: col-resize !important;
+}
+
 /* --- Global utilities -----------------------------------------------------
-   The four that earn a global: `.sr-only` is needed by components with no stylesheet of
-   their own, `.mono` and `.eyebrow` are the app's two typographic mode switches, and
-   `.tabular` keeps a column of figures from jittering between values. */
+   The three that earn a global: `.sr-only` is needed by components with no stylesheet of
+   their own, `.mono` is the app's typographic mode switch, and `.tabular` keeps a column
+   of figures from jittering between values. */
 
 .sr-only {
   position: absolute;
@@ -412,18 +446,6 @@ a {
 
 .tabular {
   font-variant-numeric: tabular-nums;
-}
-
-/* The label that names a figure, a field or a group: sentence case, quiet, a step under the
-   text it labels — never tracked capitals. `.sm` is the step down. */
-.eyebrow {
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
-}
-
-.eyebrow.sm {
-  font-size: var(--text-2xs);
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -6,7 +6,7 @@
  * Every structural element keeps the class and `data-*` attribute copy-as-markdown and
  * find-in-document read: `md-h2`/`md-h3` with `data-level`, `md-p`, `md-list`, `md-table`,
  * `md-toc` with the leader's `data-src`, `md-figure` with its `data-md`, and the
- * KaTeX-typeset `MdMath` with its own. Moving the markup here changed none of that.
+ * KaTeX-typeset `MdMath` with its own.
  *
  * A figure's crop is the caller's: `figureUrl` is the image to load, or null for the
  * dashed placeholder (no figure route, or a crop that already failed), and a load failure
@@ -23,7 +23,8 @@
  * `cite` is the agent panel's alone: given, an answer's links to the document's sections
  * are read and drawn as chips — those whose heading it says the document still has
  * (docs/web.md § The agent panel, *Section links*). So is `links`: given, an answer's links
- * to the web are drawn as links (*Links*).
+ * to the web are drawn as links (*Links*), and `files`: given, its links to the Files page's
+ * folders and documents (docs/web.md § The Files page's Agent card).
  */
 import type { CiteResolver, ResultBlock } from '~/lib/markdown'
 
@@ -33,6 +34,7 @@ const props = defineProps<{
   figureNote?: string | null
   cite?: CiteResolver
   links?: boolean
+  files?: boolean
 }>()
 
 const emit = defineEmits<{ 'figure-error': [] }>()
@@ -52,12 +54,12 @@ const figureSource = computed(() => {
 
 <template>
   <h3 v-if="block.kind === 'h2'" class="md-h2" :data-level="block.level">
-    <MdInline :text="block.text" :cite="cite" :links="links" />
+    <MdInline :text="block.text" :cite="cite" :links="links" :files="files" />
   </h3>
   <h4 v-else-if="block.kind === 'h3'" class="md-h3" :data-level="block.level">
-    <MdInline :text="block.text" :cite="cite" :links="links" />
+    <MdInline :text="block.text" :cite="cite" :links="links" :files="files" />
   </h4>
-  <p v-else-if="block.kind === 'p'" class="md-p"><MdInline :text="block.text" :cite="cite" :links="links" /></p>
+  <p v-else-if="block.kind === 'p'" class="md-p"><MdInline :text="block.text" :cite="cite" :links="links" :files="files" /></p>
 
   <!-- KaTeX-typeset, falling back to the verbatim source when it cannot parse. -->
   <MdMath v-else-if="block.kind === 'math'" :tex="block.text" />
@@ -77,7 +79,7 @@ const figureSource = computed(() => {
     :start="block.start"
   >
     <li v-for="(item, itemIndex) in block.items" :key="itemIndex">
-      <MdInline :text="item" :cite="cite" :links="links" />
+      <MdInline :text="item" :cite="cite" :links="links" :files="files" />
     </li>
   </component>
 
@@ -88,14 +90,14 @@ const figureSource = computed(() => {
       <thead>
         <tr>
           <th v-for="(cell, column) in block.header" :key="column" scope="col">
-            <MdInline :text="cell" :cite="cite" :links="links" />
+            <MdInline :text="cell" :cite="cite" :links="links" :files="files" />
           </th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="(row, rowIndex) in block.rows" :key="rowIndex">
           <td v-for="(cell, column) in row" :key="column">
-            <MdInline :text="cell" :cite="cite" :links="links" />
+            <MdInline :text="cell" :cite="cite" :links="links" :files="files" />
           </td>
         </tr>
       </tbody>
@@ -106,7 +108,7 @@ const figureSource = computed(() => {
        column instead of wrapping; its `data-src` is the dots the line carried. -->
   <div v-else-if="block.kind === 'toc'" class="md-toc">
     <p v-for="(entry, entryIndex) in block.entries" :key="entryIndex" class="md-toc-row">
-      <span class="md-toc-title"><MdInline :text="entry.title" :cite="cite" :links="links" /></span>
+      <span class="md-toc-title"><MdInline :text="entry.title" :cite="cite" :links="links" :files="files" /></span>
       <template v-if="entry.page !== null">
         <span
           class="md-toc-leader"
@@ -120,7 +122,7 @@ const figureSource = computed(() => {
   </div>
 
   <blockquote v-else-if="block.kind === 'quote'" class="md-quote">
-    <MdBlock v-for="(inner, innerIndex) in block.blocks" :key="innerIndex" :block="inner" :cite="cite" :links="links" />
+    <MdBlock v-for="(inner, innerIndex) in block.blocks" :key="innerIndex" :block="inner" :cite="cite" :links="links" :files="files" />
   </blockquote>
 
   <!-- The stored crop when one exists; the dashed frame when it does not. `data-md` is
@@ -142,7 +144,7 @@ const figureSource = computed(() => {
     <!-- Only the caption the page carried: the generated `figN` name and the bbox are how
          a crop is addressed, not something a reader was asked to read. -->
     <figcaption v-if="block.caption" class="figure-caption">
-      <MdInline :text="block.caption" :cite="cite" :links="links" />
+      <MdInline :text="block.caption" :cite="cite" :links="links" :files="files" />
     </figcaption>
   </figure>
 
@@ -161,7 +163,7 @@ const figureSource = computed(() => {
       <span>{{ t('viewer.imagePending') }}</span>
     </div>
     <figcaption v-if="block.caption" class="figure-caption">
-      <MdInline :text="block.caption" :cite="cite" :links="links" />
+      <MdInline :text="block.caption" :cite="cite" :links="links" :files="files" />
     </figcaption>
   </figure>
 </template>
@@ -197,62 +199,5 @@ const figureSource = computed(() => {
 .md-toc-page {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-}
-
-/* A figure is centered in the column, caption and all: a crop is narrower than the measure
-   far more often than not, and left-aligning it hangs it off an edge the text does not
-   share. */
-.md-figure {
-  margin: 0;
-  text-align: center;
-}
-
-/* The stored crop, at the width the prose gives it and never more. */
-.figure-image {
-  display: block;
-  margin-inline: auto;
-  max-width: 100%;
-  border: 1px solid var(--line-soft);
-  background: var(--paper);
-}
-
-/* Dashed, because it is a frame around something that is not there yet. */
-.figure-frame {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  height: 210px;
-  border: 1px dashed var(--edge);
-  background: var(--rail);
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-
-.figure-frame :deep(svg) {
-  width: 22px;
-  height: 22px;
-}
-
-/* A label on the picture, not the document's text: filled rather than outlined, so it
-   reads as a tag and not as a button, and set apart from the faint caption under it. */
-.figure-note {
-  display: inline-block;
-  margin: var(--space-2) 0 0;
-  padding: 0 var(--space-2);
-  background: var(--rail-active);
-  color: var(--ink-soft);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-}
-
-/* Prose now that the coordinates have gone from beside it: it wraps to as many lines as
-   the caption needs instead of being truncated to fit next to a readout. */
-.figure-caption {
-  margin-top: var(--space-2);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-  color: var(--faint);
 }
 </style>

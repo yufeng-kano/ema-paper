@@ -5,7 +5,8 @@ grants).
 
 Each takes the account's row lock, the ledger's first, writes into the caller's
 transaction with its audit row, and never commits: the route commits once, the grant and
-its record together.
+its record together. Beside them, which accounts are on a plan, as SQL: the users list's
+plan filter and a settings change's impact read it.
 """
 
 from __future__ import annotations
@@ -14,22 +15,57 @@ import uuid
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..billing import ledger
-from ..billing.plans import Decision, Grant, Period
+from ..billing.plans import FREE_PLAN_ID, PAID_STATUSES, Decision, Grant, Period
 from ..config import Settings
-from ..db.models import AuditLog, CreditPack, User, utcnow
+from ..db.models import AuditLog, CreditPack, PlanGrant, Subscription, User, utcnow
 from ..errors import ApiError
 from . import audit
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
+    from sqlalchemy.sql import ColumnElement
+
     from .deps import Operator
 
 # `credit_packs.pack_id` of an operator's grant: not a pack of `KANO_PAY_PACKS_JSON`.
 GRANT_PACK_ID = "grant"
+
+
+def paying(now: datetime) -> list[ColumnElement[bool]]:
+    """The `subscriptions` rows a paid period runs on at `now`, whatever their plan."""
+    return [
+        Subscription.status.in_(PAID_STATUSES),
+        Subscription.period_start <= now,
+        Subscription.period_end > now,
+    ]
+
+
+def holding_days(now: datetime) -> list[ColumnElement[bool]]:
+    """The `plan_grants` rows with granted days at `now`, running or waiting in the bank,
+    whatever their plan."""
+    return [or_(PlanGrant.period_end > now, PlanGrant.days_banked > 0)]
+
+
+def on_plan(settings: Settings, plan_id: str, now: datetime) -> ColumnElement[bool]:
+    """The accounts whose current period at `now` is `plan_id`'s, as SQL — the period
+    decision (`plans.resolve_period`) read over every account at once: a paid
+    subscription running now on a configured plan, else the granted days of a configured
+    plan, running or waiting in the bank, else Free."""
+    configured = list(settings.plans)
+    paid = select(Subscription.user_id).where(*paying(now), Subscription.plan_id.in_(configured))
+    granted = select(PlanGrant.user_id).where(*holding_days(now), PlanGrant.plan_id.in_(configured))
+    if plan_id == FREE_PLAN_ID:
+        return and_(User.id.not_in(paid), User.id.not_in(granted))
+    return or_(
+        User.id.in_(paid.where(Subscription.plan_id == plan_id)),
+        and_(User.id.not_in(paid), User.id.in_(granted.where(PlanGrant.plan_id == plan_id))),
+    )
 
 
 def day_bank(grant: Grant | None) -> dict | None:

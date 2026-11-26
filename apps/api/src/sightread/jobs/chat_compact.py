@@ -1,8 +1,8 @@
 """Compaction (docs/chat.md § Compaction): the message a compaction turn carries, what makes
 a conversation compactable, and the worker's idle pass that compacts a conversation before
-its prompt cache expires.
+its prompt cache expires; with them the turn block's text, which every user message carries.
 
-The reader's `/compact` goes through the send route, which builds the same message; the
+The reader's `/compact` goes through the send route, which builds its message here too; the
 idle pass takes the send's checks and locks itself, since no request stands behind it.
 """
 
@@ -26,13 +26,14 @@ from ..db.models import (
     Conversation,
     Document,
     Message,
-    User,
     utcnow,
 )
 from ..errors import ApiError
 from ..runtime_settings import RuntimeSettings
+from ..stopping import pause
 from ..workspace.documents import current_revision, ensure_within_quota, is_live, user_folders
 from ..workspace.layout import user_root
+from ..workspace.trash import lock_user
 from . import chat_versions
 from .queue import count_active_turns, enqueue_turn, history_bytes
 
@@ -44,13 +45,25 @@ COMPACT_CONTEXT = "compact"
 SUMMARY_CONTEXT = "summary"
 
 
-def is_summary(content: object) -> bool:
-    """Whether a stored message is the summary row a compaction left."""
-    return (
-        isinstance(content, list)
-        and len(content) > 0
-        and isinstance(content[0], dict)
-        and content[0].get("context") == SUMMARY_CONTEXT
+async def turn_note_for(
+    db: AsyncSession,
+    settings: Settings,
+    document: Document | None,
+    setting: AgentSetting | None,
+    locale: str,
+) -> str:
+    """The turn block's text a user message carries — a send's, an edit's, a compaction's:
+    the document's revision as the message is accepted, the reader's locale and the
+    languages they chose. With the message rather than in the system prompt, so an edit made
+    meanwhile reaches the model and a change of language costs no cache (docs/chat.md
+    § Prompt caching, § Instructions). A library conversation has no revision."""
+    revision = await current_revision(db, settings, document) if document is not None else None
+    return chat_agent.turn_note(
+        revision,
+        locale,
+        setting.answer_language if setting else None,
+        setting.translate_language if setting else None,
+        document=document is not None,
     )
 
 
@@ -126,17 +139,6 @@ async def compactable(db: AsyncSession, conversation_id: int) -> bool:
     return conversation_id in await compactable_ids(db, [conversation_id])
 
 
-async def unfinished_turn(db: AsyncSession, conversation_id: int) -> bool:
-    """A turn the worker may still be driving: anything without `finished_at`."""
-    return (
-        await db.execute(
-            select(ChatTurn.id).where(
-                ChatTurn.conversation_id == conversation_id, ChatTurn.finished_at.is_(None)
-            )
-        )
-    ).first() is not None
-
-
 async def _last_locale(db: AsyncSession, conversation_id: int) -> str:
     locale = (
         await db.execute(
@@ -161,7 +163,7 @@ async def try_idle_compaction(
     if row is None:
         return False
     # The user's row, then the conversation's: the send's order (docs/chat.md).
-    await db.execute(select(User.id).where(User.id == row.user_id).with_for_update())
+    await lock_user(db, row.user_id)
     # Read again under the lock, the row's columns included (`populate_existing`: the
     # session would otherwise hand back the identity it loaded above, as it was): a turn
     # or a move to another model may have cleared the clock meanwhile.
@@ -207,9 +209,13 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
     ).scalar_one_or_none()
     if setting is not None and not setting.idle_compact:
         return False
-    document = await db.get(Document, row.document_id)
-    if document is None or not is_live(document, await user_folders(db, row.user_id)):
-        return False
+    # A library conversation has no document to check (docs/chat.md § Library
+    # conversations); a document's must be live.
+    document = None
+    if row.document_id is not None:
+        document = await db.get(Document, row.document_id)
+        if document is None or not is_live(document, await user_folders(db, row.user_id)):
+            return False
     try:
         await ensure_within_quota(
             db, settings, row.user_id, user_root(settings.workspaces_dir, row.user_id)
@@ -218,7 +224,7 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
         return False
     if await count_active_turns(db, row.user_id) >= settings.max_chat_turns_per_user:
         return False
-    if await unfinished_turn(db, row.id):
+    if await chat_versions.unfinished_turn(db, row.id):
         return False
     # The branch the conversation shows is what the compaction continues (docs/chat.md
     # § History is append-only, *An edited message starts a version*).
@@ -233,13 +239,7 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
     if not await compactable(db, row.id):
         return False
     locale = await _last_locale(db, row.id)
-    revision = await current_revision(db, settings, document)
-    note = chat_agent.turn_note(
-        revision,
-        locale,
-        setting.answer_language if setting else None,
-        setting.translate_language if setting else None,
-    )
+    note = await turn_note_for(db, settings, document, setting, locale)
     # The message, the turn and its credit entry, or none of them: the balance is read as
     # the entry is reserved, and a refusal leaves only the cleared clock behind.
     try:
@@ -267,7 +267,6 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
                 kind=ledger.CHAT,
                 amount=0,
                 turn_id=turn.id,
-                model=row.model,
                 minimum=settings.chat_min_credits,
             )
             message.turn_id = turn.id
@@ -311,7 +310,7 @@ async def idle_compact_once(
             async with sessionmaker() as db:
                 if await try_idle_compaction(db, settings, conversation_id, now=now):
                     enqueued += 1
-        except Exception:  # noqa: BLE001 - the next conversation still goes
+        except Exception:  # the next conversation still goes
             logger.exception("idle compaction of conversation %d failed", conversation_id)
     return enqueued
 
@@ -330,9 +329,6 @@ async def idle_compact_forever(
             enqueued = await idle_compact_once(sessionmaker, settings)
             if enqueued:
                 logger.info("enqueued %d idle compaction(s)", enqueued)
-        except Exception:  # noqa: BLE001 - the next pass tries again
+        except Exception:  # the next pass tries again
             logger.exception("the idle compaction pass failed; the next one runs on schedule")
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=settings.chat_idle_compact_sweep_seconds)
-        except TimeoutError:
-            continue
+        await pause(stop, settings.chat_idle_compact_sweep_seconds)

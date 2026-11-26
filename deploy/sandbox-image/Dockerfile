@@ -1,5 +1,5 @@
 # What runs inside a user's VM (docs/sandbox.md § The image). Built and tagged by the
-# operator: `docker build -t sightread-sandbox deploy/sandbox-image`.
+# operator: `docker build -t ema-paper-sandbox deploy/sandbox-image`.
 FROM debian:bookworm-slim
 
 RUN apt-get update \
@@ -43,7 +43,7 @@ RUN mkdir -p /workspace
 
 WORKDIR /workspace
 # The default environment: what `python` runs and `uv pip install` installs into, made by
-# the runner after each start when its interpreter does not run (docs/sandbox.md § The
+# the runner after each start when its interpreter is missing (docs/sandbox.md § The
 # image). In the workspace's .cache, so it survives a stop and goes with a reset.
 ENV UV_CACHE_DIR=/workspace/.cache/uv \
     UV_PYTHON_INSTALL_DIR=/workspace/.cache/python \

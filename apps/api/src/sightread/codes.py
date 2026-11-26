@@ -92,9 +92,6 @@ _STATUS_WORDS = {
 async def run(args: argparse.Namespace, settings: Settings, db: AsyncSession) -> int:
     prefix = settings.redeem_code_prefix
     if args.command == "create":
-        if args.plan is not None and args.days is None:
-            print("--plan needs --days", file=sys.stderr)
-            return 2
         try:
             rows = await codes.create_codes(
                 db,

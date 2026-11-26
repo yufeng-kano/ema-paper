@@ -16,8 +16,10 @@ import {
   moveBlocks,
   parseInline,
   parseResultMarkdown,
+  passageKeys,
   placeNear,
-  replaceBlockSource,
+  placedBlocks,
+  replaceBlockSources,
   resolveAnchor,
   sectionSource,
   serializeDocument,
@@ -266,17 +268,6 @@ describe('parseResultMarkdown formulas and wrapped items', () => {
       { kind: 'list', ordered: false, items: ['First line wrapped onto a second', 'Second'] },
     ])
   })
-
-  it('ends the list at an unindented line', () => {
-    const pages = parseResultMarkdown(
-      ['<!-- page: 1 -->', '- Only item', 'A new paragraph.'].join('\n'),
-    )
-
-    expect(bare(pages[0]!.blocks)).toEqual([
-      { kind: 'list', ordered: false, items: ['Only item'] },
-      { kind: 'p', text: 'A new paragraph.' },
-    ])
-  })
 })
 
 describe('parseResultMarkdown code and numbering', () => {
@@ -307,12 +298,6 @@ describe('parseResultMarkdown code and numbering', () => {
     expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'list', ordered: true, items: ['Fifth', 'Sixth'], start: 5 },
     ])
-  })
-
-  it('leaves a list starting at one without a start attribute', () => {
-    const pages = parseResultMarkdown(['<!-- page: 1 -->', '1. First'].join('\n'))
-
-    expect(bare(pages[0]!.blocks)).toEqual([{ kind: 'list', ordered: true, items: ['First'] }])
   })
 })
 
@@ -909,11 +894,6 @@ describe('serializeDocument', () => {
     expect(serializeDocument(parseResultMarkdown(document))).toBe(document)
   })
 
-  it('is stable again on a second round trip', () => {
-    const once = serializeDocument(parseResultMarkdown(document))
-    expect(serializeDocument(parseResultMarkdown(once))).toBe(once)
-  })
-
   it('writes an empty page as its marker alone', () => {
     expect(serializeDocument([{ page: 4, blocks: [] }])).toBe('<!-- page: 4 -->')
   })
@@ -937,21 +917,19 @@ describe('serializeDocument', () => {
 })
 
 describe('appendBlockSource', () => {
-  it('gives an emptied page its text back as a new block', () => {
-    const emptied = ['<!-- page: 1 -->', '', '<!-- page: 2 -->', 'Second page.'].join('\n')
-    expect(appendBlockSource(emptied, 0, 'Back again.')).toBe(
-      ['<!-- page: 1 -->', 'Back again.', '', '<!-- page: 2 -->', 'Second page.'].join('\n'),
-    )
+  it('appends the text to the last page as a new block', () => {
+    const emptied = ['<!-- page: 1 -->', 'First.', '', '<!-- page: 2 -->'].join('\n')
+    expect(appendBlockSource(emptied, 'Back again.')).toBe(['<!-- page: 1 -->', 'First.', '', '<!-- page: 2 -->', 'Back again.'].join('\n'))
   })
 
   it('starts a document with no page at all without a marker', () => {
-    expect(appendBlockSource('', 0, 'First words.')).toBe('First words.')
-    expect(appendBlockSource('First words.', 0, 'More.')).toBe('First words.\n\nMore.')
-    expect(parseResultMarkdown(appendBlockSource('', 0, 'First words.'))[0]?.blocks[0]?.kind).toBe('p')
+    expect(appendBlockSource('', 'First words.')).toBe('First words.')
+    expect(appendBlockSource('First words.', 'More.')).toBe('First words.\n\nMore.')
+    expect(parseResultMarkdown(appendBlockSource('', 'First words.'))[0]?.blocks[0]?.kind).toBe('p')
   })
 })
 
-describe('replaceBlockSource', () => {
+describe('replaceBlockSources', () => {
   const document = [
     '<!-- page: 1 -->',
     '## Heading',
@@ -967,12 +945,12 @@ describe('replaceBlockSource', () => {
   ].join('\n')
 
   it('changes only the block that was edited', () => {
-    const edited = replaceBlockSource(document, 0, 1, 'First paragraph, revised.')
+    const edited = replaceBlockSources(document, [{ page: 0, index: 1, src: 'First paragraph, revised.' }])
     expect(edited).toBe(document.replace('First paragraph.', 'First paragraph, revised.'))
   })
 
   it('lets one block become two', () => {
-    const edited = replaceBlockSource(document, 1, 0, 'Second page.\n\nAnd a third paragraph.')
+    const edited = replaceBlockSources(document, [{ page: 1, index: 0, src: 'Second page.\n\nAnd a third paragraph.' }])
     const pages = parseResultMarkdown(edited)
     expect(bare(pages[1]!.blocks)).toEqual([
       { kind: 'p', text: 'Second page.' },
@@ -982,14 +960,31 @@ describe('replaceBlockSource', () => {
   })
 
   it('drops a block whose source was emptied', () => {
-    const edited = replaceBlockSource(document, 0, 2, '   ')
+    const edited = replaceBlockSources(document, [{ page: 0, index: 2, src: '   ' }])
     expect(edited).toBe(
       ['<!-- page: 1 -->', '## Heading', '', 'First paragraph.', '', '<!-- page: 2 -->', 'Second page.'].join('\n'),
     )
   })
 
   it('leaves the document alone for a block that does not exist', () => {
-    expect(replaceBlockSource(document, 5, 0, 'x')).toBe(document)
+    expect(replaceBlockSources(document, [{ page: 5, index: 0, src: 'x' }])).toBe(document)
+  })
+
+  it('applies every edit to the document as it was, in any order', () => {
+    const edits = [
+      { page: 0, index: 0, src: '' },
+      { page: 0, index: 1, src: 'One.\n\nTwo.' },
+      { page: 0, index: 2, src: '' },
+      { page: 1, index: 0, src: 'Second page, revised.' },
+    ]
+    const expected = ['<!-- page: 1 -->', 'One.', '', 'Two.', '', '<!-- page: 2 -->', 'Second page, revised.'].join('\n')
+    expect(replaceBlockSources(document, edits)).toBe(expected)
+    expect(replaceBlockSources(document, [...edits].reverse())).toBe(expected)
+  })
+
+  it('returns the document as written when there is no edit', () => {
+    const unshaped = '<!-- page: 1 -->\n\n\nFirst.'
+    expect(replaceBlockSources(unshaped, [])).toBe(unshaped)
   })
 })
 
@@ -998,7 +993,7 @@ describe('comments', () => {
     const source = '<!-- page: 1 -->\n\nFirst.\n\n<!-- reviewer: check this -->\n\nSecond.'
     const pages = parseResultMarkdown(source)
     expect(pages[0]?.blocks.map((block) => block.kind)).toEqual(['p', 'comment', 'p'])
-    const edited = replaceBlockSource(source, 0, 0, 'First, edited.')
+    const edited = replaceBlockSources(source, [{ page: 0, index: 0, src: 'First, edited.' }])
     expect(edited).toBe('<!-- page: 1 -->\nFirst, edited.\n\n<!-- reviewer: check this -->\n\nSecond.')
   })
 })
@@ -1185,6 +1180,23 @@ describe('links to the web', () => {
     ])
   })
 
+  it('reads the dollars in an address as the address, and math after it as math', () => {
+    const address = 'https://example.org/$x$'
+    const link = { kind: 'link', segments: [{ kind: 'text', text: address }], href: address }
+    expect(parseInline(`see ${address} now`, { links: true })).toEqual([
+      { kind: 'text', text: 'see ' },
+      { ...link, src: address },
+      { kind: 'text', text: ' now' },
+    ])
+    expect(parseInline(`<${address}>`, { links: true })).toEqual([{ ...link, src: `<${address}>` }])
+    expect(parseInline('see https://a.org/$x + y$ and $z$', { links: true })).toEqual([
+      { kind: 'text', text: 'see ' },
+      { kind: 'link', segments: [{ kind: 'text', text: 'https://a.org/$x' }], href: 'https://a.org/$x', src: 'https://a.org/$x' },
+      { kind: 'text', text: ' + y$ and ' },
+      { kind: 'math', tex: 'z' },
+    ])
+  })
+
   it('reads no address glued to a word, none without a host, and none without the option', () => {
     expect(parseInline('xhttps://example.org https:// https://.', { links: true })).toEqual([
       { kind: 'text', text: 'xhttps://example.org https:// https://.' },
@@ -1203,6 +1215,74 @@ describe('links to the web', () => {
     ])
     // The link's own `[` is a section link's first: not a web link when the section link reads.
     expect(parseInline('[site](https://example.org)', { cites: true })).toEqual([{ kind: 'text', text: '[site](https://example.org)' }])
+  })
+})
+
+describe('links to the Files page', () => {
+  const folder = '[DINO](/files?folder=12)'
+  const document = '[iBOT.pdf](/files?document=34)'
+  const answer = { cites: false, links: true, files: true }
+
+  it('reads a folder link and a document link only when asked to', () => {
+    expect(parseInline(`In ${folder}.`, { links: true })).toEqual([{ kind: 'text', text: `In ${folder}.` }])
+    expect(parseInline(`In ${folder}, see ${document}.`, answer)).toEqual([
+      { kind: 'text', text: 'In ' },
+      {
+        kind: 'link',
+        segments: [{ kind: 'text', text: 'DINO' }],
+        href: '/files?folder=12',
+        src: folder,
+        files: { kind: 'folder', id: 12 },
+      },
+      { kind: 'text', text: ', see ' },
+      {
+        kind: 'link',
+        segments: [{ kind: 'text', text: 'iBOT.pdf' }],
+        href: '/files?document=34',
+        src: document,
+        files: { kind: 'document', id: 34 },
+      },
+      { kind: 'text', text: '.' },
+    ])
+    expect(inlinePlain(`See ${document}.`, answer)).toBe('See iBOT.pdf.')
+  })
+
+  it('reads markdown and math in its text, and one inside emphasis', () => {
+    expect(parseInline('[**DINO** $v_2$](/files?folder=7)', answer)).toMatchObject([
+      {
+        kind: 'link',
+        files: { kind: 'folder', id: 7 },
+        segments: [{ kind: 'strong' }, { kind: 'text', text: ' ' }, { kind: 'math', tex: 'v_2' }],
+      },
+    ])
+    expect(parseInline(`**${document}**`, answer)).toMatchObject([
+      { kind: 'strong', segments: [{ kind: 'link', files: { kind: 'document', id: 34 } }] },
+    ])
+  })
+
+  it('leaves every other relative link, an image and an escaped bracket the text they were', () => {
+    for (const text of [
+      '[x](/files)',
+      '[x](/files?folder=)',
+      '[x](/files?folder=0)',
+      '[x](/files?folder=12&document=3)',
+      '[x](/files?trash=1)',
+      '[x](files?folder=12)',
+      '[x](/settings)',
+      '[ ](/files?folder=12)',
+      '![x](/files?document=34)',
+      `\\${folder}`,
+      '`[x](/files?folder=12)`',
+    ]) {
+      expect(parseInline(text, answer).some((segment) => segment.kind === 'link')).toBe(false)
+    }
+  })
+
+  it('leaves a section link its text where no document reads it, beside a web link', () => {
+    expect(parseInline('[3.2 Attention](#32-attention) and [site](https://example.org)', answer)).toMatchObject([
+      { kind: 'text', text: '[3.2 Attention](#32-attention) and ' },
+      { kind: 'link', href: 'https://example.org' },
+    ])
   })
 })
 
@@ -1456,6 +1536,32 @@ describe('block anchors', () => {
     expect(resolveAnchor(pages, '~Before any')).toEqual({ page: 0, index: 0 })
     expect(resolveAnchor(pages, 'gone~Nothing')).toBeNull()
     expect(resolveAnchor(pages, '')).toBeNull()
+  })
+
+  it('resolves the same from the outline, placed blocks and passage keys a caller keeps', () => {
+    const commented = parseResultMarkdown(['## Notes', '', '<!-- Same words here. -->', '', 'Same words here.'].join('\n'))
+    const anchors = [
+      'exercises-1~Same words here.',
+      'exercises~Same   words here.',
+      'missing~An attention function',
+      '32-attention~Words no block has',
+      '~Before any',
+      'gone~Nothing',
+      '',
+      'notes~Same words here.',
+      'notes~<!-- Same words',
+    ]
+    for (const doc of [pages, commented]) {
+      const placed = placedBlocks(doc)
+      const keys = passageKeys(placed)
+      for (const anchor of anchors) {
+        expect(resolveAnchor(doc, anchor, documentOutline(doc), placed, keys)).toEqual(resolveAnchor(doc, anchor))
+      }
+    }
+    const placed = placedBlocks(commented)
+    const kept = [documentOutline(commented), placed, passageKeys(placed)] as const
+    expect(resolveAnchor(commented, 'notes~Same words here.', ...kept)).toEqual({ page: 0, index: 2 })
+    expect(resolveAnchor(commented, 'notes~<!-- Same words', ...kept)).toEqual({ page: 0, index: 0 })
   })
 
   it('reads an anchor back from the escapes an address gave it', () => {

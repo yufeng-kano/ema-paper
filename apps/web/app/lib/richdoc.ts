@@ -22,9 +22,10 @@ import {
   THEMATIC_BREAK,
   WORD_CHAR,
   isEscaped,
+  locateSources,
   mathSpanAt,
+  parseBlocks,
   parseInline,
-  parseResultMarkdown,
   readsAsTocRow,
   type InlineOptions,
   type InlineSegment,
@@ -104,7 +105,7 @@ function blockNode(block: ResultBlock, options?: InlineOptions): JSONContent {
     case 'h3':
       return {
         type: 'heading',
-        attrs: { level: Math.min(6, Math.max(1, block.level)) },
+        attrs: { level: block.level },
         content: inlineContent(parseInline(block.text, options)),
       }
     case 'list':
@@ -154,9 +155,9 @@ function blockNode(block: ResultBlock, options?: InlineOptions): JSONContent {
 }
 
 /** The editor's document for a run of blocks. Never empty: an editor needs a textblock.
- *  `leads` is the whitespace before each block in the file it came from (`markdownToDoc`);
- *  `options.cites` reads section links, which only the notes do. */
-export function blocksToDoc(blocks: ResultBlock[], leads: (string | null)[] = [], options?: InlineOptions): JSONContent {
+ *  `leads` is the whitespace before each block in the file it came from, or null where none
+ *  is known; `options.cites` reads section links, which only the notes do. */
+function blocksToDoc(blocks: ResultBlock[], leads: (string | null)[], options?: InlineOptions): JSONContent {
   const content = blocks.map((block, index) => {
     const node = blockNode(block, options)
     const lead = leads[index] ?? null
@@ -177,12 +178,12 @@ function placedSource(source: string): { at: number; block: ResultBlock }[] {
   for (const match of source.matchAll(/^[ \t]*(<!--\s*page:\s*\d+\s*-->)[ \t]*$/gm)) {
     placed.push({ at: match.index + match[0].indexOf(match[1] ?? ''), block: { kind: 'comment', src: match[1] ?? '' } })
   }
+  const blocks = parseBlocks(source)
   let cursor = 0
-  for (const block of parseResultMarkdown(source).flatMap((page) => page.blocks)) {
-    const at = source.indexOf(block.src, cursor)
-    placed.push({ at: at === -1 ? cursor : at, block })
-    cursor = at === -1 ? cursor : at + block.src.length
-  }
+  locateSources(source, blocks).forEach((span, index) => {
+    placed.push({ at: span?.start ?? cursor, block: blocks[index]! })
+    cursor = span?.end ?? cursor
+  })
   return placed.sort((a, b) => a.at - b.at)
 }
 
@@ -521,6 +522,14 @@ export function quoteLines(markdown: string): string {
     : ''
 }
 
+/** A quote's content as the markdown it holds: its lines with `>` and one space removed. */
+export function unquoted(src: string): string {
+  return src
+    .split('\n')
+    .map((line) => line.replace(/^\s*> ?/, ''))
+    .join('\n')
+}
+
 function collectItems(item: JSONContent): string[] {
   const lines: string[] = []
   const nested: string[] = []
@@ -670,14 +679,6 @@ function inlineRuns(block: ResultBlock): JSONContent[][] {
   }
 }
 
-/** A quote's content as the markdown it holds: its lines with `>` and one space removed. */
-function unquoted(src: string): string {
-  return src
-    .split('\n')
-    .map((line) => line.replace(/^\s*> ?/, ''))
-    .join('\n')
-}
-
 /** The text a display formula takes when the block is not one formula: as written. */
 function textAsWritten(block: ResultBlock): string {
   switch (block.kind) {
@@ -753,7 +754,7 @@ function convertParsed(block: ResultBlock, to: BlockKindName): string | null {
  * kind already, or a kind that cannot be turned.
  */
 export function convertBlock(src: string, to: BlockKindName): string | null {
-  const blocks = parseResultMarkdown(src).flatMap((page) => page.blocks)
+  const blocks = parseBlocks(src)
   if (blocks.length !== 1) {
     return null
   }

@@ -1,15 +1,15 @@
 <script setup lang="ts">
 /**
- * Usage (docs/web.md § Pages, `/settings/usage`; the contract is docs/billing.md), laid out
+ * Usage (docs/web.md § Pages, `?settings=usage`; the contract is docs/billing.md), laid out
  * as Claude's own usage page: the plan and its action — *Upgrade* (a checkout) or *Manage
  * subscription* (Pay's portal) — then the usage limits, the period's credits and the
  * workspace's storage, each a bar with *N% used*, the top-up credits on a paid plan (the
  * packs' balance, the newest packs with every one in a dialog, and *Top up*, which opens
  * the pack's dialog before Pay's checkout — docs/billing.md § Top-up packs), one line on
- * the rates with the way to the rates page (no table here, since 2026-10-26), and the
- * sandbox the plan gives. Redeemed days of a plan are said under the plan, and the plan's foot
- * ends in the way to the redeem dialog, Free or paid (docs/billing.md § Redeem codes). Every
- * figure is the API's: the section never names a price or a plan the API did not.
+ * the rates with the way to the rates page, and the sandbox the plan gives. Redeemed days
+ * of a plan are said under the plan, and the plan's foot ends in the way to the redeem
+ * dialog, Free or paid (docs/billing.md § Redeem codes). Every figure is the API's: the
+ * section never names a price or a plan the API did not.
  */
 import {
   createCheckout,
@@ -21,7 +21,7 @@ import {
   stopSandbox,
   type SandboxState,
 } from '~/lib/api'
-import { formatBytes, formatCount, formatDate, formatShortDateTime } from '~/lib/format'
+import { formatBytes, formatCount, formatDate, formatShortDateTime, formatTime } from '~/lib/format'
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
@@ -43,9 +43,7 @@ const free = computed(() => billing.value?.plan.id === 'free')
 /** Whether a Pay subscription pays for the current period: the period says, not the row —
  *  a lapsed subscriber's row stands while their period is Free's or redeemed days'
  *  (docs/billing.md § Periods). */
-const subscribed = computed(
-  () => (billing.value?.period.source ?? (billing.value?.subscription ? 'subscription' : 'free')) === 'subscription',
-)
+const subscribed = computed(() => billing.value?.period.source === 'subscription')
 
 const planName = computed(() => {
   const plan = billing.value?.plan
@@ -60,7 +58,7 @@ const planGives = computed(() => {
   }
   return [
     t('usage.planCredits', { n: formatCount(plan.credits, locale.value) }, plan.credits),
-    t('usage.planStorage', { size: formatBytes(plan.storage_bytes, locale.value) }),
+    t('usage.planStorage', { size: formatBytes(plan.storage_bytes, locale.value, { limit: true }) }),
     t('usage.planJobs', { n: formatCount(plan.max_jobs, locale.value) }, plan.max_jobs),
     plan.sandbox ? t('usage.planSandbox') : t('usage.planNoSandbox'),
   ].join(' · ')
@@ -172,7 +170,7 @@ watch([billing, sandbox], () => {
 })
 
 const updatedLabel = computed(() =>
-  updatedAt.value ? new Intl.DateTimeFormat(locale.value, { timeStyle: 'short' }).format(updatedAt.value) : '',
+  updatedAt.value ? formatTime(updatedAt.value, locale.value) : '',
 )
 
 /** The shell's balance follows the section's read, so the two never disagree. */
@@ -233,11 +231,11 @@ async function manage() {
 
 /** The VM's controls: a runner this deployment has, on a plan that gives one. */
 const sandboxAvailable = computed(
-  () => sandbox.value !== null && sandbox.value.state !== 'unavailable' && sandbox.value.granted !== false,
+  () => sandbox.value !== null && sandbox.value.state !== 'unavailable' && sandbox.value.granted,
 )
 
-function stateTone(state: SandboxState): 'ok' | 'info' | 'neutral' {
-  return state === 'running' ? 'ok' : state === 'starting' ? 'info' : 'neutral'
+function stateTone(state: SandboxState): 'ok' | 'neutral' {
+  return state === 'running' ? 'ok' : 'neutral'
 }
 
 const sandboxActionPending = ref(false)
@@ -323,7 +321,7 @@ async function runSandboxAction(action: () => Promise<void>) {
               {{
                 t('usage.storageOf', {
                   used: formatBytes(sandbox.workspace.bytes, locale),
-                  quota: formatBytes(sandbox.workspace.quota_bytes, locale),
+                  quota: formatBytes(sandbox.workspace.quota_bytes, locale, { limit: true }),
                 })
               }}
             </p>
@@ -435,7 +433,7 @@ async function runSandboxAction(action: () => Promise<void>) {
         </div>
         <!-- The workspace above is the reader's either way (docs/billing.md § Plans). -->
         <p v-else-if="sandbox" class="sandbox-note">
-          {{ sandbox.granted === false ? t('usage.notInPlan') : t('usage.unavailable') }}
+          {{ sandbox.granted ? t('usage.unavailable') : t('usage.notInPlan') }}
         </p>
         <template v-if="sandboxError || (sandboxActionError && !confirmingReset)" #foot>
           <UiBanner v-if="sandboxError" tone="error">{{ sandboxError }}</UiBanner>

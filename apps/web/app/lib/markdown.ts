@@ -22,7 +22,7 @@
  */
 
 /** `[ymin, xmin, ymax, xmax]`, 0–1000 normalized — the `bbox_format` the result declares. */
-export type Bbox = [number, number, number, number]
+type Bbox = [number, number, number, number]
 
 /**
  * Every block keeps `src`: the exact source lines it was read from, joined by `\n`, with
@@ -60,7 +60,7 @@ export type ResultBlock =
  * One line of a contents page. `title + leader + page` is the source line exactly — the
  * leader is drawn rather than printed, and copy hands its characters back.
  */
-export interface TocEntry {
+interface TocEntry {
   title: string
   /** What sat between the title and the page number: dots, or just the space. */
   leader: string
@@ -68,7 +68,9 @@ export interface TocEntry {
 }
 
 export interface ResultPageBlocks {
-  /** The viewer never prints this — it addresses a figure's crop with it. */
+  /** The marker's number, written back by `serializeDocument`. A document can repeat it, so
+   *  the viewer keys a page by its position and never prints the number; a figure's crop is
+   *  addressed by the figure's own page. */
   page: number
   blocks: ResultBlock[]
   /** Text ahead of any marker, written back without one: a markdown document never gains
@@ -127,10 +129,6 @@ function mathFence(line: string): MathFence | null {
   return line.startsWith(BRACKETS.open) && close === line.length - BRACKETS.close.length && TEX_LIKE.test(inner)
     ? BRACKETS
     : null
-}
-
-function opensMath(line: string): boolean {
-  return mathFence(line) !== null
 }
 
 /** A page number as a contents page prints one: arabic or roman, possibly emphasised. */
@@ -201,13 +199,12 @@ function startsBlock(line: string, next = '', quoted = false): boolean {
     !line ||
     isQuoteLine(line, quoted) ||
     THEMATIC_BREAK.test(line) ||
-    opensMath(line) ||
+    mathFence(line) !== null ||
     CODE_FENCE.test(line) ||
     isTableStart(line, next) ||
     line.startsWith('#') ||
     LIST_ITEM.test(line) ||
     (!quoted && (FIGURE.test(line) || IMAGE.test(line))) ||
-    PAGE_MARKER.test(line) ||
     COMMENT.test(line)
   )
 }
@@ -226,13 +223,42 @@ function splitRow(line: string): string[] {
 }
 
 /**
- * Groups the document by page marker. Content before the first marker — a result stored
- * before the pipeline wrote them, say, or a markdown document, which has none — is kept as
- * an unmarked page 1 rather than dropped: the viewer would otherwise show an empty document
- * for a job that has one.
+ * Groups the document by page marker. Content before the first marker — all of a markdown
+ * document, which has none — is kept as an unmarked page 1 rather than dropped: the viewer
+ * would otherwise show an empty document for one that has content.
  */
 export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
   return parsePages(markdown, false)
+}
+
+/** Every block of a markdown string in reading order, page markers crossed. */
+export function parseBlocks(markdown: string): ResultBlock[] {
+  return parseResultMarkdown(markdown).flatMap((page) => page.blocks)
+}
+
+/**
+ * Where each of `blocks` — parsed from `markdown`, in order — has its source in `markdown`, as
+ * offsets into that same string; null for a block not found there. A block's source is whole
+ * lines, found only where whole lines are: a paragraph that is only `1` is not the `1` in
+ * `<!-- page: 1 -->`. A line ends at `\n` or `\r`, so a one-line block is found in CRLF text
+ * too; a block of several lines is not, its source being joined with `\n`. Each block is looked
+ * for after the last one found, comments included, so no later block is found inside one.
+ */
+export function locateSources(markdown: string, blocks: readonly ResultBlock[]): ({ start: number; end: number } | null)[] {
+  const lineBreak = (at: number) => markdown[at] === '\n' || markdown[at] === '\r'
+  const wholeLines = (start: number, end: number) => (start === 0 || lineBreak(start - 1)) && (end === markdown.length || lineBreak(end))
+  let cursor = 0
+  return blocks.map(({ src }) => {
+    let start = markdown.indexOf(src, cursor)
+    while (start !== -1 && !wholeLines(start, start + src.length)) {
+      start = markdown.indexOf(src, start + 1)
+    }
+    if (start === -1) {
+      return null
+    }
+    cursor = start + src.length
+    return { start, end: cursor }
+  })
 }
 
 /** A quote's content as blocks: no page of its own, and a `>` in it stays text. */
@@ -562,33 +588,34 @@ export function serializeDocument(pages: ResultPageBlocks[]): string {
 }
 
 /**
- * `markdown` with one block's source replaced — the viewer's edit, as the string to save.
- * The new source need not stay one block: a paragraph edited into two is two on the next
- * parse, and an emptied one disappears (see `serializeDocument`).
+ * `markdown` with blocks' sources replaced — the viewer's edit, as the string to save. Every
+ * edit addresses a block of `markdown`'s own parse, so their order does not matter, and the
+ * document is parsed and written once however many there are; with none, `markdown` comes
+ * back as written. A new source need not stay one block: a paragraph edited into two is two
+ * on the next parse, and an emptied one disappears (see `serializeDocument`).
  */
-export function replaceBlockSource(
-  markdown: string,
-  pageIndex: number,
-  blockIndex: number,
-  src: string,
-): string {
+export function replaceBlockSources(markdown: string, edits: readonly (BlockAt & { src: string })[]): string {
+  if (edits.length === 0) {
+    return markdown
+  }
   const pages = parseResultMarkdown(markdown)
-  const block = pages[pageIndex]?.blocks[blockIndex]
-  if (block) {
-    block.src = src
+  for (const edit of edits) {
+    const block = pages[edit.page]?.blocks[edit.index]
+    if (block) {
+      block.src = edit.src
+    }
   }
   return serializeDocument(pages)
 }
 
 /**
- * `markdown` with a new block appended to one page — how text comes back to a page whose
- * last block was emptied, and to a document with no block at all: a document without a
- * page gets an unmarked page 1. Only the source matters to the stored string; the block
- * parses into its kind on the next render.
+ * `markdown` with a new block appended to its last page — how text comes back to a document
+ * with no block left to draw: a document without a page gets an unmarked page 1. Only the
+ * source matters to the stored string; the block parses into its kind on the next render.
  */
-export function appendBlockSource(markdown: string, pageIndex: number, src: string): string {
+export function appendBlockSource(markdown: string, src: string): string {
   const pages = parseResultMarkdown(markdown)
-  const page = pages[pageIndex] ?? pages[pages.length - 1]
+  const page = pages[pages.length - 1]
   if (page) {
     page.blocks.push({ kind: 'p', text: src, src })
   } else {
@@ -625,8 +652,17 @@ export type InlineSegment =
   /** An answer's link to the web — `[MoCo](https://arxiv.org/abs/1911.05722)`, a bare
    *  `https://…` in its text, or one in angle brackets — read only when the caller asks for
    *  it (`links`, docs/web.md § The agent panel, *Links*). `href` is the target, `http` or
-   *  `https` only; `segments` is its text as drawn. */
-  | { kind: 'link'; segments: InlineSegment[]; href: string; src: string }
+   *  `https` only; `segments` is its text as drawn. A link to the Files page —
+   *  `[DINO](/files?folder=12)`, `[iBOT.pdf](/files?document=34)`, read only when the caller
+   *  asks for it (`files`, docs/web.md § The Files page's Agent card) — carries `files`, the
+   *  folder or document it opens, and its relative `href`. */
+  | {
+      kind: 'link'
+      segments: InlineSegment[]
+      href: string
+      src: string
+      files?: { kind: 'folder' | 'document'; id: number }
+    }
 
 /** Whether a section link's heading is still in the document: a link that answers yes is
  *  drawn as a chip, one that answers no as its plain text. */
@@ -640,6 +676,9 @@ export interface InlineOptions {
   /** Links to the web — `[text](https://…)` and bare addresses — which the agent panel's
    *  answers alone draw as links (docs/web.md § The agent panel, *Links*). */
   links?: boolean
+  /** Links to a folder or a document of the Files page, which the Files page's Agent card
+   *  alone draws (docs/web.md § The Files page's Agent card, *Links to the library*). */
+  files?: boolean
 }
 
 /**
@@ -649,15 +688,11 @@ export interface InlineOptions {
  * text**, and a transcription of a struck-through equation is full of it —
  * `$\text{\sout{$E'_v = 1$}}$` is one formula, not two. So the span closes on the first
  * dollar at **brace depth zero**, and the dollars inside a `\text{…}` are its content.
- * Closing on the first dollar instead cut such a formula in half and handed KaTeX an
- * unbalanced fragment, which fell back to source characters and left the whole line reading
- * as raw TeX.
  *
- * The rest of the rules are the ones this parser always had: a span never crosses a backtick
- * (a rejected price before a code span — ``cost $5 and `$x$` `` — must not steal its closer
- * from inside the code, and TeX has no backticks to lose) or a line break, never holds
- * leading or trailing space, and never closes on a dollar followed by a digit, so
- * "$5 and $6" stays two prices.
+ * A span never crosses a backtick (a rejected price before a code span — ``cost $5 and
+ * `$x$` `` — must not steal its closer from inside the code, and TeX has no backticks to
+ * lose) or a line break, never holds leading or trailing space, and never closes on a dollar
+ * followed by a digit, so "$5 and $6" stays two prices.
  */
 export function mathSpanAt(text: string, open: number): { tex: string; length: number } | null {
   let depth = 0
@@ -753,15 +788,21 @@ export function isEscaped(text: string, index: number): boolean {
  */
 const CITE_AT = /^\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((?:doc\.md)?#([^\s()]*(?:~(?:[^()\n]|\([^()\n]*\))*)?)\)/
 
+/** The match of a bracketed link's `pattern` at `index`, or null when there is none or the
+ *  text in its brackets is blank. */
+function labelledAt(pattern: RegExp, text: string, index: number): RegExpExecArray | null {
+  const match = pattern.exec(text.slice(index))
+  return match?.[1]?.trim() ? match : null
+}
+
 /** The section link opening at `index`, or null. Its text is read like any other inline
  *  run — math and emphasis drawn — but holds no link of its own. */
 function citeAt(text: string, index: number): { segment: InlineSegment; length: number } | null {
-  const match = CITE_AT.exec(text.slice(index))
-  const label = match?.[1] ?? ''
-  if (!match || !label.trim()) {
+  const match = labelledAt(CITE_AT, text, index)
+  if (!match) {
     return null
   }
-  const segments = parseInline(label)
+  const segments = parseInline(match[1] ?? '')
   return {
     segment: { kind: 'cite', segments, label: plainText(segments).replace(/\s+/g, ' ').trim(), anchor: match[2] ?? '', src: match[0] },
     length: match[0].length,
@@ -775,6 +816,10 @@ function citeAt(text: string, index: number): { segment: InlineSegment; length: 
  * a relative path) is not one and stays the text it was.
  */
 const LINK_AT = /^\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((https?:\/\/(?:[^\s()<>]|\([^\s()<>]*\))+)(?:\s+"[^"\n]*")?\)/
+/** A link to the Files page: a non-blank text in brackets, as a section link's, then
+ *  `(/files?folder=<id>)` or `(/files?document=<id>)` — the two forms the library prompt
+ *  writes; any other relative target is not one. */
+const FILES_LINK_AT = /^\[((?:\\[\s\S]|[^[\]\\\n])+)\]\(\/files\?(folder|document)=([1-9]\d*)\)/
 /** A bare address in the text, as far as the next space or angle bracket; `autolinkAt` cuts
  *  what trails it. */
 const URL_AT = /^https?:\/\/[^\s<>]+/
@@ -786,15 +831,40 @@ const URL_TRAIL = /[?!.,:*_~'"]$/
 /** The link to the web opening at `index`, or null. Its text is read like any other inline
  *  run — math and emphasis drawn — but holds no link of its own. */
 function linkAt(text: string, index: number): { segment: InlineSegment; length: number } | null {
-  const match = LINK_AT.exec(text.slice(index))
-  const label = match?.[1] ?? ''
-  if (!match || !label.trim()) {
+  const match = labelledAt(LINK_AT, text, index)
+  if (!match) {
     return null
   }
   return {
-    segment: { kind: 'link', segments: parseInline(label), href: match[2] ?? '', src: match[0] },
+    segment: { kind: 'link', segments: parseInline(match[1] ?? ''), href: match[2] ?? '', src: match[0] },
     length: match[0].length,
   }
+}
+
+/** The link to the Files page opening at `index`, or null; its text is read as a link's. */
+function filesLinkAt(text: string, index: number): { segment: InlineSegment; length: number } | null {
+  const match = labelledAt(FILES_LINK_AT, text, index)
+  if (!match) {
+    return null
+  }
+  const kind = match[2] === 'folder' ? 'folder' : 'document'
+  const id = Number(match[3])
+  return {
+    segment: { kind: 'link', segments: parseInline(match[1] ?? ''), href: `/files?${kind}=${id}`, src: match[0], files: { kind, id } },
+    length: match[0].length,
+  }
+}
+
+/** The link of a kind `options` reads whose bracket is at `index`, or null. An image's
+ *  bracket (`![alt](https://…)`) opens no link to the web or the Files page: the line stays
+ *  as written. */
+function bracketLinkAt(text: string, index: number, options?: InlineOptions): { segment: InlineSegment; length: number } | null {
+  const image = index > 0 && text[index - 1] === '!' && !isEscaped(text, index - 1)
+  return (
+    (options?.cites ? citeAt(text, index) : null) ??
+    (options?.files && !image ? filesLinkAt(text, index) : null) ??
+    (options?.links && !image ? linkAt(text, index) : null)
+  )
 }
 
 /**
@@ -841,7 +911,7 @@ function autolinkAt(text: string, index: number): { segment: InlineSegment; leng
  * which is also the wrong-guess fallback: visible markers beat text silently bolded.
  */
 function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
-  const cites = options?.cites === true
+  const brackets = options?.cites === true || options?.links === true || options?.files === true
   const links = options?.links === true
   const segments: InlineSegment[] = []
   let cursor = 0
@@ -883,7 +953,7 @@ function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
       char !== '`' &&
       char !== '<' &&
       char !== '\\' &&
-      !((cites || links) && char === '[') &&
+      !(brackets && char === '[') &&
       !(links && char === 'h')
     ) {
       scan += 1
@@ -906,9 +976,7 @@ function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
       continue
     }
     if (char === '[') {
-      // An image's bracket (`![alt](https://…)`) opens no link: the line stays as written.
-      const image = scan > 0 && text[scan - 1] === '!' && !isEscaped(text, scan - 1)
-      const link = (cites ? citeAt(text, scan) : null) ?? (links && !image ? linkAt(text, scan) : null)
+      const link = bracketLinkAt(text, scan, options)
       if (link) {
         push(link.segment, link.length)
         continue
@@ -1001,10 +1069,10 @@ function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
  * `\[ … \]` must hold something that reads as TeX: `\[87\]` is how a markdown-escaping
  * model writes the reference `[87]`.
  */
-export function latexMathAt(text: string, open: number): { tex: string; length: number } | null {
+function latexMathAt(text: string, open: number): { tex: string; length: number } | null {
   const kind = text[open + 1]
   const close = kind === '(' ? ')' : kind === '[' ? ']' : null
-  if (text[open] !== '\\' || !close) {
+  if (!close) {
     return null
   }
   for (let index = open + 2; index < text.length; index += 1) {
@@ -1100,7 +1168,9 @@ function restoreMath(segments: readonly InlineSegment[], maths: readonly MathSou
  * underscore-emphasis rules while a caption bolded around its formulas still reads bold.
  *
  * `cites` reads section links as well, and `links` links to the web (`InlineOptions`);
- * without them a link is the text it always was.
+ * without them a link stays the text it is written as. The math scan steps over a code
+ * span, and over each link the options read — bracketed, bare or in angle brackets — so the
+ * dollars inside one (`[The $x$ case](#…)`, `https://…/$x$`) are read with it.
  */
 export function parseInline(text: string, options?: InlineOptions): InlineSegment[] {
   const spans: { at: number; length: number; tex: string }[] = []
@@ -1120,13 +1190,24 @@ export function parseInline(text: string, options?: InlineOptions): InlineSegmen
     // A section link — or a link to the web — before the next dollar is stepped over whole
     // too: its text may hold math of its own (`[3.1 The $\epsilon$-greedy policy](#…)`),
     // which parseStyled reads with the link rather than splitting the link around it.
-    const bracket = (options?.cites || options?.links) && open !== -1 ? text.indexOf('[', scan) : -1
+    const bracket = (options?.cites || options?.links || options?.files) && open !== -1 ? text.indexOf('[', scan) : -1
+    // So is a bare or angle-bracketed address: a dollar inside one (`https://…/$x$`) is part
+    // of the address. It is stepped over as far as `autolinkAt` reads it, after trailing
+    // punctuation is cut, so a dollar just past the address can still open math.
+    let http = -1
+    if (options?.links && open !== -1) {
+      const found = text.slice(scan, open).search(/https?:\/\//)
+      http = found === -1 ? -1 : scan + found
+    }
+    if (http !== -1 && (bracket === -1 || http < bracket) && (tick === -1 || http < tick)) {
+      const angle = http > 0 && text[http - 1] === '<' && !isEscaped(text, http - 1) ? ANGLE_LINK_AT.exec(text.slice(http - 1)) : null
+      const length = angle ? angle[0].length - 1 : (autolinkAt(text, http)?.length ?? 0)
+      scan = http + Math.max(length, 1)
+      continue
+    }
     if (bracket !== -1 && bracket < open && (tick === -1 || bracket < tick)) {
       // An image's bracket opens no link here either, so its alt text's math is collected.
-      const image = bracket > 0 && text[bracket - 1] === '!' && !isEscaped(text, bracket - 1)
-      const link = isEscaped(text, bracket)
-        ? null
-        : ((options?.cites ? citeAt(text, bracket) : null) ?? (options?.links && !image ? linkAt(text, bracket) : null))
+      const link = isEscaped(text, bracket) ? null : bracketLinkAt(text, bracket, options)
       scan = bracket + (link ? link.length : 1)
       continue
     }
@@ -1159,7 +1240,7 @@ export function parseInline(text: string, options?: InlineOptions): InlineSegmen
     return segments.length ? segments : [{ kind: 'text', text: '' }]
   }
   // A text that holds a stand-in character of its own cannot stand its formulas in: its
-  // emphasis is read between them only, as it was before emphasis could hold math.
+  // emphasis is read between them only.
   if (text.includes(STAND_IN_OPEN) || text.includes(STAND_IN_CLOSE)) {
     const segments: InlineSegment[] = []
     let cursor = 0
@@ -1183,7 +1264,7 @@ export function parseInline(text: string, options?: InlineOptions): InlineSegmen
 
 /** Inline segments as the text they draw: markdown removed, a formula as its TeX. What a
  *  heading and a section link are compared by, and how a heading reads in a chip. */
-export function plainText(segments: readonly InlineSegment[]): string {
+function plainText(segments: readonly InlineSegment[]): string {
   return segments
     .map((segment) => {
       switch (segment.kind) {
@@ -1250,7 +1331,7 @@ export function documentOutline(pages: readonly ResultPageBlocks[]): OutlineEntr
   const repeats = new Map<string, number>()
   pages.forEach((page, pageIndex) => {
     page.blocks.forEach((block, index) => {
-      if (block.kind !== 'h2' && block.kind !== 'h3') {
+      if (!isHeading(block)) {
         return
       }
       const plain = inlinePlain(block.text)
@@ -1307,24 +1388,19 @@ export function findHeading(outline: readonly OutlineEntry[], label: string, anc
  * long is too long is the caller's to decide.
  */
 export function sectionSource(pages: readonly ResultPageBlocks[], pageIndex: number, blockIndex: number): string | null {
-  const heading = pages[pageIndex]?.blocks[blockIndex]
-  if (!heading || (heading.kind !== 'h2' && heading.kind !== 'h3')) {
+  const placed = placedBlocks(pages)
+  const at = placed.findIndex((entry) => entry.page === pageIndex && entry.index === blockIndex)
+  const heading = placed[at]?.block
+  if (!isHeading(heading)) {
     return null
   }
-  const parts = [heading.src]
-  for (let page = pageIndex; page < pages.length; page += 1) {
-    const blocks = pages[page]?.blocks ?? []
-    for (let index = page === pageIndex ? blockIndex + 1 : 0; index < blocks.length; index += 1) {
-      const block = blocks[index]!
-      if ((block.kind === 'h2' || block.kind === 'h3') && block.level <= heading.level) {
-        return parts.join('\n\n')
-      }
-      if (block.kind !== 'comment' && block.src.trim()) {
-        parts.push(block.src)
-      }
-    }
-  }
-  return parts.join('\n\n')
+  const { start, end } = sectionExtent(placed, at)
+  const parts = placed
+    .slice(start, end)
+    .map((entry) => entry.block)
+    .filter((block) => block.kind !== 'comment' && block.src.trim())
+    .map((block) => block.src)
+  return [heading.src, ...parts].join('\n\n')
 }
 
 // --- a block's words ---------------------------------------------------------------------
@@ -1402,23 +1478,31 @@ export function placedBlocks(pages: readonly ResultPageBlocks[]): PlacedBlock[] 
   return pages.flatMap((page, pageIndex) => page.blocks.map((block, index) => ({ page: pageIndex, index, block })))
 }
 
+/** Each placed block as a passage is compared against it (`passageKey` of its text); a
+ *  comment as nothing, which no passage starts. */
+export function passageKeys(placed: readonly PlacedBlock[]): string[] {
+  return placed.map((entry) => (entry.block.kind === 'comment' ? '' : passageKey(blockPlain(entry.block))))
+}
+
 /** Whether `a` comes before `b` in reading order. */
 export function isBefore(a: BlockAt, b: BlockAt): boolean {
   return a.page < b.page || (a.page === b.page && a.index < b.index)
 }
 
-function isHeading(block: ResultBlock): block is Extract<ResultBlock, { kind: 'h2' | 'h3' }> {
-  return block.kind === 'h2' || block.kind === 'h3'
+/** Whether a block is a heading, of either kind the parser reads one as (`h2`, `h3`). */
+export function isHeading(block: ResultBlock | null | undefined): block is Extract<ResultBlock, { kind: 'h2' | 'h3' }> {
+  return block?.kind === 'h2' || block?.kind === 'h3'
 }
 
 /**
- * The blocks a heading's section holds, by their positions in `placedBlocks`: from the block
- * after the heading up to the last before the next heading of the same or a higher level —
- * the extent `sectionSource` reads and a collapsed heading hides. `[start, end)`.
+ * The blocks a heading's section holds, by their positions in `placedBlocks` or in any run of
+ * blocks in reading order: from the block after the heading up to the last before the next
+ * heading of the same or a higher level — the extent `sectionSource` reads, a collapsed
+ * heading hides and a heading in the notes asks about. `[start, end)`.
  */
-export function sectionExtent(placed: readonly PlacedBlock[], heading: number): { start: number; end: number } {
+export function sectionExtent(placed: readonly { block: ResultBlock | null | undefined }[], heading: number): { start: number; end: number } {
   const block = placed[heading]?.block
-  const level = block && isHeading(block) ? block.level : 0
+  const level = isHeading(block) ? block.level : 0
   let end = heading + 1
   while (end < placed.length) {
     const next = placed[end]!.block
@@ -1434,10 +1518,23 @@ export function sectionExtent(placed: readonly PlacedBlock[], heading: number): 
 
 /** A move as it lands: the document, and where the moved run — trailing comments included —
  *  now sits. */
-export interface MovedBlocks {
+interface MovedBlocks {
   markdown: string
   first: BlockAt
   last: BlockAt
+}
+
+/** Where blocks placed before or after `aimed` land among `blocks`: at it, or past it and the
+ *  comments it carries. */
+function landingIndex(blocks: readonly ResultBlock[], aimed: ResultBlock, place: 'before' | 'after'): number {
+  let at = blocks.indexOf(aimed)
+  if (place === 'after') {
+    at += 1
+    while (blocks[at]?.kind === 'comment') {
+      at += 1
+    }
+  }
+  return at
 }
 
 /**
@@ -1476,13 +1573,7 @@ export function moveBlocks(
   const staying = new Set(moving)
   const rest = pages.map((page) => ({ ...page, blocks: page.blocks.filter((block) => !staying.has(block)) }))
   const host = rest.find((page) => page.blocks.includes(aimed))!
-  let at = host.blocks.indexOf(aimed)
-  if (place === 'after') {
-    at += 1
-    while (host.blocks[at]?.kind === 'comment') {
-      at += 1
-    }
-  }
+  const at = landingIndex(host.blocks, aimed, place)
   host.blocks.splice(at, 0, ...moving)
   const next = serializeDocument(rest)
   if (next === serializeDocument(pages)) {
@@ -1500,7 +1591,7 @@ export function moveBlocks(
  * left out: what lands belongs to the page it lands on. Null when `src` holds no block.
  */
 export function insertBlocks(markdown: string, target: BlockAt | null, place: 'before' | 'after', src: string): MovedBlocks | null {
-  const adding = parseResultMarkdown(src).flatMap((page) => page.blocks)
+  const adding = parseBlocks(src)
   if (!adding.length) {
     return null
   }
@@ -1511,13 +1602,7 @@ export function insertBlocks(markdown: string, target: BlockAt | null, place: 'b
   let at: number
   if (targetPage && aimed) {
     host = targetPage
-    at = host.blocks.indexOf(aimed)
-    if (place === 'after') {
-      at += 1
-      while (host.blocks[at]?.kind === 'comment') {
-        at += 1
-      }
-    }
+    at = landingIndex(host.blocks, aimed, place)
   } else if (targetPage) {
     host = targetPage
     at = host.blocks.length
@@ -1541,27 +1626,18 @@ export function insertBlocks(markdown: string, target: BlockAt | null, place: 'b
 export interface PlaceNear {
   after: string | null
   before: string | null
-  gap?: number
+  gap: number
   prefer?: 'before' | 'after'
-}
-
-/** The document's blocks in reading order, each with where it sits. */
-function blocksAt(markdown: string): { src: string; at: BlockAt }[] {
-  return parseResultMarkdown(markdown).flatMap((page, pageIndex) =>
-    page.blocks.map((block, index) => ({ src: block.src, at: { page: pageIndex, index } })),
-  )
 }
 
 /** The place before or after `target` — the document's end without one, the end of its page
  *  when it is past that page's last block — as `PlaceNear`. */
 export function placeNear(markdown: string, target: BlockAt | null, place: 'before' | 'after'): PlaceNear {
-  const blocks = blocksAt(markdown)
-  const gap =
-    target === null
-      ? blocks.length
-      : blocks.filter(({ at }) => at.page < target.page || (at.page === target.page && at.index < target.index + (place === 'after' ? 1 : 0))).length
-  const opensPage = target !== null && blocks[gap]?.at.page === target.page && blocks[gap - 1]?.at.page !== target.page
-  return { after: blocks[gap - 1]?.src ?? null, before: blocks[gap]?.src ?? null, gap, prefer: opensPage ? 'before' : 'after' }
+  const placed = placedBlocks(parseResultMarkdown(markdown))
+  const edge = target && { page: target.page, index: target.index + (place === 'after' ? 1 : 0) }
+  const gap = edge ? placed.filter((entry) => isBefore(entry, edge)).length : placed.length
+  const opensPage = target !== null && placed[gap]?.page === target.page && placed[gap - 1]?.page !== target.page
+  return { after: placed[gap - 1]?.block.src ?? null, before: placed[gap]?.block.src ?? null, gap, prefer: opensPage ? 'before' : 'after' }
 }
 
 /** Which of `srcs` a place held by `near` is beside now: the block it followed, else the one
@@ -1573,7 +1649,7 @@ export function nearestBlock(srcs: readonly string[], near: PlaceNear): { index:
     let best = -1
     let bestDistance = Infinity
     for (const [index, entry] of srcs.entries()) {
-      const distance = Math.abs(index + offset - (near.gap ?? 0))
+      const distance = Math.abs(index + offset - near.gap)
       if (src !== null && entry.trim() === src.trim() && distance < bestDistance) {
         best = index
         bestDistance = distance
@@ -1594,9 +1670,13 @@ export function nearestBlock(srcs: readonly string[], near: PlaceNear): { index:
 /** Where `near` is in the document now (`nearestBlock`), and at the end when neither of its
  *  neighbours is there any more. */
 export function findPlace(markdown: string, near: PlaceNear): { target: BlockAt | null; place: 'before' | 'after' } {
-  const blocks = blocksAt(markdown)
-  const found = nearestBlock(blocks.map((entry) => entry.src), near)
-  return found ? { target: blocks[found.index]!.at, place: found.place } : { target: null, place: 'after' }
+  const placed = placedBlocks(parseResultMarkdown(markdown))
+  const found = nearestBlock(placed.map((entry) => entry.block.src), near)
+  if (!found) {
+    return { target: null, place: 'after' }
+  }
+  const { page, index } = placed[found.index]!
+  return { target: { page, index }, place: found.place }
 }
 
 /** The line an uploaded image is written as: its file's name for the alt text — the
@@ -1665,14 +1745,16 @@ export function readBlockAnchor(anchor: string): string {
  * Where a block link leads: the first block in its section whose text starts with its words,
  * else such a block anywhere, else the section's heading, else null — the top of the document.
  * Compared as a located passage is, spacing ignored; a link survives edits above it and a
- * block moved to another section. A caller that keeps the outline and the placed blocks —
- * the agent panel, resolving a chip on every render — hands them in.
+ * block moved to another section. A caller that keeps the outline, the placed blocks and
+ * their `passageKeys` — the agent panel and the notes, resolving a chip on every draw — hands
+ * them in; without the keys, each block's is read as the search reaches it.
  */
 export function resolveAnchor(
   pages: readonly ResultPageBlocks[],
   anchor: string,
   outline: readonly OutlineEntry[] = documentOutline(pages),
   placed: readonly PlacedBlock[] = placedBlocks(pages),
+  keys?: readonly string[],
 ): BlockAt | null {
   const tilde = anchor.indexOf('~')
   const slug = (tilde === -1 ? anchor : anchor.slice(0, tilde)).trim().toLowerCase()
@@ -1682,6 +1764,9 @@ export function resolveAnchor(
   const position = (index: number): BlockAt => ({ page: placed[index]!.page, index: placed[index]!.index })
   if (key) {
     const starts = (index: number) => {
+      if (keys) {
+        return keys[index]?.startsWith(key) === true
+      }
       const block = placed[index]!.block
       return block.kind !== 'comment' && passageKey(blockPlain(block)).startsWith(key)
     }

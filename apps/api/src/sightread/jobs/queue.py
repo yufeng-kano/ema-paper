@@ -2,7 +2,7 @@
 
 A job row *is* its queue entry, so creating a job and enqueueing it are one transaction —
 there is no broker and no dual write. Claiming is `FOR UPDATE SKIP LOCKED`, FIFO, with the
-per-user cap applied at claim time so one user cannot monopolise the workers.
+per-user cap applied at claim time so one user cannot monopolise the worker.
 """
 
 from __future__ import annotations
@@ -16,11 +16,9 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from sqlalchemy import (
     ColumnElement,
-    LargeBinary,
     Text,
     bindparam,
     cast,
@@ -34,7 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 from sqlalchemy.orm import aliased
 
-from ..agents import get_agent
+from ..agents.parse import PIPELINE_VERSION
 from ..billing import ledger
 from ..billing.plans import PAID_STATUSES
 from ..config import Settings
@@ -52,15 +50,16 @@ from ..db.models import (
     utcnow,
 )
 from ..sandbox.client import SandboxClient, SandboxUnavailable
+from ..stopping import pause
 from ..workspace import git
-from ..workspace.layout import REPOS_DIR, git_dir, user_root
+from ..workspace.layout import git_dir, user_root
 from ..workspace.locks import (
-    WRITING_SUFFIX,
     clear_writing,
     read_writing,
     shell_lock,
     workspace_lock,
     writing_marker,
+    writing_users,
 )
 from ..workspace.reconcile import reconcile_locked
 from . import chat_events
@@ -113,37 +112,6 @@ CLAIM_SQL = text(
     bindparam("excluded_users", expanding=True), bindparam("paid_statuses", expanding=True)
 )
 
-# SQLite has neither SKIP LOCKED nor row locks. The fallback keeps the whole test suite
-# runnable with no services; the guarded UPDATE still makes a double claim impossible.
-CLAIM_SQL_SQLITE_SELECT = text(
-    """
-    SELECT j.id FROM jobs j
-    WHERE j.status = 'queued'
-      AND j.user_id NOT IN :excluded_users
-      AND (
-        SELECT count(*) FROM jobs running
-        WHERE running.user_id = j.user_id AND running.status = 'running'
-      ) < MIN(
-        :max_jobs_per_user,
-        COALESCE(
-          (
-            SELECT json_extract(:plan_jobs, '$."' || s.plan_id || '"') FROM subscriptions s
-            WHERE s.user_id = j.user_id AND s.status IN :paid_statuses
-              AND s.period_start <= :now AND :now < s.period_end
-          ),
-          (
-            SELECT json_extract(:plan_jobs, '$."' || g.plan_id || '"') FROM plan_grants g
-            WHERE g.user_id = j.user_id AND g.period_end IS NOT NULL AND :now < g.period_end
-          ),
-          :free_max_jobs
-        )
-      )
-    ORDER BY j.created_at LIMIT 1
-    """
-).bindparams(
-    bindparam("excluded_users", expanding=True), bindparam("paid_statuses", expanding=True)
-)
-
 _PAGES_SPEC_RE = re.compile(r"^\d+(-\d+)?(,\d+(-\d+)?)*$")
 
 
@@ -189,43 +157,49 @@ def dedup_key(
     agent: str,
     sha256: str,
     model: str,
-    connection_id: int | None,
-    connection_base_url: str | None,
+    connection_base_url: str,
     pages_spec: str,
     prompt_sha256: str,
 ) -> list:
     """Everything that has to match for two uploads to be the same parse.
 
-    Same user, agent, bytes, model, upstream (id *and* endpoint snapshot — editing a
-    connection's URL repoints what its id means, and the built-in upstream's snapshot is
-    KANO_PROXY_BASE_URL, which no historical OpenRouter row has), pages, prompt, and the
-    agent's pipeline version (docs/jobs.md § Dedup). Status is the caller's: a finished
-    parse answers the cache, an unfinished one answers a retry.
+    Same user, agent, bytes, model, endpoint snapshot (KANO_PROXY_BASE_URL: a job of an
+    upstream the deployment no longer has holds NULL, which never matches), pages, prompt,
+    and the parse pipeline's version (docs/jobs.md § Dedup). Status is the caller's: a
+    finished parse answers the cache, an unfinished one answers a retry.
     """
     return [
         Job.user_id == user_id,
         Job.agent == agent,
         Job.sha256 == sha256,
         Job.model == model,
-        Job.connection_id.is_(None)
-        if connection_id is None
-        else Job.connection_id == connection_id,
-        Job.connection_base_url.is_(None)
-        if connection_base_url is None
-        else Job.connection_base_url == connection_base_url,
+        Job.connection_base_url == connection_base_url,
         Job.pages_spec == pages_spec,
         Job.prompt_sha256 == prompt_sha256,
-        Job.pipeline_version == get_agent(agent).pipeline_version,
+        Job.pipeline_version == PIPELINE_VERSION,
     ]
+
+
+def dedup_fields(job: Job) -> dict:
+    """The fields `dedup_key` takes, as a job row holds them, so a hold taken from a row
+    and one taken from an upload fingerprint alike (`hold_dedup_key`)."""
+    return {
+        "user_id": job.user_id,
+        "agent": job.agent,
+        "sha256": job.sha256,
+        "model": job.model,
+        "connection_base_url": job.connection_base_url,
+        "pages_spec": job.pages_spec,
+        "prompt_sha256": job.prompt_sha256,
+    }
 
 
 def parse_kept(retention_days: int, margin: timedelta = timedelta(0)) -> ColumnElement[bool]:
     """The parse retention's rule, written once (docs/jobs.md § Retention): a job is kept
-    while it is queued or running, while it finished less than `retention_days` days ago
-    (a row from before `finished_at` was always written counts from its creation), while
-    any document of its user — live or in the Trash — names a parse (its `job_id` or its
-    `reconvert_job_id`) of the same original, or while an upload ticket that has not
-    expired names it. The document clause keeps a document's own parse, its re-convert,
+    while it is queued or running, while it finished less than `retention_days` days ago,
+    while any document of its user — live or in the Trash — names a parse (its `job_id`
+    or its `reconvert_job_id`) of the same original, or while an upload ticket that has
+    not expired names it. The document clause keeps a document's own parse, its re-convert,
     and the earlier parses of its original the figure route falls back on; the ticket
     clause keeps the job a spent ticket still reads, a cache hit's included.
 
@@ -236,8 +210,7 @@ def parse_kept(retention_days: int, margin: timedelta = timedelta(0)) -> ColumnE
     now = utcnow()
     return or_(
         Job.status.in_(("queued", "running")),
-        func.coalesce(Job.finished_at, Job.created_at)
-        > now - timedelta(days=retention_days) + margin,
+        Job.finished_at > now - timedelta(days=retention_days) + margin,
         select(Document.id)
         .join(named, or_(named.id == Document.job_id, named.id == Document.reconvert_job_id))
         .where(Document.user_id == Job.user_id, named.sha256 == Job.sha256)
@@ -266,17 +239,14 @@ async def hold_dedup_key(db: AsyncSession, **key) -> None:
     """Serialize everything that would enqueue this exact parse, until this commit.
 
     Reading for an in-flight duplicate is not enough on its own: two uploads of the same
-    bytes can both find nothing and both enqueue, which is the user's key charged twice for
+    bytes can both find nothing and both enqueue, which charges the user's credits twice for
     one document. A transaction-level advisory lock closes that — the second request waits
     and then sees the first's committed job.
 
     Keyed on a hash of the dedup key, so it only ever blocks a request that was about to
     parse the same document for the same account; a hash collision costs two unrelated
-    uploads a few milliseconds and nothing else. PostgreSQL only, like the claim query: the
-    SQLite fallback runs one process at a time and has nothing to serialize.
+    uploads a few milliseconds and nothing else.
     """
-    if db.get_bind().dialect.name != "postgresql":
-        return
     fingerprint = "\x1f".join(f"{name}={value!r}" for name, value in sorted(key.items()))
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:fingerprint))"),
@@ -304,17 +274,16 @@ async def find_active_job(db: AsyncSession, **key) -> Job | None:
 async def find_recent_terminal_job(
     db: AsyncSession, *, finished_since: datetime, **key
 ) -> Job | None:
-    """The same parse, finished since `finished_since` — succeeded with page errors, which
-    the cache never answers, or failed. For the web library's retry of an upload whose
-    answer was lost, and nothing else: within the window the same bytes are one upload,
-    whatever became of it (docs/jobs.md § Dedup)."""
+    """The same parse, finished since `finished_since` — failed, or succeeded past what the
+    cache answers. For the web library's retry of an upload whose answer was lost, and
+    nothing else: within the window the same bytes are one upload, whatever became of it
+    (docs/jobs.md § Dedup)."""
     return (
         await db.execute(
             select(Job)
             .where(
                 *dedup_key(**key),
                 Job.status.in_(("succeeded", "failed")),
-                Job.finished_at.is_not(None),
                 Job.finished_at >= finished_since,
             )
             .order_by(Job.finished_at.desc())
@@ -337,10 +306,11 @@ async def find_parse_to_retry(
     and whether a library document names it. The newest decides, a Files upload's
     included: a newer parse of the file is never passed over for an older failure, which
     would be billed again for nothing. The caller puts back a failed one no document
-    names, refuses a failed one a document names — the library retries it from its
-    original — and answers with one queued, running or succeeded as it stands. The model
-    and the prompt are the parse's own and play no part, as in the library's retry. With
-    `retention_days` 0 nothing is purged, and any such parse answers."""
+    names, hands a failed one a document names to the library's retry, from its original
+    (`Submission.library_retry`), and answers with one queued, running or succeeded as it
+    stands. The model and the prompt are the parse's own and play no part, as in the
+    library's retry. With `retention_days` 0 nothing is purged, and any such parse
+    answers."""
     named = (
         select(Document.id)
         .where(or_(Document.job_id == Job.id, Document.reconvert_job_id == Job.id))
@@ -351,7 +321,6 @@ async def find_parse_to_retry(
         Job.agent == agent,
         Job.sha256 == sha256,
         Job.pages_spec == pages_spec,
-        Job.status.in_(("failed", "queued", "running", "succeeded")),
     )
     if retention_days > 0:
         query = query.where(parse_kept(retention_days))
@@ -382,8 +351,7 @@ async def enqueue_job(
     sha256: str,
     pages_spec: str,
     model: str,
-    connection_id: int | None,
-    connection_base_url: str | None,
+    connection_base_url: str,
     bbox_format: str,
     prompt: str,
     prompt_sha256: str,
@@ -407,9 +375,8 @@ async def enqueue_job(
         sha256=sha256,
         pages_spec=pages_spec,
         model=model,
-        connection_id=connection_id,
         connection_base_url=connection_base_url,
-        pipeline_version=get_agent(agent).pipeline_version,
+        pipeline_version=PIPELINE_VERSION,
         bbox_format=bbox_format,
         prompt=prompt,
         prompt_sha256=prompt_sha256,
@@ -457,22 +424,9 @@ async def claim_next_job(
         "free_max_jobs": max_jobs_per_user if free_max_jobs is None else free_max_jobs,
         "now": utcnow(),
     }
-    if db.get_bind().dialect.name == "postgresql":
-        claimed = (await db.execute(CLAIM_SQL, params)).scalar_one_or_none()
-        await db.commit()
-        return claimed
-
-    candidate = (await db.execute(CLAIM_SQL_SQLITE_SELECT, params)).scalar_one_or_none()
-    if candidate is None:
-        return None
-    job_id = uuid.UUID(str(candidate))
-    updated = await db.execute(
-        update(Job)
-        .where(Job.id == job_id, Job.status == "queued")
-        .values(status="running", started_at=utcnow(), worker_generation=generation)
-    )
+    claimed = (await db.execute(CLAIM_SQL, params)).scalar_one_or_none()
     await db.commit()
-    return job_id if updated.rowcount == 1 else None
+    return claimed
 
 
 async def claim_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None) -> bool:
@@ -493,15 +447,16 @@ async def claim_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None)
 
 async def next_worker_generation(db: AsyncSession) -> int:
     """The generation a worker takes with the worker lock and writes on every job it
-    claims (docs/jobs.md § Queue). PostgreSQL: the next value of a sequence, so no two
-    workers ever hold one generation — the stale one keeps making paid calls for the
-    seconds before it notices its lock is gone, and the replacement has requeued and
-    claimed its job by then. The SQLite fallback runs one worker: past the highest on
-    record."""
-    if db.get_bind().dialect.name == "postgresql":
-        return int((await db.execute(select(WORKER_GENERATION_SEQ.next_value()))).scalar_one())
-    highest = (await db.execute(select(func.max(Job.worker_generation)))).scalar_one()
-    return int(highest or 0) + 1
+    claims (docs/jobs.md § Queue): the next value of a sequence, so no two workers ever
+    hold one generation — the stale one keeps making paid calls for the seconds before it
+    notices its lock is gone, and the replacement has requeued and claimed its job by
+    then."""
+    return int((await db.execute(select(WORKER_GENERATION_SEQ.next_value()))).scalar_one())
+
+
+def owned_by(generation: int | None) -> list[ColumnElement[bool]]:
+    """The fence: the row still holds the caller's generation (docs/jobs.md § Queue)."""
+    return [Job.worker_generation == generation] if generation is not None else []
 
 
 # The advisory lock one worker holds for its lifetime: any fixed bigint (docs/jobs.md).
@@ -513,9 +468,7 @@ async def try_worker_lock(engine: AsyncEngine) -> AsyncConnection | None:
     advisory lock, or None while another worker holds it. The recovery at start treats
     every `running` row as a dead worker's, which is only true of a singleton; a second
     worker process waits for the lock rather than taking the first one's jobs back
-    (docs/jobs.md). Not PostgreSQL (the SQLite fallback): no lock, one worker assumed."""
-    if engine.dialect.name != "postgresql":
-        return None
+    (docs/jobs.md)."""
     connection = await engine.connect()
     try:
         # Autocommit: a session-level lock outlives transactions, and a connection
@@ -543,11 +496,7 @@ async def watch_worker_lock(
     connection hands it to a waiting worker, which then requeues every `running` job,
     so this one must stop and cancel its work the moment its session is gone, rather
     than finish a parse beside the worker that took it (docs/jobs.md)."""
-    while not stop.is_set():
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
-        if stop.is_set():
-            return
+    while not await pause(stop, interval_seconds):
         try:
             (await connection.execute(text("SELECT 1"))).scalar_one()
         except Exception:  # noqa: BLE001 - any failure means the session is not ours to trust
@@ -575,8 +524,7 @@ WORKER_LOCK_OBJID = WORKER_LOCK_KEY & 0xFFFF_FFFF
 class WorkerStatus:
     """Whether a worker runs, as the worker lock says (docs/jobs.md § Queue): `running`
     while a session holds it — `since` that session's start, `generation` the live
-    generation, None before any worker took one — `stopped` while none does, and
-    `unknown` off PostgreSQL, which has no lock to read."""
+    generation, None before any worker took one — and `stopped` while none does."""
 
     state: str
     since: datetime | None = None
@@ -589,8 +537,6 @@ async def worker_status(db: AsyncSession) -> WorkerStatus:
     worker down would hold the lock itself, and a session lock left on a pooled API
     connection would keep every worker from starting — and never `nextval`, which would
     use a generation up."""
-    if db.get_bind().dialect.name != "postgresql":
-        return WorkerStatus("unknown")
     holder = (
         await db.execute(
             text(
@@ -618,10 +564,9 @@ def job_is_stuck(job: Job, worker: WorkerStatus) -> bool:
     """A `running` job no live worker drives: the worker is stopped, or runs with another
     generation than the job's — a job a dead or stale worker left, which only a worker's
     start-up or the console puts back (docs/jobs.md § Queue). Never one the live worker
-    runs, and nothing while the worker's state is unknown."""
+    runs."""
     return job.status == "running" and (
-        worker.state == "stopped"
-        or (worker.state == "running" and job.worker_generation != worker.generation)
+        worker.state == "stopped" or job.worker_generation != worker.generation
     )
 
 
@@ -634,10 +579,8 @@ async def requeue_orphaned_jobs(db: AsyncSession, generation: int | None = None)
     back is driven by nobody, and fenced on the generation it is requeued only if it is
     still this worker's (docs/jobs.md § Queue). Returns the ids that went back, whose
     crops the caller discards with the partial progress."""
-    owned = [Job.worker_generation == generation] if generation is not None else []
-    orphans = list(
-        (await db.execute(select(Job.id).where(Job.status == "running", *owned))).scalars()
-    )
+    running = select(Job.id).where(Job.status == "running", *owned_by(generation))
+    orphans = list((await db.execute(running)).scalars())
     return [job_id for job_id in orphans if await requeue_job(db, job_id, generation)]
 
 
@@ -664,7 +607,7 @@ async def requeue_job(
     """Put an interrupted job back on the queue, keeping the pages it finished.
 
     The next attempt transcribes only the pages without a succeeded row — a page the
-    user's key already paid for is not transcribed again — and crops every page anew,
+    user's credits already paid for is not transcribed again — and crops every page anew,
     so the caller discards this attempt's crops (docs/jobs.md § Queue). False when the
     job was no longer `running` — its result committed before the cancel landed — and so
     stays as it is, its pages and crops with it; or, with `generation`, when the row no
@@ -673,11 +616,10 @@ async def requeue_job(
     one, since every `running` row is then a dead worker's. `commit=False` leaves the
     commit to the caller: the console's requeue commits it with its audit row.
     """
-    owned = [Job.worker_generation == generation] if generation is not None else []
     requeued = (
         await db.execute(
             update(Job)
-            .where(Job.id == job_id, Job.status == "running", *owned)
+            .where(Job.id == job_id, Job.status == "running", *owned_by(generation))
             .values(status="queued", started_at=None, worker_generation=None)
         )
     ).rowcount > 0
@@ -694,10 +636,12 @@ async def retry_job(
     *,
     source_path: str,
     model: str | None,
+    fallback_model: str | None,
     check: CheckTarget | None,
 ) -> bool:
     """Put a failed parse back on the queue to run its failed pages, on `model` (None: the
-    job's own), from `source_path` — a copy of its document's original — and checked as
+    job's own) with `fallback_model` written as the fallback a blocked page goes to (None:
+    none), from `source_path` — a copy of its document's original — and checked as
     `check` says, the settings of this moment (None: unchecked). The caller holds the job's
     row lock and commits. False when the job is no longer `failed` (docs/jobs.md
     § Retrying failed pages)."""
@@ -712,6 +656,7 @@ async def retry_job(
                 finished_at=None,
                 worker_generation=None,
                 retry_model=model,
+                fallback_model=fallback_model,
                 check_model=check.model if check is not None else None,
                 check_effort=check.effort if check is not None else None,
                 check_prompt=check.prompt if check is not None else None,
@@ -729,7 +674,7 @@ async def retry_job(
 
 CLAIM_TURN_SQL = text(
     """
-    UPDATE chat_turns SET status = 'running', started_at = now()
+    UPDATE chat_turns SET status = 'running'
     WHERE id = (
       SELECT t.id FROM chat_turns t
       WHERE t.status = 'queued'
@@ -744,20 +689,6 @@ CLAIM_TURN_SQL = text(
     RETURNING id
     """
 )
-
-CLAIM_TURN_SQL_SQLITE_SELECT = text(
-    """
-    SELECT t.id FROM chat_turns t
-    WHERE t.status = 'queued'
-      AND (
-        SELECT count(*) FROM chat_turns running
-        WHERE running.user_id = t.user_id
-          AND running.status <> 'queued' AND running.finished_at IS NULL
-      ) < :max_turns_per_user
-    ORDER BY t.created_at LIMIT 1
-    """
-)
-
 
 # What the reader is told, at the send and in the turn alike, once a conversation's
 # stored history is past `CHAT_HISTORY_MAX_BYTES` (docs/chat.md § History is append-only).
@@ -785,12 +716,7 @@ async def history_bytes(
     `path`, the turns of the branch being measured, only their rows and the rows of no
     turn, which precede every turn (docs/chat.md § History is append-only, *An edited
     message starts a version*)."""
-    as_text = cast(Message.content, Text)
-    size = (
-        func.octet_length(as_text)
-        if db.get_bind().dialect.name == "postgresql"
-        else func.length(cast(as_text, LargeBinary))
-    )
+    size = func.octet_length(cast(Message.content, Text))
     query = select(func.coalesce(func.sum(size), 0)).where(
         Message.conversation_id == conversation_id
     )
@@ -853,30 +779,33 @@ async def enqueue_turn(
 
 async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUID | None:
     """Claim the oldest queued turn whose user is under the running cap, or None."""
-    if db.get_bind().dialect.name == "postgresql":
-        claimed = (
-            await db.execute(CLAIM_TURN_SQL, {"max_turns_per_user": max_turns_per_user})
-        ).scalar_one_or_none()
-        await db.commit()
-        return claimed
-
-    candidate = (
-        await db.execute(CLAIM_TURN_SQL_SQLITE_SELECT, {"max_turns_per_user": max_turns_per_user})
+    claimed = (
+        await db.execute(CLAIM_TURN_SQL, {"max_turns_per_user": max_turns_per_user})
     ).scalar_one_or_none()
-    if candidate is None:
-        return None
-    turn_id = uuid.UUID(str(candidate))
-    updated = await db.execute(
-        update(ChatTurn)
-        .where(ChatTurn.id == turn_id, ChatTurn.status == "queued")
-        .values(status="running", started_at=utcnow())
-    )
     await db.commit()
-    return turn_id if updated.rowcount == 1 else None
+    return claimed
+
+
+async def lock_queued_work(db: AsyncSession, user_id: int) -> None:
+    """Lock the user's queued jobs and turns in the caller's transaction: the claims'
+    SKIP LOCKED passes them by until it ends, so none starts while the caller decides
+    their fate (an account deletion takes them with the account)."""
+    await db.execute(
+        select(Job.id).where(Job.user_id == user_id, Job.status == "queued").with_for_update()
+    )
+    await db.execute(
+        select(ChatTurn.id)
+        .where(
+            ChatTurn.user_id == user_id,
+            ChatTurn.status == "queued",
+            ChatTurn.finished_at.is_(None),
+        )
+        .with_for_update()
+    )
 
 
 async def fail_orphaned_turns(
-    db: AsyncSession, sandbox: SandboxClient | None = None, settings: Settings | None = None
+    db: AsyncSession, sandbox: SandboxClient | None, settings: Settings
 ) -> tuple[int, set[int]]:
     """Finish every turn a worker that died left behind: `running`, or cancelled and not
     yet wound down. Run when a worker starts, and again until it goes through — the
@@ -888,7 +817,8 @@ async def fail_orphaned_turns(
     recorded — the worker died between a tool's write and its commit — becomes a revision
     of its own, under the same locks the tool held, so the next revision carries only
     its own changes; a tree that cannot be committed leaves the turn for the next pass
-    too. Returns (finished, the users whose turns are left for later)."""
+    too. `sandbox` None means no runner is configured. Returns (finished, the users whose
+    turns are left for later)."""
     orphans = (
         await db.execute(
             select(ChatTurn.id, ChatTurn.user_id, Conversation.id, Conversation.session)
@@ -904,16 +834,13 @@ async def fail_orphaned_turns(
     for turn_id, user_id, conversation_id, session in orphans:
         if user_id in left:
             continue
-        if sandbox is not None and sandbox.configured:
+        if sandbox is not None:
             try:
                 await sandbox.restart(user_id, session)
             except SandboxUnavailable:
                 left.add(user_id)
                 continue
-        elif (
-            settings is not None
-            and writing_marker(user_root(settings.workspaces_dir, user_id)).exists()
-        ):
+        elif writing_marker(user_root(settings.workspaces_dir, user_id)).exists():
             # A shell command was writing when the worker died, and this worker has no
             # runner to stop it with (SANDBOX_URL gone from its environment): the VM may
             # still be running the command, so the tree is not declared safe here. The
@@ -925,9 +852,7 @@ async def fail_orphaned_turns(
             )
             left.add(user_id)
             continue
-        if settings is not None and not await _record_orphaned_changes(
-            db, settings, user_id, conversation_id
-        ):
+        if not await _record_orphaned_changes(db, settings, user_id, conversation_id):
             left.add(user_id)
             continue
         await fail_turn(db, turn_id, "worker restarted")
@@ -941,17 +866,13 @@ async def recover_unsettled_commands(settings: Settings, sandbox: SandboxClient 
     turn that then ended. Its shell is restarted on the runner, which answers only once
     the command is dead, and the tree is recorded in the conversation's name; a runner
     that does not answer leaves the marker, and the user's host writes refused, for the
-    next pass. Returns the users left for later (docs/workspace.md § Revisions)."""
+    next pass. `sandbox` None means no runner is configured. Returns the users left for
+    later (docs/workspace.md § Revisions)."""
     left: set[int] = set()
-    repos = Path(settings.workspaces_dir) / REPOS_DIR
-    for marker in sorted(repos.glob(f"*{WRITING_SUFFIX}")) if repos.is_dir() else []:
-        try:
-            user_id = int(marker.name.removesuffix(WRITING_SUFFIX))
-        except ValueError:
-            continue
+    for user_id in writing_users(settings.workspaces_dir):
         root = user_root(settings.workspaces_dir, user_id)
         named = read_writing(root)
-        if sandbox is None or not sandbox.configured:
+        if sandbox is None:
             # Nothing to stop the shell with: unconfirmed, as a restart that failed.
             logger.warning(
                 "an unconfirmed shell command of user %d cannot be stopped: no sandbox "

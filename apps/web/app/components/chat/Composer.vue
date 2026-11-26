@@ -6,18 +6,23 @@
  * attachments, a picked command — then the textarea, and a foot of the attach and command
  * controls with the send button at the right.
  *
+ * In the Files page's card (`library`) the chips are the page's place instead: the open
+ * folder, and the rows selected there until the reader drops them (docs/web.md § The Files
+ * page's Agent card).
+ *
  * It owns the draft and everything attached to it; the panel owns the conversation, so
  * sending is the panel's `submit`, which says whether the server took the message. Only
  * what was sent is cleared then: whatever the reader changed while it was in flight is the
  * next draft.
  */
 import { deleteAttachment, listSkills, uploadAttachment, type AttachmentUpload, type UploadLimits } from '~/lib/api'
+import { blockKey } from '~/lib/blocks'
 import {
   acceptList,
   builtinCommands,
   commandQuery,
+  COMPACT_COMMAND,
   extensionOf,
-  formatBytes,
   isImageFile,
   matchCommands,
   NEW_COMMAND,
@@ -34,15 +39,17 @@ import {
   type ComposerPayload,
   type SentSection,
 } from '~/lib/composer'
+import { formatBytes } from '~/lib/format'
+import { libraryMessage, type LibraryPlace } from '~/lib/library'
 import { inlinePlain, type OutlineEntry } from '~/lib/markdown'
-import type { MenuItem, Point } from '~/lib/menu'
+import type { MenuItem } from '~/lib/menu'
 
 const props = defineProps<{
   /** A turn is in flight: the composer waits, and Stop is the one control. */
   running: boolean
   stopping: boolean
   /** A send would be refused (no credits, a full workspace): the draft waits, Send is off. */
-  blocked?: boolean
+  blocked: boolean
   limits: UploadLimits | null
   /** The document pane's selection, read as the reader comes to the composer. */
   documentSelection: () => string | null
@@ -58,12 +65,20 @@ const props = defineProps<{
   /** A conversation is open, as against the draft: `/compact` and `/rename` are offered
    *  (docs/web.md § The agent panel, *Commands*). */
   conversationOpen: boolean
+  /** The Files page's card: where the reader is there, drawn as the chips and sent with each
+   *  message in place of the document's context. */
+  library?: LibraryPlace
 }>()
 
 const emit = defineEmits<{ stop: []; 'new-conversation': [] }>()
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const { resolve } = useApiError()
+/** Two panels can be mounted at once — the Files page's under a viewer's — so the ids the
+ *  field and its menu refer to each other by are this composer's own. */
+const uid = useId()
+const fieldId = `${uid}-composer`
+const commandsId = `${uid}-commands`
 
 const form = ref<HTMLFormElement | null>(null)
 const textarea = ref<HTMLTextAreaElement | null>(null)
@@ -159,10 +174,6 @@ interface AddedSection extends SentSection {
 
 const addedSections = ref<AddedSection[]>([])
 
-function entryKey(entry: OutlineEntry): string {
-  return `${entry.page}-${entry.index}`
-}
-
 /** `limits.sections_per_message` reached: no further section is offered. */
 const sectionsFull = computed(() => {
   const cap = props.limits?.sections_per_message
@@ -184,7 +195,7 @@ function addEntry(entry: OutlineEntry) {
     return
   }
   addSection({
-    key: entryKey(entry),
+    key: blockKey(entry),
     heading: entry.text,
     plain: entry.plain,
     text: sectionText(source, props.limits?.selection_max_chars),
@@ -208,7 +219,7 @@ async function refocusAfterRemove(index: number) {
     // A click that never focused the control (Safari's) left focus where it was.
     return
   }
-  const next = removeControls()[index] ?? addButton.value
+  const next = removeControls()[index] ?? addButton.value ?? textarea.value
   if (next) {
     expectFocusReturn()
     next.focus()
@@ -228,52 +239,51 @@ function removeSection(key: string) {
   void refocusAfterRemove(index)
 }
 
+// --- the Files page's selection (library mode) ----------------------------------------------
+
+/** Which rows are selected: a dropped chip stays dropped until this changes, and a re-read
+ *  of the library that leaves the same rows selected changes nothing. */
+const pickedKey = computed(() => props.library?.selection.map((item) => `${item.kind}-${item.id}`).join(' ') ?? '')
+const pickedDropped = ref(false)
+watch(pickedKey, () => {
+  pickedDropped.value = false
+})
+const pickedShown = computed(() => !!props.library?.selection.length && !pickedDropped.value)
+
+function removePicked() {
+  pickedDropped.value = true
+  void refocusAfterRemove(0)
+}
+
+/** Rows dragged onto the card: they are the selection already, so its chip comes back. */
+function showPicked() {
+  pickedDropped.value = false
+}
+
 // --- *Add context*: the current section, then every heading --------------------------------
 
 const addButton = ref<HTMLButtonElement | null>(null)
-const addMenu = ref<Point | null>(null)
-const addMenuFromKey = ref(false)
 /** The section the document was at when the menu opened: scrolling with the menu open
  *  closes it, so this is the one the menu offers. */
 const menuCurrent = ref<OutlineEntry | null>(null)
-/** The event that last closed the menu, if one did. */
-let addMenuClosedBy: Event | null = null
-/** The press now on **+** is the one that closed the menu (a press outside it, caught
- *  first): that press's click must not open it again. A pick, Escape or a press elsewhere
- *  leaves the next press free. */
-let addPressClosedMenu = false
+const {
+  at: addMenu,
+  fromKey: addMenuFromKey,
+  onPointerdown: onAddPointerdown,
+  toggle: toggleAddMenu,
+  close: closeAddMenu,
+} = useMenuButton(addButton, {
+  onOpen: () => {
+    menuCurrent.value = props.currentSection()
+  },
+  // The menu gives focus back to what had it, inside the field.
+  onClose: expectFocusReturn,
+})
 
 /** A subsection is set in by a space as wide as the type, so the outline reads as one. A
  *  heading longer than the menu is cut by the menu, with an ellipsis; the row's title and
  *  the chip it adds say it whole. */
 const SUBSECTION_INDENT = ' '
-
-function onAddPointerdown(event: PointerEvent) {
-  addPressClosedMenu = addMenuClosedBy === event
-}
-
-function toggleAddMenu(event: MouseEvent) {
-  // A click the keyboard made carries no pointer detail, and no press came before it.
-  const fromKey = event.detail === 0
-  if (addMenu.value || (addPressClosedMenu && !fromKey)) {
-    addPressClosedMenu = false
-    addMenu.value = null
-    return
-  }
-  const box = addButton.value?.getBoundingClientRect()
-  addMenuFromKey.value = fromKey
-  menuCurrent.value = props.currentSection()
-  // Over the button, ending just above it: the composer sits at the foot of the column, and
-  // a menu opened down would cover the control and the draft.
-  addMenu.value = box ? { x: box.left, y: box.top - 4 } : { x: 0, y: 0 }
-}
-
-function closeAddMenu(cause?: Event) {
-  addMenu.value = null
-  addMenuClosedBy = cause ?? null
-  // The menu gives focus back to what had it, inside the field.
-  expectFocusReturn()
-}
 
 const addMenuItems = computed<MenuItem[]>(() => {
   const added = new Set(addedSections.value.map((section) => section.key))
@@ -283,20 +293,20 @@ const addMenuItems = computed<MenuItem[]>(() => {
       key: 'current',
       label: current ? t('chat.context.currentSectionNamed', { heading: current.plain }) : t('chat.context.currentSection'),
       icon: 'locate' as const,
-      disabled: !current || (sectionsFull.value && !added.has(entryKey(current))),
+      disabled: !current || (sectionsFull.value && !added.has(blockKey(current))),
     },
     ...props.outline.map((entry, index) => ({
-      key: entryKey(entry),
+      key: blockKey(entry),
       label: `${entry.level >= 3 ? SUBSECTION_INDENT : ''}${entry.plain}`,
-      checked: added.has(entryKey(entry)),
-      disabled: sectionsFull.value && !added.has(entryKey(entry)),
+      checked: added.has(blockKey(entry)),
+      disabled: sectionsFull.value && !added.has(blockKey(entry)),
       separated: index === 0,
     })),
   ]
 })
 
 function onAddSelect(key: string) {
-  const entry = key === 'current' ? menuCurrent.value : props.outline.find((candidate) => entryKey(candidate) === key)
+  const entry = key === 'current' ? menuCurrent.value : props.outline.find((candidate) => blockKey(candidate) === key)
   if (entry) {
     addEntry(entry)
   }
@@ -338,8 +348,9 @@ async function loadSkills() {
   const request = ++skillsRequest
   skillsLoading.value = true
   try {
+    // The Files page's card has no document for a document-only built-in to work on.
     const listed: CommandOption[] = (await listSkills()).skills
-      .filter((skill) => skill.user_invocable)
+      .filter((skill) => skill.user_invocable && !(props.library && skill.document_only))
       .map((skill) => ({ name: skill.name, description: skill.description, hint: skill.argument_hint, group: 'skill' }))
     if (request === skillsRequest) {
       skills.value = listed
@@ -392,7 +403,7 @@ const sections = computed(() =>
 )
 
 function optionId(option: CommandOption): string {
-  return `chat-command-${option.group}-${option.name}`
+  return `${uid}-command-${option.group}-${option.name}`
 }
 
 const activeId = computed(() => {
@@ -541,7 +552,7 @@ function refusalText(refusal: AttachmentRefusal): string {
     case 'type':
       return t('chat.attachmentUnsupported')
     case 'size':
-      return t('chat.attachmentTooLarge', { size: formatBytes(refusal.max) })
+      return t('chat.attachmentTooLarge', { size: formatBytes(refusal.max, locale.value, { limit: true }) })
     case 'count':
       return t('chat.attachmentTooMany', { count: refusal.max })
   }
@@ -652,7 +663,9 @@ function fileMeta(item: PendingAttachment): string {
   const extension = extensionOf(item.name).toUpperCase()
   const kind = extension.length <= 4 ? extension : ''
   const detail =
-    item.state === 'uploading' ? t('chat.attachmentUploading', { percent: item.progress }) : formatBytes(item.size)
+    item.state === 'uploading'
+      ? t('chat.attachmentUploading', { percent: item.progress })
+      : formatBytes(item.size, locale.value)
   return kind ? `${kind} · ${detail}` : detail
 }
 
@@ -732,6 +745,7 @@ async function send(): Promise<boolean> {
     // sections, the quote or the attachments, which stay for the next message (docs/web.md
     // § The agent panel, *Commands*).
     const initializing = picked?.group === 'builtin' && picked.name === INIT_COMMAND
+    const compacting = picked?.group === 'builtin' && picked.name === COMPACT_COMMAND
     const ready = initializing ? [] : pending.value.filter((item) => item.state === 'ready')
     const text = draft.value.trim()
     if (!text && !picked && !ready.length) {
@@ -747,6 +761,10 @@ async function send(): Promise<boolean> {
       quote: initializing ? null : quote.value,
       command: picked?.name ?? null,
       attachments: ready.map((item) => ({ id: item.id!, name: item.name, image: item.image, preview: item.preview })),
+      // `/init` sends the folder alone: the selection stays for the next message. `/compact`
+      // sends neither, the server keeping none of it for a compaction.
+      library:
+        props.library && !compacting ? libraryMessage(props.library, pickedShown.value && !initializing) : undefined,
     }
     for (const item of ready) {
       item.claimed = true
@@ -833,7 +851,7 @@ async function ask(request: AskRequest): Promise<AskOutcome> {
   if (request.section) {
     const { heading, text } = request.section
     const entry = props.outline.find((candidate) => candidate.text === heading)
-    const key = entry ? entryKey(entry) : `heading:${heading}`
+    const key = entry ? blockKey(entry) : `heading:${heading}`
     if (!addedSections.value.some((added) => added.key === key)) {
       if (sectionsFull.value) {
         return 'full'
@@ -865,7 +883,12 @@ async function ask(request: AskRequest): Promise<AskOutcome> {
   return 'focused'
 }
 
-defineExpose({ addFiles, setQuote, focus, ask })
+/** What a reload would lose: the draft, a picked command, the quote, the attachments. */
+const holds = computed(
+  () => draft.value.trim() !== '' || command.value !== null || quote.value !== null || pending.value.length > 0,
+)
+
+defineExpose({ addFiles, setQuote, focus, ask, showPicked, holds })
 </script>
 
 <template>
@@ -882,15 +905,15 @@ defineExpose({ addFiles, setQuote, focus, ask })
          first row. -->
     <div v-if="menuOpen" class="menu" @mousedown.prevent>
       <p v-if="!skillsLoaded" class="menu-empty" role="status">{{ t('common.loading') }}</p>
-      <div v-else id="chat-commands" class="menu-list" role="listbox" :aria-label="t('chat.commands')">
+      <div v-else :id="commandsId" class="menu-list" role="listbox" :aria-label="t('chat.commands')">
         <div
           v-for="section in sections"
           :key="section.group"
           class="menu-group"
           role="group"
-          :aria-labelledby="`chat-commands-${section.group}`"
+          :aria-labelledby="`${commandsId}-${section.group}`"
         >
-          <p :id="`chat-commands-${section.group}`" class="menu-label">{{ section.label }}</p>
+          <p :id="`${commandsId}-${section.group}`" class="menu-label">{{ section.label }}</p>
           <button
             v-for="option in section.options"
             :id="optionId(option)"
@@ -920,9 +943,28 @@ defineExpose({ addFiles, setQuote, focus, ask })
     <div class="field" :class="{ disabled: running }">
       <!-- What goes with the message besides its text (docs/web.md § The agent panel,
            *Context chips*): the control that adds a section, the document the
-           conversation is about, the selection read on the way in, the sections added. -->
+           conversation is about, the selection read on the way in, the sections added —
+           or, in the Files page's card, the open folder and the rows selected there. -->
       <div ref="contextRow" class="context" role="group" :aria-label="t('chat.context.label')">
+        <template v-if="library">
+          <!-- Until the library is read a folder opened by its address has no name yet: no
+               chip rather than an empty one. -->
+          <ChatContextChip
+            v-if="library.folder === null || library.name"
+            icon="folder"
+            :text="library.folder === null ? t('files.allFiles') : library.name"
+          />
+          <ChatContextChip
+            v-if="pickedShown"
+            icon="files"
+            :text="t('chat.context.selected', { n: library.selection.length })"
+            :remove-label="t('chat.context.removeSelected')"
+            accent
+            @remove="removePicked"
+          />
+        </template>
         <button
+          v-else
           ref="addButton"
           type="button"
           class="context-add"
@@ -936,7 +978,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
         >
           <UiIcon name="plus" />
         </button>
-        <ChatContextChip icon="file-text" :text="t('chat.context.document')" faint />
+        <ChatContextChip v-if="!library" icon="file-text" :text="t('chat.context.document')" faint />
         <ChatContextChip
           v-if="selection"
           icon="text-quote"
@@ -1057,16 +1099,16 @@ defineExpose({ addFiles, setQuote, focus, ask })
         <span class="command-description">{{ command.description }}</span>
       </div>
 
-      <label for="chat-composer" class="sr-only">{{ t('chat.composer') }}</label>
+      <label :for="fieldId" class="sr-only">{{ t('chat.composer') }}</label>
       <textarea
-        id="chat-composer"
+        :id="fieldId"
         ref="textarea"
         v-model="draft"
         class="input"
         rows="2"
         :placeholder="placeholder"
         :disabled="running"
-        aria-controls="chat-commands"
+        :aria-controls="commandsId"
         :aria-activedescendant="activeId"
         @focus="focused = true"
         @blur="onBlur"
@@ -1238,8 +1280,8 @@ defineExpose({ addFiles, setQuote, focus, ask })
 
 /* --- the field ------------------------------------------------------------------- */
 
-/* Paper on the agent's glass card, as the system's message field: a hairline, a faint
-   lift, the accent's ring while it has the caret. */
+/* Paper on the agent's glass card, as the system's message field: a hairline, no shadow,
+   the accent's ring while it has the caret. */
 .field {
   display: flex;
   flex-direction: column;
@@ -1248,7 +1290,6 @@ defineExpose({ addFiles, setQuote, focus, ask })
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-composer);
   background: var(--paper);
-  box-shadow: 0 1px 2px var(--glass-shadow);
   transition:
     border-color var(--duration-fast) var(--ease),
     box-shadow var(--duration-fast) var(--ease);

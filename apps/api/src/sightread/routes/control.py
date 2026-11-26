@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from datetime import timedelta
 from pathlib import Path
 
@@ -16,9 +15,8 @@ from authlib.integrations.starlette_client import OAuthError
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import case, delete, func, select
+from sqlalchemy import delete, select
 from sqlalchemy import update as sa_update
-from sqlalchemy.exc import IntegrityError
 
 from ..admin.groups import join_owner_group, permissions_of
 from ..agents import AGENTS, CHAT, CHECK, PARSE, AgentDefinition, get_agent
@@ -27,6 +25,7 @@ from ..agents import memory as memory_defs
 from ..agents import skills as skill_defs
 from ..agents import subagents as subagent_defs
 from ..agents.bbox import convention_for_model
+from ..agents.summary import TITLE_MAX_CHARS
 from ..auth.api_keys import create_api_key
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..auth.oidc import (
@@ -40,9 +39,6 @@ from ..auth.sessions import SESSION_COOKIE, SESSION_TTL, create_session, delete_
 from ..billing import ledger, pay
 from ..billing.plans import ENDED_STATUSES
 from ..db.models import (
-    COST_SOURCE_ESTIMATED,
-    COST_SOURCE_OPENROUTER,
-    COST_SOURCE_UNKNOWN,
     DOCUMENT_VIEWS,
     EFFORT_DEFAULT,
     EFFORT_LEVELS,
@@ -51,21 +47,18 @@ from ..db.models import (
     ChatAttachment,
     ChatTurn,
     Checkout,
-    Conversation,
-    Document,
     Job,
-    PromptPreset,
     Skill,
     Subagent,
     Subscription,
-    UsageLog,
     User,
     utcnow,
 )
+from ..db.session import commit_or_conflict
 from ..errors import ApiError
 from ..jobs import chat_memory, chat_runner
 from ..jobs.intake import PDF_MEDIA_TYPE
-from ..jobs.queue import count_active_turns
+from ..jobs.queue import count_active_turns, lock_queued_work
 from ..jobs.sweeper import discard_account
 from ..parsing.attachments import ATTACHMENT_EXTENSIONS
 from ..parsing.images import ACCEPTED_IMAGE_TYPES
@@ -77,14 +70,13 @@ from ..workspace.documents import (
     IMAGE_MEDIA_TYPES,
     MARKDOWN_EXTENSIONS,
     MARKDOWN_MEDIA_TYPE,
-    document_paths,
 )
 from ..workspace.layout import FILES_DIR, user_root
 from ..workspace.locks import workspace_lock
 from ..workspace.memory_file import memory_file_text, write_memory_file
 from ..workspace.trash import lock_user
 from .billing import me_fields
-from .chat import TITLE_MAX_CHARS, owned_document, turn_note
+from .chat import LANGUAGE_TAG, LANGUAGE_TAG_MAX_CHARS
 from .library import parse_auto_convert
 
 logger = logging.getLogger(__name__)
@@ -221,7 +213,6 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "email": user.email,
             "name": user.name,
             "picture": user.picture,
-            "created_at": user.created_at,
         },
         # The plan and the balance, so the shell shows them without a second request
         # (docs/billing.md § Routes).
@@ -241,7 +232,6 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
         # a limit written twice is a limit that drifts (docs/api.md § Limits).
         "limits": {
             "upload_max_bytes": settings.upload_max_bytes,
-            "page_cap": settings.page_cap,
             "accepted_media_types": [PDF_MEDIA_TYPE, *ACCEPTED_IMAGE_TYPES, MARKDOWN_MEDIA_TYPE],
             # The extensions intake falls back to when a browser reports a generic type
             # for a file it has no association for (docs/api.md § Limits).
@@ -273,8 +263,6 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "selection_max_chars": settings.chat_selection_max_chars,
             # A conversation's rename field (docs/chat.md § Conversations, turns, events).
             "conversation_title_max_chars": TITLE_MAX_CHARS,
-            # The Agent page's memory file editor (docs/chat.md § Memory, *The memory file*).
-            "memory_file_max_chars": settings.chat_memory_file_max_chars,
             # When the idle pass may queue a compaction of an open conversation, for the
             # panel to read it again then (docs/web.md § The agent panel).
             "idle_compact_lead_seconds": settings.chat_idle_compact_lead_seconds,
@@ -373,20 +361,9 @@ async def delete_account(
             await db.commit()
             raise ApiError(409, "checkout_open", "A checkout you started can still be paid")
 
-        # Queued work is locked, so the claims' SKIP LOCKED passes it by, and goes with
-        # the account; running work would go on writing files and usage as it goes.
-        await db.execute(
-            select(Job.id).where(Job.user_id == user_id, Job.status == "queued").with_for_update()
-        )
-        await db.execute(
-            select(ChatTurn.id)
-            .where(
-                ChatTurn.user_id == user_id,
-                ChatTurn.status == "queued",
-                ChatTurn.finished_at.is_(None),
-            )
-            .with_for_update()
-        )
+        # Queued work is locked, so no claim starts it, and goes with the account;
+        # running work would go on writing files and usage as it goes.
+        await lock_queued_work(db, user_id)
         running_job = await db.scalar(
             select(Job.id).where(Job.user_id == user_id, Job.status == "running").limit(1)
         )
@@ -430,7 +407,7 @@ async def delete_account(
         # The rows are gone: a file that will not go is logged, and the sweep finishes it.
         try:
             await discard_account(settings, user_id, job_ids, attachment_ids)
-        except Exception:  # noqa: BLE001 - the account is deleted either way
+        except Exception:  # the account is deleted either way
             logger.exception("account %d: its files wait for the sweep", user_id)
 
     request.app.state.pay_refreshed.pop(user_id, None)
@@ -499,152 +476,6 @@ async def revoke_key(key_id: int, user: SessionUser, db: DbSession) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# --- prompt presets ---------------------------------------------------------------------
-
-
-async def _commit_or_name_conflict(db: DbSession, message: str) -> None:
-    """Commit, mapping a unique-name race to the same 400 the pre-check gives.
-
-    Two concurrent creates can both pass the duplicate pre-check before either commits;
-    the loser's constraint violation is an ordinary name conflict, not a 500.
-    """
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        await db.rollback()
-        raise ApiError(400, "invalid_request", message) from exc
-
-
-class PromptCreate(BaseModel):
-    # The agent this prompt is for; fixed once created (docs/agents.md).
-    agent: str = Field(default="parse", max_length=32)
-    name: str = Field(min_length=1, max_length=255)
-    text: str = Field(min_length=1)
-
-
-class PromptUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=255)
-    text: str | None = Field(default=None, min_length=1)
-
-
-def _prompt_payload(row: PromptPreset) -> dict:
-    return {
-        "id": row.id,
-        "agent": row.agent,
-        "name": row.name,
-        "text": row.text,
-        "created_at": row.created_at,
-        "updated_at": row.updated_at,
-    }
-
-
-def _checked_prompt_text(text: str, settings) -> str:
-    trimmed = text.strip()
-    if not trimmed:
-        raise ApiError(400, "invalid_request", "The prompt needs text")
-    if len(trimmed) > settings.system_prompt_max_chars:
-        raise ApiError(
-            400,
-            "invalid_request",
-            f"The prompt exceeds {settings.system_prompt_max_chars} characters",
-        )
-    return trimmed
-
-
-async def _owned_prompt(db: DbSession, user_id: int, prompt_id: int) -> PromptPreset:
-    row = (
-        await db.execute(
-            select(PromptPreset).where(
-                PromptPreset.id == prompt_id, PromptPreset.user_id == user_id
-            )
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        raise ApiError(404, "invalid_request", "No such prompt")
-    return row
-
-
-async def _refuse_duplicate_prompt_name(
-    db: DbSession, user_id: int, name: str, exclude_id: int | None = None
-) -> None:
-    query = select(PromptPreset.id).where(
-        PromptPreset.user_id == user_id, PromptPreset.name == name
-    )
-    if exclude_id is not None:
-        query = query.where(PromptPreset.id != exclude_id)
-    if (await db.execute(query)).first() is not None:
-        raise ApiError(400, "invalid_request", "A prompt with this name already exists")
-
-
-@router.get("/prompts")
-async def list_prompts(user: SessionUser, db: DbSession):
-    rows = (
-        (
-            await db.execute(
-                select(PromptPreset)
-                .where(PromptPreset.user_id == user.id)
-                .order_by(PromptPreset.created_at)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return {"prompts": [_prompt_payload(row) for row in rows]}
-
-
-@router.post("/prompts", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
-async def create_prompt(
-    body: PromptCreate, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    agent = get_agent(body.agent)
-    if agent is None:
-        raise ApiError(400, "invalid_request", f"No such agent '{body.agent}'")
-    name = body.name.strip()
-    if not name:
-        raise ApiError(400, "invalid_request", "The prompt needs a name")
-    text = _checked_prompt_text(body.text, settings)
-    await _refuse_duplicate_prompt_name(db, user.id, name)
-    row = PromptPreset(user_id=user.id, agent=agent.name, name=name, text=text)
-    db.add(row)
-    await _commit_or_name_conflict(db, "A prompt with this name already exists")
-    return _prompt_payload(row)
-
-
-@router.put("/prompts/{prompt_id}", dependencies=[CsrfGuard])
-async def update_prompt(
-    prompt_id: int, body: PromptUpdate, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    row = await _owned_prompt(db, user.id, prompt_id)
-    provided = body.model_fields_set
-    if "name" in provided and body.name:
-        name = body.name.strip()
-        if not name:
-            raise ApiError(400, "invalid_request", "The prompt needs a name")
-        await _refuse_duplicate_prompt_name(db, user.id, name, exclude_id=row.id)
-        row.name = name
-    if "text" in provided and body.text:
-        row.text = _checked_prompt_text(body.text, settings)
-    row.updated_at = utcnow()
-    await _commit_or_name_conflict(db, "A prompt with this name already exists")
-    return _prompt_payload(row)
-
-
-@router.delete(
-    "/prompts/{prompt_id}", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT
-)
-async def delete_prompt(prompt_id: int, user: SessionUser, db: DbSession) -> Response:
-    row = await _owned_prompt(db, user.id, prompt_id)
-    # Explicit fallback to the agent's default prompt, not just the FK's SET NULL.
-    await db.execute(
-        sa_update(AgentSetting)
-        .where(AgentSetting.user_id == user.id, AgentSetting.prompt_preset_id == row.id)
-        .values(prompt_preset_id=None)
-    )
-    await db.delete(row)
-    await db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
 # --- agents ---------------------------------------------------------------------------
 
 
@@ -670,28 +501,27 @@ def _agent_settings_payload(settings: AppSettings, agent: str, row: AgentSetting
         "model": _effective_model(settings, agent, row),
         # The user's own template; null for the agent's default (docs/agents.md).
         "prompt": row.prompt if row else None,
-        "prompt_preset_id": row.prompt_preset_id if row else None,
-        "effort": (row.effort if row and row.effort else EFFORT_DEFAULT),
+        "effort": row.effort if row else EFFORT_DEFAULT,
         # The chat agent's own: instructions appended after the prompt, the languages it
         # answers and translates into, and the memory switches (docs/agents.md).
         "instructions": row.instructions if row else None,
         "answer_language": row.answer_language if row else None,
         "translate_language": row.translate_language if row else None,
-        "memory_auto": row.memory_auto if row and row.memory_auto is not None else True,
-        "memory_paused": bool(row.memory_paused) if row else False,
+        "memory_auto": row.memory_auto if row else True,
+        "memory_paused": row.memory_paused if row else False,
         # And whether the worker compacts the reader's long conversations before their
         # cache expires (docs/chat.md § Compaction).
-        "idle_compact": row.idle_compact if row and row.idle_compact is not None else True,
+        "idle_compact": row.idle_compact if row else True,
         # The parse agent's own: the model a blocked page goes to — the deployment's, a
         # fact — and whether it goes there on its own (docs/parsing.md § Fallback model).
         "fallback_model": (settings.parse_fallback_model or None) if agent == PARSE.name else None,
-        "auto_fallback": bool(row.auto_fallback) if row else False,
+        "auto_fallback": row.auto_fallback if row else False,
         # And whether a PDF or an image uploaded on the Files page is converted on arrival:
         # off unless the reader turned it on (docs/workspace.md § Files).
-        "auto_convert": bool(row.auto_convert) if row else False,
+        "auto_convert": row.auto_convert if row else False,
         # The check agent's own: whether a Files upload is checked before it opens
         # (docs/parsing.md § Format check).
-        "auto_check": row.auto_check if row and row.auto_check is not None else True,
+        "auto_check": row.auto_check if row else True,
     }
 
 
@@ -720,7 +550,6 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
         "agents": [
             {
                 "name": agent.name,
-                "capabilities": list(agent.capabilities),
                 "input": agent.input,
                 "output": agent.output,
                 # What the prompt dialog opens on when the user saved no prompt, and the
@@ -748,7 +577,6 @@ class AgentSettingsPut(BaseModel):
     model: str | None = Field(default=None, max_length=255)
     # Capped in the route, where the settings are (`SYSTEM_PROMPT_MAX_CHARS`).
     prompt: str | None = None
-    prompt_preset_id: int | None = None
     effort: str | None = Field(default=None, max_length=8)
     # The chat agent's own, the instructions the check agent's too (docs/agents.md);
     # checked in the route, which answers 400 for each — capped where the settings are
@@ -779,9 +607,6 @@ SETTING_OWNERS: dict[str, tuple[str, ...]] = {
     "auto_convert": (PARSE.name,),
     "auto_check": (CHECK.name,),
 }
-# A language tag, as the composer's locale is one (docs/api.md).
-LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
-LANGUAGE_TAG_MAX_CHARS = 16
 
 
 def _checked_language(value: str | None, label: str) -> str | None:
@@ -850,9 +675,6 @@ async def put_agent_settings(
                 "invalid_request",
                 f"The prompt exceeds {settings.system_prompt_max_chars} characters",
             )
-    if prompt is not None and body.prompt_preset_id is not None:
-        # The two exclude each other (docs/agents.md § Per-agent settings).
-        raise ApiError(400, "invalid_request", "Send either prompt or prompt_preset_id")
     model: str | None = None
     if "model" in provided:
         model = (body.model or "").strip() or None
@@ -863,16 +685,12 @@ async def put_agent_settings(
             raise ApiError(400, "invalid_request", "That model is not one the chat agent offers")
     if body.effort is not None and body.effort not in EFFORT_LEVELS:
         raise ApiError(400, "invalid_request", "effort must be one of " + ", ".join(EFFORT_LEVELS))
-    if body.prompt_preset_id is not None:
-        preset = await _owned_prompt(db, user.id, body.prompt_preset_id)
-        if preset.agent != agent.name:
-            raise ApiError(400, "invalid_request", f"That prompt is for the {preset.agent} agent")
 
     if "memory_paused" in provided:
         # The reader's row, held until the commit: the `memory` tool reads the switch under
         # it, so a Pause waits for a call already deciding and every later call sees it
         # (docs/chat.md § Memory).
-        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        await lock_user(db, user.id)
     row = (
         await db.execute(
             select(AgentSetting).where(
@@ -891,10 +709,8 @@ async def put_agent_settings(
         row.auto_convert = bool(body.auto_convert)
     if "auto_check" in provided:
         row.auto_check = bool(body.auto_check)
-    if "prompt" in provided or "prompt_preset_id" in provided:
-        # Writing either clears the other: one of the two is ever in force.
+    if "prompt" in provided:
         row.prompt = prompt
-        row.prompt_preset_id = body.prompt_preset_id
     if "effort" in provided:
         row.effort = body.effort or EFFORT_DEFAULT
     if "instructions" in provided:
@@ -909,13 +725,9 @@ async def put_agent_settings(
         row.memory_paused = bool(body.memory_paused)
     if "idle_compact" in provided:
         row.idle_compact = bool(body.idle_compact)
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        # Another tab deleted the selected prompt between the ownership pre-check and
-        # this commit — an ordinary selection race, not a 500.
-        await db.rollback()
-        raise ApiError(409, "invalid_request", "The selected prompt was just deleted") from exc
+    # Another request created this agent's row between the lookup and this commit — two
+    # first saves racing, not a 500.
+    await commit_or_conflict(db, "The settings were saved elsewhere at the same time")
     # The convention follows the model, so a write answers the new one along with the row.
     return {
         **_agent_settings_payload(settings, agent.name, row),
@@ -928,25 +740,15 @@ async def chat_agent_context(
     user: SessionUser,
     db: DbSession,
     settings: AppSettings,
-    locale: str = Query(default="en", max_length=16, pattern=LANGUAGE_TAG.pattern),
-    document_id: int | None = None,
+    locale: str = Query(
+        default="en", max_length=LANGUAGE_TAG_MAX_CHARS, pattern=LANGUAGE_TAG.pattern
+    ),
 ):
     """What the chat agent receives, rendered by the code the runner uses, for the Agent
-    page's drawer (docs/api.md): the system blocks in the order a turn sends them, the turn
-    block a message sent now in `locale` would carry, and the document's facts when one is
-    named. Reads only: nothing is materialized and no snapshot is taken."""
-    facts: dict[str, str] | None = None
-    # The AGENTS.md files a new conversation would read: the document's path, or the root
-    # file alone without a document (docs/chat.md § AGENTS.md).
-    folder_dir = Path(FILES_DIR)
-    if document_id is not None:
-        document = await owned_document(db, user.id, document_id)
-        paths = await document_paths(db, settings, document)
-        folder_dir = paths.relative.parent
-        # A markdown document has no job and still has facts: it has no pages to name.
-        job = await db.get(Job, document.job_id) if document.job_id is not None else None
-        if document.job_id is None or job is not None:
-            facts = chat_runner.document_facts(settings, job, paths)
+    page's drawer (docs/api.md): the system blocks in the order a turn sends them and the
+    turn block a message sent now in `locale` would carry. No document is open on the Agent
+    page, so the prompt keeps its tokens. Reads only: nothing is materialized and no
+    snapshot is taken."""
     setting = (
         await db.execute(
             select(AgentSetting).where(
@@ -955,34 +757,32 @@ async def chat_agent_context(
         )
     ).scalar_one_or_none()
     own_prompt = setting.prompt if setting and setting.prompt else None
-    preset = setting.prompt_preset if setting and own_prompt is None else None
     skills = skill_defs.resolve_skills(
         (await db.execute(select(Skill).where(Skill.user_id == user.id))).scalars()
     )
     subagents = subagent_defs.resolve_subagents(
         (await db.execute(select(Subagent).where(Subagent.user_id == user.id))).scalars()
     )
-    # What a new conversation would load: the first turn's selection, over every
-    # document's memories and, with a document, this one's (docs/chat.md § Memory).
+    # What a new conversation would load: the first turn's selection over every
+    # document's memories (docs/chat.md § Memory).
     auto = setting.memory_auto if setting else True
     paused = setting.memory_paused if setting else False
     loaded = (
         []
         if paused
         else chat_memory.first_turn_selection(
-            await chat_memory.applicable_memories(db, user.id, document_id if facts else None),
+            await chat_memory.applicable_memories(db, user.id, None),
             settings,
         )
     )
     shell = ledger.sandbox_granted(settings, await ledger.plan_of(db, settings, user.id))
-    tools = [str(tool["name"]) for tool in chat_runner.turn_tools(shell, settings)]
+    tools = _agent_tools(CHAT.name, shell, settings)
     parts = chat_agent.system_parts(
         # Without a document the template keeps its tokens, its tool lines filtered as a
         # turn's would be.
         chat_agent.render_system_prompt(
-            own_prompt or CHAT.default_prompt_template, facts, tools=tools
+            own_prompt or CHAT.default_prompt_template, None, tools=tools
         ),
-        preset=preset.text if preset is not None else None,
         instructions=setting.instructions if setting else None,
         catalogue=chat_runner.turn_catalogue(skills, subagents),
         memory=memory_defs.render_memory_block(loaded, auto=auto, paused=paused),
@@ -990,20 +790,19 @@ async def chat_agent_context(
         memory_file=chat_agent.render_memory_file(
             await memory_file_text(settings, user.id), settings.chat_memory_file_max_chars
         ),
+        # The AGENTS.md a new conversation reads with no document named: the root file
+        # alone (docs/chat.md § AGENTS.md).
         agents_file=chat_agent.render_agents_file(
-            await agents_file_text(settings, user.id, folder_dir),
+            await agents_file_text(settings, user.id, Path(FILES_DIR)),
             settings.chat_agents_file_max_chars,
         ),
     )
     extras = {
         "prompt": {"own": own_prompt is not None},
-        "catalogue": {
-            "skills": sum(1 for skill in skills if skill.model_invocable),
-            "subagents": len(subagents),
-        },
+        "catalogue": {"skills": sum(1 for skill in skills if skill.model_invocable)},
         "memory": {"count": len(loaded), "paused": paused},
     }
-    turn = turn_note(
+    turn = chat_agent.turn_note(
         "<revision>",
         locale,
         setting.answer_language if setting else None,
@@ -1020,7 +819,6 @@ async def chat_agent_context(
             for part in parts
         ],
         "turn": {"text": turn, "chars": len(turn)},
-        "facts": facts,
     }
 
 
@@ -1057,7 +855,7 @@ async def put_memory_file(
     root = user_root(settings.workspaces_dir, user.id)
     async with workspace_lock(root):
         # The send's lock: no turn is queued under the decision below.
-        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        await lock_user(db, user.id)
         if await count_active_turns(db, user.id):
             raise ApiError(
                 409,
@@ -1070,147 +868,7 @@ async def put_memory_file(
 
 
 @router.get("/agents/{agent_name}/models")
-async def list_agent_models(
-    agent_name: str, user: SessionUser, db: DbSession, settings: AppSettings
-):
+async def list_agent_models(agent_name: str, user: SessionUser, settings: AppSettings):
     """The models the agent may run — the Agent page's model picker (docs/api.md)."""
     agent = _known_agent(agent_name)
     return {"data": await agent_models(settings, agent.name)}
-
-
-# --- usage ----------------------------------------------------------------------------
-
-
-@router.get("/usage")
-async def usage(user: SessionUser, db: DbSession, days: int = Query(default=30, ge=1, le=365)):
-    """Usage aggregates with billed, estimated and unpriced cost kept apart (docs/api.md
-    § Usage aggregates): an estimate is never summed into billing, and a call nobody
-    priced is counted rather than priced at 0."""
-    since = utcnow() - timedelta(days=days)
-    day = func.date(UsageLog.created_at)  # UTC day bucket on both PostgreSQL and SQLite
-
-    def of_source(source: str, value):
-        return case((UsageLog.cost_source == source, value))
-
-    figures = (
-        func.count(),
-        func.sum(UsageLog.prompt_tokens),
-        func.sum(UsageLog.completion_tokens),
-        func.sum(of_source(COST_SOURCE_OPENROUTER, UsageLog.cost)),
-        func.sum(of_source(COST_SOURCE_ESTIMATED, UsageLog.cost)),
-        func.count(of_source(COST_SOURCE_ESTIMATED, 1)),
-        func.count(of_source(COST_SOURCE_UNKNOWN, 1)),
-        func.sum(UsageLog.cache_read_tokens),
-        func.sum(UsageLog.cache_write_tokens),
-    )
-    in_window = (UsageLog.user_id == user.id, UsageLog.created_at >= since)
-    per_day = (
-        await db.execute(select(day, *figures).where(*in_window).group_by(day).order_by(day))
-    ).all()
-    per_model = (
-        await db.execute(
-            select(UsageLog.model, *figures)
-            .where(*in_window)
-            .group_by(UsageLog.model)
-            .order_by(UsageLog.model)
-        )
-    ).all()
-    per_agent = (
-        await db.execute(
-            select(UsageLog.agent, *figures)
-            .where(*in_window)
-            .group_by(UsageLog.agent)
-            .order_by(UsageLog.agent)
-        )
-    ).all()
-    agents_by_day = (
-        await db.execute(
-            select(day, UsageLog.agent).where(*in_window).group_by(day, UsageLog.agent)
-        )
-    ).all()
-    day_agents: dict[str, list[str]] = {}
-    for bucket, agent in agents_by_day:
-        day_agents.setdefault(str(bucket)[:10], []).append(agent)
-
-    return {
-        "days": days,
-        "per_day": [
-            {
-                "date": str(row[0])[:10],
-                "agents": sorted(day_agents.get(str(row[0])[:10], [])),
-                **usage_totals(row[1:]),
-            }
-            for row in per_day
-        ],
-        "per_model": [{"model": row[0], **usage_totals(row[1:])} for row in per_model],
-        "per_agent": [{"agent": row[0], **usage_totals(row[1:])} for row in per_agent],
-    }
-
-
-def usage_totals(row) -> dict:
-    calls, prompt, completion, cost, estimated, estimated_calls, unpriced, cached, written = row
-    return {
-        "calls": int(calls),
-        "prompt_tokens": int(prompt or 0),
-        "completion_tokens": int(completion or 0),
-        "cost": float(cost or 0),
-        "estimated_cost": float(estimated or 0),
-        "estimated_calls": int(estimated_calls),
-        "unpriced_calls": int(unpriced),
-        "cache_read_tokens": int(cached or 0),
-        "cache_write_tokens": int(written or 0),
-    }
-
-
-@router.get("/usage/conversations")
-async def usage_per_conversation(
-    user: SessionUser, db: DbSession, days: int = Query(default=30, ge=1, le=365)
-):
-    """What each conversation cost over the period, through its turns
-    (docs/api.md § Usage aggregates)."""
-    since = utcnow() - timedelta(days=days)
-    rows = (
-        await db.execute(
-            select(
-                Conversation.id,
-                Conversation.title,
-                Conversation.document_id,
-                Document.name,
-                func.count(func.distinct(ChatTurn.id)),
-                func.sum(UsageLog.prompt_tokens),
-                func.sum(UsageLog.cache_read_tokens),
-                func.sum(UsageLog.completion_tokens),
-                func.sum(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, UsageLog.cost))),
-                func.count(case((UsageLog.cost_source == COST_SOURCE_UNKNOWN, 1))),
-                func.sum(UsageLog.cache_write_tokens),
-                # What tells an estimate of exactly $0 from no estimate (docs/api.md).
-                func.count(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, 1))),
-            )
-            .select_from(UsageLog)
-            .join(ChatTurn, ChatTurn.id == UsageLog.turn_id)
-            .join(Conversation, Conversation.id == ChatTurn.conversation_id)
-            .outerjoin(Document, Document.id == Conversation.document_id)
-            .where(UsageLog.user_id == user.id, UsageLog.created_at >= since)
-            .group_by(Conversation.id, Conversation.title, Conversation.document_id, Document.name)
-            .order_by(func.sum(UsageLog.prompt_tokens).desc())
-        )
-    ).all()
-    return {
-        "conversations": [
-            {
-                "id": row[0],
-                "title": row[1],
-                "document_id": row[2],
-                "document_name": row[3],
-                "turns": int(row[4]),
-                "prompt_tokens": int(row[5] or 0),
-                "cache_read_tokens": int(row[6] or 0),
-                "completion_tokens": int(row[7] or 0),
-                "estimated_cost": float(row[8] or 0),
-                "unpriced_calls": int(row[9]),
-                "cache_write_tokens": int(row[10] or 0),
-                "estimated_calls": int(row[11]),
-            }
-            for row in rows
-        ]
-    }

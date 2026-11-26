@@ -5,8 +5,13 @@
  * parse returns null and the caller falls back to the verbatim source — a wrong glyph is
  * worse than visible TeX, so `throwOnError` stays on and the failure is the signal.
  * KaTeX escapes its input and `trust` is off, so the returned HTML is inert markup.
+ *
+ * KaTeX's stylesheet is imported here, not in the app's global CSS, so it ships only in the
+ * chunks that typeset math and never in the prerendered public pages. It comes from the
+ * package with its fonts bundled by the build: math depends on nothing remote.
  */
 import katex from 'katex'
+import 'katex/dist/katex.min.css'
 
 /** Commands transcriptions produce that KaTeX does not define. */
 const MACROS: Record<string, string> = {

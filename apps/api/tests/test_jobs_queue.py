@@ -1,8 +1,4 @@
-"""Queue behaviour: page specs, dedup lookup, claiming and the retention sweeper.
-
-The `SKIP LOCKED` claim can only be exercised on PostgreSQL, so those tests skip unless
-`TEST_DATABASE_URL` points at one (docs/testing.md).
-"""
+"""Queue behaviour: page specs, dedup lookup, claiming and the retention sweeper."""
 
 from __future__ import annotations
 
@@ -13,10 +9,10 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from sightread.agents import PARSE
-from sightread.db.models import Document, Job, JobPage, User, utcnow
+from sightread.agents.parse import PIPELINE_VERSION
+from sightread.db.models import Document, Job, JobPage, UsageLog, User, utcnow
 from sightread.jobs.queue import (
     claim_job,
     claim_next_job,
@@ -28,12 +24,9 @@ from sightread.jobs.queue import (
     requeue_job,
 )
 from sightread.jobs.sweeper import sweep_uploads
-from tests.conftest import DATABASE_URL
-
-postgres_only = pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="needs TEST_DATABASE_URL pointing at PostgreSQL",
-)
+from sightread.upstream.client import PageTranscription, Usage
+from tests.conftest import path_settings
+from tests.factories import user_row
 
 JOB_DEFAULTS = {
     "kind": "pdf",
@@ -43,7 +36,6 @@ JOB_DEFAULTS = {
     "pages_spec": "",
     "agent": "parse",
     "model": "vendor/model",
-    "connection_id": None,
     # The built-in upstream's snapshot is the Kano Proxy origin (docs/jobs.md § Dedup).
     "connection_base_url": "https://kano.test",
     "bbox_format": "yxyx_norm1000",
@@ -54,7 +46,7 @@ JOB_DEFAULTS = {
 
 
 async def _user(db, email: str = "queue@example.com") -> User:
-    user = User(google_sub=email, email=email)
+    user = user_row(email)
     db.add(user)
     await db.flush()
     return user
@@ -71,11 +63,15 @@ def test_parse_pages_spec() -> None:
             parse_pages_spec(bad, 8)
 
 
-async def test_dedup_lookup_matches_the_full_key(sessionmaker) -> None:
+async def test_dedup_lookup_matches_the_full_key(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="a" * 64, source_path="unused-a.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="a" * 64,
+            source_path=str(tmp_path / "unused-a.pdf"),
+            **JOB_DEFAULTS,
         )
         job.status = "succeeded"
         job.finished_at = utcnow()
@@ -86,7 +82,6 @@ async def test_dedup_lookup_matches_the_full_key(sessionmaker) -> None:
             "agent": "parse",
             "sha256": "a" * 64,
             "model": "vendor/model",
-            "connection_id": None,
             "connection_base_url": "https://kano.test",
             "pages_spec": "",
             "prompt_sha256": "p" * 64,
@@ -101,11 +96,7 @@ async def test_dedup_lookup_matches_the_full_key(sessionmaker) -> None:
             await find_cached_job(db, retention_days=30, **{**key, "prompt_sha256": "q" * 64})
             is None
         )
-        # A different upstream is a different parse, even for the same model id — and an
-        # edited endpoint URL repoints what a connection id means, so it misses too.
-        assert (
-            await find_cached_job(db, retention_days=30, **{**key, "connection_id": 12345}) is None
-        )
+        # Another endpoint is a different parse, even for the same model id.
         assert (
             await find_cached_job(
                 db, retention_days=30, **{**key, "connection_base_url": "https://new.example/v1"}
@@ -122,8 +113,9 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
     sessionmaker,
 ) -> None:
     """Two succeeded results for the same bytes, model and prompt that must never answer
-    a new parse upload: another agent's, and one OpenRouter produced before the Kano Proxy
-    migration (connection_id and connection_base_url both NULL, docs/jobs.md § Dedup)."""
+    a new parse upload: another agent's, and one of an upstream the deployment no longer
+    has — OpenRouter, a provider connection — whose endpoint snapshot is NULL
+    (docs/jobs.md § Dedup)."""
     async with sessionmaker() as db:
         user = await _user(db)
         shared = {
@@ -132,13 +124,14 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
             "sha256": "d" * 64,
             "source_path": None,
             "status": "succeeded",
-            "pipeline_version": PARSE.pipeline_version,
+            "pipeline_version": PIPELINE_VERSION,
             "pages_done": 2,
             "created_at": utcnow(),
             "finished_at": utcnow(),
         }
         db.add(Job(**{**shared, "agent": "summarize"}))
-        db.add(Job(**{**shared, "connection_base_url": None}))
+        historical = Job(**{**shared, "connection_base_url": None})
+        db.add(historical)
         await db.commit()
 
         key = {
@@ -146,25 +139,28 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
             "agent": "parse",
             "sha256": "d" * 64,
             "model": "vendor/model",
-            "connection_id": None,
             "connection_base_url": "https://kano.test",
             "pages_spec": "",
             "prompt_sha256": "p" * 64,
         }
         assert await find_cached_job(db, retention_days=30, **key) is None
-        # The historical row is there and would match an OpenRouter-era key: the snapshot
-        # is exactly what keeps it out.
-        historical = await find_cached_job(
-            db, retention_days=30, **{**key, "connection_base_url": None}
-        )
-        assert historical is not None and historical.agent == "parse"
+        # The historical row matches the key in everything else: the NULL snapshot is
+        # exactly what keeps it out.
+        historical.connection_base_url = "https://kano.test"
+        await db.commit()
+        found = await find_cached_job(db, retention_days=30, **key)
+        assert found is not None and found.id == historical.id and found.agent == "parse"
 
 
-async def test_dedup_ignores_unfinished_jobs(sessionmaker) -> None:
+async def test_dedup_ignores_unfinished_jobs(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         await enqueue_job(
-            db, user_id=user.id, sha256="c" * 64, source_path="unused-c.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="c" * 64,
+            source_path=str(tmp_path / "unused-c.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
 
@@ -176,7 +172,6 @@ async def test_dedup_ignores_unfinished_jobs(sessionmaker) -> None:
                 agent="parse",
                 sha256="c" * 64,
                 model="vendor/model",
-                connection_id=None,
                 connection_base_url="https://kano.test",
                 pages_spec="",
                 prompt_sha256="p" * 64,
@@ -185,14 +180,22 @@ async def test_dedup_ignores_unfinished_jobs(sessionmaker) -> None:
         )
 
 
-async def test_claim_is_fifo_and_marks_the_job_running(sessionmaker) -> None:
+async def test_claim_is_fifo_and_marks_the_job_running(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         first = await enqueue_job(
-            db, user_id=user.id, sha256="1" * 64, source_path="unused-1.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="1" * 64,
+            source_path=str(tmp_path / "unused-1.pdf"),
+            **JOB_DEFAULTS,
         )
         second = await enqueue_job(
-            db, user_id=user.id, sha256="2" * 64, source_path="unused-2.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="2" * 64,
+            source_path=str(tmp_path / "unused-2.pdf"),
+            **JOB_DEFAULTS,
         )
         second.created_at = first.created_at + timedelta(seconds=5)
         await db.commit()
@@ -206,15 +209,23 @@ async def test_claim_is_fifo_and_marks_the_job_running(sessionmaker) -> None:
         assert await count_running_jobs(db, first.user_id) == 1
 
 
-async def test_claim_honours_the_per_user_cap(sessionmaker) -> None:
+async def test_claim_honours_the_per_user_cap(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         running = await enqueue_job(
-            db, user_id=user.id, sha256="3" * 64, source_path="unused-3.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="3" * 64,
+            source_path=str(tmp_path / "unused-3.pdf"),
+            **JOB_DEFAULTS,
         )
         running.status = "running"
         await enqueue_job(
-            db, user_id=user.id, sha256="4" * 64, source_path="unused-4.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="4" * 64,
+            source_path=str(tmp_path / "unused-4.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
 
@@ -224,11 +235,15 @@ async def test_claim_honours_the_per_user_cap(sessionmaker) -> None:
         assert await claim_next_job(db, max_jobs_per_user=2) is not None
 
 
-async def test_requeue_keeps_the_pages_that_succeeded(sessionmaker) -> None:
+async def test_requeue_keeps_the_pages_that_succeeded(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="5" * 64, source_path="unused-5.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="5" * 64,
+            source_path=str(tmp_path / "unused-5.pdf"),
+            **JOB_DEFAULTS,
         )
         job.status = "running"
         job.pages_done = 2
@@ -247,8 +262,8 @@ async def test_requeue_keeps_the_pages_that_succeeded(sessionmaker) -> None:
     async with sessionmaker() as db:
         requeued = await db.get(Job, job_id)
         assert (requeued.status, requeued.pages_done, requeued.started_at) == ("queued", 1, None)
-        # The page the key paid for stays for the next attempt; the failed one is
-        # forgotten, to be sent again (docs/jobs.md § Queue).
+        # The page already transcribed and billed stays for the next attempt; the failed
+        # one is forgotten, to be sent again (docs/jobs.md § Queue).
         kept = (await db.execute(select(JobPage.page_no).where(JobPage.job_id == job_id))).all()
         assert kept == [(1,)]
         # A job whose result was committed before the shutdown's cancel landed is not
@@ -262,7 +277,6 @@ async def test_requeue_keeps_the_pages_that_succeeded(sessionmaker) -> None:
         assert (done.status, done.pages_done) == ("succeeded", 3)
 
 
-@postgres_only
 async def test_one_worker_holds_the_worker_lock_at_a_time(sessionmaker) -> None:
     from sightread.jobs.queue import release_worker_lock, try_worker_lock
 
@@ -305,19 +319,26 @@ async def test_a_worker_stops_when_its_lock_session_is_gone() -> None:
     assert stop.is_set()
 
 
-@postgres_only
-async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker) -> None:
+async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker, tmp_path) -> None:
     from sightread.jobs.queue import requeue_orphaned_jobs
 
     async with sessionmaker() as db:
         user = await _user(db)
         held = await enqueue_job(
-            db, user_id=user.id, sha256="6" * 64, source_path="unused-6.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="6" * 64,
+            source_path=str(tmp_path / "unused-6.pdf"),
+            **JOB_DEFAULTS,
         )
         held.status = "running"
         held.started_at = utcnow()
         queued = await enqueue_job(
-            db, user_id=user.id, sha256="7" * 64, source_path="unused-7.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="7" * 64,
+            source_path=str(tmp_path / "unused-7.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
         held_id, queued_id = held.id, queued.id
@@ -332,7 +353,7 @@ async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker)
 
 
 async def test_after_a_turn_the_worker_requeues_only_its_own_jobs_left_running(
-    sessionmaker,
+    sessionmaker, tmp_path
 ) -> None:
     """docs/jobs.md § Queue: a parse a chat turn drove and could not put back is still the
     live worker's once the turn is over, and nobody drives it; the worker puts it back
@@ -344,16 +365,22 @@ async def test_after_a_turn_the_worker_requeues_only_its_own_jobs_left_running(
     async with sessionmaker() as db:
         user = await _user(db)
         left = await enqueue_job(
-            db, user_id=user.id, sha256="8" * 64, source_path="unused-8.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="8" * 64,
+            source_path=str(tmp_path / "unused-8.pdf"),
+            **JOB_DEFAULTS,
         )
         foreign = await enqueue_job(
-            db, user_id=user.id, sha256="9" * 64, source_path="unused-9.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="9" * 64,
+            source_path=str(tmp_path / "unused-9.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
         left_id, foreign_id = left.id, foreign.id
     async with sessionmaker() as db:
-        # Each taken after the last claim: the SQLite fallback counts from the highest
-        # generation on record (docs/jobs.md § Queue).
         other = await next_worker_generation(db)
         assert await claim_job(db, foreign_id, other)
         live = await next_worker_generation(db)
@@ -383,27 +410,26 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="8" * 64, source_path="unused-8.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="8" * 64,
+            source_path=str(tmp_path / "unused-8.pdf"),
+            **JOB_DEFAULTS,
         )
         job.status = "running"
         done = await enqueue_job(
-            db, user_id=user.id, sha256="9" * 64, source_path="unused-9.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="9" * 64,
+            source_path=str(tmp_path / "unused-9.pdf"),
+            **JOB_DEFAULTS,
         )
         done.status = "succeeded"
         await db.commit()
         job_id, done_id = job.id, done.id
-    from sightread.config import Settings
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
-
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-    )
-    await fail_job(sessionmaker, settings, job_id, "internal error")
-    await fail_job(sessionmaker, settings, done_id, "internal error")
+    settings = path_settings(tmp_path)
+    await fail_job(sessionmaker, settings, job_id)
+    await fail_job(sessionmaker, settings, done_id)
     async with sessionmaker() as db:
         failed = await db.get(Job, job_id)
         assert (failed.status, failed.error) == ("failed", "internal error")
@@ -412,8 +438,7 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(
         assert (await db.get(Job, done_id)).status == "succeeded"
 
 
-@postgres_only
-async def test_two_claimers_never_take_the_same_job(sessionmaker) -> None:
+async def test_two_claimers_never_take_the_same_job(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         for index in range(2):
@@ -421,7 +446,7 @@ async def test_two_claimers_never_take_the_same_job(sessionmaker) -> None:
                 db,
                 user_id=user.id,
                 sha256=str(index) * 64,
-                source_path=f"unused-{index}.pdf",
+                source_path=str(tmp_path / f"unused-{index}.pdf"),
                 **JOB_DEFAULTS,
             )
         await db.commit()
@@ -479,6 +504,15 @@ def test_sweeper_keeps_a_live_jobs_source_however_old(tmp_path) -> None:
     assert [entry.exists() for entry in entries] == [True, True, True, False]
 
 
+# The limits a run carries from the settings, at their defaults (docs/api.md).
+RUN_LIMITS = {
+    "max_response_bytes": 33_554_432,
+    "max_output_tokens": 16_000,
+    "figures_per_page": 40,
+    "figure_check_rounds": 2,
+}
+
+
 def test_a_discarded_jobs_figures_cannot_be_written_back(tmp_path) -> None:
     """The crop guard: after `_discard_figures`, a late crop thread writes nothing
     (docs/parsing.md § Figure crops)."""
@@ -488,7 +522,7 @@ def test_a_discarded_jobs_figures_cannot_be_written_back(tmp_path) -> None:
 
     image = tmp_path / "page.png"
     Image.new("RGB", (100, 100), (10, 10, 10)).save(image, format="PNG")
-    state = RunState(budget=VisionBudget(1), figures_dir=tmp_path / "job")
+    state = RunState(budget=VisionBudget(1), figures_dir=tmp_path / "job", **RUN_LIMITS)
 
     _locked_save_figures(state, "![fig](sightread://p1/0,0,500,500)", image, 1)
     assert (tmp_path / "job" / "p1_0_0_500_500.png").is_file()
@@ -500,11 +534,15 @@ def test_a_discarded_jobs_figures_cannot_be_written_back(tmp_path) -> None:
     assert not (tmp_path / "job").exists()
 
 
-async def test_a_job_of_a_user_with_an_orphaned_turn_is_not_claimed(sessionmaker) -> None:
+async def test_a_job_of_a_user_with_an_orphaned_turn_is_not_claimed(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="3" * 64, source_path="unused-3.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="3" * 64,
+            source_path=str(tmp_path / "unused-3.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
     async with sessionmaker() as db:
@@ -518,19 +556,17 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
     """A worker that lost the worker lock goes on for seconds; the replacement has
     requeued and claimed its job by then, and nothing the stale one writes may land —
     except the usage its calls billed (docs/jobs.md § Queue)."""
-    from sqlalchemy import func, select
-
-    from sightread.config import Settings
-    from sightread.db.models import JobPage, UsageLog
     from sightread.jobs.queue import next_worker_generation, requeue_orphaned_jobs
     from sightread.jobs.runner import PageOutcome, _record_page, fail_job
-    from sightread.upstream.client import Usage
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
 
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="c" * 64, source_path="unused-c.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="c" * 64,
+            source_path=str(tmp_path / "unused-c.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
         job_id = job.id
@@ -562,13 +598,7 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
             )
         ],
     )
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-    )
+    settings = path_settings(tmp_path)
 
     async def counts(db) -> tuple[int, int]:
         pages = select(func.count()).select_from(JobPage).where(JobPage.job_id == job_id)
@@ -582,12 +612,12 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
         assert (row.pages_done, row.status, row.worker_generation) == (0, "running", fresh)
         assert await counts(db) == (0, 1)
         assert await requeue_job(db, job_id, stale) is False
-    await fail_job(sessionmaker, settings, job_id, "internal error", stale)
+    await fail_job(sessionmaker, settings, job_id, stale)
     async with sessionmaker() as db:
         assert (await db.get(Job, job_id)).status == "running"
     # The owner's writes land.
     await _record_page(sessionmaker, job, outcome, fresh)
-    await fail_job(sessionmaker, settings, job_id, "internal error", fresh)
+    await fail_job(sessionmaker, settings, job_id, fresh)
     async with sessionmaker() as db:
         row = await db.get(Job, job_id)
         assert (row.pages_done, row.status, row.error) == (1, "failed", "internal error")
@@ -603,8 +633,8 @@ def test_an_attempts_crops_are_its_own_until_published(tmp_path) -> None:
 
     job_id = uuid.uuid4()
     figures = tmp_path / "figures"
-    stale = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.stale")
-    fresh = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.fresh")
+    stale = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.stale", **RUN_LIMITS)
+    fresh = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.fresh", **RUN_LIMITS)
     for state in (stale, fresh):
         state.figures_dir.mkdir(parents=True)
         (state.figures_dir / "p1_0_0_10_10.png").write_bytes(b"png")
@@ -619,36 +649,31 @@ def test_an_attempts_crops_are_its_own_until_published(tmp_path) -> None:
     assert list(figures.iterdir()) == []
 
 
-async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
-    sessionmaker, tmp_path, monkeypatch
-) -> None:
+async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(sessionmaker, tmp_path) -> None:
     """The endpoint snapshot a run writes at its start is fenced like every other write:
     a replacement that claimed the job between the read and the update keeps its own,
     and the stale run starts nothing (docs/jobs.md § Queue)."""
-    from types import SimpleNamespace
-
     from sqlalchemy import Update
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from sightread.config import Settings
     from sightread.jobs import runner
     from sightread.jobs.queue import next_worker_generation
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+    from tests.conftest import KANO_API_KEY
 
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="d" * 64, source_path="unused-d.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="d" * 64,
+            source_path=str(tmp_path / "unused-d.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
         job_id = job.id
     async with sessionmaker() as db:
         stale = await next_worker_generation(db)
         assert await claim_next_job(db, 2, None, stale) == job_id
-
-    monkeypatch.setattr(
-        runner, "kano_connection", lambda settings: SimpleNamespace(snapshot="https://moved.test")
-    )
 
     class Interposed(AsyncSession):
         """The replacement requeues and claims the job between this run's read of the row
@@ -667,13 +692,11 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
     interposed = async_sessionmaker(
         sessionmaker.kw["bind"], class_=Interposed, expire_on_commit=False, autoflush=False
     )
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        upload_dir=str(tmp_path / "uploads"),
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
+    settings = path_settings(
+        tmp_path,
+        # The worker restarted on another origin: the run's first write is the reconcile.
+        kano_proxy_base_url="https://moved.test",
+        kano_proxy_api_key=KANO_API_KEY,
     )
     await runner.run_job(interposed, settings, job_id, asyncio.Semaphore(1), stale)
     assert replaced
@@ -691,14 +714,16 @@ async def test_the_crops_are_published_under_the_backup_lock(
     § Queue, docs/workspace.md § Backups)."""
     import contextlib
 
-    from sightread.config import Settings
     from sightread.jobs import runner
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
 
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="e" * 64, source_path="unused-e.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="e" * 64,
+            source_path=str(tmp_path / "unused-e.pdf"),
+            **JOB_DEFAULTS,
         )
         job.status = "running"
         await db.commit()
@@ -730,13 +755,7 @@ async def test_the_crops_are_published_under_the_backup_lock(
     async with sessionmaker() as db:
         db.add(Document(user_id=user.id, folder_id=None, job_id=job_id, name="e.pdf"))
         await db.commit()
-    settings = Settings(
-        app_env="local",
-        secret_key=TEST_SECRET_KEY,
-        workspaces_dir=str(tmp_path / "workspaces"),
-        figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
-    )
+    settings = path_settings(tmp_path)
     assert await runner._finish(
         sessionmaker, job_id, status="succeeded", settings=settings, publish=publish
     )
@@ -747,3 +766,148 @@ async def test_the_crops_are_published_under_the_backup_lock(
         sessionmaker, job_id, status="succeeded", settings=settings, generation=99, publish=publish
     )
     assert published_while_held == [True]
+
+
+PAGE_USAGE = Usage(prompt_tokens=1, completion_tokens=1, cost=None, cost_source="unknown")
+
+
+async def _running_job(sessionmaker, tmp_path, sha256: str) -> Job:
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db,
+            user_id=user.id,
+            sha256=sha256,
+            source_path=str(tmp_path / f"unused-{sha256[0]}.pdf"),
+            **JOB_DEFAULTS,
+        )
+        job.status = "running"
+        await db.commit()
+    return job
+
+
+async def _usage_rows(sessionmaker, job_id: uuid.UUID) -> int:
+    async with sessionmaker() as db:
+        return (
+            await db.execute(
+                select(func.count()).select_from(UsageLog).where(UsageLog.job_id == job_id)
+            )
+        ).scalar_one()
+
+
+async def test_a_page_cancelled_while_it_is_recorded_keeps_its_usage(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """A sibling's abort or a shutdown cancels the page while its record commits: the
+    record is waited out, its answered call in `usage_log`, and the cancel still ends the
+    page (docs/parsing.md § Upstream usage)."""
+    from sqlalchemy import Update
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from sightread.jobs import runner
+
+    job = await _running_job(sessionmaker, tmp_path, "f" * 64)
+
+    async def transcribed(job, state, connection, outcome, image, page_no, sessionmaker):
+        outcome.model = job.model
+        outcome.usage.append((job.model, PAGE_USAGE))
+        return PageTranscription(markdown="text", usage=PAGE_USAGE)
+
+    monkeypatch.setattr(runner, "_transcribe", transcribed)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Held(AsyncSession):
+        """Holds the page's record at its first write until the test lets it go."""
+
+        async def execute(self, statement, *args, **kwargs):
+            if isinstance(statement, Update):
+                entered.set()
+                await release.wait()
+            return await super().execute(statement, *args, **kwargs)
+
+    held = async_sessionmaker(
+        sessionmaker.kw["bind"], class_=Held, expire_on_commit=False, autoflush=False
+    )
+    state = runner.RunState(
+        budget=runner.VisionBudget(1), figures_dir=tmp_path / "job", **RUN_LIMITS
+    )
+    outcome = runner.PageOutcome(page=1, width_pt=1.0, height_pt=1.0, method="vision")
+    image = tmp_path / "page.png"
+    image.write_bytes(b"png")
+
+    page = asyncio.create_task(runner._run_page(job, state, None, outcome, image, held))
+    await entered.wait()
+    page.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await page
+
+    assert await _usage_rows(sessionmaker, job.id) == 1
+    async with sessionmaker() as db:
+        assert (await db.get(Job, job.id)).pages_done == 1
+    assert not image.exists()
+
+
+async def test_a_figure_check_call_is_billed_before_its_raster_work(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """A cancel while the boxes a check call corrected are pushed out in a thread ends the
+    page before its record: the call that answered is in `usage_log` already
+    (docs/parsing.md § Figure check)."""
+    import threading
+
+    from PIL import Image
+
+    from sightread.jobs import runner
+
+    job = await _running_job(sessionmaker, tmp_path, "9" * 64)
+    loop = asyncio.get_running_loop()
+    entered, release = asyncio.Event(), threading.Event()
+
+    class Ink:
+        """The rules flag the page's box; the push after the model's correction blocks."""
+
+        def __init__(self, image) -> None:
+            self.pushes = 0
+
+        def push_out(self, boxes, indices):
+            self.pushes += 1
+            if self.pushes > 1:
+                loop.call_soon_threadsafe(entered.set)
+                release.wait(10)
+            return list(boxes), True
+
+    async def answered(job, state, outcome, model, call, sessionmaker):
+        outcome.usage.append((model, PAGE_USAGE))
+        return PageTranscription(markdown="verdicts", usage=PAGE_USAGE)
+
+    monkeypatch.setattr(runner, "PageInk", Ink)
+    monkeypatch.setattr(runner, "_guarded_call", answered)
+    monkeypatch.setattr(runner, "read_verdicts", lambda *args: {0: (110, 110, 510, 510)})
+    state = runner.RunState(
+        budget=runner.VisionBudget(1), figures_dir=tmp_path / "job", **RUN_LIMITS
+    )
+    outcome = runner.PageOutcome(
+        page=1,
+        width_pt=1.0,
+        height_pt=1.0,
+        method="vision",
+        markdown="![fig](sightread://p1/100,100,500,500)",
+        model=job.model,
+        usage=[(job.model, PAGE_USAGE)],
+    )
+    image = tmp_path / "page.png"
+    Image.new("RGB", (200, 200), (255, 255, 255)).save(image, format="PNG")
+
+    check = asyncio.create_task(
+        runner._check_figures(job, state, None, outcome, image, sessionmaker)
+    )
+    await entered.wait()
+    check.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await check
+
+    # The transcription and the check call.
+    assert await _usage_rows(sessionmaker, job.id) == 2

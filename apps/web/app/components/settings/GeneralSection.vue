@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * General (docs/web.md § Pages, `/settings/<section>`): the theme, the language and the
+ * General (docs/web.md § Pages, `?settings=<section>`): the theme, the language and the
  * reader's body margins.
  *
  * Theme is a three-way segmented control, kept in `localStorage` by `useTheme`. Language is

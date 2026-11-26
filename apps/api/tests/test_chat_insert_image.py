@@ -20,22 +20,25 @@ from sightread.agents import chat as chat_agent
 from sightread.config import Settings
 from sightread.jobs import chat_runner
 from sightread.workspace.documents import measure_storage
-from sightread.workspace.layout import images_dir, user_root
-from tests.conftest import PARSE_MODEL, TEST_MODEL_PRICES
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_convert import _keep, _papers
-from tests.test_chat_extensions import (
+from sightread.workspace.layout import images_dir
+from tests.chat_helpers import (
+    DOC_PATH,
+    DONE,
     chatting_client,
+    keep_file,
     new_conversation,
     one_call,
+    papers_folder,
+    run_queued_turn,
     send,
     stub_messages,
+    tool_results,
+    turn_credits,
 )
-from tests.test_chat_web import tool_results, turn_credits
-from tests.test_document_images import _image
+from tests.conftest import PARSE_MODEL, TEST_MODEL_PRICES
+from tests.helpers import staged_uploads
+from tests.library_helpers import image_bytes
 
-DOCUMENT = "/workspace/files/Papers/paper.pdf"
-DONE = ([{"type": "text", "text": "Done."}], "end_turn")
 LINE = re.compile(r"!\[\]\(figures/(img-[0-9a-f]{16}\.(?:png|jpg))\)")
 NO_DOCUMENT = "give the doc.md or notes.md of one of the user's documents."
 
@@ -47,12 +50,6 @@ def _noise(size: tuple[int, int] = (64, 64)) -> bytes:
     return buffer.getvalue()
 
 
-async def _client(make_client, tmp_path, **overrides) -> httpx.AsyncClient:
-    return await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), **overrides)
-    )
-
-
 async def _markdown(client: httpx.AsyncClient) -> str:
     """The seeded document's text; reading it writes its directory, as a turn finds it."""
     content = await client.get(f"/api/library/documents/{client.document_id}/content")
@@ -62,7 +59,7 @@ async def _markdown(client: httpx.AsyncClient) -> str:
 
 async def _workspace(client: httpx.AsyncClient) -> Path:
     await _markdown(client)
-    return user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    return client.root
 
 
 async def _turn(client: httpx.AsyncClient, conversation_id: int, *calls: dict) -> list[dict]:
@@ -71,7 +68,7 @@ async def _turn(client: httpx.AsyncClient, conversation_id: int, *calls: dict) -
         [*(one_call(f"i{i}", "insert_image", call) for i, call in enumerate(calls)), DONE]
     )
     await send(client, conversation_id, text="Put the chart in my notes")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     return await tool_results(client, conversation_id)
 
 
@@ -102,28 +99,27 @@ def test_the_tool_is_declared_last_on_every_deployment() -> None:
 
 
 @respx.mock
-async def test_a_chart_and_a_kept_picture_become_images_of_the_document(
-    make_client, tmp_path
-) -> None:
+async def test_a_chart_and_a_kept_picture_become_images_of_the_document(chat_client) -> None:
     """docs/chat.md § Tools: a PNG the shell saved under `.cache` and a JPEG in Files are
     stored under their hash and copied into the document's `figures/`, as the upload keeps
     them; each call answers the line to write. The tool writes no text, leaves the agent's
     file where it was, and costs nothing beyond the turn's tokens."""
-    client = await _client(make_client, tmp_path)
-    settings = client.app.state.settings
+    client = chat_client
     root = await _workspace(client)
     before = await _markdown(client)
-    chart = _image("PNG")
+    chart = image_bytes("PNG")
     (root / ".cache").mkdir(exist_ok=True)
     (root / ".cache" / "loss.png").write_bytes(chart)
-    await _keep(client, "photo.jpg", _image("JPEG"), "image/jpeg", await _papers(client))
+    await keep_file(
+        client, "photo.jpg", image_bytes("JPEG"), "image/jpeg", await papers_folder(client)
+    )
     conversation_id = await new_conversation(client)
     first, second = await _turn(
         client,
         conversation_id,
-        {"image": "/workspace/.cache/loss.png", "document": f"{DOCUMENT}/notes.md"},
+        {"image": "/workspace/.cache/loss.png", "document": f"{DOC_PATH}/notes.md"},
         # A picture of the reader's, into the document named by its directory.
-        {"image": "/workspace/files/Papers/photo.jpg", "document": DOCUMENT},
+        {"image": "/workspace/files/Papers/photo.jpg", "document": DOC_PATH},
     )
     names = []
     for result, suffix in ((first, ".png"), (second, ".jpg")):
@@ -132,7 +128,7 @@ async def test_a_chart_and_a_kept_picture_become_images_of_the_document(
         assert match and match.group(1).endswith(suffix), result["output"]
         names.append(match.group(1))
     assert first["output"].startswith(
-        f"Kept /workspace/.cache/loss.png as an image of the document at {DOCUMENT}."
+        f"Kept /workspace/.cache/loss.png as an image of the document at {DOC_PATH}."
     )
     for name in names:
         kept = images_dir(root) / str(client.document_id) / name
@@ -144,23 +140,22 @@ async def test_a_chart_and_a_kept_picture_become_images_of_the_document(
     # The agent's file stays; nothing staged is left behind; no text was written.
     assert (root / ".cache" / "loss.png").read_bytes() == chart
     assert (root / "files" / "Papers" / "photo.jpg").is_file()
-    assert list(Path(settings.upload_dir).iterdir()) == []
+    assert staged_uploads(client) == []
     assert await _markdown(client) == before
     assert await turn_credits(client, conversation_id) == ("succeeded", 1)
 
 
 @respx.mock
-async def test_insert_image_refuses_what_it_cannot_keep(make_client, tmp_path) -> None:
+async def test_insert_image_refuses_what_it_cannot_keep(chat_client) -> None:
     """docs/chat.md § Tools: a path outside /workspace, a missing file, a link, a file that
     is no image, and a document that is not one of the reader's — a folder, or a directory
     whose `.meta.json` the shell wrote to name a real document — each answer an error, and
     nothing is stored."""
-    client = await _client(make_client, tmp_path)
-    settings = client.app.state.settings
+    client = chat_client
     root = await _workspace(client)
     cache = root / ".cache"
     (cache / "forged").mkdir(parents=True)
-    (cache / "loss.png").write_bytes(_image("PNG"))
+    (cache / "loss.png").write_bytes(image_bytes("PNG"))
     (cache / "notes.txt").write_text("not a picture")
     (cache / "link.png").symlink_to(cache / "loss.png")
     (cache / "forged" / ".meta.json").write_text(json.dumps({"document_id": client.document_id}))
@@ -170,11 +165,11 @@ async def test_insert_image_refuses_what_it_cannot_keep(make_client, tmp_path) -
         client,
         conversation_id,
         # The VM's /tmp is the VM's alone: never a path the worker can read.
-        {"image": "/tmp/loss.png", "document": DOCUMENT},  # noqa: S108
+        {"image": "/tmp/loss.png", "document": DOC_PATH},  # noqa: S108
         {"image": chart, "document": ""},
-        {"image": "/workspace/.cache/none.png", "document": DOCUMENT},
-        {"image": "/workspace/.cache/link.png", "document": DOCUMENT},
-        {"image": "/workspace/.cache/notes.txt", "document": DOCUMENT},
+        {"image": "/workspace/.cache/none.png", "document": DOC_PATH},
+        {"image": "/workspace/.cache/link.png", "document": DOC_PATH},
+        {"image": "/workspace/.cache/notes.txt", "document": DOC_PATH},
         {"image": chart, "document": "/workspace/files/Papers"},
         {"image": chart, "document": "/workspace/.cache/forged/doc.md"},
     )
@@ -190,15 +185,15 @@ async def test_insert_image_refuses_what_it_cannot_keep(make_client, tmp_path) -
     ]
     assert not (images_dir(root) / str(client.document_id)).exists()
     assert not (root / "files" / "Papers" / "paper.pdf" / "figures").exists()
-    assert list(Path(settings.upload_dir).iterdir()) == []
+    assert staged_uploads(client) == []
 
 
 @respx.mock
-async def test_an_image_past_its_cap_or_the_quota_is_refused(make_client, tmp_path) -> None:
+async def test_an_image_past_its_cap_or_the_quota_is_refused(make_client) -> None:
     """docs/chat.md § Tools: the file is read at most `DOCUMENT_IMAGE_MAX_BYTES`, and the
     quota is checked on each image, as the upload checks it: the first kept image fills the
     room the plan left, and the next is refused as storage full."""
-    client = await _client(make_client, tmp_path, document_image_max_bytes=64 * 1024)
+    client = await chatting_client(make_client(document_image_max_bytes=64 * 1024))
     root = await _workspace(client)
     cache = root / ".cache"
     cache.mkdir(exist_ok=True)
@@ -210,28 +205,27 @@ async def test_an_image_past_its_cap_or_the_quota_is_refused(make_client, tmp_pa
         used = (await measure_storage(db, client.app.state.settings, client.user_id, root)).total
     # The same workspace and user, on a plan with room for a few bytes more.
     tight = make_client(
-        workspaces_dir=str(tmp_path / "workspaces"),
         document_image_max_bytes=64 * 1024,
         free_storage_bytes=used + 50,
     )
     stub_messages(
         [
             one_call(
-                "i0", "insert_image", {"image": "/workspace/.cache/big.png", "document": DOCUMENT}
+                "i0", "insert_image", {"image": "/workspace/.cache/big.png", "document": DOC_PATH}
             ),
             one_call(
-                "i1", "insert_image", {"image": "/workspace/.cache/first.png", "document": DOCUMENT}
+                "i1", "insert_image", {"image": "/workspace/.cache/first.png", "document": DOC_PATH}
             ),
             one_call(
                 "i2",
                 "insert_image",
-                {"image": "/workspace/.cache/second.png", "document": DOCUMENT},
+                {"image": "/workspace/.cache/second.png", "document": DOC_PATH},
             ),
             DONE,
         ]
     )
     await send(client, conversation_id, text="Put the charts in")
-    await _run_queued_turn(tight)
+    await run_queued_turn(tight)
     big, first, second = await tool_results(client, conversation_id)
     assert big["is_error"] is True
     assert big["output"] == (

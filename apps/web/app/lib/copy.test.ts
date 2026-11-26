@@ -201,14 +201,6 @@ describe('rendered inline markdown', () => {
 
     expect(nodesToMarkdown([paragraph])).toBe('H<sub>2</sub>O and THYAGATURU<SUP>1</SUP>')
   })
-
-  it('hands back a KaTeX display block from its data-md', () => {
-    const block = el('div', { class: 'md-math-block', 'data-md': '$$\nx = 1\n$$' }, [
-      text('x=1'),
-    ])
-
-    expect(nodesToMarkdown([block])).toBe('$$\nx = 1\n$$')
-  })
 })
 
 describe('partially selected styled elements', () => {

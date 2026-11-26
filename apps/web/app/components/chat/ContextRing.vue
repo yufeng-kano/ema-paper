@@ -9,19 +9,16 @@
  * what a cold next message re-reads; no cache on this model — the **Compact idle
  * conversations** switch, and **Compact now**, which the panel sends as `/compact`.
  */
-import { putAgentSettings, type AgentSettings, type Conversation, type SavedAgentSettings } from '~/lib/api'
+import { CHAT_AGENT, putAgentSettings, type AgentSettings, type Conversation, type SavedAgentSettings } from '~/lib/api'
 import { cacheState, contextFill, contextLine, formatTokens, ringLevel } from '~/lib/context'
 import { formatCount } from '~/lib/format'
-import { modalPanelKey } from '~/lib/menu'
+import { modalPanelKey, placeCard } from '~/lib/menu'
 
-const CHAT_AGENT = 'chat'
 /** The ring's circumference: a 20-unit box, a radius of 8. */
 const RADIUS = 8
 const CIRCUMFERENCE = 2 * Math.PI * RADIUS
 /** How often the card reads the clock again. */
 const TICK_MS = 30_000
-const GAP = 6
-const MARGIN = 8
 
 const props = defineProps<{
   /** The open conversation as the panel last read it; null on the draft. */
@@ -107,32 +104,15 @@ function place() {
   if (!element || !anchor) {
     return
   }
-  const at = anchor.getBoundingClientRect()
-  const size = { width: element.offsetWidth, height: element.offsetHeight }
-  const roomAbove = at.top - GAP - MARGIN
-  const y =
-    size.height <= roomAbove
-      ? at.top - GAP - size.height
-      : Math.min(at.bottom + GAP, Math.max(MARGIN, window.innerHeight - MARGIN - size.height))
-  const x = Math.max(MARGIN, Math.min(at.left, window.innerWidth - MARGIN - size.width))
-  position.value = { x, y }
+  position.value = placeCard(
+    anchor.getBoundingClientRect(),
+    { width: element.offsetWidth, height: element.offsetHeight },
+    { width: window.innerWidth, height: window.innerHeight },
+    { prefer: 'above' },
+  )
 }
 
-function outside(target: EventTarget | null): boolean {
-  return target instanceof Node && !card.value?.contains(target) && !button.value?.contains(target)
-}
-
-function onPointerdown(event: PointerEvent) {
-  if (outside(event.target)) {
-    close()
-  }
-}
-
-function onFocusout(event: FocusEvent) {
-  if (outside(event.relatedTarget)) {
-    close()
-  }
-}
+const floating = useFloatingCard({ card, anchor: () => button.value, place, close })
 
 function onKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape') {
@@ -143,8 +123,6 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
-let observer: ResizeObserver | null = null
-
 async function show() {
   open.value = true
   now.value = Date.now()
@@ -154,12 +132,7 @@ async function show() {
   await nextTick()
   place()
   card.value?.focus()
-  observer = new ResizeObserver(() => place())
-  if (card.value) {
-    observer.observe(card.value)
-  }
-  window.addEventListener('pointerdown', onPointerdown, true)
-  window.addEventListener('resize', place)
+  floating.start()
 }
 
 function close() {
@@ -171,10 +144,7 @@ function close() {
     clearInterval(ticker)
     ticker = null
   }
-  observer?.disconnect()
-  observer = null
-  window.removeEventListener('pointerdown', onPointerdown, true)
-  window.removeEventListener('resize', place)
+  floating.stop()
 }
 
 function toggle() {
@@ -221,23 +191,17 @@ onBeforeUnmount(close)
       :aria-labelledby="titleId"
       :style="{ left: `${position.x}px`, top: `${position.y}px` }"
       @keydown="onKeydown"
-      @focusout="onFocusout"
+      @focusout="floating.onFocusout"
     >
       <p :id="titleId" class="card-title">{{ t('chat.ring.title') }}</p>
-      <p class="card-line tabular" :class="level">
-        <template v-if="line">
-          {{ line }}
-        </template>
-        <template v-else>{{ t('chat.ring.empty') }}</template>
-      </p>
+      <p class="card-line tabular" :class="level">{{ line ?? t('chat.ring.empty') }}</p>
       <p v-if="conversation?.context_window && !line" class="card-note">
         {{ t('chat.ring.window', { window: formatTokens(conversation.context_window) }) }}
       </p>
       <p v-if="cacheText" class="card-line" :class="{ danger: cache?.kind === 'expired' }">{{ cacheText }}</p>
-      <div class="card-switch">
-        <UiSwitch :model-value="idleOn" :label="t('agents.idleCompact.label')" :busy="idlePending" @update:model-value="toggleIdle" />
-        <span class="card-switch-words">{{ t('agents.idleCompact.label') }}</span>
-      </div>
+      <UiSwitch class="card-switch" :model-value="idleOn" :busy="idlePending" @update:model-value="toggleIdle">
+        {{ t('agents.idleCompact.label') }}
+      </UiSwitch>
       <p class="card-note">{{ t('agents.idleCompact.note') }}</p>
       <UiButton size="sm" variant="secondary" :disabled="!canCompact" @click="emit('compact')">
         {{ t('chat.ring.compactNow') }}
@@ -299,7 +263,8 @@ onBeforeUnmount(close)
   color: var(--danger);
 }
 
-/* The context card's surface (chat/ContextCard.vue). */
+/* The context card's surface (chat/ContextCard.vue), drawn here in this card's own scoped
+   rules: a little narrower, and short enough never to scroll. */
 .card {
   position: fixed;
   z-index: 90;
@@ -346,23 +311,15 @@ onBeforeUnmount(close)
   color: var(--ink);
 }
 
-.card-line.accent {
-  color: var(--ink);
-}
-
 .card-note {
   color: var(--muted);
 }
 
+/* The capsule's words line up with the card's text. */
 .card-switch {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+  align-self: flex-start;
   margin-top: var(--space-1);
-}
-
-.card-switch-words {
-  color: var(--ink);
+  margin-left: calc(-1 * var(--space-3));
 }
 
 .card > :last-child {

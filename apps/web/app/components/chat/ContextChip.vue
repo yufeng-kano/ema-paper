@@ -12,6 +12,8 @@ defineProps<{
   text: string
   /** The fixed **This document** chip: drawn quieter, since it carries nothing of its own. */
   faint?: boolean
+  /** The Files page's selection: on the accent's tint, as the selected rows are. */
+  accent?: boolean
   /** The remove control's name; none, no control. */
   removeLabel?: string
   /** What a cut text stands for in full — a section's heading. */
@@ -25,7 +27,7 @@ const emit = defineEmits<{ remove: [] }>()
 </script>
 
 <template>
-  <span class="chip" :class="{ faint, refused: refusal }">
+  <span class="chip" :class="{ faint, accent, refused: refusal }">
     <UiIcon :name="icon" />
     <span class="chip-text" :title="tooltip">{{ text }}</span>
     <span v-if="refusal" class="chip-reason">{{ refusal }}</span>
@@ -69,6 +71,16 @@ const emit = defineEmits<{ remove: [] }>()
 
 .chip.faint {
   color: var(--faint);
+}
+
+.chip.accent,
+.chip.accent > :deep(svg),
+.chip.accent .chip-drop {
+  color: var(--accent);
+}
+
+.chip.accent {
+  background: var(--accent-tint);
 }
 
 .chip.refused {

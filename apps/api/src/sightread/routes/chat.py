@@ -12,33 +12,29 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import re
 import secrets
 import uuid
 from pathlib import Path
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy import ColumnElement, delete, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
 from ..agents import chat as chat_agent
 from ..agents import memory as memory_defs
 from ..agents import skills as skill_defs
-from ..agents.chat import (  # noqa: F401 - re-exported: the context route and the tests read them here
-    ANSWER_LANGUAGE_RULE,
-    TRANSLATION_LANGUAGE_RULE,
-    TURN_CONTEXT,
-    turn_note,
-)
+from ..agents.chat import TURN_CONTEXT
 from ..agents.summary import TITLE_MAX_CHARS
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger
 from ..billing.credits import credits_for_usd
 from ..db.models import (
     COMPACT_TURN,
-    FILE_KIND,
     MESSAGE_TURN,
     AgentSetting,
     ChatAttachment,
@@ -47,7 +43,6 @@ from ..db.models import (
     Document,
     Message,
     Skill,
-    User,
     utcnow,
 )
 from ..errors import ApiError
@@ -57,16 +52,24 @@ from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history
 from ..parsing.attachments import prepared_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..upstream.client import agent_models
+from ..workspace.agents_file import AGENTS_FILE, VM_ROOT
 from ..workspace.documents import (
     StorageUsage,
-    current_revision,
     ensure_within_quota,
+    folder_chain,
+    folder_path,
     is_live,
+    item_path,
+    live_text_document,
+    make_folder_dir,
     materialize_document,
     measure_storage,
+    trashed_folder_ids,
     user_folders,
 )
-from ..workspace.layout import user_root
+from ..workspace.layout import FILES_DIR, path_segment, user_root
+from ..workspace.locks import workspace_lock
+from ..workspace.trash import lock_user
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -90,9 +93,7 @@ def conversation_payload(row: Conversation, settings: AppSettings, *, compactabl
     return {
         "id": row.id,
         "title": row.title,
-        "document_id": row.document_id,
         "model": row.model,
-        "compacted_message_id": row.compacted_message_id,
         "compactable": compactable,
         "context_tokens": row.context_tokens,
         "context_window": (
@@ -120,35 +121,16 @@ async def owned_conversation(db: AsyncSession, user_id: int, conversation_id: in
     return row
 
 
-async def owned_document(db: AsyncSession, user_id: int, document_id: int) -> Document:
-    """A document of the caller's that is not in the Trash: a trashed file is not talked
-    about until it is put back (docs/api.md)."""
-    row = (
-        await db.execute(
-            select(Document).where(Document.id == document_id, Document.user_id == user_id)
-        )
-    ).scalar_one_or_none()
-    # A file of the library has no conversations (docs/workspace.md § Files).
-    if row is None or row.kind == FILE_KIND or not is_live(row, await user_folders(db, user_id)):
-        raise ApiError(404, "invalid_request", "No such document")
-    return row
-
-
-@router.get("/library/documents/{document_id}/conversations")
-async def list_conversations(
-    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    document = await owned_document(db, user.id, document_id)
+async def _listed(db: AsyncSession, settings: AppSettings, *where: ColumnElement[bool]) -> dict:
+    """The conversations `where` picks, the one continued last first, as a list route
+    answers with them."""
     # Only threads with a message: an empty row is a first send that was refused, kept for
     # its retry, and never a conversation to pick (docs/chat.md § Conversations).
     rows = (
         (
             await db.execute(
                 select(Conversation)
-                .where(
-                    Conversation.document_id == document.id,
-                    exists().where(Message.conversation_id == Conversation.id),
-                )
+                .where(*where, exists().where(Message.conversation_id == Conversation.id))
                 .order_by(Conversation.updated_at.desc())
             )
         )
@@ -163,6 +145,14 @@ async def list_conversations(
     }
 
 
+@router.get("/library/documents/{document_id}/conversations")
+async def list_conversations(
+    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    document = await live_text_document(db, user.id, document_id)
+    return await _listed(db, settings, Conversation.document_id == document.id)
+
+
 @router.post(
     "/library/documents/{document_id}/conversations",
     dependencies=[CsrfGuard],
@@ -171,15 +161,15 @@ async def list_conversations(
 async def create_conversation(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    document = await owned_document(db, user.id, document_id)
+    document = await live_text_document(db, user.id, document_id)
     # The document's directory exists from here on: the thread is about its files.
     await materialize_document(db, settings, document)
     # The user's row, the lock a delete takes before it decides, then the document
     # again under it: a delete racing this ends with a clean 404 here, or with a thread
     # the delete then takes along with the document — never a 500 (docs/api.md).
-    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    await lock_user(db, user.id)
     # The same lock a move to the Trash takes: one meanwhile is a 404 here too.
-    await owned_document(db, user.id, document.id)
+    await live_text_document(db, user.id, document.id)
     row = Conversation(
         user_id=user.id,
         document_id=document.id,
@@ -187,6 +177,30 @@ async def create_conversation(
         # The shell this thread holds in the user's VM (docs/sandbox.md).
         session=secrets.token_hex(8),
     )
+    db.add(row)
+    await db.commit()
+    return conversation_payload(row, settings, compactable=False)
+
+
+@router.get("/library/conversations")
+async def list_library_conversations(user: SessionUser, db: DbSession, settings: AppSettings):
+    """The Files page's threads: the caller's library conversations, apart from every
+    document's, only those holding a message, the one continued last first (docs/chat.md
+    § Library conversations)."""
+    return await _listed(
+        db, settings, Conversation.user_id == user.id, Conversation.document_id.is_(None)
+    )
+
+
+@router.post(
+    "/library/conversations", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED
+)
+async def create_library_conversation(user: SessionUser, db: DbSession, settings: AppSettings):
+    """A library conversation, about no document: the workspace is made sure of first, since
+    there is no document to materialize (docs/chat.md § Library conversations)."""
+    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        await make_folder_dir(settings, user.id, Path(FILES_DIR))
+    row = Conversation(user_id=user.id, document_id=None, title="", session=secrets.token_hex(8))
     db.add(row)
     await db.commit()
     return conversation_payload(row, settings, compactable=False)
@@ -200,6 +214,11 @@ ATTACHMENT_EXPIRED = "An attachment is no longer available; attach it again"
 
 
 SECTION_CONTEXT = "section"
+# The Files page as a library conversation's message carries it (docs/chat.md § Library
+# conversations): the block's marker, and what the model reads before the folder.
+LIBRARY_CONTEXT = "library"
+LIBRARY_PREFIX = "The Files page as the user sent this message:"
+NO_PASSAGE = "A library conversation has no document passage"
 
 
 def section_text(heading: str, text: str | None) -> str:
@@ -222,7 +241,8 @@ def display_content(content: list) -> list:
     selection and the quote are sent as the passage alone, without the line that
     introduces it to the model, so the note the panel shows counts the passage and
     nothing else; a command's skill, an attached file and a whole section are sent as what
-    they name, not the text the model reads (docs/api.md § Chat)."""
+    they name, not the text the model reads
+    (docs/api.md § Chat, `GET /api/conversations/{id}`)."""
     shown = []
     for block in content:
         if not isinstance(block, dict):
@@ -250,6 +270,19 @@ def display_content(content: list) -> list:
             shown.append(
                 {"type": "text", "context": "attachment", "attachment": block.get("attachment")}
             )
+        elif marker == LIBRARY_CONTEXT:
+            # The Files paths the thread draws above the bubble, never the model's text.
+            stored = block.get("library") if isinstance(block.get("library"), dict) else {}
+            shown.append(
+                {
+                    "type": "text",
+                    "context": LIBRARY_CONTEXT,
+                    "library": {
+                        "folder": stored.get("folder") or "",
+                        "items": stored.get("items") or [],
+                    },
+                }
+            )
         elif marker == chat_agent.INIT_CONTEXT:
             # The `/init` instruction is nothing the thread shows; the marker stays, so the
             # thread knows the message for a command and an edit keeps its arguments
@@ -274,31 +307,49 @@ async def read_conversation(
     turns = await chat_versions.conversation_turns(db, row.id)
     shown = chat_versions.branch(turns, row.head_id)
     on_branch = [turn.id for turn in shown]
-    messages = (
-        await db.execute(
-            select(Message)
-            .where(
-                Message.conversation_id == row.id,
-                or_(Message.turn_id.is_(None), Message.turn_id.in_(on_branch)),
+    # Read batch by batch, each row kept only as the panel draws it: a long thread's stored
+    # images are never held whole in the API process (docs/api.md). With them, what
+    # `chat_compact.compactable` asks, answered from the branch's rows as they are read: an
+    # assistant message since the branch's summary row (docs/chat.md § Compaction).
+    boundary = row.compacted_message_id or 0
+    compactable = False
+    messages: list[dict] = []
+    cursor = 0
+    while True:
+        batch = (
+            (
+                await db.execute(
+                    select(Message)
+                    .where(
+                        Message.conversation_id == row.id,
+                        or_(Message.turn_id.is_(None), Message.turn_id.in_(on_branch)),
+                        Message.id > cursor,
+                    )
+                    .order_by(Message.id)
+                    .limit(chat_events.REPLAY_BATCH_SIZE)
+                )
             )
-            .order_by(Message.id)
+            .scalars()
+            .all()
         )
-    ).scalars()
+        for message in batch:
+            compactable = compactable or (message.role == "assistant" and message.id > boundary)
+            messages.append(
+                {
+                    "id": message.id,
+                    "role": message.role,
+                    "content": display_content(message.content),
+                    "turn_id": str(message.turn_id) if message.turn_id else None,
+                    "created_at": message.created_at,
+                }
+            )
+        if len(batch) < chat_events.REPLAY_BATCH_SIZE:
+            break
+        cursor = batch[-1].id
     credits = await ledger.credits_by_turn(db, on_branch)
     return {
-        "conversation": conversation_payload(
-            row, settings, compactable=await chat_compact.compactable(db, row.id)
-        ),
-        "messages": [
-            {
-                "id": message.id,
-                "role": message.role,
-                "content": display_content(message.content),
-                "turn_id": str(message.turn_id) if message.turn_id else None,
-                "created_at": message.created_at,
-            }
-            for message in messages
-        ],
+        "conversation": conversation_payload(row, settings, compactable=compactable),
+        "messages": messages,
         "turns": [
             {
                 "id": str(turn.id),
@@ -336,7 +387,7 @@ async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSes
     # rows vanish under it (docs/chat.md § Conversations, turns, events). A cancelled turn
     # counts until the worker has wound it down — only `finished_at` says it has.
     await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
-    if await _active_turn(db, row.id) is not None:
+    if await chat_versions.unfinished_turn(db, row.id):
         raise ApiError(
             409,
             "invalid_request",
@@ -404,7 +455,7 @@ async def update_conversation(
         # Under the conversation's lock, as a send decides: no turn may start under the
         # move or the switch.
         await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
-        if await _active_turn(db, row.id) is not None:
+        if await chat_versions.unfinished_turn(db, row.id):
             raise ApiError(
                 409,
                 "invalid_request",
@@ -437,10 +488,16 @@ async def update_conversation(
     )
 
 
+# A language tag, as the web app's locale is one (docs/api.md).
+LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
+LANGUAGE_TAG_MAX_CHARS = 16
+Locale = Annotated[str, Field(max_length=LANGUAGE_TAG_MAX_CHARS, pattern=LANGUAGE_TAG.pattern)]
+
+
 class TitleRequest(BaseModel):
     # The web app's locale: the language the title is written in unless the reader chose
     # an answer language (docs/chat.md § Conversations, turns, events).
-    locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
+    locale: Locale = "en"
 
 
 @router.post("/conversations/{conversation_id}/title", dependencies=[CsrfGuard])
@@ -471,6 +528,21 @@ class SectionIn(BaseModel):
     text: str | None = None
 
 
+class LibraryItemIn(BaseModel):
+    kind: Literal["folder", "document"]
+    id: int
+
+
+class LibraryIn(BaseModel):
+    """The Files page as the reader sent a library conversation's message: the folder open
+    in the list (None: the top) and the rows selected on the Files tab (docs/chat.md
+    § Library conversations). At most `CHAT_LIBRARY_ITEMS_PER_MESSAGE` items, checked in
+    the route."""
+
+    folder_id: int | None = None
+    items: list[LibraryItemIn] = Field(default_factory=list)
+
+
 class MessageCreate(BaseModel):
     # The caps are the deployment's (`CHAT_MESSAGE_MAX_CHARS`, `CHAT_SELECTION_MAX_CHARS`,
     # `CHAT_SECTIONS_PER_MESSAGE`, `CHAT_ATTACHMENTS_PER_MESSAGE`), checked in the route
@@ -489,24 +561,10 @@ class MessageCreate(BaseModel):
     command: str | None = Field(default=None, max_length=64)
     # Ids `POST /api/attachments` returned.
     attachments: list[uuid.UUID] = Field(default_factory=list)
+    # A library conversation's only: the Files page as the message was sent.
+    library: LibraryIn | None = None
     # The web app's locale: the language the turn answers in (docs/chat.md § System prompt).
-    locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
-
-
-async def _active_turn(db: AsyncSession, conversation_id: int) -> uuid.UUID | None:
-    """A turn the worker may still be driving: queued, running, or cancelled but not
-    yet wound down — anything without `finished_at` (docs/chat.md)."""
-    return (
-        (
-            await db.execute(
-                select(ChatTurn.id).where(
-                    ChatTurn.conversation_id == conversation_id, ChatTurn.finished_at.is_(None)
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
+    locale: Locale = "en"
 
 
 async def _ready_to_chat(
@@ -549,17 +607,18 @@ async def _admitted(
     """The admission a message and an edit share (docs/chat.md § Conversations, turns,
     events): the workspace's quota, the locks, the live-document check, the model fixed on
     a first send, the per-user cap and one turn at a time. Returns the conversation's row
-    as locked — its title, head and summary row, read under the lock — the document, the
-    chat agent's settings and the conversation's turns, read under the lock too: the branch
-    a message joins is decided where no other send can move it."""
+    as locked — its title, head and summary row, read under the lock — the document (None
+    for a library conversation), the chat agent's settings and the conversation's turns,
+    read under the lock too: the branch a message joins is decided where no other send can
+    move it."""
     # A full workspace runs no turn (docs/workspace.md § Quota): refused here, where the
     # reader is told at once, rather than as a turn that fails after it was accepted.
     await ensure_within_quota(db, settings, user.id, user_root(settings.workspaces_dir, user.id))
     # Enforced where the decisions are made, under row locks held until this transaction
-    # commits (PostgreSQL; the SQLite fallback runs one request at a time): the user's row
-    # for the per-user cap, so two sends to different conversations cannot both slip under
-    # it, then the conversation's for one turn at a time — always in that order.
-    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    # commits: the user's row for the per-user cap, so two sends to different
+    # conversations cannot both slip under it, then the conversation's for one turn at a
+    # time — always in that order.
+    await lock_user(db, user.id)
     # The title read under the lock too: a rename that landed after `row` was read must
     # not be overwritten by the first line of a first message.
     locked = (
@@ -580,12 +639,17 @@ async def _admitted(
         raise ApiError(404, "invalid_request", "No such conversation")
     # Under the user's row lock, which a move to the Trash takes before it marks the row:
     # no turn starts on a file in the Trash, and none queued here is missed by its check
-    # for unfinished turns (docs/workspace.md § The Trash).
-    document = await db.get(Document, row.document_id)
-    if document is None or not is_live(document, await user_folders(db, user.id)):
-        raise ApiError(409, "invalid_request", "This file is in the Trash; put it back to continue")
+    # for unfinished turns (docs/workspace.md § The Trash). A library conversation has no
+    # document to check (docs/chat.md § Library conversations).
+    document = None
+    if row.document_id is not None:
+        document = await db.get(Document, row.document_id)
+        if document is None or not is_live(document, await user_folders(db, user.id)):
+            raise ApiError(
+                409, "invalid_request", "This file is in the Trash; put it back to continue"
+            )
     setting, model = await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
-    if row.model is None and model is not None:
+    if row.model is None:
         # The model the message was sent under, fixed as it is accepted: a change on the
         # Agent page while the turn waits in the queue does not reach it (docs/chat.md).
         row.model = model
@@ -596,7 +660,7 @@ async def _admitted(
             "Too many running conversations; wait for one to finish",
             headers={"Retry-After": str(settings.chat_retry_after_seconds)},
         )
-    if await _active_turn(db, row.id) is not None:
+    if await chat_versions.unfinished_turn(db, row.id):
         raise ApiError(409, "invalid_request", "This conversation is still answering")
     return locked, document, setting, await chat_versions.conversation_turns(db, row.id)
 
@@ -627,23 +691,24 @@ async def post_message(
             "invalid_request",
             f"At most {settings.chat_attachments_per_message} attachments go with one message",
         )
+    _check_library_size(body.library, settings)
     command = (body.command or "").strip() or None
     if not body.text.strip() and command is None and not attachment_ids:
         raise ApiError(400, "invalid_request", "The message needs text, a command or a file")
     row = await owned_conversation(db, user.id, conversation_id)
+    in_library = row.document_id is None
+    _check_kind(in_library, body.library, (body.selection or "").strip() or sections)
     locked, document, setting, turns = await _admitted(db, settings, user, row)
     # The message continues the branch the conversation shows, measured from that branch's
     # summary row, both as locked (docs/chat.md § History is append-only, *An edited
     # message starts a version*).
     shown = chat_versions.branch(turns, locked.head_id)
     path = [turn.id for turn in shown]
-    boundary = locked.compacted_message_id
     # Under the conversation's lock: a history past the cap takes no further message, or
     # capped-size sends would grow it without end while every turn on it failed
     # (docs/chat.md § History is append-only). What a turn replays: from the last
     # compaction's summary on (docs/chat.md § Compaction).
-    if await history_bytes(db, row.id, since=boundary, path=path) > settings.chat_history_max_bytes:
-        raise ApiError(409, "invalid_request", HISTORY_FULL)
+    history = await _check_history(db, settings, row.id, locked.compacted_message_id, path)
 
     # The reader's `/compact`: the runner's own command, never a skill's name
     # (docs/chat.md § Compaction).
@@ -662,7 +727,7 @@ async def post_message(
         raise ApiError(400, "invalid_request", "/init takes no attachments")
 
     skill = (
-        await _invocable_skill(db, user.id, command)
+        await _invocable_skill(db, user.id, command, library=in_library)
         if command is not None and not compact and not init
         else None
     )
@@ -671,128 +736,84 @@ async def post_message(
     # prepared at its upload, and the send embeds and deletes it (docs/chat.md § What a
     # user message carries). Under the user's row lock: two sends cannot take one.
     attachments = await _claimed_attachments(db, settings, user.id, attachment_ids)
-    content: list[dict] = [block for _, block in attachments]
 
-    if skill is not None:
-        arguments = body.text.strip()
-        visible = f"/{skill.name}" + (f" {arguments}" if arguments else "")
-    elif compact:
-        focus = body.text.strip()
-        visible = f"/{chat_agent.COMPACT_COMMAND}" + (f" {focus}" if focus else "")
-    elif init:
-        note = body.text.strip()
-        visible = f"/{chat_agent.INIT_COMMAND}" + (f" {note}" if note else "")
-    else:
-        visible = body.text
-    if visible.strip():
-        content.append({"type": "text", "text": visible})
-    # A compaction carries the instruction and the turn block, nothing else: the selection
-    # the composer read as the command was sent is not what it is about. Nor is an
-    # `/init`'s, which is about the folder.
-    passage_free = compact or init
-    selection = (body.selection or "").strip() if not passage_free else ""
-    if passage_free:
-        sections = []
-    if selection:
-        # Marked as ours: the runner strips the marker before the block goes upstream,
-        # and the thread shows a note rather than the scaffolding (docs/chat.md).
-        content.append(
-            {
-                "type": "text",
-                "text": f"{SELECTION_PREFIX}{selection}",
-                "context": "selection",
-            }
-        )
-    for heading, text in sections:
-        content.append(
-            {
-                "type": "text",
-                "text": section_text(heading, text),
-                "context": SECTION_CONTEXT,
-                "section": heading,
-            }
-        )
-    quote = (body.quote or "").strip() if not passage_free else ""
-    if quote:
-        content.append({"type": "text", "text": f"{QUOTE_PREFIX}{quote}", "context": "quote"})
+    # Every command left is `/compact`, `/init` or the skill of that name.
+    visible = _visible(command, body.text)
+    note = await chat_compact.turn_note_for(db, settings, document, setting, body.locale)
     if compact:
-        content.append(
-            {
-                "type": "text",
-                "text": chat_agent.compact_instruction(body.text),
-                "context": chat_compact.COMPACT_CONTEXT,
-            }
+        # A compaction carries the reader's line, the instruction and the turn block, nothing
+        # else: the selection the composer read as the command was sent is not what it is
+        # about, and no Files page goes with it.
+        content = chat_compact.compact_message_content(visible=visible, focus=body.text, note=note)
+    else:
+        content = [block for _, block in attachments]
+        if visible.strip():
+            content.append({"type": "text", "text": visible})
+        # An `/init` carries no passage either: it is about the folder.
+        selection = (body.selection or "").strip() if not init else ""
+        if init:
+            sections = []
+        if selection:
+            # Marked as ours: the runner strips the marker before the block goes upstream,
+            # and the thread shows a note rather than the scaffolding (docs/chat.md).
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"{SELECTION_PREFIX}{selection}",
+                    "context": "selection",
+                }
+            )
+        for heading, text in sections:
+            content.append(
+                {
+                    "type": "text",
+                    "text": section_text(heading, text),
+                    "context": SECTION_CONTEXT,
+                    "section": heading,
+                }
+            )
+        quote = (body.quote or "").strip() if not init else ""
+        if quote:
+            content.append({"type": "text", "text": f"{QUOTE_PREFIX}{quote}", "context": "quote"})
+        # The Files page, after the quote (docs/chat.md § What a user message carries) — with
+        # an `/init` too, whose open folder it names.
+        library = (
+            await _library_block(db, user.id, body.library) if body.library is not None else None
         )
-    if init:
-        content.append(
-            {
-                "type": "text",
-                "text": chat_agent.init_instruction(body.text),
-                "context": chat_agent.INIT_CONTEXT,
-            }
-        )
-    if skill is not None:
-        content.append(
-            _skill_block(skill, body.text, bool(selection), [heading for heading, _ in sections])
-        )
-    # The document's revision as the message is accepted, the reader's locale and the
-    # languages they chose: with the message rather than in the system prompt, so an edit
-    # made meanwhile reaches the model and a change of language costs no cache (docs/chat.md
-    # § Prompt caching, § Instructions).
-    revision = await current_revision(db, settings, document)
-    note = turn_note(
-        revision,
-        body.locale,
-        setting.answer_language if setting else None,
-        setting.translate_language if setting else None,
+        if library is not None:
+            content.append(library)
+        if init:
+            content.append(
+                await _init_block(db, user.id, in_library, [library] if library else [], body.text)
+            )
+        if skill is not None:
+            content.append(
+                _skill_block(
+                    skill, body.text, bool(selection), [heading for heading, _ in sections]
+                )
+            )
+        content.append({"type": "text", "text": note, "context": TURN_CONTEXT})
+    message, turn = await _accept(
+        db,
+        settings,
+        user.id,
+        row.id,
+        content,
+        history=history,
+        locale=body.locale,
+        kind=COMPACT_TURN if compact else MESSAGE_TURN,
+        parent_id=path[-1] if path else None,
     )
-    content.append({"type": "text", "text": note, "context": TURN_CONTEXT})
-    message = Message(conversation_id=row.id, role="user", content=content)
-    db.add(message)
-    await db.flush()
-    # Again with the message in, measured as the worker measures it: attached images can
-    # carry a history from under the cap to past it, and the turn would then fail before
-    # its first call with the attachments spent. Refused here instead, so the rollback
-    # keeps them for a new conversation.
-    if await history_bytes(db, row.id, since=boundary, path=path) > settings.chat_history_max_bytes:
-        raise ApiError(409, "invalid_request", HISTORY_FULL)
     if not locked.title and not compact:
         named = visible.strip() or (attachments[0][0].name if attachments else "")
         first_line = named.splitlines()[0] if named else ""
         # Trimmed after the cut, as a rename is: a line cut at a space keeps none.
         row.title = first_line[:TITLE_MAX_CHARS].strip()
-    turn = await enqueue_turn(
-        db,
-        user_id=user.id,
-        conversation_id=row.id,
-        message_id=message.id,
-        locale=body.locale,
-        kind=COMPACT_TURN if compact else MESSAGE_TURN,
-        parent_id=path[-1] if path else None,
-    )
-    # The turn's entry, under the user's row lock taken above: a send needs the minimum
-    # balance, and what the turn costs is settled on it as it runs (docs/billing.md
-    # § A chat turn).
-    try:
-        await ledger.reserve(
-            db,
-            settings,
-            user_id=user.id,
-            kind=ledger.CHAT,
-            amount=0,
-            turn_id=turn.id,
-            model=row.model,
-            minimum=settings.chat_min_credits,
-        )
-    except ledger.InsufficientCredits as exc:
-        raise insufficient_credits(exc) from exc
     # The conversation list orders by it: the thread continued last is listed first.
     row.updated_at = utcnow()
     # The turn continues the branch, and the conversation shows it (docs/chat.md § History
     # is append-only, *An edited message starts a version*).
     row.head_id = turn.id
-    # The message belongs to the turn that answers it: a reloaded thread groups by turn.
-    message.turn_id = turn.id
     await db.commit()
     # Embedded now: the prepared files have nothing left to wait for.
     for attachment, _ in attachments:
@@ -807,7 +828,7 @@ class MessageEdit(BaseModel):
     locale (docs/api.md)."""
 
     text: str = ""
-    locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
+    locale: Locale = "en"
 
 
 @router.post(
@@ -832,6 +853,7 @@ async def edit_message(
     if len(body.text) > settings.chat_message_max_chars:
         raise ApiError(400, "invalid_request", "The message is too long")
     row = await owned_conversation(db, user.id, conversation_id)
+    in_library = row.document_id is None
     original = await db.get(Message, message_id)
     if original is None or original.conversation_id != row.id or original.role != "user":
         raise ApiError(404, "invalid_request", "No such message")
@@ -846,12 +868,11 @@ async def edit_message(
     joined = [] if edited.parent_id is None else chat_versions.branch(turns, edited.parent_id)
     path = [turn.id for turn in joined]
     boundary = await chat_versions.branch_boundary(db, joined)
-    if await history_bytes(db, row.id, since=boundary, path=path) > settings.chat_history_max_bytes:
-        raise ApiError(409, "invalid_request", HISTORY_FULL)
-    # What the message carried, as stored: its attachments, its selection, sections and
-    # quote; the text is the reader's new one, the skill's body is rendered again from the
-    # skill as it is now, and the turn block is this send's (docs/chat.md § What a user
-    # message carries).
+    history = await _check_history(db, settings, row.id, boundary, path)
+    # What the message carried, as stored: its attachments, its selection, sections, quote
+    # and Files page; the text is the reader's new one, the skill's body is rendered again
+    # from the skill as it is now, and the turn block is this send's (docs/chat.md § What a
+    # user message carries).
     carried = [block for block in original.content if isinstance(block, dict)]
     attachments = [
         block
@@ -861,29 +882,26 @@ async def edit_message(
     selection = [block for block in carried if block.get("context") == "selection"]
     sections = [block for block in carried if block.get("context") == SECTION_CONTEXT]
     quote = [block for block in carried if block.get("context") == "quote"]
+    library = [block for block in carried if block.get("context") == LIBRARY_CONTEXT]
     command = next((block for block in carried if block.get("context") == "skill"), None)
     skill = (
-        await _invocable_skill(db, user.id, str(command.get("skill") or ""))
+        await _invocable_skill(db, user.id, str(command.get("skill") or ""), library=in_library)
         if command is not None
         else None
     )
     # An `/init` edited is an `/init` again, its instruction rendered anew with the new
     # note (docs/chat.md § AGENTS.md).
     init = any(block.get("context") == chat_agent.INIT_CONTEXT for block in carried)
-    if skill is not None:
-        arguments = body.text.strip()
-        visible = f"/{skill.name}" + (f" {arguments}" if arguments else "")
-    elif init:
-        note = body.text.strip()
-        visible = f"/{chat_agent.INIT_COMMAND}" + (f" {note}" if note else "")
-    else:
-        visible = body.text
+    visible = _visible(
+        skill.name if skill is not None else chat_agent.INIT_COMMAND if init else None,
+        body.text,
+    )
     if not visible.strip() and not attachments:
         raise ApiError(400, "invalid_request", "The message needs text, a command or a file")
     content: list[dict] = list(attachments)
     if visible.strip():
         content.append({"type": "text", "text": visible})
-    content += selection + sections + quote
+    content += selection + sections + quote + library
     if skill is not None:
         content.append(
             _skill_block(
@@ -894,48 +912,20 @@ async def edit_message(
             )
         )
     if init:
-        content.append(
-            {
-                "type": "text",
-                "text": chat_agent.init_instruction(body.text),
-                "context": chat_agent.INIT_CONTEXT,
-            }
-        )
-    revision = await current_revision(db, settings, document)
-    note = turn_note(
-        revision,
-        body.locale,
-        setting.answer_language if setting else None,
-        setting.translate_language if setting else None,
-    )
+        content.append(await _init_block(db, user.id, in_library, library, body.text))
+    note = await chat_compact.turn_note_for(db, settings, document, setting, body.locale)
     content.append({"type": "text", "text": note, "context": TURN_CONTEXT})
-    message = Message(conversation_id=row.id, role="user", content=content)
-    db.add(message)
-    await db.flush()
-    # Again with the message in, measured as the worker measures it (the send does the same).
-    if await history_bytes(db, row.id, since=boundary, path=path) > settings.chat_history_max_bytes:
-        raise ApiError(409, "invalid_request", HISTORY_FULL)
-    turn = await enqueue_turn(
+    message, turn = await _accept(
         db,
-        user_id=user.id,
-        conversation_id=row.id,
-        message_id=message.id,
+        settings,
+        user.id,
+        row.id,
+        content,
+        history=history,
         locale=body.locale,
+        kind=MESSAGE_TURN,
         parent_id=edited.parent_id,
     )
-    try:
-        await ledger.reserve(
-            db,
-            settings,
-            user_id=user.id,
-            kind=ledger.CHAT,
-            amount=0,
-            turn_id=turn.id,
-            model=row.model,
-            minimum=settings.chat_min_credits,
-        )
-    except ledger.InsufficientCredits as exc:
-        raise insufficient_credits(exc) from exc
     # The new version is what the conversation shows and continues, with the summary row,
     # the context size and the cache clock its branch's: what the next call replays only
     # that call reports (docs/chat.md § History is append-only, *An edited message starts
@@ -954,16 +944,16 @@ async def edit_message(
             cache_warm_until=None,
         )
     )
-    message.turn_id = turn.id
     await db.commit()
     return {"turn_id": str(turn.id), "message_id": message.id}
 
 
 async def _invocable_skill(
-    db: AsyncSession, user_id: int, command: str
+    db: AsyncSession, user_id: int, command: str, *, library: bool
 ) -> skill_defs.ResolvedSkill:
     """The skill a command names, as the caller can run it now (docs/chat.md § Skills);
-    **400** for a name that is no such skill — or no longer is."""
+    **400** for a name that is no such skill — or no longer is — and, in a library
+    conversation (`library`), for one that works on a document."""
     rows = (await db.execute(select(Skill).where(Skill.user_id == user_id))).scalars().all()
     skill = next(
         (
@@ -975,7 +965,195 @@ async def _invocable_skill(
     )
     if skill is None:
         raise ApiError(400, "invalid_request", f"No command /{command}")
+    if library and skill.document_only:
+        raise ApiError(400, "invalid_request", "This skill works on a document: open one to use it")
     return skill
+
+
+async def _check_history(
+    db: AsyncSession,
+    settings: AppSettings,
+    conversation_id: int,
+    boundary: int | None,
+    path: list[uuid.UUID],
+) -> int:
+    """The size of a branch's history, from its summary row `boundary` on along `path`;
+    **409** past `CHAT_HISTORY_MAX_BYTES` (docs/chat.md § History is append-only)."""
+    measured = await history_bytes(db, conversation_id, since=boundary, path=path)
+    if measured > settings.chat_history_max_bytes:
+        raise ApiError(409, "invalid_request", HISTORY_FULL)
+    return measured
+
+
+async def _accept(
+    db: AsyncSession,
+    settings: AppSettings,
+    user_id: int,
+    conversation_id: int,
+    content: list[dict],
+    *,
+    history: int,
+    locale: str,
+    kind: str,
+    parent_id: uuid.UUID | None,
+) -> tuple[Message, ChatTurn]:
+    """The user message a send or an edit built, stored with its turn queued under
+    `parent_id` and the turn's credit entry reserved; `history` is the branch's size as
+    `_check_history` measured it before the message. The caller moves the conversation's
+    head and commits."""
+    message = Message(conversation_id=conversation_id, role="user", content=content)
+    db.add(message)
+    await db.flush()
+    # Again with the message in, measured as the worker measures it: attached images can
+    # carry a history from under the cap to past it, and the turn would then fail before
+    # its first call with the attachments spent. Refused here instead, so the rollback
+    # keeps them for a new conversation. Under the locks `_admitted` took, with no turn
+    # unfinished, no other row joins the conversation meanwhile: the new row — its newest,
+    # of no turn yet — is measured alone (`since` it) and added to what was measured before.
+    added = await history_bytes(db, conversation_id, since=message.id)
+    if history + added > settings.chat_history_max_bytes:
+        raise ApiError(409, "invalid_request", HISTORY_FULL)
+    turn = await enqueue_turn(
+        db,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        message_id=message.id,
+        locale=locale,
+        kind=kind,
+        parent_id=parent_id,
+    )
+    # The turn's entry, under the user's row lock `_admitted` took: a send needs the minimum
+    # balance, and what the turn costs is settled on it as it runs (docs/billing.md
+    # § A chat turn).
+    try:
+        await ledger.reserve(
+            db,
+            settings,
+            user_id=user_id,
+            kind=ledger.CHAT,
+            amount=0,
+            turn_id=turn.id,
+            minimum=settings.chat_min_credits,
+        )
+    except ledger.InsufficientCredits as exc:
+        raise insufficient_credits(exc) from exc
+    # The message belongs to the turn that answers it: a reloaded thread groups by turn.
+    message.turn_id = turn.id
+    return message, turn
+
+
+def _visible(command: str | None, text: str) -> str:
+    """The message's line as the thread shows it: for a command `/name`, then its
+    arguments when there are any; otherwise the text as typed."""
+    if command is None:
+        return text
+    arguments = text.strip()
+    return f"/{command} {arguments}" if arguments else f"/{command}"
+
+
+def _check_library_size(library: LibraryIn | None, settings: AppSettings) -> None:
+    """The Files page's items past `CHAT_LIBRARY_ITEMS_PER_MESSAGE` are refused (docs/api.md)."""
+    if library is not None and len(library.items) > settings.chat_library_items_per_message:
+        raise ApiError(
+            400,
+            "invalid_request",
+            f"At most {settings.chat_library_items_per_message} items go with one message",
+        )
+
+
+def _check_kind(in_library: bool, library: LibraryIn | None, passage: object) -> None:
+    """What each kind of conversation takes (docs/chat.md § Library conversations): a
+    library conversation no passage of a document, a document's no Files page."""
+    if in_library and passage:
+        raise ApiError(400, "invalid_request", NO_PASSAGE)
+    if not in_library and library is not None:
+        raise ApiError(
+            400, "invalid_request", "Only a conversation from the Files page carries `library`"
+        )
+
+
+async def _library_block(db: AsyncSession, user_id: int, library: LibraryIn) -> dict:
+    """The Files page as the message carries it: the open folder and the selected items by
+    their Files paths, for the model, and the paths alone for the thread. An id that is not
+    the caller's, is in the Trash or is gone is left out; such a folder open reads as the
+    top (docs/chat.md § Library conversations)."""
+    folders = await user_folders(db, user_id)
+    trashed = trashed_folder_ids(folders.values())
+
+    def live_folder(folder_id: int | None) -> bool:
+        return folder_id in folders and folder_id not in trashed
+
+    wanted = [item.id for item in library.items if item.kind == "document"]
+    documents = (
+        {
+            row.id: row
+            for row in (
+                await db.execute(
+                    select(Document).where(Document.user_id == user_id, Document.id.in_(wanted))
+                )
+            ).scalars()
+        }
+        if wanted
+        else {}
+    )
+    picked: list[tuple[str, str, int]] = []
+    for item in library.items:
+        if any(kind == item.kind and row_id == item.id for _, kind, row_id in picked):
+            continue
+        if item.kind == "folder":
+            if live_folder(item.id):
+                picked.append((folder_path(folders, item.id), "folder", item.id))
+            continue
+        document = documents.get(item.id)
+        if document is not None and is_live(document, folders):
+            path = item_path(folders, document.folder_id, document.name)
+            picked.append((path, "document", item.id))
+    opened = library.folder_id if live_folder(library.folder_id) else None
+    folder = folder_path(folders, opened)
+    lines = [
+        LIBRARY_PREFIX,
+        f"- open folder: {folder} (folder {opened})"
+        if opened is not None
+        else "- open folder: the top of the library",
+    ]
+    if picked:
+        lines.append(f"- selected ({len(picked)}):")
+        lines += [f"  - {path} ({kind} {row_id})" for path, kind, row_id in picked]
+    return {
+        "type": "text",
+        "text": "\n".join(lines),
+        "context": LIBRARY_CONTEXT,
+        # `folder_id` for an `/init` edited later, whose folder may have moved since.
+        "library": {
+            "folder": folder,
+            "folder_id": opened,
+            "items": [path for path, _, _ in picked],
+        },
+    }
+
+
+async def _init_block(
+    db: AsyncSession, user_id: int, in_library: bool, library: list[dict], note: str
+) -> dict:
+    """The `/init` instruction: about the folder the document is in, or in a library
+    conversation the open folder its Files-page block names, where it is now — the top
+    without one, or once it is gone or in the Trash (docs/chat.md § AGENTS.md)."""
+    if not in_library:
+        text = chat_agent.init_instruction(note)
+    else:
+        shown = library[0].get("library") if library else None
+        folder_id = shown.get("folder_id") if isinstance(shown, dict) else None
+        folders = await user_folders(db, user_id)
+        if folder_id not in folders or folder_id in trashed_folder_ids(folders.values()):
+            folder_id = None
+        names = [row.name for row in folder_chain(folders, folder_id)]
+        agents_file = VM_ROOT.joinpath(
+            FILES_DIR, *(path_segment(name) for name in names), AGENTS_FILE
+        ).as_posix()
+        text = chat_agent.library_init_instruction(
+            folder_path(folders, folder_id), agents_file, note
+        )
+    return {"type": "text", "text": text, "context": chat_agent.INIT_CONTEXT}
 
 
 def _skill_block(
@@ -1223,14 +1401,9 @@ async def sandbox_status(user: SessionUser, db: DbSession, settings: AppSettings
     client = SandboxClient(settings)
     try:
         runner = await client.status(user.id)
-        state = {
-            "state": runner.state,
-            "last_used_at": runner.last_used_at,
-            "shells": runner.shells,
-            "uptime_seconds": runner.uptime_seconds,
-        }
+        state = {"state": runner.state, "last_used_at": runner.last_used_at}
     except SandboxUnavailable:
-        state = {"state": "unavailable", "last_used_at": None, "shells": 0, "uptime_seconds": 0}
+        state = {"state": "unavailable", "last_used_at": None}
     root = user_root(settings.workspaces_dir, user.id)
     plan = await ledger.plan_of(db, settings, user.id)
     workspace = workspace_payload(
@@ -1257,10 +1430,3 @@ async def sandbox_reset(user: SessionUser, settings: AppSettings) -> Response:
     except SandboxUnavailable as exc:
         raise ApiError(503, "upstream", "The sandbox is unavailable") from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-def turn_id_of(raw: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(raw)
-    except ValueError as exc:
-        raise ApiError(404, "invalid_request", "No such turn") from exc

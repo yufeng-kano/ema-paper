@@ -42,7 +42,7 @@ export const NOTES_BLOCK_DRAG_TYPE = 'application/x-sightread-notes-block'
 export const ROWS_DRAG_TYPE = 'application/x-sightread-rows'
 
 /** What a handler claimed a drag event for. */
-export type DragClaim =
+type DragClaim =
   /** A folder is the destination under the pointer, and it is drawn as the target. */
   | 'target'
   /** The open folder's list is under the pointer — where dropped files land, and rows a
@@ -53,6 +53,10 @@ export type DragClaim =
   /** The open document or its notes are under image files being dragged — where they would
    *  be inserted (docs/web.md § Editing, *Images*). */
   | 'image'
+  /** An agent panel is under files being dragged — where they would be attached — or, the
+   *  Files page's card, under the page's rows, which it takes as the selection (docs/web.md
+   *  § The Files page's Agent card). */
+  | 'attach'
 
 const claims = new WeakMap<DragEvent, DragClaim>()
 
@@ -67,9 +71,14 @@ export function dragClaim(event: DragEvent): DragClaim | undefined {
   return claims.get(event)
 }
 
+/** A drag carrying `type` among its types — readable throughout the drag. */
+export function carries(transfer: DataTransfer | null, type: string): boolean {
+  return [...(transfer?.types ?? [])].includes(type)
+}
+
 /** A drag carrying files from outside the browser, rather than a row of this page. */
 export function carriesFiles(transfer: DataTransfer | null): boolean {
-  return [...(transfer?.types ?? [])].includes('Files')
+  return carries(transfer, 'Files')
 }
 
 /**

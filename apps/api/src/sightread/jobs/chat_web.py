@@ -32,6 +32,7 @@ import httpx
 
 from ..parsing import poppler
 from .chat_tools import ToolOutcome, truncate
+from .intake import PDF_MEDIA_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,6 @@ CHUNK_BYTES = 64 * 1024
 # What a read or a download that failed tells the model to do next: an address that refused
 # or broke off once is rarely the way to the fact (docs/chat.md § Tools).
 ANOTHER_SOURCE = "find another source rather than retrying it"
-PDF_MEDIA_TYPE = "application/pdf"
 TEXT_MEDIA_TYPES = frozenset(
     {"application/json", "application/xml", "application/x-ndjson", "application/javascript"}
 )
@@ -95,7 +95,7 @@ def resolve_host(host: str) -> list[str]:
     """Every address the name resolves to, once each, through the system resolver and in
     its order: glibc sorts an address this host has no route to after the others — an
     IPv6 one on a worker without IPv6 — where a sort by text would put it first. The tests
-    replace it with a documentation address (docs/testing.md)."""
+    replace it with a fixed public address (docs/testing.md)."""
     infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     return list(dict.fromkeys(str(info[4][0]) for info in infos))
 
@@ -153,7 +153,9 @@ async def check_target(url: str) -> Target:
         raise FetchRefused("The URL points at a private or local network, which is not fetched.")
     connects = tuple(parsed.copy_with(host=address) for address in addresses)
     default_port = 443 if parsed.scheme == "https" else 80
-    host_header = host if parsed.port in (None, default_port) else f"{host}:{parsed.port}"
+    # An IPv6 literal is bracketed in the header (RFC 3986), never in the TLS name.
+    name = f"[{host}]" if ":" in host else host
+    host_header = name if parsed.port in (None, default_port) else f"{name}:{parsed.port}"
     return Target(connects=connects, host=host, host_header=host_header)
 
 
@@ -323,8 +325,33 @@ def _upstream_failure(service: str, response: httpx.Response) -> ToolOutcome:
     )
 
 
-def _search_client(timeout: float, user_agent: str) -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=timeout, headers={"User-Agent": user_agent})
+async def _search_json(
+    service: str,
+    what: str,
+    url: str,
+    *,
+    params: dict,
+    headers: dict,
+    timeout: float,
+    user_agent: str,
+) -> object | ToolOutcome:
+    """One GET of a search API: its parsed JSON body, or the outcome that tells the model
+    why there is none — `service` names the API, `what` the search that failed."""
+    try:
+        async with (
+            asyncio.timeout(timeout),
+            httpx.AsyncClient(timeout=timeout, headers={"User-Agent": user_agent}) as client,
+        ):
+            response = await client.get(url, params=params, headers=headers)
+    except (httpx.HTTPError, TimeoutError) as exc:
+        logger.warning("%s did not answer: %s", service, exc.__class__.__name__)
+        return ToolOutcome(f"The {what} failed: {failure(exc, timeout)}; try again.", is_error=True)
+    if response.status_code != 200:
+        return _upstream_failure(service, response)
+    try:
+        return response.json()
+    except ValueError:
+        return ToolOutcome(f"{service} answered something that is not JSON.", is_error=True)
 
 
 async def web_search(
@@ -336,24 +363,18 @@ async def web_search(
     query = query.strip()
     if not query:
         return ToolOutcome("The query is empty.", is_error=True)
-    try:
-        async with asyncio.timeout(timeout), _search_client(timeout, user_agent) as client:
-            response = await client.get(
-                url,
-                params={"q": query[:400], "count": RESULTS_PER_SEARCH},
-                headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-            )
-    except (httpx.HTTPError, TimeoutError) as exc:
-        logger.warning("Brave did not answer: %s", exc.__class__.__name__)
-        return ToolOutcome(
-            f"The web search failed: {failure(exc, timeout)}; try again.", is_error=True
-        )
-    if response.status_code != 200:
-        return _upstream_failure("Brave", response)
-    try:
-        results = response.json().get("web", {}).get("results", [])
-    except ValueError:
-        return ToolOutcome("Brave answered something that is not JSON.", is_error=True)
+    body = await _search_json(
+        "Brave",
+        "web search",
+        url,
+        params={"q": query[:400], "count": RESULTS_PER_SEARCH},
+        headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+        timeout=timeout,
+        user_agent=user_agent,
+    )
+    if isinstance(body, ToolOutcome):
+        return body
+    results = body.get("web", {}).get("results", []) if isinstance(body, dict) else []
     if not results:
         return ToolOutcome(f"No web results for {query!r}.")
     lines = [f"Web results for {query!r} (Brave):"]
@@ -397,23 +418,19 @@ async def search_papers(
             "cited_by_count,best_oa_location"
         ),
     }
-    # The key as a header, never in the URL: httpx logs every request's URL at INFO.
-    try:
-        async with asyncio.timeout(timeout), _search_client(timeout, user_agent) as client:
-            response = await client.get(
-                url, params=params, headers={"Authorization": f"Bearer {api_key}"}
-            )
-    except (httpx.HTTPError, TimeoutError) as exc:
-        logger.warning("OpenAlex did not answer: %s", exc.__class__.__name__)
-        return ToolOutcome(
-            f"The paper search failed: {failure(exc, timeout)}; try again.", is_error=True
-        )
-    if response.status_code != 200:
-        return _upstream_failure("OpenAlex", response)
-    try:
-        works = response.json().get("results", [])
-    except ValueError:
-        return ToolOutcome("OpenAlex answered something that is not JSON.", is_error=True)
+    body = await _search_json(
+        "OpenAlex",
+        "paper search",
+        url,
+        params=params,
+        # The key as a header, never in the URL: httpx logs every request's URL at INFO.
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=timeout,
+        user_agent=user_agent,
+    )
+    if isinstance(body, ToolOutcome):
+        return body
+    works = body.get("results", []) if isinstance(body, dict) else []
     if not works:
         return ToolOutcome(f"No works match {query!r}.")
     lines = [f"Works matching {query!r} (OpenAlex):"]
@@ -504,13 +521,11 @@ def html_to_text(markup: str) -> tuple[str, str]:
 def _decode(data: bytes, charset: str | None) -> str:
     """Bytes as text, the declared charset first, UTF-8 (BOM or not) otherwise, with
     replacement rather than refusal; a character the cap split is dropped."""
-    for encoding in ((charset,) if charset else ()) + ("utf-8-sig",):
-        try:
-            decoder = codecs.getincrementaldecoder(encoding)("replace")
-        except LookupError:
-            continue
-        return decoder.decode(data).replace("\x00", "")
-    return data.decode("utf-8", "replace")
+    try:
+        decoder = codecs.getincrementaldecoder(charset or "utf-8-sig")("replace")
+    except LookupError:
+        decoder = codecs.getincrementaldecoder("utf-8-sig")("replace")
+    return decoder.decode(data).replace("\x00", "")
 
 
 async def read_url(
@@ -578,7 +593,7 @@ async def _pdf_text(data: bytes, *, max_chars: int, timeout: float) -> tuple[str
     (docs/parsing.md); four bytes a character at most, so the cap always holds."""
     with tempfile.TemporaryDirectory(prefix="sr-read-url-") as work:
         path = Path(work) / "page.pdf"
-        path.write_bytes(data)
+        await asyncio.to_thread(path.write_bytes, data)
         text_bytes, goes_on = await poppler.pdf_text(
             path, cwd=Path(work), timeout=timeout, max_bytes=4 * max_chars
         )
@@ -645,12 +660,12 @@ async def download(
             )
         declared = response.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > cap:
-            raise FetchRefused(_too_large(int(declared), max_bytes, room))
+            raise FetchRefused(_too_large(int(declared), max_bytes))
         size = 0
         async for chunk in iter_body(response):
             size += len(chunk)
             if size > cap:
-                raise FetchRefused(_too_large(size, max_bytes, room))
+                raise FetchRefused(_too_large(size, max_bytes))
             await asyncio.to_thread(_write_all, fd, chunk)
         media_type, _charset = media_type_of(response)
         return Downloaded(
@@ -664,7 +679,7 @@ async def download(
         )
 
 
-def _too_large(size: int, max_bytes: int, room: int) -> str:
+def _too_large(size: int, max_bytes: int) -> str:
     if size > max_bytes:
         return f"The file is larger than the {max_bytes:,} bytes a download may be."
     return "The user's storage is full; the file does not fit."

@@ -13,7 +13,7 @@ import {
   rewriteBlockLinks,
   sectionOf,
 } from './excerpts'
-import { documentOutline, parseResultMarkdown } from './markdown'
+import { documentOutline, parseResultMarkdown, passageKeys, placedBlocks } from './markdown'
 
 const document = [
   '<!-- page: 1 -->',
@@ -66,6 +66,13 @@ describe('appendExcerpt', () => {
     const notes = '## 摘錄\n\n> Old.\n\n[Intro](#intro)\n\n## Later\n\nText.'
     const added = appendExcerpt(notes, 'New.', excerpt('New.'), '## Excerpts')
     expect(added.notes).toBe('## 摘錄\n\n> Old.\n\n[Intro](#intro)\n\n> New.\n\n[Intro](#intro)\n\n## Later\n\nText.')
+    expect(added.notes.slice(added.at)).toMatch(/^> New\./)
+  })
+
+  it('ends the section at its last block, not at the same text inside a page marker', () => {
+    const notes = '## Excerpts\n\n<!-- page: 2 -->\n2'
+    const added = appendExcerpt(notes, 'New.', excerpt('New.'), '## Excerpts')
+    expect(added.notes).toBe(`${notes}\n\n> New.\n\n[Intro](#intro)`)
     expect(added.notes.slice(added.at)).toMatch(/^> New\./)
   })
 
@@ -162,6 +169,15 @@ describe('block references in the notes', () => {
     expect(linkResolves(pages, outline, { label: 'x', anchor: '~A+preface+before', passage: null })).toBe(true)
     expect(linkResolves(pages, outline, { label: 'x', anchor: 'gone~Words+no+block+has', passage: null })).toBe(false)
   })
+
+  it('resolves a block reference the same from the placed blocks and passage keys a caller keeps', () => {
+    const placed = placedBlocks(pages)
+    const keys = passageKeys(placed)
+    const resolves = (anchor: string) => linkResolves(pages, outline, { label: 'x', anchor, passage: null }, placed, keys)
+    expect(resolves('321-scaled-dot-product-attention~We%20suspect%20that')).toBe(true)
+    expect(resolves('~A+preface+before')).toBe(true)
+    expect(resolves('gone~Words+no+block+has')).toBe(false)
+  })
 })
 
 describe('droppedBlocksMarkdown', () => {
@@ -226,6 +242,15 @@ describe('insertNoteBlocks', () => {
     const notes = ['> First passage.', link, '> Second passage.', link, 'Tail.'].join('\n\n')
     expect(insertNoteBlocks(notes, { after: link, before: 'Tail.', gap: 4 }, line)).toBe(
       ['> First passage.', link, '> Second passage.', link, line, 'Tail.'].join('\n\n'),
+    )
+  })
+
+  it('finds a block by its own line, never inside a page marker', () => {
+    const notes = '<!-- page: 1 -->\n1\n\nNext'
+    expect(insertNoteBlocks(notes, { after: '1', before: 'Next', gap: 1 }, line)).toBe(`<!-- page: 1 -->\n1\n\n${line}\n\nNext`)
+    // A line ends at a carriage return too.
+    expect(insertNoteBlocks('First.\r\n\r\nSecond.\r\n', { after: 'First.', before: 'Second.', gap: 1 }, line)).toBe(
+      `First.\n\n${line}\n\nSecond.\r\n`,
     )
   })
 

@@ -2,7 +2,9 @@
 /**
  * One edit as a diff card: applied as made, undone from its footer (docs/web.md § The agent
  * panel). Removed lines on the danger wash, added ones on the accent wash, wrapped rather
- * than scrolled sideways — a panel this narrow has no room for a second scrollbar.
+ * than scrolled sideways — a panel this narrow has no room for a second scrollbar. *Revert*
+ * is left out in library mode (`useStepLabels().library`, the Files page's card): the
+ * revisions route is a document's (docs/web.md § The Files page's Agent card).
  */
 import { basename } from '~/lib/steps'
 import type { CardState, EditCard } from '~/lib/thread'
@@ -36,10 +38,10 @@ const ownFile = computed(() => labels.ownFile(props.card.path))
       <span class="card-state">
         {{ state.reverted ? t('chat.reverted') : t('chat.applied') }}
         <span v-if="ownFile" class="card-file">· {{ ownFile }}</span>
-        <span v-else class="mono card-path">· {{ basename(card.path) }}</span>
+        <span v-else-if="card.path" class="mono card-path">· {{ basename(card.path) }}</span>
       </span>
       <button
-        v-if="card.commit"
+        v-if="card.commit && !labels.library"
         type="button"
         class="text-link"
         :disabled="state.pending || locked"

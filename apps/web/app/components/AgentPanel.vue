@@ -1,35 +1,36 @@
 <script setup lang="ts">
 /**
- * The selected agent's panel on `/agents` (docs/web.md § Pages, docs/agents.md): one row of
- * controls — the model it runs (the deployment's parse model as a fact; for the chat agent a
- * dropdown of the offered models), then for the chat agent its effort, for the parse agent
- * its prompt — then, for the parse agent, its fallback for failed pages and the format check
- * (the `check` agent's settings, which have no tab of their own);
+ * The selected agent's panel in the settings dialog's Agent section (`?settings=agent`;
+ * docs/web.md § Pages, docs/agents.md): one row of controls — the model it runs (the
+ * deployment's parse model as a fact; for the chat agent a dropdown of the offered models),
+ * then for the chat agent its effort, for the parse agent its prompt — then, for the parse
+ * agent, its fallback for failed pages and the format check (the `check` agent's settings,
+ * which have no tab of their own);
  * for the chat agent, its instructions (with the whole prompt as their advanced option), its
  * memory, its tools, skills and subagents.
- * Every save hands the server's answer back through `saved`, so the page's tab list reads
- * the same state these controls write.
+ * Every save hands the server's answer back through `saved`, so the section's tab row reads
+ * the same state these controls write. The section keys the panel by agent name, so each
+ * agent's panel is its own instance.
  *
  * Nothing on this panel explains itself beyond the few lines that state a consequence the
  * controls cannot show: labels, states and errors only (docs/web.md).
  */
 import {
   AGENT_EFFORTS,
+  CHAT_AGENT,
   listAgentModels,
   putAgentSettings,
   type AgentEffort,
   type AgentEntry,
-  type ConnectionModel,
+  type AgentModel,
   type SavedAgentSettings,
 } from '~/lib/api'
 
-const CHAT_AGENT = 'chat'
-const DEFAULT_EFFORT: AgentEffort = 'medium'
-
 const props = defineProps<{
   agent: AgentEntry
-  /** The `check` agent, whose settings the parse panel shows; null while the registry has
-   *  none (an older API). */
+  /** The agent's display name, the section's heading over the panel. */
+  title: string
+  /** The registry's `check` entry, whose settings the parse panel shows. */
   check: AgentEntry | null
   /** `limits.prompt_max_chars` from `GET /api/me`; null until the session has loaded. */
   promptMaxChars: number | null
@@ -41,12 +42,9 @@ const emit = defineEmits<{
   saved: [agent: string, settings: SavedAgentSettings]
 }>()
 
-const { t, te } = useI18n()
+const { t } = useI18n()
 const { resolve } = useApiError()
 
-const title = computed(() =>
-  te(`agents.names.${props.agent.name}`) ? t(`agents.names.${props.agent.name}`) : props.agent.name,
-)
 const settings = computed(() => props.agent.settings)
 
 /** The chat agent has the effort, instructions, memory, tools, skills and subagents; parse
@@ -57,48 +55,23 @@ const isChat = computed(() => props.agent.name === CHAT_AGENT)
 
 /** The chat agent's offered models (docs/billing.md § Models); the parse agent's model is
  *  a fact of the deployment and loads nothing. */
-const models = ref<ConnectionModel[] | null>(null)
+const models = ref<AgentModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 const modelPending = ref(false)
-/** Request generation: only the newest load may fill the picker. */
-let modelsSeq = 0
 
-/** The list loads when the panel opens; opening it again is what reloads it. */
+/** The list loads when the panel mounts; opening the panel again mounts it again, which is
+    what reloads it. */
 async function loadModels() {
-  const seq = ++modelsSeq
-  models.value = null
-  modelsError.value = null
   try {
-    const data = (await listAgentModels(props.agent.name)).data
-    if (seq === modelsSeq) {
-      models.value = data
-    }
+    models.value = (await listAgentModels(props.agent.name)).data
   } catch (error) {
-    if (seq === modelsSeq) {
-      modelsError.value = await resolve(error)
-    }
+    modelsError.value = await resolve(error)
   }
 }
 
-watch(
-  () => props.agent.name,
-  () => {
-    if (isChat.value) {
-      void loadModels()
-    }
-  },
-  { immediate: true },
-)
-
-/** A stored model the list does not carry (delisted, or not loaded) is still the current
-    choice, so the picker shows it rather than silently blanking it. */
-const modelInjected = computed(() => {
-  const current = settings.value.model
-  if (!current) {
-    return null
-  }
-  return (models.value ?? []).some((model) => model.id === current) ? null : current
-})
+if (isChat.value) {
+  void loadModels()
+}
 
 /** The chat agent's current model: the reader's pick, or with none the list's first —
     the default only the live list can name (docs/billing.md § Models). */
@@ -127,7 +100,7 @@ const convention = computed(() =>
 
 const effortPending = ref(false)
 const effortError = ref<string | null>(null)
-const effortChoice = computed(() => settings.value.effort ?? DEFAULT_EFFORT)
+const effortChoice = computed(() => settings.value.effort)
 
 async function applyEffort(value: string) {
   effortPending.value = true
@@ -145,7 +118,7 @@ async function applyEffort(value: string) {
 
 /** Whether the worker compacts the reader's long conversations before their cache expires
  *  (docs/chat.md § Compaction, *Idle compaction*): on unless turned off. */
-const idleOn = computed(() => settings.value.idle_compact ?? true)
+const idleOn = computed(() => settings.value.idle_compact)
 const idlePending = ref(false)
 const idleError = ref<string | null>(null)
 
@@ -181,8 +154,8 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
   <div class="rows">
     <!-- Model, then effort (chat) or prompt (parse): one row that wraps on a narrow window. -->
     <div class="row reveal-on-hover">
-      <div class="controls">
-        <UiField v-if="isChat" v-slot="{ id }" class="model" :label="t('agents.modelLabel')">
+      <div class="agents-controls">
+        <UiField v-if="isChat" v-slot="{ id }" class="agents-model" :label="t('agents.modelLabel')">
           <UiSelect
             :id="id"
             :model-value="modelChoice"
@@ -190,17 +163,14 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
             @update:model-value="applyModel"
           >
             <option v-if="!modelChoice" value="">{{ t('agents.modelNone') }}</option>
-            <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
-            <option v-for="model in models ?? []" :key="model.id" :value="model.id">
-              {{ model.name ? `${model.name} · ${model.id}` : model.id }}
-            </option>
+            <ModelOptions :models="models" :current="settings.model" />
           </UiSelect>
         </UiField>
         <!-- The parse model is the deployment's: a fact under the label, not a control. -->
-        <div v-else class="model fact">
-          <span class="fact-label">{{ t('agents.modelLabel') }}</span>
-          <span v-if="settings.model" class="mono fact-value">{{ settings.model }}</span>
-          <span v-else class="fact-value muted">{{ t('agents.modelNone') }}</span>
+        <div v-else class="agents-model agents-fact">
+          <span class="agents-label">{{ t('agents.modelLabel') }}</span>
+          <span v-if="settings.model" class="mono agents-fact-value">{{ settings.model }}</span>
+          <span v-else class="agents-fact-value muted">{{ t('agents.modelNone') }}</span>
         </div>
         <UiField v-if="isChat" v-slot="{ id }" class="effort" :label="t('agents.effortLabel')">
           <UiSelect :id="id" :model-value="effortChoice" :disabled="effortPending" @update:model-value="applyEffort">
@@ -217,19 +187,13 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
         />
       </div>
       <p v-if="convention" class="convention mono reveal">{{ convention }}</p>
-      <p v-if="isChat" class="note">{{ t('agents.cacheNote') }}</p>
+      <p v-if="isChat" class="agents-note">{{ t('agents.cacheNote') }}</p>
       <!-- The idle-compaction switch, after the cache line (docs/web.md § Pages). -->
       <template v-if="isChat">
-        <div class="switch-line">
-          <UiSwitch
-            :model-value="idleOn"
-            :label="t('agents.idleCompact.label')"
-            :busy="idlePending"
-            @update:model-value="applyIdleCompact"
-          />
-          <span class="switch-words">{{ t('agents.idleCompact.label') }}</span>
-        </div>
-        <p class="note">{{ t('agents.idleCompact.note') }}</p>
+        <UiSwitch class="idle-switch" :model-value="idleOn" :busy="idlePending" @update:model-value="applyIdleCompact">
+          {{ t('agents.idleCompact.label') }}
+        </UiSwitch>
+        <p class="agents-note">{{ t('agents.idleCompact.note') }}</p>
       </template>
       <UiBanner v-if="modelsError" class="row-banner" tone="error">{{ modelsError }}</UiBanner>
       <UiBanner v-if="effortError" class="row-banner" tone="error">{{ effortError }}</UiBanner>
@@ -258,7 +222,7 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
 
       <!-- Tools: read-only facts. The sandbox's state is on the Usage page. ---------- -->
       <div class="row">
-        <p class="tools-label">{{ t('agents.toolsLabel') }}</p>
+        <p class="agents-label">{{ t('agents.toolsLabel') }}</p>
         <ul class="tools" :aria-label="t('agents.toolsLabel')">
           <li v-for="tool in agent.tools" :key="tool" class="chip mono">{{ tool }}</li>
         </ul>
@@ -286,47 +250,6 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-}
-
-/* One row of same-height controls, aligned on their bottom edge under the field labels. */
-.controls {
-  display: flex;
-  align-items: flex-end;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
-.model {
-  flex: 1 1 14rem;
-  min-width: 0;
-}
-
-/* The parse model, drawn as a field — its label, then the value where a control would be —
-   so the row reads the same whichever agent is open. */
-.fact {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
-.fact-label {
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
-}
-
-.fact-value {
-  display: flex;
-  align-items: center;
-  min-height: var(--control-height);
-  overflow: hidden;
-  font-size: var(--text-sm);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.fact-value.muted {
-  color: var(--muted);
 }
 
 /* An effort picker is five short words; it does not need the model picker's width. */
@@ -363,31 +286,11 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
   max-width: 72ch;
 }
 
-/* The one line under the row: a consequence of changing it, not an explanation of it. */
-.note {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
-/* A switch beside its words, under the cache line. */
-.switch-line {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+/* The switch and its words under the cache line, the words on the column's text edge. */
+.idle-switch {
+  align-self: flex-start;
   margin-top: var(--space-2);
-}
-
-.switch-words {
-  font-size: var(--text-sm);
-}
-
-/* The tools row has the field label's treatment with no control under it. */
-.tools-label {
-  margin: 0;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
+  margin-left: calc(-1 * var(--space-3));
 }
 
 .tools {

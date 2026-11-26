@@ -60,7 +60,7 @@ const panelWidth = ref(PANEL_WIDTH_PX)
 const button = ref<ComponentPublicInstance | null>(null)
 const fnameButton = ref<HTMLElement | null>(null)
 const nav = ref<HTMLElement | null>(null)
-const panel = ref<{ root: HTMLElement | null; focusCurrent: () => void } | null>(null)
+const panel = ref<{ focusCurrent: () => void } | null>(null)
 /** The pointer is down on the button or in the panel: the focus such a press takes is not the
  *  reader leaving — Safari, which focuses no pressed button, blurs whatever had focus — and
  *  the click that follows does what the press meant. */

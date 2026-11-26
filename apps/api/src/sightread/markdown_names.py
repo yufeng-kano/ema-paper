@@ -24,6 +24,7 @@ from .db.models import MARKDOWN_KIND, Document, Folder
 from .db.session import create_engine, create_sessionmaker
 from .errors import ApiError
 from .workspace import documents as workspace_documents
+from .workspace import git
 from .workspace.agents_file import AGENTS_FILE
 from .workspace.documents import MARKDOWN_EXTENSIONS, markdown_name
 from .workspace.filing import (
@@ -98,7 +99,9 @@ async def _rename(
         # A directory never made moves nothing: the row changes alone.
         landed = (Document, row.id, {"folder_id": row.folder_id, "name": row.name})
         after = await document_relative(db, row)
-        await move_then_commit(db, settings, user_id, before, after, landed=landed)
+        await move_then_commit(
+            db, settings, user_id, before, after, landed=landed, author=git.USER_AUTHOR
+        )
     return f"{old} → {row.name}"
 
 

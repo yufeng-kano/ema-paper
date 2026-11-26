@@ -5,19 +5,24 @@
 # Caddy is the only service with published ports; api, worker, web and pg are reachable
 # on the compose network alone. Secrets come from `.env` next to this file.
 
+# The project name is pinned: compose would otherwise take it from the checkout directory,
+# and with it the names of the volumes (`ema-paper_pgdata`, ...) and the default network —
+# a renamed checkout would then come up beside its own data instead of on it.
+name: ema-paper
+
 services:
   caddy:
     image: caddy:2-alpine
-    container_name: sightread-caddy
+    container_name: ema-paper-caddy
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
       - "443:443/udp"
     environment:
-      # Both are read by the Caddyfile; see the production block of .env.example.
-      DOMAIN: ${DOMAIN}
-      ACME_EMAIL: ${ACME_EMAIL}
+      # Both are read by the Caddyfile; see .env.production.example.
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required}
     volumes:
       - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -28,7 +33,7 @@ services:
 
   pg:
     image: postgres:16
-    container_name: sightread-pg
+    container_name: ema-paper-pg
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sightread}
@@ -45,7 +50,7 @@ services:
   api:
     build:
       context: ./apps/api
-    container_name: sightread-api
+    container_name: ema-paper-api
     restart: unless-stopped
     env_file:
       - .env
@@ -67,13 +72,10 @@ services:
       # Every user's files and revisions — primary data, bind-mounted at the same host
       # path the sandbox runner hands to `docker run` (docs/workspace.md).
       - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
-    # Migrations run once, from the api container, before it serves (docs/database.md).
-    command: >
-      sh -c "alembic upgrade head &&
-      uvicorn sightread.main:app --host 0.0.0.0 --port 8000"
-    # Healthy only once /healthz answers — which is only after `alembic upgrade head`
-    # finished and uvicorn is serving. The worker gates on this, so it can never claim a
-    # queued job against a schema the migration has not written yet.
+    # Healthy only once /healthz answers — which is only after the image's start command
+    # (apps/api/Dockerfile) finished `alembic upgrade head` and uvicorn is serving. The
+    # worker gates on this, so it can never claim a queued job against a schema the
+    # migration has not written yet.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
       interval: 5s
@@ -84,7 +86,7 @@ services:
   worker:
     build:
       context: ./apps/api
-    container_name: sightread-worker
+    container_name: ema-paper-worker
     restart: unless-stopped
     env_file:
       - .env
@@ -112,22 +114,21 @@ services:
     command: ["python", "-m", "sightread.worker"]
 
   # The sandbox runner (docs/sandbox.md): alone in holding the Docker socket, it starts
-  # one Kata microVM per user from the sandbox image (`docker build -t sightread-sandbox
+  # one Kata microVM per user from the sandbox image (`docker build -t ema-paper-sandbox
   # deploy/sandbox-image`). The host needs /dev/kvm and the `kata` runtime registered with
   # Docker; the runner refuses to start in production with `runc`.
   sandbox:
     build:
       context: ./apps/sandbox
-    # Named explicitly: compose would otherwise tag this build `sightread-sandbox`, the
+    # Named explicitly: compose would otherwise tag this build `ema-paper-sandbox`, the
     # tag the VM image (deploy/sandbox-image, SANDBOX_IMAGE) is documented to carry.
-    image: sightread-sandbox-runner
-    container_name: sightread-sandbox
+    image: ema-paper-sandbox-runner
+    container_name: ema-paper-sandbox
     restart: unless-stopped
     env_file:
       - .env
     environment:
       APP_ENV: production
-      SANDBOX_BACKEND: docker
       SANDBOX_WORKSPACES_MOUNT: /data/workspaces
       # The egress proxy as a VM reaches it — by address, since Docker's DNS does not
       # answer inside a Kata VM — once SANDBOX_NETWORK names its network
@@ -151,8 +152,8 @@ services:
   sandbox-egress:
     build:
       context: ./apps/sandbox
-    image: sightread-sandbox-runner
-    container_name: sightread-sandbox-egress
+    image: ema-paper-sandbox-runner
+    container_name: ema-paper-sandbox-egress
     restart: unless-stopped
     command: ["python", "-m", "sightread_sandbox.egress"]
     # tini as pid 1: as pid 1 itself, Python would ignore docker stop's SIGTERM.
@@ -189,7 +190,7 @@ services:
         # and the sitemap take the origin here (docs/web.md § Search engines). A changed
         # WEB_URL needs the image rebuilt.
         WEB_URL: ${WEB_URL:?WEB_URL is required}
-    container_name: sightread-web
+    container_name: ema-paper-web
     restart: unless-stopped
     depends_on:
       - api
@@ -201,7 +202,7 @@ services:
     # newest seven of each. Deliberately a visible shell loop: a cron container would hide
     # the schedule and the rotation in two more places.
     image: postgres:16
-    container_name: sightread-backup
+    container_name: ema-paper-backup
     restart: unless-stopped
     environment:
       PGUSER: ${POSTGRES_USER:-sightread}
@@ -285,7 +286,7 @@ networks:
   # addresses come from, so a VM started while the proxy restarts cannot take it
   # (docs/sandbox.md § Network). The runner refuses a network without the first two.
   sandbox:
-    name: sightread-sandbox
+    name: ema-paper-sandbox
     internal: true
     driver_opts:
       com.docker.network.bridge.inhibit_ipv4: "true"

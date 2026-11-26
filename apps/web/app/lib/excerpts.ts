@@ -9,6 +9,7 @@
  * as their TeX, spacing ignored — the same way everywhere, so a marker, a locate and a
  * duplicate check never disagree about whether a passage is there.
  */
+import { blockKey } from './blocks'
 import {
   blockPlain,
   decodeBlockAnchor,
@@ -16,10 +17,12 @@ import {
   headingKey,
   inlinePlain,
   isBefore,
+  locateSources,
   nearestBlock,
+  parseBlocks,
   parseInline,
-  parseResultMarkdown,
   passageKey,
+  passageKeys,
   placedBlocks,
   readBlockAnchor,
   resolveAnchor,
@@ -31,20 +34,16 @@ import {
   type ResultBlock,
   type ResultPageBlocks,
 } from './markdown'
-import { quoteLines } from './richdoc'
+import { quoteLines, unquoted } from './richdoc'
 
 /** The `##` headings an excerpt section may carry, compared with case and spacing ignored:
  *  a heading in the other language is still the reader's. */
-export const EXCERPT_HEADINGS = ['excerpts', '摘錄']
-
-function blocksOf(markdown: string): ResultBlock[] {
-  return parseResultMarkdown(markdown).flatMap((page) => page.blocks)
-}
+const EXCERPT_HEADINGS = ['excerpts', '摘錄']
 
 /** A passage's text as it is compared. */
 export function passageText(markdown: string): string {
   return passageKey(
-    blocksOf(markdown)
+    parseBlocks(markdown)
       .map((block) => blockPlain(block))
       .filter(Boolean)
       .join(' '),
@@ -69,7 +68,7 @@ export function excerptPassage(markdown: string): string | null {
       parts.push(block.src)
     }
   }
-  blocksOf(markdown).forEach(take)
+  parseBlocks(markdown).forEach(take)
   const passage = parts.join('\n\n').trim()
   return passage ? passage : null
 }
@@ -82,7 +81,7 @@ export function excerptPassage(markdown: string): string | null {
  */
 export function droppedBlocksMarkdown(markdown: string): string | null {
   const parts: string[] = []
-  for (const block of blocksOf(markdown)) {
+  for (const block of parseBlocks(markdown)) {
     if (block.kind !== 'comment') {
       parts.push(block.src)
     }
@@ -104,7 +103,7 @@ export function appendBlocks(notes: string, markdown: string): { notes: string; 
   }
   const body = notes.replace(/\s+$/, '')
   const lead = body ? `${body}\n\n` : ''
-  return { notes: `${lead}${blocks}${notes.slice(body.length)}`, at: lead.length, count: blocksOf(blocks).length }
+  return { notes: `${lead}${blocks}${notes.slice(body.length)}`, at: lead.length, count: parseBlocks(blocks).length }
 }
 
 /**
@@ -168,7 +167,7 @@ export function rewriteBlockLinks(markdown: string, anchorOf: (address: string) 
 }
 
 /** The section a passage is in, as its excerpt's link names it; null before the first heading. */
-export interface ExcerptSection {
+interface ExcerptSection {
   /** The heading's markdown as the document has it. */
   text: string
   slug: string
@@ -188,19 +187,11 @@ export function excerptMarkdown(passage: string, section: ExcerptSection | null,
   return `${quoteLines(passage)}\n\n${link}`
 }
 
-/** Each top-level block of a markdown file with where its source starts and ends. */
+/** Each top-level block of a markdown file with where its source starts and ends; a block
+ *  whose source is not found there is left out. */
 function located(markdown: string): { block: ResultBlock; start: number; end: number }[] {
-  const out: { block: ResultBlock; start: number; end: number }[] = []
-  let cursor = 0
-  for (const block of blocksOf(markdown)) {
-    const start = markdown.indexOf(block.src, cursor)
-    if (start === -1) {
-      continue
-    }
-    out.push({ block, start, end: start + block.src.length })
-    cursor = start + block.src.length
-  }
-  return out
+  const blocks = parseBlocks(markdown)
+  return locateSources(markdown, blocks).flatMap((span, index) => (span ? [{ block: blocks[index]!, ...span }] : []))
 }
 
 /** Whether a block is a `##` heading reading *Excerpts* (or *摘錄*). */
@@ -210,7 +201,7 @@ function isExcerptHeading(block: ResultBlock): boolean {
 
 /** Where an excerpt went: the notes it made, and where in them it starts. `duplicate` says it
  *  was there already and nothing was added — `at` is then that one. */
-export interface AppendedExcerpt {
+interface AppendedExcerpt {
   notes: string
   at: number
   duplicate: boolean
@@ -225,21 +216,13 @@ export interface AppendedExcerpt {
 export function appendExcerpt(notes: string, passage: string, excerpt: string, heading: string): AppendedExcerpt {
   const blocks = located(notes)
   const key = passageText(passage)
-  const existing = blocks.find((entry) => entry.block.kind === 'quote' && passageText(quoteContent(entry.block)) === key)
+  const existing = blocks.find((entry) => entry.block.kind === 'quote' && passageText(unquoted(entry.block.src)) === key)
   if (existing && key) {
     return { notes, at: existing.start, duplicate: true }
   }
   const section = blocks.findIndex((entry) => isExcerptHeading(entry.block))
   if (section !== -1) {
-    let last = section
-    while (last + 1 < blocks.length) {
-      const next = blocks[last + 1]!.block
-      if ((next.kind === 'h2' || next.kind === 'h3') && next.level <= 2) {
-        break
-      }
-      last += 1
-    }
-    const end = blocks[last]!.end
+    const end = blocks[sectionExtent(blocks, section).end - 1]!.end
     return { notes: `${notes.slice(0, end)}\n\n${excerpt}${notes.slice(end)}`, at: end + 2, duplicate: false }
   }
   const body = notes.replace(/\s+$/, '')
@@ -249,18 +232,10 @@ export function appendExcerpt(notes: string, passage: string, excerpt: string, h
   return { notes: `${added}${trailing}`, at: lead.length + heading.length + 2, duplicate: false }
 }
 
-/** A quote block's content as markdown: its lines with `>` and one space removed. */
-function quoteContent(block: Extract<ResultBlock, { kind: 'quote' }>): string {
-  return block.src
-    .split('\n')
-    .map((line) => line.replace(/^\s*> ?/, ''))
-    .join('\n')
-}
-
 // --- finding a passage ------------------------------------------------------------------------
 
 /** A run of text in the order the reader reads it — a text node's, or a formula's TeX. */
-export interface PassageHit {
+interface PassageHit {
   /** Indices into the parts, and offsets into those parts' text; `end` is exclusive. */
   start: { part: number; offset: number }
   end: { part: number; offset: number }
@@ -330,7 +305,7 @@ interface PassageIndex {
 
 function passageIndex(pages: readonly ResultPageBlocks[]): PassageIndex {
   const placed = placedBlocks(pages)
-  return { placed, keys: placed.map((entry) => (entry.block.kind === 'comment' ? '' : passageKey(blockPlain(entry.block)))) }
+  return { placed, keys: passageKeys(placed) }
 }
 
 function locateIn(index: PassageIndex, passage: string, heading: OutlineEntry | null): { start: BlockAt; end: BlockAt } | null {
@@ -400,7 +375,7 @@ export function matchExcerpts(notes: string, pages: readonly ResultPageBlocks[],
     if (!link) {
       return
     }
-    const passage = quoteContent(entry.block)
+    const passage = unquoted(entry.block.src)
     const heading = link.anchor === '' ? null : findHeading(outline, link.label, link.anchor)
     index_ ??= passageIndex(pages)
     matches.push({ at: entry.start, passage, ...link, heading, found: locateIn(index_, passage, heading) })
@@ -417,7 +392,7 @@ export function excerptMarkers(matches: readonly ExcerptMatch[]): Map<string, Ex
   const markers = new Map<string, ExcerptMatch[]>()
   for (const match of matches) {
     if (match.found) {
-      const key = `${match.found.end.page}-${match.found.end.index}`
+      const key = blockKey(match.found.end)
       markers.set(key, [...(markers.get(key) ?? []), match])
     }
   }
@@ -426,18 +401,21 @@ export function excerptMarkers(matches: readonly ExcerptMatch[]): Map<string, Ex
 
 /** Whether a section link in the notes leads anywhere: an excerpt's while its passage or its
  *  heading is found, a block reference's while its anchor resolves, any other while its
- *  heading is found, and `#` — the whole document — always. */
+ *  heading is found, and `#` — the whole document — always. A caller that keeps the placed
+ *  blocks and their `passageKeys` hands them in for a block reference (`resolveAnchor`). */
 export function linkResolves(
   pages: readonly ResultPageBlocks[],
   outline: readonly OutlineEntry[],
   link: { label: string; anchor: string; passage: string | null },
+  placed?: readonly PlacedBlock[],
+  keys?: readonly string[],
 ): boolean {
   if (link.anchor === '') {
     return true
   }
   if (link.anchor.includes('~')) {
     // A block reference: it leads wherever its anchor resolves to.
-    return resolveAnchor(pages, readBlockAnchor(link.anchor), outline) !== null
+    return resolveAnchor(pages, readBlockAnchor(link.anchor), outline, placed, keys) !== null
   }
   const heading = findHeading(outline, link.label, link.anchor)
   return heading !== null || (link.passage !== null && locatePassage(pages, link.passage, null) !== null)

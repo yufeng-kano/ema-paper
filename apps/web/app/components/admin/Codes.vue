@@ -9,21 +9,21 @@
  * The filter, the search and the page live in the route query (`?status=all&q=&page=`), so
  * Back and a reload return to them; nothing of the list is kept in browser storage.
  */
-import { disableAdminCode, listAdminCodes, type AdminCode, type AdminCodesCreated, type AdminCodesList } from '~/lib/api'
+import { disableAdminCode, listAdminCodes, type AdminCode, type AdminCodesCreated } from '~/lib/api'
 import { CODE_CLOSING_DAYS, adminFailure, daysUntil, formatRedeemBy, pageOf } from '~/lib/admin'
 import { formatCount, formatDate } from '~/lib/format'
 import type { TableColumn } from '~/lib/table'
 
-/** How long typing rests before the search runs. */
-const SEARCH_DELAY_MS = 300
 /** The longest search the field takes: a label is at most 255 characters. */
 const SEARCH_MAX = 255
 
 const { t, locale } = useI18n()
+const { personName, grantLabel } = useAdminLabels()
 const route = useRoute()
-const router = useRouter()
 const adminConsole = useAdminConsole()
 const { explain } = useAdminFailure()
+const { setQuery, goToPage, withinPages } = useAdminQuery()
+const hold = useHeldRequest()
 
 const canWrite = computed(() => adminConsole.can('codes', 'write'))
 
@@ -31,86 +31,20 @@ const showAll = computed(() => route.query.status === 'all')
 const q = computed(() => (typeof route.query.q === 'string' ? route.query.q.trim() : ''))
 const page = computed(() => pageOf(route.query.page))
 
-/** Moves the query; a filter or a search starts again at the first page. */
-function setQuery(patch: Record<string, string | null>, replace = false) {
-  const query = Object.fromEntries(Object.entries({ ...route.query, ...patch }).filter(([, value]) => value !== null))
-  void (replace ? router.replace({ query }) : router.push({ query }))
-}
-
 function chooseAll(all: boolean) {
   if (all !== showAll.value) {
     setQuery({ status: all ? 'all' : null, page: null })
   }
 }
 
-function goToPage(next: number) {
-  setQuery({ page: next > 1 ? String(next) : null })
-}
-
-// --- the search, typed ahead of the query ------------------------------------------------
-
-const search = ref(q.value)
-let searchTimer: ReturnType<typeof setTimeout> | undefined
-
-watch(search, (value) => {
-  clearTimeout(searchTimer)
-  searchTimer = setTimeout(() => {
-    const next = value.trim()
-    if (next !== q.value) {
-      setQuery({ q: next || null, page: null }, true)
-    }
-  }, SEARCH_DELAY_MS)
-})
-
-// Back and Forward move the query under the field: the field follows.
-watch(q, (value) => {
-  if (value !== search.value.trim()) {
-    search.value = value
-  }
-})
-
-onBeforeUnmount(() => clearTimeout(searchTimer))
+const search = useQuerySearch(q, setQuery)
 
 // --- the list --------------------------------------------------------------------------
 
-const data = shallowRef<AdminCodesList | null>(null)
-const pending = ref(false)
-const error = ref<string | null>(null)
-/** Only the newest read may write. */
-let seq = 0
-
-async function load(): Promise<void> {
-  const mine = ++seq
-  pending.value = true
-  try {
-    const loaded = await listAdminCodes({
-      page: page.value,
-      status: showAll.value ? 'all' : undefined,
-      q: q.value || undefined,
-    })
-    if (mine !== seq) {
-      return
-    }
-    const last = Math.max(1, Math.ceil(loaded.total / loaded.page_size))
-    if (!loaded.items.length && page.value > last) {
-      // A page past the end — a link from a longer list: its last page instead, which the
-      // query's change reads.
-      setQuery({ page: last > 1 ? String(last) : null }, true)
-      return
-    }
-    data.value = loaded
-    error.value = null
-  } catch (failure) {
-    const message = await explain(failure)
-    if (mine === seq) {
-      error.value = message
-    }
-  } finally {
-    if (mine === seq) {
-      pending.value = false
-    }
-  }
-}
+const { data, pending, error, load } = useAdminRead(
+  () => listAdminCodes({ page: page.value, status: showAll.value ? 'all' : undefined, q: q.value || undefined }),
+  { accept: (loaded) => withinPages(loaded, page.value) },
+)
 
 onMounted(load)
 
@@ -152,20 +86,6 @@ const columns = computed<TableColumn<AdminCode>[]>(() => [
 
 // --- labels ----------------------------------------------------------------------------
 
-/** What a code grants: credits and how long they last, or days of a plan by its id. */
-function grantLabel(row: { kind: string; credits: number | null; valid_days: number | null; plan_id: string | null; days: number | null }): string {
-  if (row.kind === 'credits') {
-    const days = row.valid_days ?? 0
-    return t(
-      'admin.codes.grantCredits',
-      { credits: formatCount(row.credits ?? 0, locale.value), n: formatCount(days, locale.value) },
-      days,
-    )
-  }
-  const days = row.days ?? 0
-  return t('admin.codes.grantPlan', { n: formatCount(days, locale.value), plan: row.plan_id ?? '' }, days)
-}
-
 // `plan_missing` is the operator's to fix — configure the plan again or disable the code — so it
 // stands out as `disabled` does.
 const TONES = { active: 'ok', disabled: 'danger', expired: 'neutral', used_up: 'neutral', plan_missing: 'danger' } as const
@@ -179,8 +99,7 @@ function statusNote(row: AdminCode): string | null {
   }
   if (row.status === 'disabled' && row.disabled_at) {
     const date = formatDate(row.disabled_at, locale.value)
-    const name = row.disabled_by?.name?.trim() || (row.disabled_by ? t('admin.accountId', { id: row.disabled_by.id }) : null)
-    return name ? t('admin.codes.disabledBy', { date, name }) : date
+    return row.disabled_by ? t('admin.codes.disabledBy', { date, name: personName(row.disabled_by) }) : date
   }
   return null
 }
@@ -204,22 +123,13 @@ async function confirmDisable() {
   }
   disabling.value = true
   disableError.value = null
-  // Back would leave the dialog while the request runs, and its answer would land unseen.
-  const release = router.beforeEach(() => false)
-  let failure: unknown = null
-  try {
-    await disableAdminCode(row.id)
-  } catch (caught) {
-    failure = caught
-  } finally {
-    release()
-  }
-  if (failure && adminFailure(failure).kind !== 'notFound') {
-    disableError.value = await explain(failure)
+  const result = await hold(() => disableAdminCode(row.id))
+  if ('failure' in result && adminFailure(result.failure).kind !== 'notFound') {
+    disableError.value = await explain(result.failure)
   } else {
     disableTarget.value = null
     await load()
-    if (failure && !error.value) {
+    if ('failure' in result && !error.value) {
       // Codes are never deleted, so this is a list read from another deployment's state:
       // read again, and said over it — after the read, which clears what was said before.
       error.value = t('admin.codes.gone')
@@ -345,10 +255,7 @@ function onCreated(answer: AdminCodesCreated) {
         </template>
       </UiDataTable>
 
-      <footer v-if="data && data.total" class="foot">
-        <span>{{ t('admin.codes.hint') }}</span>
-        <UiPager :page="data.page" :page-size="data.page_size" :total="data.total" @update:page="goToPage" />
-      </footer>
+      <AdminListFoot v-if="data && data.total" :hint="t('admin.codes.hint')" :list="data" @page="goToPage" />
     </UiPanel>
 
     <UiConfirmDialog
@@ -408,17 +315,6 @@ function onCreated(answer: AdminCodesCreated) {
 
 .note {
   color: var(--muted);
-}
-
-.foot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2) var(--space-4);
-  padding: var(--space-3) var(--cell-x) 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
 }
 
 @media (max-width: 900px) {

@@ -7,12 +7,12 @@ settings in effect anyway, writes the list in effect to a file on a volume the t
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 from pathlib import Path
 
 from ..runtime_settings import RuntimeSettings
+from ..stopping import pause
 
 logger = logging.getLogger(__name__)
 
@@ -53,5 +53,4 @@ async def write_hosts_forever(
             else:
                 written, failing = hosts, False
                 logger.info("the sandbox's sites: %s", ", ".join(hosts) or "none")
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=interval)
+        await pause(stop, interval)

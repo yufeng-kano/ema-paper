@@ -14,20 +14,19 @@
  * (docs/jobs.md § Re-converting a document).
  */
 import {
+  CHECK_AGENT,
   creditsRefusalOf,
+  documentPageImageUrl,
   getDocumentPages,
-  listAgentModels,
-  listAgents,
+  PARSE_AGENT,
   retryDocument,
-  type ConnectionModel,
+  type AgentModel,
   type CreditsRefusal,
   type DocumentPage,
   type LibraryDocument,
 } from '~/lib/api'
 import { PAGE_FAILURE_REASONS, RETRY_TILES_MAX, checkFailureReason } from '~/lib/library'
-
-const PARSE_AGENT = 'parse'
-const CHECK_AGENT = 'check'
+import { loadParseModels } from '~/lib/models'
 
 const props = defineProps<{ document: LibraryDocument }>()
 
@@ -38,10 +37,12 @@ const { resolve } = useApiError()
 
 const pages = ref<DocumentPage[] | null>(null)
 const pagesError = ref<string | null>(null)
-const models = ref<ConnectionModel[] | null>(null)
+const models = ref<AgentModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 /** The parse agent's fallback, the first choice when there is one. */
 const fallback = ref<string | null>(null)
+/** The parse agent's own model (`PARSE_MODEL`), what a retry naming no model falls back to. */
+const own = ref<string | null>(null)
 /** The reader's pick; until there is one, the default below. */
 const chosen = ref<string | null>(null)
 /** Whether the format check is on now — a retry checks with the settings of its moment.
@@ -73,15 +74,17 @@ const jobError = computed(() => {
   return t('files.retry.checkFailed', { reason: key ? t(`files.retry.reasons.${key}`) : check })
 })
 
-/** The fallback, else the model the failed pages last ran on. */
+/** Whether the catalog lists `id`: a model the deployment no longer offers is refused. */
+const offered = (id: string | null | undefined) => !!id && (models.value ?? []).some((m) => m.id === id)
+/** The fallback, else the model the failed pages last ran on or the job's while the
+ *  deployment offers it, else the parse agent's own. */
 const model = computed(
   () =>
     chosen.value ??
-    (fallback.value || missing.value.find((page) => page.model)?.model || props.document.model || ''),
-)
-/** A model the catalog does not list (delisted, or not loaded) is still the choice shown. */
-const modelInjected = computed(() =>
-  model.value && !(models.value ?? []).some((entry) => entry.id === model.value) ? model.value : null,
+    (fallback.value ||
+      [missing.value.find((page) => page.model)?.model, props.document.model].find(offered) ||
+      own.value ||
+      ''),
 )
 
 const submitLabel = computed(() => {
@@ -108,13 +111,16 @@ async function loadPages() {
   }
 }
 
-/** The picker's catalog and the fallback: without them the default model still retries. */
+/** The picker's catalog, the fallback and the agent's model: without them the server's
+ *  default still retries. */
 async function loadModels() {
   try {
-    const [agents, catalog] = await Promise.all([listAgents(), listAgentModels(PARSE_AGENT)])
-    fallback.value = agents.agents.find((agent) => agent.name === PARSE_AGENT)?.settings.fallback_model ?? null
-    checkOn.value = agents.agents.find((agent) => agent.name === CHECK_AGENT)?.settings.auto_check ?? false
-    models.value = [...catalog.data].sort((left, right) => left.id.localeCompare(right.id))
+    const loaded = await loadParseModels()
+    const parse = loaded.agents.find((agent) => agent.name === PARSE_AGENT)
+    fallback.value = parse?.settings.fallback_model ?? null
+    own.value = parse?.settings.model ?? null
+    checkOn.value = loaded.agents.find((agent) => agent.name === CHECK_AGENT)?.settings.auto_check ?? false
+    models.value = loaded.models
   } catch (error) {
     modelsError.value = await resolve(error)
   }
@@ -161,7 +167,7 @@ async function retry() {
           <img
             v-if="!broken.has(page.page)"
             class="page-image"
-            :src="`/api/library/documents/${document.id}/pages/${page.page}/image`"
+            :src="documentPageImageUrl(document.id, page.page)"
             :alt="t('files.retry.pageImage', { n: page.page })"
             loading="lazy"
             decoding="async"
@@ -180,10 +186,7 @@ async function retry() {
       <template v-if="missing.length">
         <UiField v-slot="{ id }" :label="t('files.retry.model')">
           <UiSelect :id="id" :model-value="model" :disabled="busy" @update:model-value="chosen = $event">
-            <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
-            <option v-for="entry in models ?? []" :key="entry.id" :value="entry.id">
-              {{ entry.name ? `${entry.name} · ${entry.id}` : entry.id }}
-            </option>
+            <ModelOptions :models="models" :current="model" />
           </UiSelect>
         </UiField>
         <p class="note">{{ t(replacing ? 'files.retry.noteReconvert' : 'files.retry.note') }}</p>
@@ -215,7 +218,7 @@ async function retry() {
   letter-spacing: normal;
 }
 
-/* The document, under the verb — a fact, as in the move dialog. */
+/* The document, under the verb, as a fact. */
 .subject {
   margin-top: var(--space-1);
   overflow: hidden;
@@ -237,8 +240,7 @@ async function retry() {
   font-size: var(--text-sm);
 }
 
-/* Bounded and scrolling, like the move dialog's tree: twelve pages must not push the
-   buttons off the screen. */
+/* Bounded and scrolling: twelve pages must not push the buttons off the screen. */
 .tiles {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr));

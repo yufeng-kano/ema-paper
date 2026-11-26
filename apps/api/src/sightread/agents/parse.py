@@ -2,22 +2,14 @@
 (docs/parsing.md, docs/agents.md).
 
 Its run loop lives in `jobs/runner.py`; this module holds what defines its output — the
-default prompt, the coordinate contract it declares, and the pipeline version that keys
-its cached results.
+default prompt and the pipeline version that keys its cached results. The coordinate
+contract its results declare is `agents/bbox.py`'s.
 """
 
 from __future__ import annotations
 
-# Coordinate contract every result declares: [ymin, xmin, ymax, xmax], normalized 0-1000,
-# origin top-left. What a model is asked for depends on its family and is converted into
-# this space before storage (agents/bbox.py, docs/parsing.md § Coordinate conventions).
-BBOX_FORMAT_YXYX = "yxyx_norm1000"
-
-# Part of the dedup cache key; bump when the pipeline changes results (docs/jobs.md).
-# 6: the coordinate paragraph follows the model's family; 7: code fences kept; 8: a page
-# the model stopped (blocked, cut off) fails rather than passing as the page; 9: the box
-# encloses the whole figure, and a caption is only the line right after its placeholder;
-# 10: every page's boxes are checked, and each figure carries the check's status.
+# Part of the dedup cache key; bumped whenever results for the same input would change
+# (docs/jobs.md; docs/parsing.md says what moved each version).
 PIPELINE_VERSION = 10
 
 # A job queued under an earlier version runs without the figure check: its result answers

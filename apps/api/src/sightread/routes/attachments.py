@@ -19,19 +19,20 @@ from pathlib import Path, PurePath
 
 from fastapi import APIRouter, Request, Response, status
 from sqlalchemy import delete, func, select
-from starlette.datastructures import UploadFile
-from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
-from ..db.models import ChatAttachment, User, utcnow
+from ..body_limit import is_multipart
+from ..db.models import ChatAttachment, utcnow
 from ..errors import ApiError
-from ..jobs.intake import MULTIPART_ENVELOPE_BYTES, capped_stream, store_upload, upload_chunks
+from ..jobs.intake import store_upload, upload_chunks
 from ..parsing.attachments import (
     FILE_PREFIX,
     AttachmentRefused,
     prepare_attachment,
     prepared_path,
 )
+from ..workspace.trash import lock_user
+from .multipart import capped_form, form_file
 
 router = APIRouter(prefix="/api", tags=["attachments"])
 
@@ -82,7 +83,7 @@ async def upload_attachment(
     request: Request, user: SessionUser, db: DbSession, settings: AppSettings
 ):
     user_id = user.id
-    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+    if not is_multipart(request.headers.get("content-type", "")):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     # A cheap refusal before a byte is read; the count under the user's lock below, once the
     # file is prepared, is the one that holds (docs/api.md).
@@ -90,22 +91,11 @@ async def upload_attachment(
     if await _pending(db, user_id, max_age) >= settings.chat_attachments_pending_max:
         raise ApiError(429, "rate_limit", PENDING_FULL)
     cap = settings.chat_attachment_max_bytes
-    declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > cap + MULTIPART_ENVELOPE_BYTES:
-        raise ApiError(413, "invalid_request", f"The upload exceeds {CAP_NAME}")
     # Bounded before the parser spools a byte: a chunked request without a length would
     # otherwise fill the disk before anything answered 413 (jobs/intake.capped_stream).
+    form = await capped_form(request, cap, CAP_NAME)
     try:
-        form = await MultiPartParser(
-            request.headers,
-            capped_stream(request.stream(), cap + MULTIPART_ENVELOPE_BYTES, cap_name=CAP_NAME),
-        ).parse()
-    except MultiPartException as exc:
-        raise ApiError(400, "invalid_request", "The multipart body could not be read") from exc
-    try:
-        upload = form.get("file")
-        if not isinstance(upload, UploadFile):
-            raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
+        upload = form_file(form)
         name = attachment_name(upload.filename)
         upload_dir = Path(settings.upload_dir)
         upload_dir.mkdir(parents=True, exist_ok=True)
@@ -132,8 +122,8 @@ async def upload_attachment(
         await form.close()
 
     # Under the user's row, held until the insert commits: two uploads at the cap must not
-    # both count below it (PostgreSQL; the SQLite fallback runs one request at a time).
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    # both count below it.
+    await lock_user(db, user_id)
     # The caller's rows the sweeper has taken the files of are no attachments any more:
     # they go with this upload, so the never-sent ones do not pile up (docs/jobs.md
     # § Retention).

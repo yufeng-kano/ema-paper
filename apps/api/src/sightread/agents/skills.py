@@ -8,7 +8,7 @@ model. It reads no database: the caller hands it the rows.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -34,12 +34,17 @@ class SkillDefinition:
     body: str
     user_invocable: bool = True
     model_invocable: bool = True
+    # Works on a document — its doc.md, pages and figures — so a library conversation, which
+    # has none, neither lists nor runs it (docs/chat.md § Skills). Not one of the fields an
+    # edit writes: an edited built-in keeps the flag, a skill of the reader's own never has it.
+    document_only: bool = False
 
 
 CHECK_FIGURES = SkillDefinition(
     name="check-figures",
     description="Check each figure caption against its page image and correct the captions that differ.",
     argument_hint="[pages]",
+    document_only=True,
     body="""Check every figure caption in the range against the page it is on.
 
 Range: the selected passage or the sections this message carries, when it carries any. Otherwise the pages given here: $ARGUMENTS (the whole document when none are given).
@@ -58,6 +63,7 @@ FIX_MATH = SkillDefinition(
     name="fix-math",
     description="Check formulas against the page images and correct transcription errors in them.",
     argument_hint="[pages]",
+    document_only=True,
     body="""Check the formulas in the range against the page images and correct them.
 
 Range: the selected passage or the sections this message carries, when it carries any. Otherwise the pages given here: $ARGUMENTS (the whole document when none are given).
@@ -79,6 +85,7 @@ TRANSLATE = SkillDefinition(
     name="translate",
     description="Translate the selected passage, the sections sent with it, or the whole document, inserting each block's translation right under it.",
     argument_hint="[language] [instructions]",
+    document_only=True,
     body="""Translate into the document with the `translator` subagent: translators read doc.md and write the translation into it themselves. Do not translate yourself: your part is to split the work, start them, proofread what they wrote as one translation, and tell the user how it went. The user ran this command to have the translation written into the document.
 
 Arguments: $ARGUMENTS
@@ -124,6 +131,8 @@ class ResolvedSkill:
     modified: bool
     # A built-in's shipped values; None for a skill of the user's own.
     default: SkillDefinition | None
+    # A built-in's flag, whatever the edit: see `SkillDefinition.document_only`.
+    document_only: bool = False
 
 
 def _resolved(
@@ -139,18 +148,21 @@ def _resolved(
         builtin=builtin,
         modified=modified,
         default=default,
+        document_only=default is not None and default.document_only,
     )
 
 
-def resolve_skills(rows: Iterable[SkillRow]) -> list[ResolvedSkill]:
+def overlay[Resolved](
+    builtins: Iterable, rows: Iterable, resolved: Callable[..., Resolved]
+) -> list[Resolved]:
     """The built-ins in their code order, each as the user's edit when there is one, then
-    the user's own by name (docs/api.md)."""
+    the user's own by name (docs/api.md). `resolved` builds one entry from its source."""
     by_name = {row.name: row for row in rows}
-    resolved = []
-    for builtin in BUILTIN_SKILLS:
+    merged = []
+    for builtin in builtins:
         row = by_name.pop(builtin.name, None)
-        resolved.append(
-            _resolved(
+        merged.append(
+            resolved(
                 row if row is not None else builtin,
                 builtin=True,
                 modified=row is not None,
@@ -158,8 +170,13 @@ def resolve_skills(rows: Iterable[SkillRow]) -> list[ResolvedSkill]:
             )
         )
     for name in sorted(by_name):
-        resolved.append(_resolved(by_name[name], builtin=False, modified=False, default=None))
-    return resolved
+        merged.append(resolved(by_name[name], builtin=False, modified=False, default=None))
+    return merged
+
+
+def resolve_skills(rows: Iterable[SkillRow]) -> list[ResolvedSkill]:
+    """The built-in skills overlaid with the user's rows (see `overlay`)."""
+    return overlay(BUILTIN_SKILLS, rows, _resolved)
 
 
 def same_as_default(values: dict, default: SkillDefinition) -> bool:

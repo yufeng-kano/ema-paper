@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { ApiRequestError } from './api'
-import { presentCode, redeemErrorKey } from './redeem'
+import { redeemErrorKey } from './redeem'
 
 describe('redeemErrorKey', () => {
   it('words every refusal the API names', () => {
@@ -18,11 +18,5 @@ describe('redeemErrorKey', () => {
     expect(redeemErrorKey(new ApiRequestError(503, 'upstream', 'x'))).toBeNull()
     expect(redeemErrorKey(new ApiRequestError(0, 'internal', 'offline'))).toBeNull()
     expect(redeemErrorKey(new Error('x'))).toBeNull()
-  })
-})
-
-describe('presentCode', () => {
-  it('shows the code as printed while the server reads it', () => {
-    expect(presentCode('ema-7k3q wx9m-4htb')).toBe('EMA-7K3Q WX9M-4HTB')
   })
 })

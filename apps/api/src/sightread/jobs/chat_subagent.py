@@ -12,7 +12,6 @@ paths, one write of the turn at a time (`chat_runner.run_writer`).
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -21,8 +20,7 @@ from ..agents import chat as chat_agent
 from ..agents import subagents as subagent_defs
 from ..upstream.client import PaymentRequired, RateLimited, UpstreamError
 from ..workspace import git
-from ..workspace.documents import MARKDOWN_KIND
-from . import chat_events, chat_runner, chat_tools
+from . import chat_runner, chat_tools
 
 logger = logging.getLogger(__name__)
 
@@ -42,38 +40,6 @@ CREDITS_SPENT = (
     "The account's credits are spent and the tool calls left to this turn are used; the "
     "subagent stopped here."
 )
-
-
-class _ImageBudget:
-    """The run's own image budgets — per round, and over the whole run — kept like the
-    turn's (docs/chat.md § Tools): a result that would cross one is replaced before it is
-    reported, one at a time, so neither is ever exceeded."""
-
-    def __init__(self, round_max: int, total_max: int) -> None:
-        self.round_max = round_max
-        self.total_max = total_max
-        self.round = 0
-        self.total = 0
-
-    def start_round(self) -> None:
-        self.round = 0
-
-    def refusal(self) -> chat_tools.ToolOutcome | None:
-        if self.total >= self.total_max:
-            return chat_tools.ToolOutcome(IMAGE_RUN_BUDGET_SPENT, is_error=True)
-        if self.round >= self.round_max:
-            return chat_tools.ToolOutcome(chat_runner.IMAGE_BUDGET_SPENT, is_error=True)
-        return None
-
-    def admit(self, outcome: chat_tools.ToolOutcome) -> chat_tools.ToolOutcome:
-        size = chat_runner._image_bytes({"content": outcome.content})
-        if size and self.total + size > self.total_max:
-            return chat_tools.ToolOutcome(IMAGE_RUN_BUDGET_SPENT, is_error=True)
-        if size and self.round + size > self.round_max:
-            return chat_tools.ToolOutcome(chat_runner.IMAGE_BUDGET_SPENT, is_error=True)
-        self.round += size
-        self.total += size
-        return outcome
 
 
 def _bounded_input(value: object) -> object:
@@ -105,29 +71,19 @@ async def _run_one(
     name = block.get("name")
     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
     if str(block.get("id")) in malformed:
-        return chat_tools.ToolOutcome(
-            "The tool input was not valid JSON; send it again.", is_error=True
-        )
-    if name not in definition.tools:
+        return chat_tools.ToolOutcome(chat_runner.MALFORMED_INPUT, is_error=True)
+    # A library conversation has no document for `view_page` and `view_figure` to read:
+    # taken out of every subagent's tools there (docs/chat.md § Library conversations).
+    if name not in definition.tools or (
+        ctx.document is None and name in chat_agent.DOCUMENT_TOOL_NAMES
+    ):
         return chat_tools.ToolOutcome(
             f"{name!r} is not one of this subagent's tools", is_error=True
         )
     if name == "view_page":
-        return await chat_tools.view_page(
-            ctx.paths,
-            tool_input,
-            document_id=ctx.document.id,
-            page_count=ctx.job.page_count if ctx.job is not None else None,
-            render_slots=ctx.render_slots,
-            decode_slot=ctx.decode_slot,
-            max_bytes=ctx.settings.upload_max_bytes,
-            max_pixels=ctx.settings.chat_page_image_max_pixels,
-            kind=ctx.job.kind if ctx.job is not None else MARKDOWN_KIND,
-        )
+        return await chat_runner.view_page(ctx, tool_input)
     if name == "view_figure":
-        return await chat_tools.view_figure(
-            ctx.paths, tool_input, max_bytes=ctx.settings.chat_image_round_max_bytes
-        )
+        return await chat_runner.view_figure(ctx, tool_input)
     if _writes(definition, block):
         # The agent's own paths: a revision per write, the shell under the user's locks.
         return await chat_runner.run_mutating(ctx, str(name), tool_input)
@@ -135,9 +91,9 @@ async def _run_one(
     # § Subagents).
     if tool_input.get("command") != "view":
         return chat_tools.ToolOutcome(READ_ONLY, is_error=True)
-    # An image it views is the run's to budget (`_ImageBudget`); the crop commands only to
-    # one with a shell (docs/chat.md § Subagents).
-    shell = definition.writes and "bash" in definition.tools and ctx.sandbox is not None
+    # An image it views is the run's to budget (`chat_runner.ImageBudget`); the crop
+    # commands only to one with a shell (docs/chat.md § Subagents).
+    shell = _has_shell(ctx, definition)
     return await chat_tools.run_editor(
         ctx.paths.root,
         tool_input,
@@ -146,6 +102,12 @@ async def _run_one(
         max_bytes=ctx.settings.content_max_bytes,
         images=chat_runner.editor_images(ctx, shell=shell),
     )
+
+
+def _has_shell(ctx: chat_runner.TurnContext, definition: subagent_defs.ResolvedSubagent) -> bool:
+    """The shell only to one that may change files, and only where there is a sandbox: a
+    tool the harness cannot run is never offered (docs/chat.md § Subagents)."""
+    return definition.writes and "bash" in definition.tools and ctx.sandbox is not None
 
 
 def _writes(definition: subagent_defs.ResolvedSubagent, block: dict) -> bool:
@@ -168,13 +130,11 @@ async def _run_one_guarded(
     """A tool that raises answers an error result, as the turn's own do."""
     try:
         return await _run_one(ctx, definition, block, malformed)
-    except (asyncio.CancelledError, chat_runner.TurnCancelled):
+    except chat_runner.TurnCancelled:
         raise
-    except Exception:  # noqa: BLE001 - any failure is this tool's, never the run's
+    except Exception:  # any failure is this tool's, never the run's
         logger.exception("a subagent's %s failed in turn %s", block.get("name"), ctx.turn.id)
-        return chat_tools.ToolOutcome(
-            "The tool failed unexpectedly; try another way.", is_error=True
-        )
+        return chat_tools.ToolOutcome(chat_runner.TOOL_FAILED, is_error=True)
 
 
 async def _run_tools(
@@ -184,107 +144,40 @@ async def _run_tools(
     tool_uses: list[dict],
     malformed: set[str],
     steps_by_id: dict[str, dict],
-    budget: _ImageBudget,
+    images: chat_runner.ImageBudget,
 ) -> list[dict]:
-    """One round of the run's calls, the results in the order of the calls. Reads run
-    together, at most as many at a time as the turn's, each looking for a Stop before it
-    starts; writes run one after another, each waiting its turn with every other write of
-    the turn and started only if no Stop came (docs/chat.md § Tools)."""
-    results: dict[int, dict] = {}
+    """One round of the run's calls (`chat_runner.run_round`), against the run's own image
+    budget and the turn's credits; its events carry `parent`, and each step of the record
+    is marked as its call ended."""
     may_run = ctx.round_admission(len(tool_uses))
-    slots = asyncio.Semaphore(chat_runner.READ_CONCURRENCY)
-    stopped = asyncio.Event()
-    budget.start_round()
+    images.start_round()
 
     async def report(block: dict, outcome: chat_tools.ToolOutcome) -> dict:
         tool_use_id = str(block.get("id"))
-        summary = outcome.content if isinstance(outcome.content, str) else "(image)"
-        await chat_runner._emit(
-            ctx,
-            chat_events.TOOL_RESULT,
-            {
-                "id": tool_use_id,
-                "name": block.get("name"),
-                "is_error": outcome.is_error,
-                "output": summary,
-                "parent": parent,
-            },
+        result = await chat_runner.report_tool(
+            ctx, tool_use_id, block.get("name"), outcome, parent=parent
         )
-        if outcome.edit is not None:
-            # The viewer reloads on it, and the panel joins it to the step's diff card.
-            await chat_runner._emit(
-                ctx,
-                chat_events.EDIT,
-                {**outcome.edit, "tool_use_id": tool_use_id, "parent": parent},
-            )
         if tool_use_id in steps_by_id:
             steps_by_id[tool_use_id]["is_error"] = outcome.is_error
-        result: dict = {
-            "type": "tool_result",
-            "tool_use_id": tool_use_id,
-            "content": outcome.content,
-        }
-        if outcome.is_error:
-            result["is_error"] = True
         return result
 
-    async def reads() -> None:
-        async def one(index: int, block: dict) -> None:
-            async with slots:
-                # Noted, not raised, as the turn's own reads do: a raise here would leave
-                # the reads beside it running while the run ends.
-                if stopped.is_set() or await chat_runner._cancelled(ctx):
-                    stopped.set()
-                    return
-                refusal = budget.refusal()
-                if refusal is None and not may_run(index):
-                    # Past the turn's allowance once the credits ran out (docs/billing.md
-                    # § A chat turn).
-                    refusal = chat_tools.ToolOutcome(
-                        chat_runner.NOT_RUN_OUT_OF_CREDITS, is_error=True
-                    )
-                outcome = refusal or await _run_one_guarded(ctx, definition, block, malformed)
-                results[index] = await report(block, budget.admit(outcome))
+    async def run(index: int, block: dict) -> dict:
+        # Only a page or a figure is refused ahead for a spent budget, as in the turn's own
+        # round: an editor `view` of a text file still runs. A write is admitted when its
+        # turn at the gate has come, as the turn's own writes are, and reported inside the
+        # shielded writer: an `edit` the deadline interrupted is still announced before the
+        # terminal event.
+        refusal = images.refusal() if block.get("name") in chat_runner.IMAGE_READ_TOOLS else None
+        if refusal is None and not may_run(index):
+            # Past the turn's allowance once the credits ran out (docs/billing.md § A chat
+            # turn).
+            refusal = chat_tools.ToolOutcome(chat_runner.NOT_RUN_OUT_OF_CREDITS, is_error=True)
+        outcome = refusal or await _run_one_guarded(ctx, definition, block, malformed)
+        return await report(block, images.admit(outcome))
 
-        await asyncio.gather(
-            *(
-                one(index, block)
-                for index, block in enumerate(tool_uses)
-                if not _writes(definition, block)
-            )
-        )
-
-    async def writes() -> None:
-        async def write(index: int, block: dict) -> dict:
-            # Admitted when its turn at the gate has come, as the turn's own writes are
-            # (docs/billing.md § A chat turn). Reported inside the shielded writer: an
-            # `edit` the deadline interrupted is still announced before the terminal event.
-            if not may_run(index):
-                return await report(
-                    block,
-                    chat_tools.ToolOutcome(chat_runner.NOT_RUN_OUT_OF_CREDITS, is_error=True),
-                )
-            return await report(block, await _run_one_guarded(ctx, definition, block, malformed))
-
-        for index, block in enumerate(tool_uses):
-            if _writes(definition, block):
-                results[index] = await chat_runner.run_writer(
-                    ctx,
-                    str(block.get("name")),
-                    lambda index=index, block=block: write(index, block),
-                )
-
-    # A task group: when the writes stop on a cancel, the reads still running are cancelled
-    # with them rather than left to finish a run that is over.
-    try:
-        async with asyncio.TaskGroup() as group:
-            group.create_task(reads())
-            group.create_task(writes())
-    except* chat_runner.TurnCancelled:
-        raise chat_runner.TurnCancelled() from None
-    if stopped.is_set():
-        raise chat_runner.TurnCancelled()
-    return [results[index] for index in range(len(tool_uses))]
+    return await chat_runner.run_round(
+        ctx, tool_uses, is_write=lambda block: _writes(definition, block), run=run
+    )
 
 
 async def run_subagent(
@@ -312,14 +205,16 @@ async def run_subagent(
             "subagent another model, or none to run on the conversation's.",
             is_error=True,
         )
-    # The shell only to one that may change files, and only where there is a sandbox: a
-    # tool the harness cannot run is never offered (docs/chat.md § Subagents).
-    shell = definition.writes and "bash" in definition.tools and ctx.sandbox is not None
+    shell = _has_shell(ctx, definition)
     system = [
         {
             "type": "text",
             "text": subagent_defs.render_system(
-                definition.prompt, ctx.facts, writes=definition.writes, shell=shell
+                definition.prompt,
+                ctx.facts,
+                writes=definition.writes,
+                shell=shell,
+                library=ctx.document is None,
             ),
             "cache_control": {"type": "ephemeral", "ttl": chat_agent.CACHE_TTL},
         }
@@ -327,13 +222,17 @@ async def run_subagent(
     tools = [
         tool
         for tool in chat_agent.SUBAGENT_TOOLS
-        if tool["name"] in definition.tools and (tool["name"] != "bash" or shell)
+        if tool["name"] in definition.tools
+        and (tool["name"] != "bash" or shell)
+        and (ctx.document is not None or tool["name"] not in chat_agent.DOCUMENT_TOOL_NAMES)
     ]
     messages: list[dict] = [{"role": "user", "content": [{"type": "text", "text": task.strip()}]}]
     steps: list[dict] = []
     calls = 0
-    budget = _ImageBudget(
-        ctx.settings.chat_image_round_max_bytes, ctx.settings.chat_image_turn_max_bytes
+    images = chat_runner.ImageBudget(
+        ctx.settings.chat_image_round_max_bytes,
+        ctx.settings.chat_image_turn_max_bytes,
+        IMAGE_RUN_BUDGET_SPENT,
     )
     report = ""
     note: str | None = None
@@ -382,14 +281,14 @@ async def run_subagent(
             return chat_tools.ToolOutcome(
                 f"The subagent's model call failed: {reason}", is_error=True, subagent=record()
             )
-        # Billed whether or not anything of it is used, under the model it ran on, not the
-        # conversation's (docs/chat.md § Subagents).
+        # Billed as its stream closed (`chat_runner._stream_once`), whether or not anything
+        # of it is used, under the model it ran on, not the conversation's (docs/chat.md
+        # § Subagents). A reply that named no model is the one asked for.
         if not completed.model:
             completed.model = model
-        await chat_runner._record_usage_settled(ctx, completed.model, completed.usage)
         if await chat_runner._cancelled(ctx):
             raise chat_runner.TurnCancelled()
-        if completed.model and completed.model != model:
+        if completed.model != model:
             # A fallback answered: the blocks the run replays are that model's now.
             model = completed.model
 
@@ -456,7 +355,7 @@ async def run_subagent(
             tool_uses,
             completed.malformed_tool_uses,
             steps_by_id,
-            budget,
+            images,
         )
         messages.append({"role": "user", "content": results})
 

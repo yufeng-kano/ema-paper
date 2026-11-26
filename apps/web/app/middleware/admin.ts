@@ -1,5 +1,5 @@
 import { ApiRequestError } from '~/lib/api'
-import { areaOf, consoleDestination } from '~/lib/admin'
+import { firstReadablePath } from '~/lib/admin'
 
 /**
  * Every console page's second middleware, after `authed` (docs/admin.md § Pages): reads
@@ -31,12 +31,12 @@ export default defineNuxtRouteMiddleware(async (to) => {
     return
   }
 
-  const area = areaOf(to.meta.adminArea)
-  const destination = consoleDestination(adminConsole.permissions.value, area)
-  if (destination === null) {
+  const first = firstReadablePath(adminConsole.permissions.value)
+  if (first === null) {
     return notFound()
   }
-  if (area === null || !adminConsole.can(area, 'read')) {
-    return navigateTo(localePath(destination), { replace: true })
+  const area = to.meta.adminArea
+  if (area === undefined || !adminConsole.can(area, 'read')) {
+    return navigateTo(localePath(first), { replace: true })
   }
 })

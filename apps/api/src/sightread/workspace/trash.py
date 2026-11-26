@@ -25,9 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 async def lock_user(db: AsyncSession, user_id: int) -> None:
-    """Serialize this user's name decisions: the unique indexes cannot see across the
-    two tables, so two requests choosing a name for a folder and a file at once are
-    ordered here (docs/database.md)."""
+    """The user's row lock, held to the end of the transaction. It orders that user's
+    name decisions — the unique indexes cannot see across folders and documents, so two
+    requests choosing a name for a folder and a file at once are ordered here
+    (docs/database.md) — and every per-user cap and ordering decision taken under it."""
     await db.execute(select(User.id).where(User.id == user_id).with_for_update())
 
 
@@ -59,7 +60,7 @@ async def read_row(db: AsyncSession, model: type, row_id: int) -> tuple[bool, ob
     try:
         async with AsyncSession(bind=db.bind, expire_on_commit=False) as fresh:
             return True, await fresh.get(model, row_id)
-    except Exception:  # noqa: BLE001 - the database is away
+    except Exception:  # the database is away
         logger.exception("could not read row %s of %s after a failed commit", row_id, model)
         return False, None
 
@@ -94,11 +95,11 @@ async def _discard_for_good(
 ) -> None:
     try:
         await workspace_documents.discard_trash(settings, user_id, entries)
-    except Exception:  # noqa: BLE001 - the repair rule removes an entry with no row
+    except Exception:  # the repair rule removes an entry with no row
         logger.exception("could not remove %s from the Trash", entries)
     try:
         await workspace_documents.discard_originals(settings, user_id, document_ids)
-    except Exception:  # noqa: BLE001 - reconciliation sweeps an original with no row
+    except Exception:  # reconciliation sweeps an original with no row
         logger.exception("could not discard the originals of %s", entries)
 
 
@@ -137,6 +138,7 @@ async def empty_trash(
             for document in documents
             if expired(document) or document.folder_id in doomed_folders
         ]
+        doomed_ids = set(doomed)
         # Every deleted row put in the Trash itself has an entry there.
         roots: list[tuple[type, int]] = [
             (Folder, folder_id)
@@ -145,7 +147,7 @@ async def empty_trash(
         ] + [
             (Document, row.id)
             for row in documents
-            if row.id in doomed and row.trashed_at is not None
+            if row.id in doomed_ids and row.trashed_at is not None
         ]
         if not roots:
             return 0

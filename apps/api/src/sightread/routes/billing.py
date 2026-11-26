@@ -1,7 +1,7 @@
-"""Control plane `/api/billing` — the plan, the period's balance, the top-up packs and
-the rates, the Usage tab's credits view, and the Kano Pay surface: checkout (a plan's or a
-pack's), portal, the public catalog and the signed webhook (docs/billing.md § Kano Pay,
-§ Routes).
+"""Control plane `/api/billing` — the plan, the period's balance, the top-up packs, the
+bank of granted days and the rates, redeeming a code, and the Kano Pay surface: checkout
+(a plan's or a pack's), portal, the public catalog and the signed webhook (docs/billing.md
+§ Kano Pay, § Routes).
 """
 
 from __future__ import annotations
@@ -10,28 +10,25 @@ import json
 import logging
 import secrets
 import time
-from datetime import timedelta
 from typing import NamedTuple
 
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func, select
+from sqlalchemy import select
 
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import codes, ledger, pay
-from ..billing.plans import FREE_PLAN_ID
 from ..db.models import (
     Checkout,
-    CreditEntry,
     CreditPack,
     PackCheckout,
     PayEvent,
-    Redemption,
     Subscription,
     User,
     utcnow,
 )
 from ..errors import ApiError
+from ..workspace.trash import lock_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/billing", tags=["billing"])
@@ -57,10 +54,6 @@ class Sale(NamedTuple):
     enabled: bool
     plans: dict[str, pay.CatalogPlan]
     packs: dict[str, pay.CatalogPack]
-
-
-def _catalog_cache(request: Request) -> pay.CatalogCache:
-    return request.app.state.pay_catalog
 
 
 async def _may_have_purchases(db: DbSession, user_id: int) -> bool:
@@ -109,7 +102,7 @@ async def _refresh(
         return False
     if canonical is not None or purchases:
         # The same writes the webhook makes, under the same lock.
-        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+        await lock_user(db, user_id)
         if canonical is not None:
             await pay.apply_canonical(db, user_id, canonical)
             # A subscription that began inside a granted period cuts it: written here,
@@ -129,7 +122,7 @@ async def _on_sale(request: Request, settings: AppSettings) -> Sale | None:
     if not settings.kano_pay_configured:
         return None
     try:
-        catalog = await _catalog_cache(request).get(pay.PayClient(settings))
+        catalog = await request.app.state.pay_catalog.get(pay.PayClient(settings))
     except (pay.PayUnavailable, pay.PayRefused) as exc:
         logger.warning("Kano Pay catalog unavailable: %s", exc)
         return None
@@ -170,13 +163,6 @@ async def billing(request: Request, user: SessionUser, db: DbSession, settings: 
     balance = await ledger.read_balance(db, settings, user.id)
     plan = balance.period.plan
     subscription = await db.get(Subscription, user.id)
-    redemptions = (
-        await db.execute(
-            select(Redemption)
-            .where(Redemption.user_id == user.id)
-            .order_by(Redemption.redeemed_at.desc(), Redemption.id.desc())
-        )
-    ).scalars()
     return {
         "plan": {
             "id": plan.id,
@@ -223,7 +209,6 @@ async def billing(request: Request, user: SessionUser, db: DbSession, settings: 
                     "purchased_at": pack.purchased_at,
                     "expires_at": pack.expires_at,
                     "source": pack.source,
-                    "redemption_id": pack.redemption_id,
                 }
                 for pack in balance.packs
             ],
@@ -240,18 +225,6 @@ async def billing(request: Request, user: SessionUser, db: DbSession, settings: 
                 "period_end": balance.grant.period_end,
             }
         ),
-        # Every code this user redeemed, newest first (docs/billing.md § Redeem codes).
-        "redemptions": [
-            {
-                "id": row.id,
-                "kind": row.kind,
-                "credits": row.credits,
-                "plan_id": row.plan_id,
-                "days": row.days,
-                "redeemed_at": row.redeemed_at,
-            }
-            for row in redemptions
-        ],
         "credits_available": balance.available,
         "rates": rates(settings),
         # On sale: Pay configured and reachable, its checkout open, and at least one plan
@@ -268,9 +241,9 @@ async def billing(request: Request, user: SessionUser, db: DbSession, settings: 
 @router.get("/catalog")
 async def catalog(request: Request, response: Response, settings: AppSettings):
     """Public: the plans and the packs on sale with Pay's prices and this deployment's
-    grants, the Free plan and the credit rates, cached for five minutes; unconfigured or
-    unreachable Pay answers `available: false` with no plans and no packs, never an error
-    (docs/billing.md § Kano Pay)."""
+    grants, the Free plan and the credit rates, cached for `KANO_PAY_CATALOG_TTL_SECONDS`;
+    unconfigured or unreachable Pay answers `available: false` with no plans and no
+    packs, never an error (docs/billing.md § Kano Pay)."""
     # The deployment's own side of the page: the Free plan and the rates, which Pay has no
     # say in, answered whether or not Pay is.
     free = settings.free_plan
@@ -344,7 +317,7 @@ async def checkout(
         raise ApiError(503, "pay_unavailable", "The payment service is unavailable; try again")
     if not sale.enabled or plan_id not in sale.plans:
         raise ApiError(409, "checkout_unavailable", "This plan is not on sale")
-    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    await lock_user(db, user.id)
     row = await db.get(Checkout, user.id)
     if row is None or row.plan_id != plan_id or row.completed_at is not None:
         # A fresh key for a new purchase; the same plan's open checkout keeps its key.
@@ -387,15 +360,14 @@ async def pack_checkout(
     checkout takes `checkouts` (docs/billing.md § Top-up packs, § Kano Pay *Pack
     checkout*)."""
     pack_id = body.pack_id.strip()
-    balance = await ledger.read_balance(db, settings, user.id)
-    if balance.period.plan.free:
+    if (await ledger.plan_of(db, settings, user.id)).free:
         raise ApiError(409, "plan_required", "Top-up packs are for paid plans")
     sale = await _on_sale(request, settings)
     if sale is None:
         raise ApiError(503, "pay_unavailable", "The payment service is unavailable; try again")
     if not sale.enabled or pack_id not in sale.packs:
         raise ApiError(409, "checkout_unavailable", "This pack is not on sale")
-    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    await lock_user(db, user.id)
     row = await db.get(PackCheckout, user.id)
     if (
         row is None
@@ -501,15 +473,15 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
     if (
         # Exactly one of the two: a notification is a subscription's or a purchase's.
         isinstance(subscription, dict) == isinstance(purchase, dict)
-        or not isinstance(event_id, str)
-        or not pay._ID.match(event_id)
+        or not pay.valid_id(event_id)
+        # A notification must name its type; nothing is decided or stored by it.
         or not isinstance(event_type, str)
         or not 0 < len(event_type) <= 64
     ):
         raise ApiError(400, "invalid_request", "Invalid event")
     named = subscription if isinstance(subscription, dict) else purchase
     purchase_id = named.get("purchaseId") if named is purchase else None
-    if named is purchase and (not isinstance(purchase_id, str) or not pay._ID.match(purchase_id)):
+    if named is purchase and not pay.valid_id(purchase_id):
         raise ApiError(400, "invalid_request", "Invalid event")
     if named.get("appId") != settings.kano_pay_app_id:
         logger.warning("Kano Pay event %s names another App", event_id)
@@ -543,11 +515,11 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
         # Pay does not list what the event names yet: nothing to write, and the event is
         # not recorded, so Pay's retry lands once it does.
         raise ApiError(503, "pay_unavailable", "Retry this notification")
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    await lock_user(db, user_id)
     if await db.get(PayEvent, event_id) is not None:
         await db.rollback()
         return {}
-    db.add(PayEvent(id=event_id, type=event_type, user_id=user_id))
+    db.add(PayEvent(id=event_id, user_id=user_id))
     if canonical is not None:
         await pay.apply_canonical(db, user_id, canonical)
         # The cut of a granted period the subscription began inside, as the refresh
@@ -560,47 +532,6 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
     return {}
 
 
-@router.get("/entries")
-async def entries(user: SessionUser, db: DbSession, days: int = Query(default=30, ge=1, le=365)):
-    """Credits per UTC day and per agent over the window, from the entries that cost
-    something: reserved and consumed, never released (docs/billing.md § Routes)."""
-    since = utcnow() - timedelta(days=days)
-    day = func.date(CreditEntry.created_at)
-    in_window = (
-        CreditEntry.user_id == user.id,
-        CreditEntry.created_at >= since,
-        CreditEntry.state != ledger.RELEASED,
-    )
-    per_day = (
-        await db.execute(
-            select(
-                day,
-                func.sum(case((CreditEntry.kind == ledger.PARSE, CreditEntry.amount), else_=0)),
-                func.sum(case((CreditEntry.kind == ledger.CHAT, CreditEntry.amount), else_=0)),
-            )
-            .where(*in_window)
-            .group_by(day)
-            .order_by(day)
-        )
-    ).all()
-    per_agent = (
-        await db.execute(
-            select(CreditEntry.kind, func.sum(CreditEntry.amount))
-            .where(*in_window)
-            .group_by(CreditEntry.kind)
-            .order_by(CreditEntry.kind)
-        )
-    ).all()
-    return {
-        "days": days,
-        "per_day": [
-            {"date": str(row[0])[:10], "parse": int(row[1] or 0), "chat": int(row[2] or 0)}
-            for row in per_day
-        ],
-        "per_agent": [{"agent": row[0], "credits": int(row[1] or 0)} for row in per_agent],
-    }
-
-
 async def me_fields(db: DbSession, settings: AppSettings, user_id: int) -> dict:
     """What `GET /api/me` adds for the shell: the plan, the balance a charge is measured
     against, when the period resets, and whether a pack can be offered — Pay configured, a
@@ -609,7 +540,7 @@ async def me_fields(db: DbSession, settings: AppSettings, user_id: int) -> dict:
     balance = await ledger.read_balance(db, settings, user_id)
     plan = balance.period.plan
     return {
-        "plan": FREE_PLAN_ID if plan.free else plan.id,
+        "plan": plan.id,
         "credits_remaining": balance.available,
         "period_end": balance.period.end,
         "chat_min_credits": settings.chat_min_credits,

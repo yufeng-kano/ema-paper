@@ -9,11 +9,11 @@
 
 /** Less than this between the box and the visual viewport is not a keyboard: the shortcut bar
  *  an iPad shows over a hardware keyboard, a rounding difference. */
-export const KEYBOARD_MIN_PX = 100
+const KEYBOARD_MIN_PX = 100
 
 /** Less room than this is left to the browser's own pan: a phone held sideways, where the
  *  viewer's header and the agent's composer alone would fill it. */
-export const KEYBOARD_FRAME_MIN_PX = 320
+const KEYBOARD_FRAME_MIN_PX = 320
 
 /** A zoom past this is the reader's pinch, which the viewer never fights. */
 const PINCH_SCALE = 1.01

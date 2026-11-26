@@ -64,7 +64,7 @@ defineSlots<Record<string, (props: { row: Row }) => unknown>>()
           v-for="column in columns"
           :key="column.key"
           scope="col"
-          :class="{ numeric: column.numeric, end: column.align === 'end' }"
+          :class="[`column-${column.key}`, { numeric: column.numeric, end: column.align === 'end' }]"
           :style="column.width ? { width: column.width } : undefined"
         >
           <span v-if="!column.header && column.srHeader" class="sr-only">{{ column.srHeader }}</span>
@@ -82,7 +82,7 @@ defineSlots<Record<string, (props: { row: Row }) => unknown>>()
           <td
             v-for="column in columns"
             :key="column.key"
-            :class="{ numeric: column.numeric, end: column.align === 'end' }"
+            :class="[`column-${column.key}`, { numeric: column.numeric, end: column.align === 'end' }]"
           >
             <slot :name="`cell-${column.key}`" :row="row">{{ column.value?.(row) ?? '' }}</slot>
           </td>

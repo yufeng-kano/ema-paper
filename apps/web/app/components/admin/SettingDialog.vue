@@ -35,8 +35,8 @@ const props = defineProps<{
 const emit = defineEmits<{ close: []; saved: [settings: AdminSettingsResponse] }>()
 
 const { t, locale } = useI18n()
-const router = useRouter()
 const { explain } = useAdminFailure()
+const hold = useHeldRequest()
 
 const label = computed(() => t(`admin.settings.keys.${props.setting.key}`))
 const json = computed(() => isJsonSetting(props.setting.key))
@@ -92,27 +92,17 @@ async function send(confirm: boolean) {
   }
   pending.value = true
   error.value = null
-  // Back would close the dialog while the request runs, and its answer would land unseen.
-  const release = router.beforeEach(() => false)
-  let settings: AdminSettingsResponse | null = null
-  let failure: unknown = null
-  try {
-    settings =
-      props.mode === 'edit'
-        ? await putAdminSetting(props.setting.key, text.value, confirm)
-        : await resetAdminSetting(props.setting.key, confirm)
-  } catch (caught) {
-    failure = caught
-  } finally {
-    // Released before any failure is explained: a 401's way back to the landing page
-    // must not be the navigation the guard refuses.
-    release()
-  }
-  if (settings) {
+  const result = await hold(() =>
+    props.mode === 'edit'
+      ? putAdminSetting(props.setting.key, text.value, confirm)
+      : resetAdminSetting(props.setting.key, confirm),
+  )
+  if ('value' in result) {
     pending.value = false
-    emit('saved', settings)
+    emit('saved', result.value)
     return
   }
+  const { failure } = result
   const asked = settingImpact(failure)
   if (asked) {
     impact.value = asked

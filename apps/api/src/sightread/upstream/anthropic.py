@@ -2,8 +2,8 @@
 
 Streams `POST {base}/messages` over Kano Proxy's Anthropic-format route and turns the SSE
 events into content blocks the runner can act on and store verbatim. Like `client.py`, it
-is one of the two modules that ever decrypt a stored user key, and the plaintext never
-leaves the request it authorises. Errors map onto the same classes the vision client
+presents the operator's Kano Proxy key, and the key never leaves the request it
+authorises. Errors map onto the same classes the vision client
 raises so the runner's failure policy has one vocabulary.
 """
 
@@ -17,27 +17,19 @@ from decimal import Decimal
 
 import httpx
 
-from ..db.models import COST_SOURCE_ESTIMATED, COST_SOURCE_UNKNOWN
+from ..db.models import COST_SOURCE_UNKNOWN
 from .client import (
-    COST_QUANTUM,
-    DEFAULT_RESPONSE_MAX_BYTES,
-    MAX_REPORTED_COST,
     Connection,
-    PaymentRequired,
-    RateLimited,
     ResponseTooLarge,
     UpstreamError,
-    _is_transient,
+    as_int,
+    raise_for_status,
+    reported_cost,
 )
 
 ANTHROPIC_VERSION = "2023-06-01"
 # A turn can think and call tools for a long time; the stream keeps the connection alive.
 STREAM_TIMEOUT_SECONDS = 600.0
-# The defaults of `UPSTREAM_SSE_LINE_MAX_BYTES` and `UPSTREAM_CONTENT_BLOCKS_MAX`: one
-# SSE line past the first is a broken upstream, not a long answer, and a block index past
-# the second is refused outright. The runner passes the deployment's values.
-DEFAULT_SSE_LINE_MAX_BYTES = 4 * 1024 * 1024
-DEFAULT_CONTENT_BLOCKS_MAX = 4096
 # The output of a call cut short is estimated from what streamed, one token per this many
 # bytes of UTF-8 (docs/chat.md § Conversations, turns, events).
 ESTIMATED_BYTES_PER_TOKEN = 3
@@ -76,13 +68,24 @@ class ChatUsage:
         """The call read or wrote the prompt cache of the Anthropic API."""
         return self.cache_native and (self.cache_read_tokens > 0 or self.cache_write_tokens > 0)
 
+    def log_fields(self) -> dict:
+        """The figures a `usage_log` row records of this call; the caller adds the row's
+        owner, agent and model."""
+        return {
+            "prompt_tokens": self.input_tokens,
+            "completion_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "cost": self.cost,
+            "cost_source": self.cost_source,
+        }
+
 
 @dataclass(frozen=True)
 class StreamEvent:
     """One incremental step of the stream the runner relays to the conversation."""
 
-    kind: str  # text_delta | thinking_delta | block_start | block_stop
-    index: int
+    kind: str  # text_delta | thinking_delta | block_stop
     text: str = ""
     block: dict | None = None
 
@@ -93,7 +96,6 @@ class CompletedMessage:
 
     content: list[dict]
     stop_reason: str | None
-    stop_details: dict | None
     usage: ChatUsage
     model: str | None
     # Tool-use blocks whose input never parsed: the runner answers them with an error
@@ -125,23 +127,26 @@ class StreamProgress:
         figure covers the call as it was cut."""
         if not self.started:
             return None
-        return ChatUsage(
-            input_tokens=_int(self.usage.get("input_tokens")),
+        return _chat_usage(
+            self.usage,
             output_tokens=self.output_tokens
             or math.ceil(self.output_bytes / ESTIMATED_BYTES_PER_TOKEN),
-            cache_read_tokens=_int(self.usage.get("cache_read_input_tokens")),
-            cache_write_tokens=_int(self.usage.get("cache_creation_input_tokens")),
-            cost=None,
-            cost_source=COST_SOURCE_UNKNOWN,
-            cache_native=isinstance(self.usage.get("cache_creation"), dict),
+            cost=(None, COST_SOURCE_UNKNOWN),
         )
 
 
-def _int(value: object) -> int:
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0
+def _chat_usage(raw: dict, *, output_tokens: int, cost: tuple[Decimal | None, str]) -> ChatUsage:
+    """A call's usage from the stream's `usage` figures, with its output and its cost and
+    the cost's source as the caller determined them."""
+    return ChatUsage(
+        input_tokens=as_int(raw.get("input_tokens")),
+        output_tokens=output_tokens,
+        cache_read_tokens=as_int(raw.get("cache_read_input_tokens")),
+        cache_write_tokens=as_int(raw.get("cache_creation_input_tokens")),
+        cost=cost[0],
+        cost_source=cost[1],
+        cache_native=isinstance(raw.get("cache_creation"), dict),
+    )
 
 
 def _index(data: dict) -> int:
@@ -152,47 +157,15 @@ def _index(data: dict) -> int:
     return value
 
 
-def _usage(raw: dict, *, output_tokens: int) -> ChatUsage:
-    reported = raw.get("cost")
-    cost: Decimal | None = None
-    source = COST_SOURCE_UNKNOWN
-    if isinstance(reported, int | float) and not isinstance(reported, bool):
-        candidate = Decimal(str(reported))
-        if candidate.is_finite() and 0 <= candidate <= MAX_REPORTED_COST:
-            cost, source = candidate.quantize(COST_QUANTUM), COST_SOURCE_ESTIMATED
-    return ChatUsage(
-        input_tokens=_int(raw.get("input_tokens")),
-        output_tokens=output_tokens,
-        cache_read_tokens=_int(raw.get("cache_read_input_tokens")),
-        cache_write_tokens=_int(raw.get("cache_creation_input_tokens")),
-        cost=cost,
-        cost_source=source,
-        cache_native=isinstance(raw.get("cache_creation"), dict),
-    )
-
-
-def _raise_for_status(response: httpx.Response) -> None:
-    if response.status_code == 429:
-        retry_after = response.headers.get("retry-after")
-        raise RateLimited(float(retry_after) if (retry_after or "").isdigit() else None)
-    if response.status_code == 402:
-        raise PaymentRequired()
-    if response.status_code in (401, 403):
-        raise UpstreamError("The upstream rejected the stored key", fatal=True)
-    if response.status_code >= 400:
-        raise UpstreamError(
-            f"The upstream returned {response.status_code}",
-            transient=_is_transient(response.status_code),
-        )
-
-
 async def _bounded_lines(
     response: httpx.Response, max_bytes: int, line_max_bytes: int
 ) -> AsyncIterator[str]:
     """The body's lines, decoded, from the chunks as the transport hands them on; a line
-    that outgrows `line_max_bytes` or a body that outgrows `max_bytes` ends the read. No
-    chunk size is asked for: httpx would then hold the bytes until that many had come, and
-    an answer shorter than that would reach the reader in one piece at its end."""
+    that outgrows `line_max_bytes` or a body that outgrows `max_bytes` ends the read before
+    it is held. Bytes, not `aiter_lines()`, which would hold a whole line before any check
+    could run. No chunk size is asked for: httpx would then hold the bytes until that many
+    had come, and an answer shorter than that would reach the reader in one piece at its
+    end."""
     pending = bytearray()
     seen = 0
     async for chunk in response.aiter_bytes():
@@ -220,17 +193,11 @@ async def _bounded_lines(
 async def _sse_events(
     response: httpx.Response, max_bytes: int, line_max_bytes: int
 ) -> AsyncIterator[tuple[str, dict]]:
-    """`(event, data)` pairs from an SSE body, bounded in total size and per line."""
-    total = 0
+    """`(event, data)` pairs from an SSE body, read through `_bounded_lines`, which holds
+    the body to its size and line bounds."""
     event_name = ""
     data_lines: list[str] = []
-    # Bytes, not `aiter_lines()`: that would hold a whole line before any check could
-    # run. Lines are split as the chunks come, and a line past `line_max_bytes` or a
-    # body past `max_bytes` is refused before it is held.
     async for line in _bounded_lines(response, max_bytes, line_max_bytes):
-        total += len(line) + 1
-        if total > max_bytes:
-            raise ResponseTooLarge()
         if not line:
             if data_lines:
                 try:
@@ -250,8 +217,6 @@ async def _sse_events(
         if key == "event":
             event_name = value
         elif key == "data":
-            if len(value) > line_max_bytes:
-                raise ResponseTooLarge()
             data_lines.append(value)
 
 
@@ -260,9 +225,9 @@ async def stream_messages(
     body: dict,
     *,
     betas: tuple[str, ...] = (),
-    max_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
-    line_max_bytes: int = DEFAULT_SSE_LINE_MAX_BYTES,
-    blocks_max: int = DEFAULT_CONTENT_BLOCKS_MAX,
+    max_bytes: int,
+    line_max_bytes: int,
+    blocks_max: int,
     timeout: float = STREAM_TIMEOUT_SECONDS,
     progress: StreamProgress | None = None,
 ) -> AsyncIterator[StreamEvent | CompletedMessage]:
@@ -288,7 +253,6 @@ async def stream_messages(
     partial_json: dict[int, list[str]] = {}
     malformed: set[str] = set()
     stop_reason: str | None = None
-    stop_details: dict | None = None
     model: str | None = None
     thinking_dropped = 0
     finished = False
@@ -300,9 +264,8 @@ async def stream_messages(
                 "POST", f"{connection.base_url}/messages", headers=headers, json=request_body
             ) as response,
         ):
-            if response.status_code >= 400:
-                # Drain nothing: the status alone decides, and a body may carry content.
-                _raise_for_status(response)
+            # Drain nothing: the status alone decides, and a body may carry content.
+            raise_for_status(response)
 
             async for event, data in _sse_events(response, max_bytes, line_max_bytes):
                 kind = data.get("type") or event
@@ -338,7 +301,6 @@ async def stream_messages(
                     while len(blocks) <= index:
                         blocks.append({})
                     blocks[index] = block
-                    yield StreamEvent("block_start", index, block=block)
                 elif kind == "content_block_delta":
                     index = _index(data)
                     if index >= len(blocks):
@@ -356,13 +318,13 @@ async def stream_messages(
                         text = str(delta.get("text") or "")
                         block["text"] = block.get("text", "") + text
                         progress.output_bytes += len(text.encode())
-                        yield StreamEvent("text_delta", index, text=text)
+                        yield StreamEvent("text_delta", text=text)
                     elif delta_type == "thinking_delta":
                         text = str(delta.get("thinking") or "")
                         block["thinking"] = block.get("thinking", "") + text
                         progress.output_bytes += len(text.encode())
                         if text:
-                            yield StreamEvent("thinking_delta", index, text=text)
+                            yield StreamEvent("thinking_delta", text=text)
                     elif delta_type == "signature_delta":
                         block["signature"] = block.get("signature", "") + str(
                             delta.get("signature") or ""
@@ -389,16 +351,14 @@ async def stream_messages(
                             parsed = {}
                             malformed.add(str(block.get("id")))
                         block["input"] = parsed
-                    yield StreamEvent("block_stop", index, block=block)
+                    yield StreamEvent("block_stop", block=block)
                 elif kind == "message_delta":
                     delta = data.get("delta") or {}
                     if delta.get("stop_reason"):
                         stop_reason = str(delta["stop_reason"])
-                    if isinstance(delta.get("stop_details"), dict):
-                        stop_details = delta["stop_details"]
                     usage = data.get("usage") or {}
                     progress.output_tokens = (
-                        _int(usage.get("output_tokens")) or progress.output_tokens
+                        as_int(usage.get("output_tokens")) or progress.output_tokens
                     )
                     # Some servers report the final input figures here as well.
                     for key in (
@@ -438,8 +398,11 @@ async def stream_messages(
     yield CompletedMessage(
         content=[block for block in blocks if block],
         stop_reason=stop_reason,
-        stop_details=stop_details,
-        usage=_usage(progress.usage, output_tokens=progress.output_tokens),
+        usage=_chat_usage(
+            progress.usage,
+            output_tokens=progress.output_tokens,
+            cost=reported_cost(progress.usage),
+        ),
         model=model,
         malformed_tool_uses=malformed,
         thinking_dropped=thinking_dropped,

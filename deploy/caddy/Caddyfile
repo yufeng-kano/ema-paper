@@ -1,9 +1,5 @@
 # Production routing and TLS (docs/deployment.md). DOMAIN and ACME_EMAIL come from the
 # environment of the caddy service in docker-compose.production.yaml.
-{
-	email {$ACME_EMAIL}
-}
-
 {$DOMAIN} {
 	encode zstd gzip
 
@@ -41,8 +37,11 @@
 	}
 
 	# Body caps per route (docs/deployment.md § Caddy routing). The web upload carries a
-	# file of any kind: FILE_MAX_BYTES plus the multipart envelope. Everything else keeps
-	# UPLOAD_MAX_BYTES. Keep both in sync with .env: the app enforces the same caps while
+	# file of any kind: FILE_MAX_BYTES plus the multipart envelope. Everything else is held
+	# to the largest body the app accepts on any of those routes, /v1/parse's JSON form:
+	# UPLOAD_MAX_BYTES in base64 plus 64 KiB (179,022,508 bytes at the default; Caddy's MB
+	# is 10^6 bytes). When .env raises FILE_MAX_BYTES or UPLOAD_MAX_BYTES, raise the
+	# matching value here and in Caddyfile.local: the app enforces its own caps while
 	# streaming, these stop an oversized body before it reaches Python.
 	@upload path /api/library/documents
 	request_body @upload {
@@ -50,13 +49,11 @@
 	}
 	@rest not path /api/library/documents
 	request_body @rest {
-		max_size 128MB
+		max_size 180MB
 	}
 
 	# Everything the FastAPI app owns: the data plane, the control plane, the OAuth
-	# authorization server, its discovery documents, and the MCP endpoint. The ACME
-	# challenge also lives under /.well-known/, but Caddy answers that itself on :80
-	# before any route here is consulted.
+	# authorization server, its discovery documents, and the MCP endpoint.
 	@api path /healthz /v1/* /api/* /oauth/* /mcp /mcp/* /.well-known/*
 	handle @api {
 		reverse_proxy api:8000 {

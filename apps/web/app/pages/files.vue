@@ -46,7 +46,9 @@ import {
   updateFolder,
   uploadDocument,
   creditsRefusalOf,
+  documentFiguresBase,
   documentFileUrl,
+  documentImagesBase,
   documentOriginalUrl,
   putDocumentView,
   type CreditsRefusal,
@@ -58,6 +60,7 @@ import {
   type TrashedFolder,
 } from '~/lib/api'
 import {
+  carries,
   carriesFiles,
   claimDrag,
   dragClaim,
@@ -69,7 +72,6 @@ import { formatBytes, formatShortDateTime } from '~/lib/format'
 import type { IconName } from '~/lib/icons'
 import type { MenuFact, MenuItem, Point } from '~/lib/menu'
 import {
-  acceptsUpload,
   childFolders,
   DOCUMENT_NAME_MAX,
   FOLDER_NAME_MAX,
@@ -79,7 +81,6 @@ import {
   folderPath,
   initialView,
   isConvertible,
-  isMarkdownUpload,
   isPending,
   isReconverting,
   keyRange,
@@ -90,7 +91,9 @@ import {
   typeAheadMatch,
   uploadCap,
   type FolderId,
+  type LibraryPlace,
 } from '~/lib/library'
+import type { LibraryItem as Item, LibraryMove as Move, LibraryStep as Step } from '~/lib/steps'
 import type { TableColumn } from '~/lib/table'
 
 definePageMeta({ middleware: 'authed' })
@@ -99,16 +102,12 @@ definePageMeta({ middleware: 'authed' })
 const POLL_MS = 2000
 /** How long a file refused by the per-user job cap waits before trying again. */
 const BACKOFF_MS = 3000
-/** How long a row reached through `?document=` stays lit. */
+/** How long a row reached through `?document=`, or one the Agent changed, stays lit. */
 const REVEAL_MS = 2400
 /** How long a drag rests on a folder before the folder springs open under it. */
 const SPRING_MS = 800
 /** How long typed letters keep adding to the name being looked for. */
 const TYPE_AHEAD_MS = 1000
-/** How long the status note shows, and how long one carrying *Undo* waits for the reader
- *  (docs/web.md § Editing, *Undo and the status note*). */
-const NOTE_MS = 1600
-const NOTE_UNDO_MS = 8000
 /** How many file operations ⌘Z can take back. */
 const UNDO_MAX = 50
 
@@ -249,9 +248,10 @@ function onTabKeydown(event: KeyboardEvent) {
  * `&block=<anchor>` — a block's *Copy link to block* — the document opens too, scrolled to
  * that block.
  */
-const revealId = Number(route.query.document) || null
+const revealId = queryId(route.query.document)
 const revealBlock = typeof route.query.block === 'string' ? route.query.block : null
-const revealed = ref<number | null>(null)
+/** The rows lit for a moment, by key: the one a link pointed at, or those the Agent changed. */
+const revealed = ref<ReadonlySet<string>>(new Set())
 /** The block link's target, handed to the viewer only while it shows that document. */
 const linkedBlock = ref<{ id: number; anchor: string } | null>(null)
 let revealTimer: ReturnType<typeof setTimeout> | undefined
@@ -269,13 +269,7 @@ if (revealId !== null) {
       if (!target) {
         return
       }
-      currentFolder.value = target.folder_id
-      writeFolder(target.folder_id, true)
-      revealed.value = target.id
-      await nextTick()
-      selectOnly(`file-${target.id}`)
-      document.querySelector('.contents tr.revealed')?.scrollIntoView({ block: 'center' })
-      revealTimer = setTimeout(() => (revealed.value = null), REVEAL_MS)
+      await revealDocument(target, true)
       if (revealBlock !== null) {
         linkedBlock.value = { id: target.id, anchor: revealBlock }
         void showResult(target)
@@ -283,6 +277,29 @@ if (revealId !== null) {
     },
     { once: true },
   )
+}
+
+/** Shows a document's row in the Files tab: its folder open — `replace` for a link read on
+ *  arrival, which leaves no entry of its own — and the row lit, selected and scrolled to. */
+async function revealDocument(row: LibraryDocument, replace: boolean) {
+  showView('files')
+  if (replace) {
+    currentFolder.value = row.folder_id
+    writeFolder(row.folder_id, true)
+  } else if (currentFolder.value !== row.folder_id) {
+    openFolder(row.folder_id)
+  }
+  light([`file-${row.id}`])
+  await nextTick()
+  selectOnly(`file-${row.id}`)
+  document.querySelector('.contents tr.revealed')?.scrollIntoView({ block: 'center' })
+}
+
+/** Lights these rows for a moment — those the open folder shows; any other key lights nothing. */
+function light(keys: string[]) {
+  clearTimeout(revealTimer)
+  revealed.value = new Set(keys)
+  revealTimer = setTimeout(() => (revealed.value = new Set()), REVEAL_MS)
 }
 
 onBeforeUnmount(() => clearTimeout(revealTimer))
@@ -301,7 +318,6 @@ watch(
       writeFolder(null, true)
     }
   },
-  { immediate: true },
 )
 
 // --- rows ------------------------------------------------------------------
@@ -415,6 +431,21 @@ function documentState(document: LibraryDocument): { failed: boolean; label: str
       return null
   }
 }
+
+/** Each listed file's state by row key, worked out once per change of the list rather than
+ *  in each of its cell's bindings on every render; a file that says nothing has no entry. */
+const rowStates = computed(() => {
+  const states = new Map<string, { failed: boolean; label: string }>()
+  for (const row of rows.value) {
+    if (row.kind === 'file') {
+      const state = documentState(row.document)
+      if (state) {
+        states.set(row.key, state)
+      }
+    }
+  }
+  return states
+})
 
 /** *Converting · 3 of 21 pages* — the pages once the parse has counted them. */
 function withProgress(state: string, job: Pick<LibraryDocument, 'page_count' | 'pages_done'>): string {
@@ -617,7 +648,7 @@ const autoConvert = computed(() => auth.me.value?.auto_convert ?? false)
 /** The view a converted PDF or image opens on until it was switched once (Settings ›
  *  Preferences, docs/web.md § Result viewer, *Original and Markdown*). */
 const defaultView = computed<DocumentView>(() => auth.me.value?.default_view ?? 'markdown')
-/** How long the Trash keeps an item; 0 (or an older API's silence) keeps it until emptied. */
+/** How long the Trash keeps an item; 0 keeps it until emptied. */
 const trashRetentionDays = computed(() => limits.value?.trash_retention_days ?? 0)
 /** The 409 of an upload past the plan's storage: a banner with the way to more of it
  *  (docs/web.md § Files). */
@@ -657,13 +688,12 @@ function rejected(file: File): string | null {
   // Size is the one refusal: every kind of file is kept (docs/web.md § Files). The cap is
   // the one intake applies to this file — a markdown document's, a parse's, a file's —
   // judged the way intake judges it, media type then extension (`lib/library.ts`).
-  const max = uploadCap(file, limits.value, autoConvert.value)
-  if (max === null || file.size <= max) {
+  const cap = uploadCap(file, limits.value, autoConvert.value)
+  if (!cap || file.size <= cap.bytes) {
     return null
   }
-  const limit = formatBytes(max, locale.value)
-  const kept = !isMarkdownUpload(file, limits.value) && !(autoConvert.value && acceptsUpload(file, limits.value))
-  return t(kept ? 'files.tooLargeFile' : 'files.tooLarge', { name: file.name, limit })
+  const limit = formatBytes(cap.bytes, locale.value, { limit: true })
+  return t(cap.as === 'file' ? 'files.tooLargeFile' : 'files.tooLarge', { name: file.name, limit })
 }
 
 function addToQueue(files: File[], folderId: FolderId) {
@@ -783,6 +813,13 @@ onBeforeUnmount(() => {
 
 // --- the result viewer -----------------------------------------------------
 
+/** The viewer and the Agent card's chat load as chunks of their own, so the list paints
+ *  without them, and are fetched at idle once it has, so the first open finds them ready. */
+useIdleWarmUp(
+  () => import('~/components/ResultViewer.vue'),
+  () => import('~/components/ChatPanel.vue'),
+)
+
 const openDocument = ref<LibraryDocument | null>(null)
 /** Which viewer the open row is in — whatever opened it, a double click, ⌘↓, the menu's
  *  *Open*, `?doc=`, a single upload opening itself (`rowViewer`, docs/web.md § Files). */
@@ -792,12 +829,22 @@ const openViewer = computed(() => (openDocument.value ? rowViewer(openDocument.v
 const retrying = ref<LibraryDocument | null>(null)
 /** The parsed document whose re-convert dialog is open. */
 const reconverting = ref<LibraryDocument | null>(null)
-// Read once: closing the viewer, or opening another document, spends the link.
+/**
+ * Whenever the open document changes: the block link is read once, so closing the viewer or
+ * opening another document spends it; the URL follows (`writeDocQuery`); and whatever closes
+ * the viewer — its own button, Escape, Back, a move to the Trash — reads the library again,
+ * so a file the agent converted while it was open, whose answer the page never saw, shows
+ * its true state on its row (docs/web.md § Files).
+ */
 watch(
-  () => openDocument.value?.id,
-  (id) => {
+  () => openDocument.value?.id ?? null,
+  (id, before) => {
     if (linkedBlock.value && id !== linkedBlock.value.id) {
       linkedBlock.value = null
+    }
+    writeDocQuery(id)
+    if (id === null && before !== null) {
+      void refresh()
     }
   },
 )
@@ -875,24 +922,21 @@ async function showResult(document: LibraryDocument) {
  * same place without the document, and drops `doc` otherwise — the viewer opened from the
  * URL itself, or another entry (Settings over the viewer) pushed between.
  */
-watch(
-  () => openDocument.value?.id ?? null,
-  (id) => {
-    if (queryId((wantedQuery ?? route.query).doc) === id) {
-      return
-    }
-    if (id !== null) {
-      writeQuery({ doc: String(id) }, false)
-      return
-    }
-    const without = router.resolve({ query: { ...route.query, doc: undefined } }).fullPath
-    if (router.options.history.state.back === without) {
-      navigating = navigating.then(() => router.back())
-    } else {
-      writeQuery({ doc: undefined }, true)
-    }
-  },
-)
+function writeDocQuery(id: number | null) {
+  if (queryId((wantedQuery ?? route.query).doc) === id) {
+    return
+  }
+  if (id !== null) {
+    writeQuery({ doc: String(id) }, false)
+    return
+  }
+  const without = router.resolve({ query: { ...route.query, doc: undefined } }).fullPath
+  if (router.options.history.state.back === without) {
+    navigating = navigating.then(() => router.back())
+  } else {
+    writeQuery({ doc: undefined }, true)
+  }
+}
 
 /** A `doc` that arrives with the URL — a refresh, a pasted address, Forward — opens once the
  *  library has it; one that cannot be opened is dropped. */
@@ -912,18 +956,6 @@ async function openDocQuery() {
   }
 }
 
-/** Whatever closes the viewer — its own button, Escape, Back, a move to the Trash — the
- *  library is read again: a file the agent converted while it was open, whose answer the
- *  page never saw, shows its true state on its row (docs/web.md § Files). */
-watch(
-  () => openDocument.value?.id ?? null,
-  (id, before) => {
-    if (id === null && before !== null) {
-      void refresh()
-    }
-  },
-)
-
 /** Back taking `doc` away closes the viewer; Forward bringing one opens it. */
 watch(
   () => route.query.doc,
@@ -936,7 +968,6 @@ watch(
   },
 )
 watch(data, () => void openDocQuery(), { once: true })
-onMounted(() => void openDocQuery())
 
 /** The open viewer follows its own row: a parse only opens finished, so there is nothing
  *  more of it to read, but its name and folder can still change — and a re-convert that
@@ -1087,6 +1118,12 @@ const openFailure = computed(() => {
     : null
 })
 
+/** Whether the viewer shows the open document as converted: a parse that succeeded or a
+ *  markdown document, never a file or a failed parse. */
+const openConverted = computed(
+  () => !!openDocument.value && openDocument.value.kind !== 'file' && openDocument.value.status !== 'failed',
+)
+
 /** The open file's facts for the viewer's More menu while it is not converted, or its
  *  parse failed, and a markdown file's: what the file viewer's menu says of any file. */
 const openFileFacts = computed<MenuFact[]>(() => {
@@ -1177,32 +1214,9 @@ function trashOpen() {
 
 // --- file operations -------------------------------------------------------
 
-/** An item an operation acted on, as the undo stack keeps it. */
-interface Item {
-  kind: 'folder' | 'file'
-  id: number
-}
-
-/** A move as undo needs it: where from and where to, and the name on each side — the
- *  destination suffixes a name it already holds. */
-interface Move {
-  item: Item
-  from: FolderId
-  to: FolderId
-  fromName: string
-  toName: string
-}
-
-/**
- * One file operation, as ⌘Z takes it back (docs/web.md § Files, *Undo*). Trashing and
- * putting back are each other's undo; whatever made items appear — a copy, a paste, a
- * duplicate, a new folder or document, a Put Back — is undone by trashing them.
- */
-type Step =
-  | { type: 'trash'; items: Item[] }
-  | { type: 'appear'; items: Item[] }
-  | { type: 'move'; moves: Move[] }
-  | { type: 'rename'; item: Item; from: string; to: string }
+// An operation's items, moves and steps (`Item`, `Move`, `Step`) are `lib/steps.ts`'s: the
+// shapes ⌘Z takes back (docs/web.md § Files, *Undo*), which the Agent's library tools' undo
+// records share, so the card's Undo replays one with the code below.
 
 const undoSteps: Step[] = []
 const redoSteps: Step[] = []
@@ -1234,6 +1248,17 @@ function forget(gone: Item[]) {
 
 /** One request in flight at a time: a second key press while one runs does nothing. */
 const busy = ref(false)
+
+/** A tab that comes back reads the library again, once: Claude may have organized it through
+ *  the connector meanwhile, from another app or device (docs/web.md § Files). Not while an
+ *  action of the page runs, which reads it again itself, nor over a read in flight. */
+function onVisible() {
+  if (document.visibilityState === 'visible' && !busy.value && !pending.value) {
+    void refresh()
+  }
+}
+onMounted(() => document.addEventListener('visibilitychange', onVisible))
+onBeforeUnmount(() => document.removeEventListener('visibilitychange', onVisible))
 
 /**
  * Every operation is the same steps: run it, re-read the library, report what went wrong
@@ -1510,8 +1535,17 @@ function onTabPress(event: KeyboardEvent) {
   }
 }
 
-function onPointerPress() {
+function onPointerPress(event: PointerEvent) {
   keyboardFocus.value = false
+  const target = event.target as Node | null
+  // A press in a surface teleported to the body, outside the app the page is part of — the
+  // card's reply toolbar, a menu or a popover opened from it, a dialog — leaves the flag as
+  // it was: the card's own surfaces sit outside its box.
+  const app = region.value?.closest('body > *')
+  if (app && target && !app.contains(target)) {
+    return
+  }
+  pressedInAgent = agentCard.value?.contains(target) ?? false
 }
 
 // Capture: a handler that stops the event must not leave the ring in the wrong state. The
@@ -1659,6 +1693,166 @@ async function stepHistory(direction: 'undo' | 'redo') {
   }
 }
 
+/** An Agent step's Undo, from its card (docs/web.md § The Files page's Agent card): the inverse,
+ *  run by the code ⌘Z runs for a step of its type, and kept off the page's own stacks, which
+ *  stay the reader's. A refusal goes back to the card, which shows it under the step. Held by
+ *  the page's one-request-at-a-time rule like ⌘Z: false when another action is running,
+ *  which leaves the step's Undo to press again. */
+async function undoAgentStep(step: Step): Promise<boolean> {
+  if (busy.value) {
+    return false
+  }
+  busy.value = true
+  try {
+    await replay(step, 'undo')
+    return true
+  } finally {
+    await refresh()
+    busy.value = false
+  }
+}
+
+// --- the Agent card (docs/web.md § The Files page's Agent card) -----------------------------
+
+/** Open or not; the card reads and keeps it with its width (`FilesAgent`). */
+const agentOpen = ref(false)
+const agentCard = ref<{ contains: (node: Node | null) => boolean; holds: boolean; sheet: boolean } | null>(null)
+const agentToggle = ref<ComponentPublicInstance | null>(null)
+/** The last pointer press landed in the card: a key that follows on the page is still its. */
+let pressedInAgent = false
+
+/** Where the reader is, for the card's chips and its messages: the open folder, and the rows
+ *  selected on the Files tab — the Trash tab sends none. */
+const agentPlace = computed<LibraryPlace>(() => {
+  const path = crumbs.value.map((folder) => folder.name).join('/')
+  return {
+    folder: currentFolder.value,
+    name: crumbs.value.at(-1)?.name ?? '',
+    path,
+    selection:
+      view.value === 'files'
+        ? selection.value.map((entry) => ({ kind: entry.kind, id: entry.id, path: path ? `${path}/${entry.name}` : entry.name }))
+        : [],
+  }
+})
+
+/** Closed from the card — its close, its grip, the sheet's way back: the toggle takes the
+ *  focus the card had, or the More button where the toolbar is folded into it. */
+async function closeAgent() {
+  agentOpen.value = false
+  await nextTick()
+  // Chrome keeps a focused element that has just been hidden as the active one until its next
+  // frame, so focus still inside the card has gone too.
+  const active = document.activeElement
+  if (!active || active === document.body || agentCard.value?.contains(active)) {
+    for (const button of [agentToggle.value?.$el, toolbarMoreButton.value?.$el]) {
+      if (button instanceof HTMLElement && button.getClientRects().length) {
+        button.focus()
+        return
+      }
+    }
+  }
+}
+
+// --- the toolbar folded into More ------------------------------------------------------------
+// Too narrow for the capsule and Upload beside the tabs, the toolbar is one More button whose
+// menu holds the same actions (docs/web.md § Files, *The toolbar folds on a narrow screen*).
+
+const toolbarMoreButton = ref<ComponentPublicInstance | null>(null)
+const toolbarMore = ref<Point | null>(null)
+const toolbarMoreFromKey = ref(false)
+/** When the menu last closed itself. The press on More that closes it (a press outside the
+ *  menu) is followed by that button's click, which must not open it again. */
+let toolbarMoreClosedAt = 0
+
+const toolbarMoreItems = computed<MenuItem[]>(() => [
+  { key: 'upload', label: t('files.upload'), icon: 'upload' },
+  { key: 'file', label: t('files.newDocument'), icon: 'file-plus', disabled: busy.value, separated: true },
+  { key: 'folder', label: t('files.newFolder'), icon: 'folder-plus', disabled: busy.value },
+  { key: 'refresh', label: t('common.refresh'), icon: 'refresh', disabled: pending.value },
+  // The toggle's on and off, as its `aria-pressed` says it in the capsule.
+  { key: 'agent', label: t('viewer.agentLabel'), icon: 'message-circle', checked: agentOpen.value, separated: true },
+])
+
+/** The menu under the button's right edge; flipped by the menu itself where it does not fit. */
+function toggleToolbarMore(event: MouseEvent) {
+  if (toolbarMore.value || performance.now() - toolbarMoreClosedAt < 200) {
+    toolbarMore.value = null
+    return
+  }
+  const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  // A click the keyboard made carries no pointer detail.
+  toolbarMoreFromKey.value = event.detail === 0
+  toolbarMore.value = { x: box.right, y: box.bottom + 4 }
+}
+
+function closeToolbarMore() {
+  toolbarMore.value = null
+  toolbarMoreClosedAt = performance.now()
+}
+
+// The menu belongs to the Files tab's toolbar: the Trash's has no More.
+watch(view, () => {
+  toolbarMore.value = null
+})
+
+function onToolbarMoreSelect(key: string) {
+  toolbarMore.value = null
+  switch (key) {
+    case 'upload':
+      return pickFiles(currentFolder.value)
+    case 'file':
+      return createEntry('file')
+    case 'folder':
+      return createEntry('folder')
+    case 'refresh':
+      return refresh()
+    case 'agent':
+      agentOpen.value = !agentOpen.value
+  }
+}
+
+/** The list follows the agent: read again on its changes and as the turn ends, the rows the
+ *  changes name lit where the open folder shows them. */
+async function onAgentLibrary(records: Step[]) {
+  await refresh()
+  if (records.length) {
+    light(records.flatMap(stepItems).map((item) => `${item.kind}-${item.id}`))
+  }
+}
+
+/** Rows dropped on the card are what its next message is about: the selection again, in the
+ *  folder they were dragged from — one the drag sprang open on its way had cleared it. */
+function onAgentRows() {
+  const rows = draggedRows
+  const from = rows[0] ? liveRow(rows[0]) : null
+  if (!from) {
+    return
+  }
+  if (currentFolder.value !== from.parent) {
+    openFolder(from.parent)
+  }
+  selectKeys(rows.map((row) => row.key))
+}
+
+/** An answer's link to the library: a folder opens in the list, a document's row is revealed
+ *  as `?document=` reveals it. One that names nothing live any more leaves the page as it is. */
+async function openFromAgent(target: { kind: 'folder' | 'document'; id: number }) {
+  if (target.kind === 'folder') {
+    if (folders.value.some((folder) => folder.id === target.id)) {
+      showView('files')
+      if (currentFolder.value !== target.id) {
+        openFolder(target.id)
+      }
+    }
+    return
+  }
+  const row = documents.value.find((entry) => entry.id === target.id)
+  if (row) {
+    await revealDocument(row, false)
+  }
+}
+
 // --- deleting for good -----------------------------------------------------
 
 /** The question the strip over the Trash's list asks: these items, or all of it. */
@@ -1736,52 +1930,9 @@ async function confirmDelete() {
 
 // --- the status note -------------------------------------------------------
 
-/** The one line at the list's foot an action with nothing else to show confirms in. */
-const note = ref<{ text: string; undo: boolean } | null>(null)
-let noteTimer: ReturnType<typeof setTimeout> | undefined
-let noteHeld = false
-
-function showNote(text: string, undoable: boolean) {
-  note.value = { text, undo: undoable }
-  announce(text)
-  timeNote()
-}
-
-function timeNote() {
-  clearTimeout(noteTimer)
-  const shown = note.value
-  if (shown && !noteHeld) {
-    noteTimer = setTimeout(() => (note.value = null), shown.undo ? NOTE_UNDO_MS : NOTE_MS)
-  }
-}
-
-/** The pointer resting on the note holds it; leaving starts its time again. */
-function holdNote(held: boolean) {
-  noteHeld = held
-  if (held) {
-    clearTimeout(noteTimer)
-  } else {
-    timeNote()
-  }
-}
-
-/** A note carrying *Undo* stays until the reader's next action. */
-function hideUndoNote() {
-  if (note.value?.undo) {
-    clearTimeout(noteTimer)
-    note.value = null
-  }
-}
-
-onBeforeUnmount(() => clearTimeout(noteTimer))
-
-/** The page's one polite live region, for what its notes and the keys' selection say. */
-const liveText = ref('')
-
-function announce(text: string) {
-  liveText.value = ''
-  void nextTick(() => (liveText.value = text))
-}
+/** The one line at the list's foot an action with nothing else to show confirms in, and the
+ *  page's one polite live region, for what its notes and the keys' selection say. */
+const { note, show: showNote, hold: holdNote, hideSticky: hideUndoNote, liveText, announce } = useStatusNote()
 
 /** A selection the keys made is said: the row's name, or how many rows. */
 function announceSelection() {
@@ -1863,6 +2014,11 @@ function onKeydown(event: KeyboardEvent) {
     return
   }
   if (target && target !== document.body && target.id !== 'content' && !region.value?.contains(target)) {
+    return
+  }
+  // The Agent card owns its keys, and so does a press in it that left focus on the page:
+  // Safari focuses no button it clicks (docs/web.md § The Files page's Agent card).
+  if (agentCard.value?.contains(target) || (pressedInAgent && (target === document.body || target?.id === 'content'))) {
     return
   }
   // A focused button or link answers Return and Space itself.
@@ -1995,6 +2151,12 @@ function folderName(id: FolderId): string {
   return folders.value.find((folder) => folder.id === id)?.name ?? t('files.root')
 }
 
+/** The document the selection is, when it is one: what the menu's parse actions act on. */
+const selectedDocument = computed(() => {
+  const one = selection.value.length === 1 ? selection.value[0]! : null
+  return one?.kind === 'file' ? documents.value.find((row) => row.id === one.id) : undefined
+})
+
 const menuItems = computed<MenuItem[]>(() => {
   const on = menu.value?.on
   if (!on) {
@@ -2044,7 +2206,7 @@ const menuItems = computed<MenuItem[]>(() => {
     ]
   }
   const one = items.length === 1 ? items[0]! : null
-  const parse = one?.kind === 'file' ? documents.value.find((row) => row.id === one.id) : undefined
+  const parse = selectedDocument.value
   return [
     ...(one
       ? [
@@ -2131,7 +2293,7 @@ function runMenu(action: string) {
       return items[0] && openEntry(items[0].key)
     // The retry dialog straight away, without the viewer a failed parse opens on.
     case 'retry': {
-      const document = items[0] && documents.value.find((row) => row.id === items[0]!.id)
+      const document = selectedDocument.value
       if (document) {
         retrying.value = document
       }
@@ -2144,7 +2306,7 @@ function runMenu(action: string) {
     case 'downloadOriginal':
       return items[0] && downloadEntry(documentOriginalUrl(items[0].id, true))
     case 'convert': {
-      const document = items[0] && documents.value.find((row) => row.id === items[0]!.id)
+      const document = selectedDocument.value
       if (document) {
         convertingView.value = null
         converting.value = document
@@ -2154,7 +2316,7 @@ function runMenu(action: string) {
     case 'reconvert':
     case 'retryReconvert':
     case 'dismissReconvert': {
-      const document = items[0] && documents.value.find((row) => row.id === items[0]!.id)
+      const document = selectedDocument.value
       if (!document) {
         return
       }
@@ -2234,7 +2396,7 @@ let springTimer: ReturnType<typeof setTimeout> | undefined
 
 /** The rows this drag carries, when it is a drag of this page's rows. */
 function rowsOf(event: DragEvent): Entry[] {
-  return [...(event.dataTransfer?.types ?? [])].includes(ROWS_DRAG_TYPE) ? draggedRows : []
+  return carries(event.dataTransfer, ROWS_DRAG_TYPE) ? draggedRows : []
 }
 
 /** ⌥ as it drops copies, as in Finder — Ctrl off Apple platforms, as in Explorer. */
@@ -2512,11 +2674,11 @@ function rowAttrs(row: Row): Record<string, unknown> {
   }
   const lit = { selected: selected.value.has(row.key), editing }
   if (row.kind === 'file') {
-    return { ...base, class: { ...lit, file: true, revealed: revealed.value === row.document.id } }
+    return { ...base, class: { ...lit, file: true, revealed: revealed.value.has(row.key) } }
   }
   return {
     ...base,
-    class: { ...lit, 'drop-target': dropTarget.value === row.folder.id },
+    class: { ...lit, folder: true, revealed: revealed.value.has(row.key), 'drop-target': dropTarget.value === row.folder.id },
     onDragover: (event: DragEvent) => onTargetDragOver(event, row.folder.id),
     onDrop: (event: DragEvent) => onTargetDrop(row.folder.id, event),
   }
@@ -2531,9 +2693,13 @@ const activeRow = computed(() =>
   cursor.value !== null && entryKeys.value.includes(cursor.value) ? rowId(cursor.value) : undefined,
 )
 
-// A reload onto a new build would drop files still waiting to upload, a name being typed or
-// a reader's place — so it waits for all three to be over (docs/web.md § Rules).
-useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocument.value !== null)
+// A reload onto a new build would drop files still waiting to upload, a name being typed,
+// a reader's place or what the Agent card holds — so it waits for all four to be over
+// (docs/web.md § Rules).
+useBuildHold(
+  () =>
+    queue.value.length > 0 || renaming.value !== null || openDocument.value !== null || !!agentCard.value?.holds,
+)
 </script>
 
 <template>
@@ -2545,7 +2711,9 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       multiple
       @change="onPicked"
     >
-    <UiScreen>
+    <!-- Under the Agent card's phone sheet the list is out of reach: neither Tab nor a screen
+         reader goes into what the sheet covers. -->
+    <UiScreen class="list-screen" :inert="!!agentCard?.sheet">
       <template #toolbar-start>
         <UiSegmented glass role="tablist" :aria-label="t('files.tabs')">
           <button
@@ -2586,7 +2754,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       <!-- The list menu's commonest items, one press away (docs/web.md § Files). -->
       <template #toolbar>
         <template v-if="view === 'files'">
-          <UiCapsule :label="t('files.actions')">
+          <UiCapsule class="toolbar-actions" :label="t('files.actions')">
             <UiButton
               variant="ghost"
               icon-only
@@ -2614,11 +2782,46 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
             >
               <template #icon><UiIcon name="refresh" /></template>
             </UiButton>
+            <!-- The Agent card's toggle, after a thin rule (docs/web.md § The Files page's
+                 Agent card). -->
+            <span class="capsule-rule" aria-hidden="true" />
+            <UiButton
+              ref="agentToggle"
+              variant="ghost"
+              icon-only
+              :label="t('viewer.agentLabel')"
+              :aria-pressed="agentOpen ? 'true' : 'false'"
+              @click="agentOpen = !agentOpen"
+            >
+              <template #icon><UiIcon name="message-circle" /></template>
+            </UiButton>
           </UiCapsule>
-          <UiButton class="upload" variant="primary" size="lg" :label="t('files.upload')" @click="pickFiles(currentFolder)">
+          <UiButton class="upload" variant="primary" size="lg" icon-only :label="t('files.upload')" @click="pickFiles(currentFolder)">
             <template #icon><UiIcon name="upload" /></template>
-            <span class="upload-label">{{ t('files.upload') }}</span>
           </UiButton>
+          <!-- Drawn instead of the two above where they do not fit beside the tabs. -->
+          <UiCapsule class="toolbar-more" :label="t('files.actions')">
+            <UiButton
+              ref="toolbarMoreButton"
+              variant="ghost"
+              icon-only
+              :label="t('viewer.more')"
+              aria-haspopup="menu"
+              :aria-expanded="toolbarMore ? 'true' : 'false'"
+              @click="toggleToolbarMore"
+            >
+              <template #icon><UiIcon name="ellipsis" /></template>
+            </UiButton>
+          </UiCapsule>
+          <UiContextMenu
+            v-if="toolbarMore"
+            :at="toolbarMore"
+            :items="toolbarMoreItems"
+            :label="t('viewer.more')"
+            :focus-first="toolbarMoreFromKey"
+            @select="onToolbarMoreSelect"
+            @close="closeToolbarMore"
+          />
         </template>
         <UiButton v-else variant="danger" size="lg" :disabled="!trashTotal || busy" @click="askEmpty">
           {{ t('files.emptyTrash') }}
@@ -2713,7 +2916,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 
           <!-- The two deletes nothing can undo ask here, not in a dialog: nothing else on
                the page is held up while the question stands. -->
-          <UiBanner v-if="view === 'trash' && confirming" class="state confirm" tone="error">
+          <UiBanner v-if="view === 'trash' && confirming" class="state" tone="error">
             {{ confirmText }}
             <template #actions>
               <UiButton ref="confirmCancel" variant="ghost" size="xs" :disabled="busy" @click="cancelConfirm">
@@ -2735,6 +2938,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 
             <UiDataTable
               v-else
+              class="files-table"
               role="grid"
               aria-multiselectable="true"
               :columns="columns"
@@ -2791,14 +2995,14 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                   <!-- Only a document that is not simply ready says anything: what is in
                        flight, or what failed. -->
                   <span
-                    v-if="row.kind === 'file' && documentState(row.document)"
+                    v-if="rowStates.has(row.key)"
                     class="entry-state"
-                    :class="{ failed: documentState(row.document)!.failed }"
+                    :class="{ failed: rowStates.get(row.key)!.failed }"
                     role="img"
-                    :title="documentState(row.document)!.label"
-                    :aria-label="documentState(row.document)!.label"
+                    :title="rowStates.get(row.key)!.label"
+                    :aria-label="rowStates.get(row.key)!.label"
                   >
-                    <UiIcon v-if="documentState(row.document)!.failed" name="circle-alert" />
+                    <UiIcon v-if="rowStates.get(row.key)!.failed" name="circle-alert" />
                     <UiSpinner v-else />
                   </span>
                 </span>
@@ -2843,6 +3047,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 
             <UiDataTable
               v-else
+              class="trash-table"
               role="grid"
               aria-multiselectable="true"
               :columns="trashColumns"
@@ -2903,6 +3108,21 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
         <p class="sr-only" role="status" aria-live="polite">{{ liveText }}</p>
       </div>
     </UiScreen>
+
+    <!-- The agent about the whole library, beside the list (docs/web.md § The Files page's
+         Agent card). Under a viewer it is inert: the viewer's own card is the one in use. -->
+    <FilesAgent
+      ref="agentCard"
+      v-model:open="agentOpen"
+      :library="agentPlace"
+      :undo-library="undoAgentStep"
+      :covered="openDocument !== null"
+      @close="closeAgent"
+      @library="onAgentLibrary"
+      @filed="refresh()"
+      @open-files="openFromAgent"
+      @rows-dropped="onAgentRows"
+    />
 
     <UiContextMenu
       v-if="menu"
@@ -2967,26 +3187,24 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       @show="showOpenInFiles"
       @trash="trashOpen"
     />
-    <ResultViewer
+    <LazyResultViewer
       v-else-if="openDocument"
       :key="`${openDocument.id}:${openDocument.job_id}:${openDocument.status === 'failed' ? 'failed' : 'parsed'}`"
       :title="openDocument.name"
-      :error="openDocument.error"
       :result="results.get(openDocument.id) ?? null"
       :pending="!results.has(openDocument.id) && loadingResults.has(openDocument.id)"
       :error-message="resultErrors.get(openDocument.id) ?? null"
-      :figure-base="openDocument.kind === 'markdown' || openViewer === 'text' ? null : `/api/library/documents/${openDocument.id}/figures`"
-      :image-base="openViewer === 'text' ? null : `/api/library/documents/${openDocument.id}/images`"
-      :document-id="openViewer === 'text' || (openDocument.kind !== 'file' && openDocument.status !== 'failed') ? openDocument.id : null"
+      :figure-base="openDocument.kind === 'markdown' || openViewer === 'text' ? null : documentFiguresBase(openDocument.id)"
+      :image-base="openViewer === 'text' ? null : documentImagesBase(openDocument.id)"
+      :document-id="openViewer === 'text' || openConverted ? openDocument.id : null"
       :markdown-document="openDocument.kind === 'markdown'"
       :markdown-file="openViewer === 'text'"
       :initial-block="linkedBlock?.id === openDocument.id ? linkedBlock.anchor : null"
       :reconvert-note="reconvertNote"
       :initial-view="initialView(openDocument, defaultView)"
       :original="openOriginal"
-      :converted="openDocument.kind !== 'file' && openDocument.status !== 'failed'"
-      :convertible="openDocument.kind === 'file' ? isConvertible(openDocument, limits) : openDocument.status !== 'failed'"
-      :facts="openDocument.kind === 'file' || openDocument.status === 'failed' ? openFileFacts : []"
+      :convertible="isConvertible(openDocument, limits)"
+      :facts="openFileFacts"
       :failure="openFailure"
       @view="recordView(openDocument, $event)"
       @convert="convertOpen"
@@ -3002,12 +3220,18 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 </template>
 
 <style scoped>
-/* The page's one box: the screen fills it, and it is the region the keys belong to. */
+/* The page's one box and the region the keys belong to: the list's screen, then the Agent
+   card beside it when it is open. */
 .library {
-  display: grid;
-  grid-template-rows: minmax(0, 1fr);
+  position: relative;
+  display: flex;
   min-width: 0;
   min-height: 0;
+}
+
+.list-screen {
+  flex: 1 1 auto;
+  container: files-screen / inline-size;
 }
 
 /* --- Toolbar -------------------------------------------------------------- */
@@ -3038,6 +3262,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
   min-width: 0;
   min-height: 0;
   border-radius: var(--radius-lg);
+  container: files-list / inline-size;
 }
 
 /* Its ring is the keyboard's, set by `keyboardFocus` rather than `:focus-visible`, which a key
@@ -3126,12 +3351,12 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
   max-width: 100%;
   min-width: 0;
   color: var(--ink);
+  /* No intrinsic width of its own: a long name would otherwise widen its column past the list,
+     which never scrolls sideways (*A narrow list drops columns*, below). */
+  contain: inline-size;
 }
 
-.entry.pendingup {
-  color: var(--muted);
-}
-
+.entry.pendingup,
 .entry.origin {
   color: var(--muted);
 }
@@ -3213,8 +3438,10 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
   color: var(--accent-fg);
 }
 
-/* The row `?document=` pointed at: lit on arrival, then fading back to an ordinary row. */
-.contents :deep(tr.file) td {
+/* The row `?document=` pointed at, or one the Agent changed: lit on arrival, then fading back
+   to an ordinary row. */
+.contents :deep(tr.file) td,
+.contents :deep(tr.folder) td {
   transition: background var(--duration-slow) var(--ease);
 }
 
@@ -3262,15 +3489,66 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
   color: var(--accent);
 }
 
-/* The label goes before anything else does: under 800px the upload button is its glyph. */
-@media (max-width: 800px) {
-  .upload-label {
+/* The screen's own width decides, not the window's: the Agent card beside the list narrows
+   the screen as much as a small window does. Too narrow, the capsule and Upload fold into one
+   More button beside the tabs. */
+.list-screen .toolbar-more {
+  display: none;
+}
+
+@container files-screen (max-width: 470px) {
+  .list-screen .toolbar-actions,
+  .btn.upload {
     display: none;
   }
 
-  .btn.upload {
-    width: var(--control-height-lg);
-    padding: 0;
+  .list-screen .toolbar-more {
+    display: inline-flex;
+  }
+}
+
+/* The list never scrolls sideways. The name takes whatever the other columns leave and is cut
+   with an ellipsis (its full text is the row's tooltip); as the list narrows, the columns that
+   matter least go first — Kind, then Size in Files; Size, then Original location in the Trash — and
+   the date last (docs/web.md § Files, *A narrow list drops columns*). */
+.contents :deep(.table) {
+  --table-min: 0px;
+}
+
+@container files-list (max-width: 640px) {
+  .files-table :deep(.column-kind) {
+    display: none;
+  }
+}
+
+@container files-list (max-width: 440px) {
+  .files-table :deep(.column-size) {
+    display: none;
+  }
+}
+
+@container files-list (max-width: 700px) {
+  .trash-table :deep(.column-size) {
+    display: none;
+  }
+}
+
+@container files-list (max-width: 590px) {
+  .trash-table :deep(.column-origin) {
+    display: none;
+  }
+}
+
+/* Narrower still, the name is all a row has room for. */
+@container files-list (max-width: 340px) {
+  .files-table :deep(.column-added),
+  .trash-table :deep(.column-trashed) {
+    display: none;
+  }
+
+  /* The hidden date is still the row's last cell, so the name takes the row's both ends. */
+  .contents :deep(.table td.column-name) {
+    border-radius: var(--radius-md);
   }
 }
 

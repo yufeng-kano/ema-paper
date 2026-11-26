@@ -2,7 +2,7 @@
 /**
  * One row of a settings group: a label and its one-line description at the left, the
  * control at the right, a hairline between it and the row above (docs/web.md § Pages,
- * `/settings/<section>`).
+ * `?settings=<section>`).
  *
  * The description says the consequence the control does not show by itself — where a
  * language applies, what signing out ends — and nothing else; a row with nothing to add

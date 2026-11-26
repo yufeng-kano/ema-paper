@@ -38,9 +38,10 @@ import { closeHistory } from '@tiptap/pm/history'
 import { Slice, type Node as ProseNode } from '@tiptap/pm/model'
 import { NodeSelection, Selection, TextSelection, type Transaction } from '@tiptap/pm/state'
 import type { EditorView } from '@tiptap/pm/view'
-import { blockName, type NameText } from '~/lib/blocks'
+import type { DragCardControls } from '~/components/DragCard.vue'
+import { askKind, blockName } from '~/lib/blocks'
 import { isImageFile, matchCommands } from '~/lib/composer'
-import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
+import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE, carries, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
 import { blockPlain, nearestBlock, type PlaceNear, type ResultBlock } from '~/lib/markdown'
@@ -170,6 +171,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { nameText, kindLabel } = useBlockNames()
 
 const root = ref<HTMLElement | null>(null)
 const mount = ref<HTMLElement | null>(null)
@@ -402,7 +404,7 @@ const { label: keyLabel, matches } = useShortcuts()
 
 // --- the slash menu --------------------------------------------------------------------
 
-/** The menu's widest and tallest, and the gap between it and the slash's line. */
+/** The menu's tallest, and the gap between it and the slash's line. */
 const SLASH_MAX_HEIGHT = 432
 const SLASH_GAP = 4
 
@@ -1009,7 +1011,7 @@ async function insertImages(files: File[], slot: ImageSlot) {
         if (!slot.near || !strayed?.(line, slot.near)) {
           return
         }
-        slot.near = { after: line, before: slot.near.before, gap: (slot.near.gap ?? 0) + 1 }
+        slot.near = { after: line, before: slot.near.before, gap: slot.near.gap + 1 }
         continue
       }
       const { state } = editor
@@ -1027,25 +1029,29 @@ async function insertImages(files: File[], slot: ImageSlot) {
   }
 }
 
+/** The editor's top-level blocks as markdown, each with where it starts and ends; empty
+ *  paragraphs are passed over. */
+function topBlocks(doc: ProseNode): { markdown: string; from: number; to: number }[] {
+  const blocks: { markdown: string; from: number; to: number }[] = []
+  doc.forEach((node, offset) => {
+    const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
+    if (markdown) {
+      blocks.push({ markdown, from: offset, to: offset + node.nodeSize })
+    }
+  })
+  return blocks
+}
+
 /** A place in the editor by the top-level blocks around it, empty paragraphs passed over: the
  *  last before it, the first from it on, and how many come before it. */
 function placeIn(doc: ProseNode, pos: number): PlaceNear {
-  let after: string | null = null
-  let before: string | null = null
-  let gap = 0
-  doc.forEach((node, offset) => {
-    const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
-    if (!markdown) {
-      return
-    }
-    if (offset < pos) {
-      after = markdown
-      gap += 1
-    } else if (before === null) {
-      before = markdown
-    }
-  })
-  return { after, before, gap }
+  const blocks = topBlocks(doc)
+  const ahead = blocks.filter((block) => block.from < pos)
+  return {
+    after: ahead.at(-1)?.markdown ?? null,
+    before: blocks.find((block) => block.from >= pos)?.markdown ?? null,
+    gap: ahead.length,
+  }
 }
 
 function imagesOf(transfer: DataTransfer | null): File[] {
@@ -1067,7 +1073,7 @@ function carriesImages(event: DragEvent): boolean {
 const dropLine = ref<{ top: number; left: number; width: number } | null>(null)
 
 function carriesBlocks(event: DragEvent): boolean {
-  return props.variant === 'notes' && [...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE)
+  return props.variant === 'notes' && carries(event.dataTransfer, BLOCK_DRAG_TYPE)
 }
 
 /** The top-level position the drop lands at — before or after the block under the pointer by
@@ -1194,21 +1200,10 @@ let unitMenuClosedBy: EventTarget | null = null
 let unitFocusLeft = false
 const unitHandle = ref<HTMLElement | null>(null)
 const handleTop = ref(0)
-const unitDragCard = ref<HTMLElement | null>(null)
+const unitDragCard = ref<DragCardControls | null>(null)
 /** The gap a drag would land in, and what the live region says about it. */
 let unitDragSlot: number | null = null
 const unitLive = ref('')
-
-/** What a handle calls its unit, as the document's handles do. */
-const nameText = computed<NameText>(() => ({
-  formula: t('viewer.names.formula'),
-  formulaTag: (tag) => t('viewer.names.formulaTag', { tag }),
-  quoted: (words) => t('viewer.names.quoted', { words }),
-  figure: (words) => t('viewer.names.figure', { name: t('viewer.names.quoted', { words }) }),
-  figureBare: t('viewer.names.figureBare'),
-  image: (words) => t('viewer.names.image', { name: t('viewer.names.quoted', { words }) }),
-  imageBare: t('viewer.names.imageBare'),
-}))
 
 /** One handle at a time. An empty line and a comment have none. */
 const shownUnit = computed<number | null>(() => {
@@ -1233,11 +1228,6 @@ function unitName(index: number): string {
 }
 
 const handleName = computed(() => (shownUnit.value === null ? '' : unitName(shownUnit.value)))
-
-/** Block kinds as the document's menu header names them. */
-function kindLabel(block: ResultBlock): string {
-  return t(`viewer.block.kinds.${block.kind === 'h2' || block.kind === 'h3' ? 'h' : block.kind}`)
-}
 
 /** Each unit's extent on screen, its first block's top to its last block's bottom. */
 function unitBoxes(): UnitBox[] {
@@ -1423,17 +1413,7 @@ function askWhich(unit: NoteUnit, block: ResultBlock | null): string {
   if (unit.excerpt) {
     return 'excerpt'
   }
-  switch (block?.kind) {
-    case 'p':
-      return 'paragraph'
-    case 'h2':
-    case 'h3':
-      return 'section'
-    case 'math':
-      return 'formula'
-    default:
-      return 'block'
-  }
+  return block ? askKind(block) : 'block'
 }
 
 /**
@@ -1574,7 +1554,7 @@ function closeUnitMenu(cause?: Event) {
 
 /** A drag of this editor's own unit: the type alone could be another tab's notes. */
 function carriesUnit(event: DragEvent): boolean {
-  return draggedUnit.value !== null && [...(event.dataTransfer?.types ?? [])].includes(NOTES_BLOCK_DRAG_TYPE)
+  return draggedUnit.value !== null && carries(event.dataTransfer, NOTES_BLOCK_DRAG_TYPE)
 }
 
 /** The drag carries its own type and no text, so no other target takes it; its picture is the
@@ -1593,13 +1573,8 @@ function onUnitDragStart(event: DragEvent) {
   unitLive.value = ''
   transfer.effectAllowed = 'move'
   transfer.setData(NOTES_BLOCK_DRAG_TYPE, String(unit.from))
-  const card = unitDragCard.value
-  const text = card?.querySelector('.drag-card-text')
-  if (card && text) {
-    const block = unitBlock(editor.state.doc, unit)
-    text.textContent = (block && blockPlain(block, inlineOptions)) || handleName.value
-    transfer.setDragImage(card, 12, 14)
-  }
+  const block = unitBlock(editor.state.doc, unit)
+  unitDragCard.value?.paint(transfer, (block && blockPlain(block, inlineOptions)) || handleName.value)
   setUnitLook({ from: unit.from, to: unit.to, look: 'moving' })
 }
 
@@ -1855,13 +1830,7 @@ watch(
     const places = [...landing].map((slot) => ({ slot, near: placeIn(editor!.state.doc, slot.pos) }))
     editor.chain().setMeta('addToHistory', false).setContent(markdownToDoc(source, inlineOptions), { emitUpdate: false }).run()
     const { doc } = editor.state
-    const blocks: { markdown: string; from: number; to: number }[] = []
-    doc.forEach((node, offset) => {
-      const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
-      if (markdown) {
-        blocks.push({ markdown, from: offset, to: offset + node.nodeSize })
-      }
-    })
+    const blocks = topBlocks(doc)
     for (const { slot, near } of places) {
       // After the block it followed, else before the one it preceded, else at the end.
       const found = nearestBlock(blocks.map((block) => block.markdown), near)
@@ -1934,7 +1903,7 @@ onBeforeUnmount(() => {
       slot.near = {
         after: after ?? outer?.after ?? null,
         before: before ?? outer?.before ?? null,
-        gap: (outer?.gap ?? 0) + (gap ?? 0),
+        gap: (outer?.gap ?? 0) + gap,
         // Beside a block of its own editor's, that block first: the editor's text is on its
         // page, a neighbour from around the editor may not be.
         prefer: after !== null ? 'after' : before !== null ? 'before' : (outer?.prefer ?? 'after'),
@@ -1950,9 +1919,10 @@ onBeforeUnmount(() => {
 })
 
 defineExpose({
-  focus: (where: 'start' | 'end' = 'end') => {
+  /** The caret at the end of the text. */
+  focus: () => {
     if (editor) {
-      focusAt(where === 'start' ? Selection.atStart(editor.state.doc) : Selection.atEnd(editor.state.doc))
+      focusAt(Selection.atEnd(editor.state.doc))
     }
   },
   wash,
@@ -2015,12 +1985,7 @@ defineExpose({
     >
     <p v-if="uploading" class="image-status" role="status">{{ t('viewer.imageUploading') }}</p>
     <!-- Where blocks dragged from the document would land: on a block's edge. -->
-    <div
-      v-if="dropLine"
-      class="drop-line"
-      aria-hidden="true"
-      :style="{ top: `${dropLine.top}px`, left: `${dropLine.left}px`, width: `${dropLine.width}px` }"
-    />
+    <DropLine v-if="dropLine" :line="dropLine" />
     <!-- The TeX field: the context menu's floating surface, under the formula it edits or
          standing on its top. -->
     <div
@@ -2153,10 +2118,7 @@ defineExpose({
         <UiIcon name="grip-vertical" />
       </div>
       <!-- The drag's picture, written as the drag starts; never seen in place. -->
-      <div ref="unitDragCard" class="drag-card" aria-hidden="true">
-        <UiIcon name="grip-vertical" />
-        <span class="drag-card-text" />
-      </div>
+      <DragCard ref="unitDragCard" />
       <p class="sr-only" role="status" aria-live="polite">{{ unitLive }}</p>
       <UiContextMenu
         v-if="unitMenu"
@@ -2181,29 +2143,6 @@ defineExpose({
 /* The notes fill their column, so a drop anywhere in it lands. */
 .rich-notes {
   min-height: 100%;
-}
-
-/* The document pane's drop line, on the notes (docs/web.md § Editing, *Moving blocks*). */
-.drop-line {
-  position: absolute;
-  z-index: 4;
-  height: 2px;
-  margin-top: -1px;
-  background: var(--accent);
-  pointer-events: none;
-}
-
-.drop-line::before {
-  content: '';
-  position: absolute;
-  top: -3px;
-  left: -8px;
-  box-sizing: border-box;
-  width: 8px;
-  height: 8px;
-  border: 2px solid var(--accent);
-  border-radius: 50%;
-  background: var(--paper);
 }
 
 /* --- the notes' blocks (docs/web.md § Notes, *The notes' blocks have handles*) --------- */
@@ -2249,14 +2188,6 @@ defineExpose({
   height: 16px;
 }
 
-/* The layers drawn behind blocks — a unit's selection, the wash — belong to the editor's own
-   stacking context, not the block's: there they sit behind the whole block, its quote bar and
-   its heading's rule included, as the document's sit behind a block's wrapper. In the block's
-   own context they would paint over its border. */
-.rich :deep(.rich-doc) {
-  isolation: isolate;
-}
-
 /* A unit selected whole, or the one its menu holds: the document's selection, a layer behind
    its blocks that moves no text — an excerpt's two blocks joined into one layer. */
 .rich :deep(.rich-unit-selected) {
@@ -2288,39 +2219,6 @@ defineExpose({
   opacity: 0.4;
 }
 
-/* The drag's picture, as the document's: off screen until the browser takes it. */
-.drag-card {
-  position: fixed;
-  top: -1000px;
-  left: -1000px;
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  max-width: 280px;
-  padding: var(--space-1) var(--space-3) var(--space-1) var(--space-2);
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: var(--paper);
-  box-shadow: var(--shadow-menu);
-  color: var(--ink);
-  font-size: var(--text-sm);
-  white-space: nowrap;
-  pointer-events: none;
-}
-
-.drag-card > :deep(svg) {
-  flex: none;
-  width: 16px;
-  height: 16px;
-  color: var(--faint);
-}
-
-.drag-card-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 /* The editable surface draws nothing of its own: no border, no ring, no fill — the block is
    the same block, now with a caret in it. Blocks inside one editor keep the gap the
    surface around them keeps between rendered blocks — as margins, not a flex gap: a flex
@@ -2333,6 +2231,11 @@ defineExpose({
      rendered block: they stay on, as they are there. */
   font-variant-ligatures: normal;
   font-feature-settings: normal;
+  /* The layers drawn behind blocks — a unit's selection, the wash — belong to the editor's
+     own stacking context, not the block's: there they sit behind the whole block, its quote
+     bar and its heading's rule included, as the document's sit behind a block's wrapper. In
+     the block's own context they would paint over its border. */
+  isolation: isolate;
 }
 
 .rich :deep(.rich-doc > * + *) {
@@ -2362,9 +2265,6 @@ defineExpose({
   overflow-x: auto;
 }
 
-.rich :deep(.md-table th p) {
-}
-
 /* A formula is one object: it highlights as a whole and opens on a click. */
 .rich :deep(.rich-math) {
   border-radius: var(--radius);
@@ -2391,47 +2291,14 @@ defineExpose({
   color: var(--faint);
 }
 
-/* A figure or an image in the editor, drawn as `MdBlock` draws one (its styles are scoped
-   there): centered, the picture at the column's width and never more, the caption faint. */
+/* A figure or an image in the editor is styled as the document draws one (markdown.css
+   `.md-figure`), with no block gap above it and a shorter frame for a picture not loaded. */
 .rich :deep(.rich-figure) {
   margin: 0;
-  text-align: center;
-}
-
-.rich :deep(.rich-figure .figure-image) {
-  display: block;
-  margin-inline: auto;
-  max-width: 100%;
-  border: 1px solid var(--line-soft);
-  background: var(--paper);
 }
 
 .rich :deep(.rich-figure .figure-frame) {
-  display: flex;
-  align-items: center;
-  justify-content: center;
   height: 120px;
-  border: 1px dashed var(--edge);
-  background: var(--rail);
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-
-.rich :deep(.rich-figure .figure-note) {
-  display: inline-block;
-  margin: var(--space-2) 0 0;
-  padding: 0 var(--space-2);
-  background: var(--rail-active);
-  color: var(--ink-soft);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-}
-
-.rich :deep(.rich-figure .figure-caption) {
-  margin-top: var(--space-2);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-  color: var(--faint);
 }
 
 /* Selected as one atom: the surface a selected formula gets. */
@@ -2621,7 +2488,7 @@ defineExpose({
   }
 }
 
-/* The rows scroll; the legend under them stays. */
+/* The rows scroll inside the menu's max height. */
 .slash-list {
   flex: 1 1 auto;
   min-height: 0;

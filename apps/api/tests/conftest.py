@@ -1,22 +1,29 @@
 """Shared test fixtures.
 
-Database: set `TEST_DATABASE_URL` (or `DATABASE_URL`) to run the suite against a real
-PostgreSQL — e.g. `docker compose up -d pg` then
+Database: the suite runs on the PostgreSQL database `TEST_DATABASE_URL` names, and refuses
+to start without one. It is the only variable read here (never the app's `DATABASE_URL`).
+A run drops and re-creates every table in that database, once, and empties every table
+before each test, so it must name a database of its own, never the app's. On the compose
+server, for example, create one once (docs/testing.md):
 
-    TEST_DATABASE_URL=postgresql+asyncpg://sightread:sightread@127.0.0.1:5432/sightread \
+    docker compose up -d pg
+    docker compose exec pg createdb -U sightread sightread_test
+    TEST_DATABASE_URL=postgresql+asyncpg://sightread:sightread@127.0.0.1:5432/sightread_test \
         uv run pytest
 
-Without it the suite falls back to a throwaway SQLite file so `uv run pytest` works with
-no services and no network. The models carry SQLite variants for the two PostgreSQL-only
-types (JSONB and timestamptz) precisely so this fallback stays honest.
+Settings: no test reads a setting from the caller's environment. Every variable that names
+a `Settings` field is removed before each test, so an exported `.env` changes nothing;
+`TEST_DATABASE_URL` is not one, and it is read once, at import.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -24,22 +31,22 @@ import pytest
 import pytest_asyncio
 import respx
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import create_async_engine
 
-from sightread.config import Settings
-from sightread.db.models import Base
-from sightread.db.session import create_sessionmaker
+from sightread.config import Settings, get_settings
+from sightread.db.models import WORKER_GENERATION_SEQ, Base, Subscription
+from sightread.db.session import create_engine, create_sessionmaker
+from sightread.jobs.chat_tools import ImageView
 from sightread.main import create_app
 from sightread.mcp import mcp_session_manager
+from sightread.workspace.layout import user_root
 from tests.fixtures.documents import (
     build_corrupt_pdf,
     build_image,
-    build_mixed_pdf,
+    build_pdf,
     build_rotated_jpeg,
-    build_scanned_pdf,
-    build_table_pdf,
-    build_text_layer_pdf,
-    build_two_column_pdf,
+    scanned_page,
+    text_layer_page,
+    two_column_page,
 )
 
 TEST_SECRET_KEY = "test-secret-key-not-a-real-one"
@@ -47,9 +54,9 @@ CSRF_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 
 
 async def convert_on_upload(client: AsyncClient) -> None:
-    """Turn the parse agent's `auto_convert` on for the signed-in user: off by default
-    since 2026-10-26, so a Files upload of a PDF or an image is kept as a file unless a test
-    asks for the parse (docs/agents.md)."""
+    """Turn the parse agent's `auto_convert` on for the signed-in user. It is off by
+    default (docs/agents.md), so a Files upload of a PDF or an image is kept as a file
+    unless a test asks for the parse."""
     saved = await client.put(
         "/api/agents/parse/settings", json={"auto_convert": True}, headers=CSRF_HEADERS
     )
@@ -67,7 +74,19 @@ KANO_API_KEY = "sk-kano-proxy-test-not-a-real-one"
 PARSE_MODEL = "vendor/vision-model"
 CATALOG_MODELS = "claude-code/claude-opus-5-5,codex/gpt-5.5,vendor/chat-model"
 
-DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """No database, no run: one line that says how to name one, before anything is
+    collected."""
+    if not TEST_DATABASE_URL.startswith("postgresql+asyncpg://"):
+        raise pytest.UsageError(
+            "the api tests need a PostgreSQL test database: set TEST_DATABASE_URL, e.g. "
+            "TEST_DATABASE_URL=postgresql+asyncpg://sightread:sightread@127.0.0.1:5432/"
+            "sightread_test uv run pytest (docs/testing.md)"
+        )
+
 
 # USD per 1M tokens, every kind alike, for the models the tests chat on.
 TEST_MODEL_PRICES = json.dumps(
@@ -76,7 +95,6 @@ TEST_MODEL_PRICES = json.dumps(
         for model in (
             "claude-code/claude-opus-5-5",
             "claude-code/claude-opus-5",
-            "claude-code/claude-fallback-9",
             "claude-code/claude-haiku-5-5",
             "claude-opus-5-5",
             "codex/gpt-5.5",
@@ -90,16 +108,89 @@ TEST_MODEL_PRICES = json.dumps(
 )
 
 
+def base_settings(**overrides) -> Settings:
+    """The settings every test deployment starts from: local, the dev login on, Kano Proxy at
+    `KANO_BASE` with the operator's key and `PARSE_MODEL`, and every test model priced."""
+    return Settings(
+        **{
+            "app_env": "local",
+            "auth_dev_mode": True,
+            "secret_key": TEST_SECRET_KEY,
+            "database_url": TEST_DATABASE_URL,
+            "kano_proxy_base_url": KANO_BASE,
+            "kano_proxy_api_key": KANO_API_KEY,
+            "parse_model": PARSE_MODEL,
+            # Every model a test turn runs on is priced, as the deployment requires of its
+            # offered models (docs/billing.md § Models): a flat list price so the credits a
+            # test sees are predictable. Tests of the arithmetic set their own.
+            "model_prices_json": TEST_MODEL_PRICES,
+            **overrides,
+        }
+    )
+
+
+def path_settings(tmp_path: Path, **overrides) -> Settings:
+    """Settings for code driven without an app: its uploads, workspaces and figures under
+    `tmp_path`, Kano Proxy at `KANO_BASE`."""
+    return Settings(
+        **{
+            "app_env": "local",
+            "secret_key": TEST_SECRET_KEY,
+            "upload_dir": str(tmp_path / "uploads"),
+            "workspaces_dir": str(tmp_path / "workspaces"),
+            "figures_dir": str(tmp_path / "figures"),
+            "kano_proxy_base_url": KANO_BASE,
+            **overrides,
+        }
+    )
+
+
+@pytest.fixture(autouse=True)
+def hermetic_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every `Settings` a test builds, bare `Settings()` and the cached `get_settings()`
+    included, sees only its own arguments and the defaults. The names match without regard
+    to case, as the settings read them."""
+    fields = set(Settings.model_fields)
+    for name in list(os.environ):
+        if name.lower() in fields:
+            monkeypatch.delenv(name)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+async def _rebuild_schema(url: str, *, create: bool) -> None:
+    engine = create_engine(url)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.drop_all)
+        if create:
+            await connection.run_sync(Base.metadata.create_all)
+    await engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def database_schema() -> Iterator[None]:
+    """The schema, made once per run from a clean database and dropped at its end;
+    `sessionmaker` empties it before each test."""
+    asyncio.run(_rebuild_schema(TEST_DATABASE_URL, create=True))
+    yield
+    asyncio.run(_rebuild_schema(TEST_DATABASE_URL, create=False))
+
+
 @pytest_asyncio.fixture
-async def sessionmaker(tmp_path):
-    url = DATABASE_URL or f"sqlite+aiosqlite:///{tmp_path}/test.db"
-    engine = create_async_engine(url)
+async def sessionmaker(database_schema):
+    """A database no earlier test has written to: every table is truncated and every
+    sequence restarted before the test, so ids count from 1 as on a fresh schema."""
+    # The app's own engine factory, so the tests have production's session settings.
+    engine = create_engine(TEST_DATABASE_URL)
     async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
-        await connection.run_sync(Base.metadata.create_all)
+        quote = engine.dialect.identifier_preparer.quote
+        tables = ", ".join(quote(table.name) for table in Base.metadata.sorted_tables)
+        await connection.exec_driver_sql(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")
+        await connection.exec_driver_sql(
+            f"ALTER SEQUENCE {quote(WORKER_GENERATION_SEQ.name)} RESTART"
+        )
     yield create_sessionmaker(engine)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
     await engine.dispose()
 
 
@@ -107,28 +198,17 @@ async def sessionmaker(tmp_path):
 async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., AsyncClient]]:
     """Build a client for an app with the given settings overrides.
 
-    The app's sessionmaker is injected directly, so no lifespan and no live database are
-    needed. `https://` base URL so the `Secure` session cookie is stored by httpx.
+    The app's sessionmaker is injected directly, so no lifespan is needed. `https://` base
+    URL so the `Secure` session cookie is stored by httpx.
     """
     opened: list[AsyncClient] = []
 
     def _make(**overrides) -> AsyncClient:
-        settings = Settings(
+        settings = base_settings(
             **{
-                "app_env": "local",
-                "auth_dev_mode": True,
-                "secret_key": TEST_SECRET_KEY,
-                "database_url": "sqlite+aiosqlite://",
                 "upload_dir": str(tmp_path / "uploads"),
                 "figures_dir": str(tmp_path / "figures"),
-                "kano_proxy_base_url": KANO_BASE,
-                "kano_proxy_api_key": KANO_API_KEY,
-                "parse_model": PARSE_MODEL,
-                # Every model a test turn runs on is priced, as the deployment requires
-                # of its offered models (docs/billing.md § Models): a flat list price so
-                # the credits a test sees are predictable. Tests of the arithmetic set
-                # their own.
-                "model_prices_json": TEST_MODEL_PRICES,
+                "workspaces_dir": str(tmp_path / "workspaces"),
                 **overrides,
             }
         )
@@ -148,6 +228,24 @@ async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., Asy
 @pytest.fixture
 def client(make_client) -> AsyncClient:
     return make_client()
+
+
+@pytest_asyncio.fixture
+async def chat_client(make_client) -> AsyncClient:
+    """Signed in, a chat model chosen, one document (tests/chat_helpers.py)."""
+    # Imported here: chat_helpers imports this module.
+    from tests.chat_helpers import chatting_client
+
+    return await chatting_client(make_client())
+
+
+@pytest_asyncio.fixture
+async def parse_library(make_client) -> AsyncClient:
+    """Signed in, Files uploads parsed, `FALLBACK` named (tests/library_helpers.py)."""
+    # Imported here: library_helpers imports this module.
+    from tests.library_helpers import parsing_client
+
+    return await parsing_client(make_client)
 
 
 @pytest.fixture(autouse=True)
@@ -175,11 +273,11 @@ def documents(tmp_path_factory) -> dict[str, Path]:
     """Every fixture document, built once per session (tests/fixtures/documents.py)."""
     directory = tmp_path_factory.mktemp("documents")
     built = {
-        "text_pdf": build_text_layer_pdf(directory / "text.pdf"),
-        "scanned_pdf": build_scanned_pdf(directory / "scanned.pdf"),
-        "two_column_pdf": build_two_column_pdf(directory / "two-column.pdf"),
-        "table_pdf": build_table_pdf(directory / "table.pdf"),
-        "mixed_pdf": build_mixed_pdf(directory / "mixed.pdf"),
+        "text_pdf": build_pdf(directory / "text.pdf", text_layer_page),
+        "scanned_pdf": build_pdf(directory / "scanned.pdf", scanned_page),
+        "mixed_pdf": build_pdf(
+            directory / "mixed.pdf", text_layer_page, scanned_page, two_column_page
+        ),
         "corrupt_pdf": build_corrupt_pdf(directory / "corrupt.pdf"),
         "jpg": build_image(directory / "tiny.jpg", "JPEG"),
         "png": build_image(directory / "tiny.png", "PNG"),
@@ -193,11 +291,39 @@ def documents(tmp_path_factory) -> dict[str, Path]:
     return built
 
 
+async def sign_in(client: AsyncClient) -> AsyncClient:
+    """Sign `client` in as the dev user and note who that is: `client.user_id`, and
+    `client.root`, the user's workspace."""
+    response = await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    assert response.status_code == 200, response.text
+    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
+    client.root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    return client
+
+
 @pytest_asyncio.fixture
 async def signed_in(client: AsyncClient) -> AsyncClient:
-    response = await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    assert response.status_code == 200
+    return await sign_in(client)
+
+
+@pytest_asyncio.fixture
+async def writer(make_client) -> AsyncClient:
+    """A signed-in client of its own, apart from the `client` fixture."""
+    return await sign_in(make_client())
+
+
+async def api_key_client(client: AsyncClient) -> AsyncClient:
+    """Sign `client` in as the dev user and send a fresh API key of theirs on every
+    request; its session cookie stays, for the routes a key does not open."""
+    await sign_in(client)
+    created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
+    client.headers["Authorization"] = f"Bearer {created.json()['key']}"
     return client
+
+
+@pytest_asyncio.fixture
+async def api_client(make_client) -> AsyncClient:
+    return await api_key_client(make_client())
 
 
 def mcp_running(client: AsyncClient):
@@ -236,10 +362,6 @@ PAY_SETTINGS = {
 async def grant_plan(sessionmaker, user_id: int, plan_id: str = "pro", *, version: int = 1):
     """A subscription row as the webhook would write it: the user is on `plan_id` for a
     period around now (docs/billing.md § Periods)."""
-    from datetime import UTC, datetime, timedelta
-
-    from sightread.db.models import Subscription
-
     now = datetime.now(UTC)
     async with sessionmaker() as db:
         db.add(
@@ -255,3 +377,15 @@ async def grant_plan(sessionmaker, user_id: int, plan_id: str = "pro", *, versio
             )
         )
         await db.commit()
+
+
+def image_view(*, max_bytes: int = 32 << 20, shell: bool = True) -> ImageView:
+    """What the editor may show of an image, made fresh per call: its semaphore binds to
+    the event loop of the test that first waits on it."""
+    return ImageView(
+        max_bytes=max_bytes,
+        max_pixels=40_000_000,
+        long_edge=1568,
+        decode_slot=asyncio.Semaphore(1),
+        shell=shell,
+    )

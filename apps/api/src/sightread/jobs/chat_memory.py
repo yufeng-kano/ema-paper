@@ -19,12 +19,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ..agents import CHAT
 from ..agents import memory as memory_defs
 from ..config import Settings
-from ..db.models import AgentSetting, Conversation, Memory, User, utcnow
+from ..db.models import AgentSetting, Conversation, Memory, utcnow
+from ..workspace.trash import lock_user
 from .chat_tools import ToolOutcome
 
 PAUSED = "Memory is paused: the user turned it off. Nothing was saved or changed; go on without it."
 ACTIONS = {"save": "saved", "update": "updated", "forget": "forgotten"}
 SCOPES = ("all", "document")
+NO_DOCUMENT = "There is no document in this conversation: save it for all documents"
 # How the block names a memory, and what the tool takes back: `m12`, or the bare number.
 _ID = re.compile(r"^\[?m?(\d{1,18})\]?$", re.IGNORECASE)
 
@@ -53,22 +55,21 @@ def first_turn_selection(rows: Sequence[Memory], settings: Settings) -> list[Mem
 
 
 async def snapshot_rows(
-    db: AsyncSession, user_id: int, document_id: int, ids: Sequence[object]
+    db: AsyncSession, user_id: int, document_id: int | None, ids: Sequence[int]
 ) -> list[Memory]:
     """The snapshot's memories as they are now, in its order: one the reader deleted is
     gone, and one whose scope no longer takes in this document is dropped."""
-    wanted = [value for value in ids if isinstance(value, int) and not isinstance(value, bool)]
-    if not wanted:
+    if not ids:
         return []
     rows = {
         row.id: row
         for row in (
-            await db.execute(select(Memory).where(Memory.user_id == user_id, Memory.id.in_(wanted)))
+            await db.execute(select(Memory).where(Memory.user_id == user_id, Memory.id.in_(ids)))
         ).scalars()
     }
     return [
         rows[memory_id]
-        for memory_id in wanted
+        for memory_id in ids
         if memory_id in rows and rows[memory_id].document_id in (None, document_id)
     ]
 
@@ -142,13 +143,14 @@ async def run_memory_tool(
     *,
     user_id: int,
     conversation_id: int,
-    document_id: int,
+    document_id: int | None,
     tool_use_id: str,
     tool_input: dict,
 ) -> ToolOutcome:
     """One `memory` call: save, update or forget one of the reader's memories (docs/chat.md
     § Memory). Every refusal is an error result the model can correct; a success carries
-    what its `memory` event reports, and a save of what is already saved carries nothing."""
+    what its `memory` event reports, and a save of what is already saved carries nothing.
+    `document_id` None: a library conversation, which has no document to scope one to."""
     action = _field(tool_input, "action")
     if action not in ACTIONS:
         return _error("`action` is save, update or forget.")
@@ -158,6 +160,9 @@ async def run_memory_tool(
     scope = _field(tool_input, "scope")
     if scope and scope not in SCOPES:
         return _error("`scope` is all or document.")
+    if scope == "document" and document_id is None:
+        # Never widened to every document unseen (docs/chat.md § Library conversations).
+        return _error(NO_DOCUMENT)
     raw_text = tool_input.get("text")
     text = memory_defs.clean_text(raw_text, single_line=True) if isinstance(raw_text, str) else ""
     if len(text) > settings.chat_memory_max_chars:
@@ -179,7 +184,7 @@ async def run_memory_tool(
     async with sessionmaker() as db:
         # The reader's row, held until the commit: the count below must not race another
         # conversation's save past the cap (docs/chat.md § Memory).
-        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+        await lock_user(db, user_id)
         paused = (
             await db.execute(
                 select(AgentSetting.memory_paused).where(

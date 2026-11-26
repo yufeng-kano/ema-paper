@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * Account (docs/web.md § Pages, `/settings/<section>`): who is signed in, Sign out, and
+ * Account (docs/web.md § Pages, `?settings=<section>`): who is signed in, Sign out, and
  * Delete account. Nothing else: the app holds no profile of its own — the name and picture
  * are Google's.
  *

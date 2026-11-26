@@ -12,19 +12,19 @@
  */
 import {
   AGENT_EFFORTS,
+  CHAT_AGENT,
+  DEFAULT_EFFORT,
   listAgentModels,
   putAgentSettings,
   updateConversation,
   type AgentEffort,
   type AgentSettings,
-  type ConnectionModel,
+  type AgentModel,
   type Conversation,
   type SavedAgentSettings,
 } from '~/lib/api'
-import type { MenuItem, Point } from '~/lib/menu'
+import type { MenuItem } from '~/lib/menu'
 
-const CHAT_AGENT = 'chat'
-const DEFAULT_EFFORT: AgentEffort = 'medium'
 const MODEL_KEY = 'model:'
 const EFFORT_KEY = 'effort:'
 
@@ -48,15 +48,10 @@ const { t } = useI18n()
 const { resolve } = useApiError()
 
 const button = ref<HTMLButtonElement | null>(null)
-const menu = ref<Point | null>(null)
-const menuFromKey = ref(false)
-/** The press that closed the menu: a click on the pill right after it reopens nothing. */
-let closedBy: Event | null = null
-let pressClosedMenu = false
 
 // --- the offered models --------------------------------------------------------------------
 
-const models = ref<ConnectionModel[] | null>(null)
+const models = ref<AgentModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 let modelsSeq = 0
 
@@ -127,28 +122,17 @@ const items = computed<MenuItem[]>(() => {
 
 // --- opening and picking -------------------------------------------------------------------
 
-function onPointerdown(event: PointerEvent) {
-  pressClosedMenu = closedBy === event
-}
-
-function toggle(event: MouseEvent) {
-  const fromKey = event.detail === 0
-  if (menu.value || (pressClosedMenu && !fromKey)) {
-    pressClosedMenu = false
-    menu.value = null
-    return
-  }
-  const box = button.value?.getBoundingClientRect()
-  menuFromKey.value = fromKey
-  // Over the pill, ending just above it: the composer sits at the foot of the column.
-  menu.value = box ? { x: box.left, y: box.top - 4 } : { x: 0, y: 0 }
-  void loadModels()
-}
-
-function close(cause?: Event) {
-  menu.value = null
-  closedBy = cause ?? null
-}
+const {
+  at: menu,
+  fromKey: menuFromKey,
+  onPointerdown,
+  toggle,
+  close,
+} = useMenuButton(button, {
+  onOpen: () => {
+    void loadModels()
+  },
+})
 
 async function onSelect(key: string) {
   if (pending.value) {

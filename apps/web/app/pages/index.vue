@@ -18,7 +18,7 @@
  *
  * Full-bleed, so the page owns its frame rather than sitting in a layout.
  */
-import { devLogin, isDevLoginAvailable } from '~/lib/api'
+import { devLogin, isDevLoginAvailable, loginUrl } from '~/lib/api'
 import type { IconName } from '~/lib/icons'
 import { takeAfterSignIn } from '~/lib/settings'
 
@@ -110,7 +110,7 @@ async function signInAsDeveloper() {
              locale rides along because it lives in the URL everywhere else, and Google is
              the one leg that would drop it: the callback returns the visitor to the web app
              in the language they were reading this page in. -->
-        <a class="btn-google" :href="`/api/auth/login?locale=${encodeURIComponent(locale)}`">
+        <a class="btn-google" :href="loginUrl(locale)">
           <svg class="btn-google-mark" viewBox="0 0 18 18" aria-hidden="true" focusable="false">
             <path
               fill="#4285F4"
@@ -211,7 +211,7 @@ async function signInAsDeveloper() {
   text-wrap: pretty;
 }
 
-/* The sign-in card: paper on the desk, the reader's cards' radius and lift. */
+/* The sign-in card: paper on the desk, the reader's cards' radius and edge. */
 .card {
   display: flex;
   flex-direction: column;

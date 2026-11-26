@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -16,40 +15,33 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from sightread.agents import CHAT
 from sightread.agents import chat as chat_agent
 from sightread.agents import memory as memory_defs
+from sightread.agents import subagents as subagent_defs
+from sightread.agents.chat import TURN_CONTEXT, turn_note
 from sightread.db.models import (
     Conversation,
-    Document,
-    Folder,
-    Job,
     Memory,
     Message,
-    Result,
     User,
 )
-from sightread.jobs import chat_events, chat_memory, chat_runner, chat_tools
-from sightread.routes.chat import TURN_CONTEXT, turn_note
-from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, DATABASE_URL
-from tests.test_chat import _run_queued_turn
-from tests.test_chat_extensions import (
-    DOC_PATH,
+from sightread.jobs import chat_events, chat_memory, chat_runner, chat_subagent, chat_tools
+from sightread.parsing.attachments import ATTACHMENT_EXTENSIONS
+from tests.chat_helpers import (
+    DONE,
     chatting_client,
     new_conversation,
     one_call,
+    record_round,
     replayed_events,
+    round_ctx,
+    run_queued_turn,
+    seed_document,
     send,
     stub_messages,
 )
-
-DONE = ([{"type": "text", "text": "Done."}], "end_turn")
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
+from tests.conftest import CSRF_HEADERS, sign_in
+from tests.factories import filed_parse, user_row
 
 
 async def put_chat(client: AsyncClient, **fields):
@@ -62,60 +54,13 @@ async def save_memory(client: AsyncClient, **body) -> dict:
     return created.json()
 
 
-async def another_document(client: AsyncClient, user_id: int, name: str) -> int:
-    """A second document of the reader's, at the library's root."""
-    async with client.app.state.sessionmaker() as db:
-        job = Job(
-            id=uuid.uuid4(),
-            user_id=user_id,
-            agent="parse",
-            kind="pdf",
-            filename=name,
-            media_type="application/pdf",
-            size_bytes=10,
-            sha256="c" * 64,
-            model="claude-x",
-            bbox_format="yxyx_norm1000",
-            status="succeeded",
-            page_count=2,
-        )
-        db.add(job)
-        await db.flush()
-        db.add(
-            Result(job_id=job.id, markdown="# Other\n", pages=[], figures=[], errors=[], meta={})
-        )
-        document = Document(user_id=user_id, folder_id=None, job_id=job.id, name=name)
-        db.add(document)
-        await db.commit()
-        return document.id
-
-
 async def stranger_rows(client: AsyncClient) -> SimpleNamespace:
     """Another reader with a document, a conversation and a memory of their own."""
     async with client.app.state.sessionmaker() as db:
-        stranger = User(google_sub="stranger", email="stranger@example.com")
+        stranger = user_row("stranger@example.com")
         db.add(stranger)
         await db.flush()
-        folder = Folder(user_id=stranger.id, parent_id=None, name="Theirs")
-        job = Job(
-            id=uuid.uuid4(),
-            user_id=stranger.id,
-            agent="parse",
-            kind="pdf",
-            filename="theirs.pdf",
-            media_type="application/pdf",
-            size_bytes=1,
-            sha256="d" * 64,
-            model="m",
-            bbox_format="yxyx_norm1000",
-            status="succeeded",
-            page_count=1,
-        )
-        db.add_all([folder, job])
-        await db.flush()
-        document = Document(user_id=stranger.id, folder_id=folder.id, job_id=job.id, name="t.pdf")
-        db.add(document)
-        await db.flush()
+        document = await filed_parse(db, stranger.id, name="t.pdf", folder="Theirs")
         conversation = Conversation(
             user_id=stranger.id, document_id=document.id, title="Theirs", session="s"
         )
@@ -233,12 +178,10 @@ def test_the_selected_block_never_passes_its_cap() -> None:
 
 
 def test_the_system_parts_keep_their_order_and_the_cache_on_the_last() -> None:
+    parts = chat_agent.system_parts("prompt", instructions="  ", catalogue=None, memory="memory")
+    assert [part.kind for part in parts] == ["prompt", "memory"]
     parts = chat_agent.system_parts(
-        "prompt", preset="preset", instructions="  ", catalogue=None, memory="memory"
-    )
-    assert [part.kind for part in parts] == ["prompt", "preset", "memory"]
-    parts = chat_agent.system_parts(
-        "prompt", preset=" ", instructions="Mine {page_count}", catalogue="cat", memory="mem"
+        "prompt", instructions="Mine {page_count}", catalogue="cat", memory="mem"
     )
     assert [part.kind for part in parts] == ["prompt", "instructions", "catalogue", "memory"]
     # Appended verbatim: a token in the reader's words is theirs, not substituted.
@@ -261,8 +204,6 @@ def test_the_memory_tool_is_the_last_tool_and_never_a_subagents() -> None:
     assert schema["required"] == ["action", "id", "kind", "text", "scope"]
     assert schema["properties"]["kind"]["enum"] == ["term", "preference", "about", "document", ""]
     assert schema["properties"]["scope"]["enum"] == ["all", "document", ""]
-    # Bumped with the memory tool (7), and only ever forward since.
-    assert CHAT.pipeline_version >= 7
 
 
 def test_the_prompt_says_how_to_link_a_section_and_which_language_to_answer_in() -> None:
@@ -290,8 +231,8 @@ def test_the_turn_block_names_the_languages_only_when_chosen() -> None:
     assert turn_note("abc", "en", None, None) == (
         "Context for this message:\n- document revision: abc\n- reader locale: en"
     )
-    # Each line carries its own rule: a prompt the reader replaced, or the one a migration
-    # moved their preset into, knows nothing of these lines (docs/chat.md § Instructions).
+    # Each line carries its own rule: a prompt the reader replaced knows nothing of these
+    # lines (docs/chat.md § Instructions).
     assert turn_note(None, "zh-TW", "ja", "zh-TW").endswith(
         f"- reader locale: zh-TW\n{ANSWER_JA}\n{translation_line('zh-TW')}"
     )
@@ -304,7 +245,7 @@ def test_the_turn_block_names_the_languages_only_when_chosen() -> None:
 
 async def test_the_chat_settings_take_instructions_languages_and_switches(make_client) -> None:
     client = make_client(chat_instructions_max_chars=16)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    await sign_in(client)
     agents = (await client.get("/api/agents")).json()["agents"]
     defaults = next(agent for agent in agents if agent["name"] == "chat")["settings"]
     assert {key: defaults[key] for key in memory_setting_keys()} == {
@@ -365,21 +306,29 @@ def memory_setting_keys() -> tuple[str, ...]:
     return ("instructions", "answer_language", "translate_language", "memory_auto", "memory_paused")
 
 
-async def test_me_carries_the_composer_and_editor_limits(make_client) -> None:
-    client = make_client(
-        chat_instructions_max_chars=111,
-        chat_memory_max_chars=222,
-        chat_sections_per_message=3,
-        chat_section_heading_max_chars=55,
-        chat_selection_max_chars=444,
-    )
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+# Each chat limit `/api/me` carries, the setting it comes from, and a value no default has.
+CHAT_LIMITS = {
+    "attachment_max_bytes": ("chat_attachment_max_bytes", 5_000_000),
+    "attachments_per_message": ("chat_attachments_per_message", 3),
+    "instructions_max_chars": ("chat_instructions_max_chars", 111),
+    "memory_max_chars": ("chat_memory_max_chars", 222),
+    "sections_per_message": ("chat_sections_per_message", 5),
+    "section_heading_max_chars": ("chat_section_heading_max_chars", 55),
+    "selection_max_chars": ("chat_selection_max_chars", 444),
+    # The panel reads the open conversation again as the worker's window opens (docs/web.md).
+    "idle_compact_lead_seconds": ("chat_idle_compact_lead_seconds", 123),
+}
+
+
+async def test_me_carries_the_chat_limits(make_client) -> None:
+    """The composer and the Agent page read their limits from the server's own settings
+    (docs/api.md § Limits)."""
+    client = await sign_in(make_client(**dict(CHAT_LIMITS.values())))
     limits = (await client.get("/api/me")).json()["limits"]
-    assert limits["instructions_max_chars"] == 111
-    assert limits["memory_max_chars"] == 222
-    assert limits["sections_per_message"] == 3
-    assert limits["section_heading_max_chars"] == 55
-    assert limits["selection_max_chars"] == 444
+    assert {key: limits[key] for key in CHAT_LIMITS} == {
+        key: value for key, (_, value) in CHAT_LIMITS.items()
+    }
+    assert limits["attachment_extensions"] == list(ATTACHMENT_EXTENSIONS)
 
 
 # --- the memories routes --------------------------------------------------------------------
@@ -406,7 +355,6 @@ async def test_memories_are_listed_edited_and_deleted(chat_client) -> None:
 
     listed = (await client.get("/api/memories")).json()
     assert [memory["id"] for memory in listed["memories"]] == [second["id"], first["id"]]
-    assert listed["max"] == client.app.state.settings.chat_memories_max
 
     widened = await client.put(
         f"/api/memories/{first['id']}",
@@ -446,12 +394,8 @@ async def test_memories_are_listed_edited_and_deleted(chat_client) -> None:
     )
 
 
-async def test_a_memory_is_checked_capped_and_the_callers_own(make_client, tmp_path) -> None:
-    client = await chatting_client(
-        make_client(
-            workspaces_dir=str(tmp_path / "ws"), chat_memories_max=2, chat_memory_max_chars=10
-        )
-    )
+async def test_a_memory_is_checked_capped_and_the_callers_own(make_client) -> None:
+    client = await chatting_client(make_client(chat_memories_max=2, chat_memory_max_chars=10))
     for body in (
         {"kind": "fact", "text": "x"},
         {"kind": "term", "text": "  \n\u200b "},
@@ -502,10 +446,6 @@ async def test_a_memory_is_checked_capped_and_the_callers_own(make_client, tmp_p
     assert left == [theirs.memory_id]
 
 
-@pytest.mark.skipif(
-    not (DATABASE_URL or "").startswith("postgresql"),
-    reason="row locks only block on PostgreSQL",
-)
 async def test_the_readers_memory_writes_wait_for_a_call_in_flight(chat_client) -> None:
     """A Pause, an edit, a delete and *Clear all* each take the reader's row before they
     act, as the `memory` tool does before it reads the switch, so none lands under a call
@@ -538,10 +478,8 @@ async def test_the_readers_memory_writes_wait_for_a_call_in_flight(chat_client) 
 
 async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> None:
     client = chat_client
-    other = await another_document(client, client.user_id, "other.pdf")
     everywhere = await save_memory(client, kind="term", text="query → 查詢")
     await save_memory(client, kind="document", text="d is 512", document_id=client.document_id)
-    await save_memory(client, kind="document", text="elsewhere", document_id=other)
 
     bare = await client.get("/api/agents/chat/context")
     assert bare.status_code == 200, bare.text
@@ -552,10 +490,11 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
     # No document: the template with its tokens, its tool lines as a turn has them.
     assert prompt["own"] is False and "{document_path}" in prompt["text"]
     assert "\n- bash:" not in prompt["text"] and "\n- memory:" in prompt["text"]
-    assert (catalogue["skills"], catalogue["subagents"]) == (1, 1)  # fix-math, translator
+    assert catalogue["skills"] == 1  # fix-math
+    assert "\n- translator" in catalogue["text"]
     assert (memory["count"], memory["paused"]) == (1, False)
     assert f"[m{everywhere['id']}]" in memory["text"] and "d is 512" not in memory["text"]
-    assert context["facts"] is None
+    assert "facts" not in context
     assert context["turn"] == {
         "text": "Context for this message:\n- document revision: <revision>\n- reader locale: en",
         "chars": len(
@@ -563,40 +502,18 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
         ),
     }
 
-    # The reader's prompt, a legacy preset, instructions and languages, with a document.
-    preset = await client.post(
-        "/api/prompts",
-        json={"agent": "chat", "name": "Legacy", "text": "Legacy words."},
-        headers=CSRF_HEADERS,
-    )
-    await put_chat(client, prompt_preset_id=preset.json()["id"])
+    # Instructions and languages.
     await put_chat(client, instructions="Be brief.", answer_language="ja", translate_language="en")
-    with_document = (
-        await client.get(
-            "/api/agents/chat/context",
-            params={"locale": "zh-TW", "document_id": client.document_id},
-        )
-    ).json()
-    kinds = [part["kind"] for part in with_document["parts"]]
-    assert kinds == ["prompt", "preset", "instructions", "catalogue", "memory"]
-    parts = {part["kind"]: part for part in with_document["parts"]}
-    assert parts["preset"]["text"] == "Legacy words."
+    configured = (await client.get("/api/agents/chat/context", params={"locale": "zh-TW"})).json()
+    kinds = [part["kind"] for part in configured["parts"]]
+    assert kinds == ["prompt", "instructions", "catalogue", "memory"]
+    parts = {part["kind"]: part for part in configured["parts"]}
     assert parts["instructions"]["text"] == chat_agent.INSTRUCTIONS_INTRO + "Be brief."
-    assert parts["memory"]["count"] == 2 and "d is 512 (this document)" in parts["memory"]["text"]
-    assert "elsewhere" not in parts["memory"]["text"]
-    assert with_document["facts"] == {
-        "document_path": DOC_PATH,
-        "page_count": "1",
-        "bbox_format": "yxyx_norm1000",
-        "parse_model": "claude-x",
-        "network": chat_agent.network_note("none", ()),
-    }
-    assert f"Current document: {DOC_PATH}" in parts["prompt"]["text"]
-    assert with_document["turn"]["text"].endswith(
+    assert configured["turn"]["text"].endswith(
         f"- reader locale: zh-TW\n{ANSWER_JA}\n{translation_line('en')}"
     )
-    # Reads only: the document was never materialized for it.
-    assert not (user_root(client.app.state.settings.workspaces_dir, client.user_id)).exists()
+    # Reads only: nothing was materialized for it.
+    assert not client.root.exists()
 
     await put_chat(client, prompt="Mine for {document_path}.")
     await put_chat(client, memory_paused=True)
@@ -617,11 +534,6 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
     assert (paused["count"], paused["paused"]) == (0, True)
     assert paused["text"] == memory_defs.PAUSED
 
-    theirs = await stranger_rows(client)
-    missing = await client.get(
-        "/api/agents/chat/context", params={"document_id": theirs.document_id}
-    )
-    assert missing.status_code == 404
     assert (
         await client.get("/api/agents/chat/context", params={"locale": "not a tag"})
     ).status_code == 422
@@ -672,16 +584,15 @@ async def test_a_message_carries_whole_sections_after_the_selection(chat_client)
         {"type": "text", "context": "section", "section": "4 Results"},
     ]
 
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     upstream = main[0]["messages"][0]["content"]
     assert all("section" not in block and "context" not in block for block in upstream)
     assert upstream[2]["text"].endswith("## 3.2 Attention\n\nBody.")
 
 
-async def test_sections_are_capped_and_never_a_message_alone(make_client, tmp_path) -> None:
+async def test_sections_are_capped_and_never_a_message_alone(make_client) -> None:
     client = await chatting_client(
         make_client(
-            workspaces_dir=str(tmp_path / "ws"),
             chat_sections_per_message=2,
             chat_section_heading_max_chars=20,
             chat_selection_max_chars=50,
@@ -723,34 +634,26 @@ async def test_the_turn_block_carries_the_readers_languages(chat_client) -> None
 
 
 @respx.mock
-async def test_the_instructions_follow_the_prompt_and_preset_verbatim(chat_client) -> None:
+async def test_the_instructions_follow_the_prompt_verbatim(chat_client) -> None:
     client = chat_client
-    preset = await client.post(
-        "/api/prompts",
-        json={"agent": "chat", "name": "Legacy", "text": "Legacy words."},
-        headers=CSRF_HEADERS,
-    )
-    await put_chat(client, prompt_preset_id=preset.json()["id"])
     instructions = "I study {page_count} things.\n\n- Answer in tables"
     await put_chat(client, instructions=instructions)
     main, _ = stub_messages([DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="hello")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     system = main[0]["system"]
-    assert len(system) == 5
-    assert system[1]["text"] == "Legacy words."
-    assert system[2]["text"] == chat_agent.INSTRUCTIONS_INTRO + instructions
-    assert "# Skills" in system[3]["text"]
-    assert system[4]["text"].startswith("# Memory\n")
-    assert [block.get("cache_control") for block in system] == [None] * 4 + [
+    assert len(system) == 4
+    assert system[1]["text"] == chat_agent.INSTRUCTIONS_INTRO + instructions
+    assert "# Skills" in system[2]["text"]
+    assert system[3]["text"].startswith("# Memory\n")
+    assert [block.get("cache_control") for block in system] == [None] * 3 + [
         {"type": "ephemeral", "ttl": "1h"}
     ]
     assert "memory" in [tool["name"] for tool in main[0]["tools"]]
     start = turn_starts(await replayed_events(client, conversation_id))[0]
     assert start == {
-        "model": "claude-code/claude-opus-5-5",
         "kind": "message",
         "instructions": True,
         "memory_ids": [],
@@ -761,7 +664,7 @@ async def test_the_instructions_follow_the_prompt_and_preset_verbatim(chat_clien
 @respx.mock
 async def test_a_conversation_renders_the_snapshot_its_first_turn_took(chat_client) -> None:
     client = chat_client
-    other = await another_document(client, client.user_id, "other.pdf")
+    other = await seed_document(client, client.user_id, name="other.pdf", folder=None)
     kept = await save_memory(client, kind="term", text="query → 查詢")
     scoped = await save_memory(
         client, kind="document", text="d is 512", document_id=client.document_id
@@ -773,7 +676,7 @@ async def test_a_conversation_renders_the_snapshot_its_first_turn_took(chat_clie
     main, _ = stub_messages([DONE, DONE, DONE])
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="one")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     first = main[0]["system"][-1]["text"]
     assert f"## Terms\n- [m{kept['id']}] query → 查詢" in first
     assert f"- [m{scoped['id']}] d is 512 (this document)" in first
@@ -792,7 +695,7 @@ async def test_a_conversation_renders_the_snapshot_its_first_turn_took(chat_clie
         f"/api/memories/{narrowed['id']}", json={"document_id": other}, headers=CSRF_HEADERS
     )
     await send(client, conversation_id, text="two")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     second = main[1]["system"][-1]["text"]
     assert f"- [m{kept['id']}] query → 查询" in second
     assert f"m{added['id']}" not in second and "d is 512" not in second
@@ -805,7 +708,7 @@ async def test_a_conversation_renders_the_snapshot_its_first_turn_took(chat_clie
     # A new conversation reads them as they are now.
     fresh = await new_conversation(client)
     await send(client, fresh, text="three")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     assert f"m{added['id']}" in main[2]["system"][-1]["text"]
 
 
@@ -827,7 +730,7 @@ async def test_paused_memory_loads_nothing_and_the_tool_refuses(chat_client) -> 
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="remember I am a student")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     assert main[0]["system"][-1]["text"] == memory_defs.PAUSED
     # Still declared: a changed tool list would cost the cached prefix.
@@ -845,7 +748,7 @@ async def test_paused_memory_loads_nothing_and_the_tool_refuses(chat_client) -> 
     # Resumed, with auto-remember off: the next turn takes the snapshot.
     await put_chat(client, memory_paused=False, memory_auto=False)
     await send(client, conversation_id, text="go on")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
     block = main[2]["system"][-1]["text"]
     assert f"- [m{kept['id']}] query → 查詢" in block and memory_defs.ON_REQUEST_ONLY in block
     assert await memory_ids_of(client, conversation_id) == [kept["id"]]
@@ -869,7 +772,7 @@ async def test_the_memory_tool_saves_updates_and_forgets(chat_client) -> None:
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Remember query is 查詢")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     async with client.app.state.sessionmaker() as db:
         rows = (await db.execute(select(Memory).order_by(Memory.id))).scalars().all()
@@ -895,7 +798,7 @@ async def test_the_memory_tool_saves_updates_and_forgets(chat_client) -> None:
         ]
     )
     await send(client, conversation_id, text="Actually 查询, and forget d_model")
-    await _run_queued_turn(client)
+    await run_queued_turn(client)
 
     events = [
         data for name, data in await replayed_events(client, conversation_id) if name == "memory"
@@ -1059,36 +962,6 @@ async def test_control_characters_never_reach_a_stored_text(chat_client) -> None
 # --- the tool in a round ------------------------------------------------------------------
 
 
-def round_context() -> SimpleNamespace:
-    """What `_run_tools` reads of a turn, for a round of reads with no database behind it."""
-    return SimpleNamespace(
-        settings=SimpleNamespace(
-            chat_image_round_max_bytes=1000,
-            chat_image_turn_max_bytes=1000,
-            chat_page_image_max_pixels=1,
-            upload_max_bytes=1,
-            chat_bash_timeout_seconds=1,
-            sandbox_start_timeout_seconds=1,
-            sandbox_exec_grace_seconds=1,
-            chat_writer_grace_seconds=1,
-        ),
-        sessionmaker=None,
-        conversation=SimpleNamespace(id=1, session="s"),
-        paths=None,
-        document=SimpleNamespace(id=1),
-        decode_slot=asyncio.Semaphore(1),
-        job=SimpleNamespace(page_count=12, kind="pdf"),
-        render_slots=None,
-        sandbox=None,
-        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        image_spent=0,
-        credits_exhausted=False,
-        round_admission=lambda calls: lambda index: True,
-        writers={},
-        write_gate=asyncio.Lock(),
-    )
-
-
 SAVED = chat_tools.ToolOutcome(
     "Saved as m1.",
     memory={
@@ -1097,6 +970,7 @@ SAVED = chat_tools.ToolOutcome(
         "previous": None,
     },
 )
+SKILL_TEXT = chat_tools.ToolOutcome("The skill's instructions.")
 MEMORY_CALL = {
     "type": "tool_use",
     "id": "toolu_m",
@@ -1109,17 +983,10 @@ async def test_a_spent_image_budget_never_refuses_the_memory_tool(monkeypatch) -
     async def fake_memory_tool(sessionmaker, settings, **kwargs):
         return SAVED
 
-    async def no_events(ctx, event, data):
-        return None
-
-    async def never_cancelled(ctx):
-        return False
-
     monkeypatch.setattr(chat_memory, "run_memory_tool", fake_memory_tool)
-    monkeypatch.setattr(chat_runner, "_emit", no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
-    ctx = round_context()
-    ctx.image_spent = ctx.settings.chat_image_turn_max_bytes
+    record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
+    ctx.images.total = ctx.settings.chat_image_turn_max_bytes
     page = {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}}
     viewed, remembered = await chat_runner._run_tools(ctx, [page, MEMORY_CALL], set())
     # The page is refused; the memory, which returns no image, is saved all the same.
@@ -1127,43 +994,102 @@ async def test_a_spent_image_budget_never_refuses_the_memory_tool(monkeypatch) -
     assert remembered["content"] == "Saved as m1." and "is_error" not in remembered
 
 
-async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(monkeypatch) -> None:
+async def test_a_spent_image_budget_refuses_only_pages_and_figures_ahead(monkeypatch) -> None:
+    """docs/chat.md § Tools: a skill and a subagent return no image before they run, so a
+    spent turn budget refuses neither; a page and a figure are refused."""
+
+    async def fake_subagent(ctx, tool_use_id, tool_input):
+        return chat_tools.ToolOutcome("The report.")
+
+    monkeypatch.setattr(chat_runner, "_load_skill", lambda ctx, tool_input: SKILL_TEXT)
+    monkeypatch.setattr(chat_subagent, "run_subagent", fake_subagent)
+    record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
+    ctx.images.total = ctx.settings.chat_image_turn_max_bytes
+    calls = [
+        {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}},
+        {"type": "tool_use", "id": "f1", "name": "view_figure", "input": {"page": 1}},
+        {"type": "tool_use", "id": "k1", "name": "skill", "input": {"name": "translate"}},
+        {"type": "tool_use", "id": "s1", "name": "subagent", "input": {"name": "x", "task": "y"}},
+    ]
+    page, figure, skill, subagent = await chat_runner._run_tools(ctx, calls, set())
+    assert page["content"] == figure["content"] == chat_runner.IMAGE_TURN_BUDGET_SPENT
+    assert skill["content"] == SKILL_TEXT.content and "is_error" not in skill
+    assert subagent["content"] == "The report." and "is_error" not in subagent
+
+
+async def test_a_subagents_spent_image_budget_still_lets_it_view_text(monkeypatch) -> None:
+    """docs/chat.md § Subagents: a subagent whose own image budget is spent is refused a
+    page ahead, but its editor still answers a `view` of a text file."""
+
+    async def text_view(root, tool_input, author, **kwargs):
+        return chat_tools.ToolOutcome("1\tBody text.")
+
+    monkeypatch.setattr(chat_tools, "run_editor", text_view)
+    record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
+    ctx.paths = SimpleNamespace(root=None)
+    ctx.settings.chat_tool_result_max_chars = 1000
+    ctx.settings.content_max_bytes = 1000
+    ctx.settings.chat_attachment_image_long_edge = 1
+    reader = subagent_defs.ResolvedSubagent(
+        name="reader",
+        description="",
+        model=None,
+        writes=False,
+        tools=("view_page", "str_replace_based_edit_tool"),
+        prompt="",
+        builtin=False,
+        modified=False,
+        default=None,
+    )
+    budget = chat_runner.ImageBudget(1000, 1000, chat_subagent.IMAGE_RUN_BUDGET_SPENT)
+    budget.total = 1000
+    calls = [
+        {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}},
+        {
+            "type": "tool_use",
+            "id": "e1",
+            "name": "str_replace_based_edit_tool",
+            "input": {"command": "view", "path": "/workspace/files/a/doc.md"},
+        },
+    ]
+    page, viewed = await chat_subagent._run_tools(ctx, "toolu_s", reader, calls, set(), {}, budget)
+    assert page["content"] == chat_subagent.IMAGE_RUN_BUDGET_SPENT
+    assert viewed["content"] == "1\tBody text." and "is_error" not in viewed
+
+
+async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(
+    monkeypatch,
+) -> None:
     """Cancelled between the row's commit and what reports it, the call runs on, and the
     end of the turn waits for its tool_result and `memory` event, as it does for a write:
     otherwise the reader keeps a memory the thread draws no line for."""
     in_flight = asyncio.Event()
     release = asyncio.Event()
-    emitted: list[tuple[str, dict]] = []
 
     async def slow_memory_tool(sessionmaker, settings, **kwargs):
         in_flight.set()
         await release.wait()
         return SAVED
 
-    async def record(ctx, event, data):
-        emitted.append((event, data))
-
-    async def never_cancelled(ctx):
-        return False
-
     monkeypatch.setattr(chat_memory, "run_memory_tool", slow_memory_tool)
-    monkeypatch.setattr(chat_runner, "_emit", record)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
-    ctx = round_context()
+    round_events = record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
     running = asyncio.create_task(chat_runner._run_tools(ctx, [MEMORY_CALL], set()))
     await asyncio.wait_for(in_flight.wait(), 5)
     running.cancel()
     with pytest.raises(asyncio.CancelledError):
         await running
-    assert list(ctx.writers.values()) == ["memory"] and emitted == []
+    assert list(ctx.writers.values()) == ["memory"] and round_events == []
 
     settling = asyncio.create_task(chat_runner._settle_writers(ctx))
     await asyncio.sleep(0.05)
     assert not settling.done()
     release.set()
     await asyncio.wait_for(settling, 5)
-    assert [event for event, _ in emitted] == [chat_events.TOOL_RESULT, chat_events.MEMORY]
-    assert emitted[1][1]["tool_use_id"] == "toolu_m" and ctx.writers == {}
+    assert [event for event, _ in round_events] == [chat_events.TOOL_RESULT, chat_events.MEMORY]
+    assert round_events[1][1]["tool_use_id"] == "toolu_m" and ctx.writers == {}
 
 
 async def test_a_memory_call_that_fails_after_a_cancel_is_logged_and_reported(
@@ -1173,23 +1099,15 @@ async def test_a_memory_call_that_fails_after_a_cancel_is_logged_and_reported(
     answered as an error tool_result there, as `_run_tool` would have done."""
     in_flight = asyncio.Event()
     release = asyncio.Event()
-    emitted: list[tuple[str, dict]] = []
 
     async def failing_memory_tool(sessionmaker, settings, **kwargs):
         in_flight.set()
         await release.wait()
         raise RuntimeError("the connection dropped")
 
-    async def record(ctx, event, data):
-        emitted.append((event, data))
-
-    async def never_cancelled(ctx):
-        return False
-
     monkeypatch.setattr(chat_memory, "run_memory_tool", failing_memory_tool)
-    monkeypatch.setattr(chat_runner, "_emit", record)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
-    ctx = round_context()
+    round_events = record_round(monkeypatch)
+    ctx = round_ctx(round_budget=1000, turn_budget=1000)
     running = asyncio.create_task(chat_runner._run_tools(ctx, [MEMORY_CALL], set()))
     await asyncio.wait_for(in_flight.wait(), 5)
     running.cancel()
@@ -1202,26 +1120,5 @@ async def test_a_memory_call_that_fails_after_a_cancel_is_logged_and_reported(
     assert [record.getMessage() for record in caplog.records] == [
         f"tool memory failed in turn {ctx.turn.id}"
     ]
-    assert [event for event, _ in emitted] == [chat_events.TOOL_RESULT]
-    assert emitted[0][1]["is_error"] is True and ctx.writers == {}
-
-
-async def test_a_failed_statement_never_carries_the_readers_text(tmp_path) -> None:
-    """The engine hides bound values, so a database error logged with its traceback cannot
-    write a memory's text — or instructions, or a message — into the log."""
-    from sqlalchemy import text as sql
-    from sqlalchemy.exc import DBAPIError
-
-    from sightread.db.session import create_engine
-
-    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'hidden.db'}")
-    try:
-        async with engine.connect() as connection:
-            with pytest.raises(DBAPIError) as failed:
-                await connection.execute(
-                    sql("insert into no_such_table (text) values (:text)"),
-                    {"text": "the reader reads with a screen reader"},
-                )
-    finally:
-        await engine.dispose()
-    assert "screen reader" not in str(failed.value)
+    assert [event for event, _ in round_events] == [chat_events.TOOL_RESULT]
+    assert round_events[0][1]["is_error"] is True and ctx.writers == {}

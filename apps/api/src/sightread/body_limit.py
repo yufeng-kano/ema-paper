@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import json
 
+from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-TOO_LARGE = {"error": {"type": "invalid_request", "message": "The request body is too large"}}
+TOO_LARGE_MESSAGE = "The request body is too large"
+_TOO_LARGE_BODY = json.dumps(
+    {"error": {"type": "invalid_request", "message": TOO_LARGE_MESSAGE}}
+).encode()
 
 
 # The routes that stream a multipart body to disk under a cap of their own: UPLOAD_MAX_BYTES
@@ -29,7 +33,14 @@ STREAMING_UPLOADS = frozenset(
         ("POST", "/api/library/images"),
     }
 )
-MULTIPART = b"multipart/form-data"
+MULTIPART = "multipart/form-data"
+
+
+def is_multipart(content_type: str) -> bool:
+    """Whether a Content-Type labels a multipart form, in any letter case as MIME types are
+    read: the middleware and `/v1/parse` decide it alike, so a body this exempts is read
+    by the route's capped form reader."""
+    return content_type.lower().startswith(MULTIPART)
 
 
 class BodyTooLarge(Exception):
@@ -47,24 +58,24 @@ class BodyLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        # Read as the route reads them (`request.headers`): of a repeated header, the first.
+        headers = Headers(scope=scope)
         route = (scope.get("method"), scope.get("path"))
-        content_type = headers.get(b"content-type", b"").lower()
-        if route in STREAMING_UPLOADS and content_type.startswith(MULTIPART):
+        content_type = headers.get("content-type", "")
+        if route in STREAMING_UPLOADS and is_multipart(content_type):
             # The only routes that read a body without holding it, and only their
             # multipart form (docs/api.md § POST /v1/parse); a multipart label on any
             # other route buys no exemption, and a JSON body on these is counted.
             await self.app(scope, receive, send)
             return
         limit = self.parse_json_max_bytes if route == PARSE_ROUTE else self.max_bytes
-        declared = headers.get(b"content-length", b"")
+        declared = headers.get("content-length", "")
         if declared.isdigit() and int(declared) > limit:
             await _refuse(send)
             return
 
         received = 0
         overflowed = False
-        body = json.dumps(TOO_LARGE).encode()
 
         async def counted() -> Message:
             nonlocal received, overflowed
@@ -80,31 +91,30 @@ class BodyLimitMiddleware:
             # The framework turns a failed body read into its own 400; what the client
             # must hear is 413, so the response is rewritten on its way out.
             if overflowed and message["type"] == "http.response.start":
-                message = {
-                    "type": "http.response.start",
-                    "status": 413,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode()),
-                    ],
-                }
+                message = _start_413()
             elif overflowed and message["type"] == "http.response.body":
-                message = {"type": "http.response.body", "body": body, "more_body": False}
+                message = {
+                    "type": "http.response.body",
+                    "body": _TOO_LARGE_BODY,
+                    "more_body": False,
+                }
             await send(message)
 
         await self.app(scope, counted, answered)
 
 
+def _start_413() -> Message:
+    # A fresh message each time: a middleware further out may edit its headers in place.
+    return {
+        "type": "http.response.start",
+        "status": 413,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(_TOO_LARGE_BODY)).encode()),
+        ],
+    }
+
+
 async def _refuse(send: Send) -> None:
-    body = json.dumps(TOO_LARGE).encode()
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 413,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-        }
-    )
-    await send({"type": "http.response.body", "body": body})
+    await send(_start_413())
+    await send({"type": "http.response.body", "body": _TOO_LARGE_BODY})

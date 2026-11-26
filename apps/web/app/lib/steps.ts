@@ -10,31 +10,10 @@
  * Pure and framework-free, so the parsing — the part with edges — is unit tested.
  */
 
-export type StepKind =
-  | 'read'
-  | 'search'
-  | 'list'
-  | 'count'
-  | 'run'
-  | 'restart'
-  | 'edit'
-  | 'create'
-  | 'page'
-  | 'figure'
-  | 'skill'
-  | 'subagent'
-  | 'web'
-  | 'papers'
-  | 'fetch'
-  | 'download'
-  | 'convert'
-  | 'retry'
-  | 'image'
-  | 'tool'
-
 export interface Step {
   kind: StepKind
-  /** What the step acted on, drawn in mono: a file, a pattern, a program, a skill. */
+  /** What the step acted on, drawn in mono: a file, a pattern, a program, a skill. A library
+   *  tool's is a Files path, `''` the top. */
   target: string
   /** The file a search ran over. */
   file?: string
@@ -45,18 +24,64 @@ export interface Step {
   page?: number
   /** Where a shell command `cd`'d first, when it said so. */
   cwd?: string
+  /** A library tool's batch of more than one item: how many, in place of a target. */
+  items?: number
+  /** The folder a move or a copy went into, as a Files path. */
+  place?: string
+  /** A rename's new name. */
+  name?: string
+  /** A listing of the Trash rather than a folder. */
+  trash?: boolean
+  /** The document whose own file — its `doc.md` or `notes.md` — the step's file is, by its
+   *  Files path, when the call's path says: what the Files page's card, about many documents,
+   *  names that file by. */
+  document?: string
 }
 
-/** The order a group's summary names its kinds in: what was looked at, then what changed. */
-export const SUMMARY_ORDER: readonly StepKind[] = [
+/** An item a library operation acted on: `file` is any `documents` row, a document as well
+ *  as a file (docs/chat.md § The library tools). */
+export interface LibraryItem {
+  kind: 'folder' | 'file'
+  id: number
+}
+
+/** A move as undo needs it: where from and where to (folder ids, null the top), and the
+ *  name on each side — the destination suffixes a name it already holds. */
+export interface LibraryMove {
+  item: LibraryItem
+  from: number | null
+  to: number | null
+  fromName: string
+  toName: string
+}
+
+/**
+ * One change to the library as its undo takes it back (docs/web.md § Files, *Undo*): the
+ * Files page's own undo stack keeps these, and a library tool's result carries one as its
+ * undo record, so the page replays either with the same code. Trashing and putting back
+ * are each other's undo; whatever made items appear — a copy, a paste, a duplicate, a new
+ * folder or document, a Put Back — is undone by trashing them.
+ */
+export type LibraryStep =
+  | { type: 'trash'; items: LibraryItem[] }
+  | { type: 'appear'; items: LibraryItem[] }
+  | { type: 'move'; moves: LibraryMove[] }
+  | { type: 'rename'; item: LibraryItem; from: string; to: string }
+
+/**
+ * Every kind of step, in the order a group's summary names them: what was looked at, then
+ * what changed. `browse`, and `folder` through `putBack`, are the library tools of the Files
+ * page's Agent (docs/chat.md § The library tools).
+ */
+export const SUMMARY_ORDER = [
   'read',
   'search',
   'list',
+  'browse',
   'count',
   'page',
   'figure',
   'skill',
-  'subagent',
   'web',
   'papers',
   'fetch',
@@ -68,10 +93,20 @@ export const SUMMARY_ORDER: readonly StepKind[] = [
   'convert',
   'retry',
   'image',
+  'folder',
+  'newDocument',
+  'move',
+  'rename',
+  'duplicate',
+  'trash',
+  'putBack',
   'tool',
-]
+] as const
 
-const EDITOR_TOOL = 'str_replace_based_edit_tool'
+export type StepKind = (typeof SUMMARY_ORDER)[number]
+
+/** The chat agent's editor tool (docs/chat.md § Tools). */
+export const EDITOR_TOOL = 'str_replace_based_edit_tool'
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value : ''
@@ -340,8 +375,17 @@ export function readShell(command: string): Step {
 
 // --- any tool call --------------------------------------------------------------------------
 
+/**
+ * The document a workspace path is one of the own files of, by its Files path: `DL/iBOT.pdf`
+ * for `/workspace/files/DL/iBOT.pdf/doc.md` or its `notes.md`; undefined for any other path.
+ */
+export function ownFileDocument(path: string): string | undefined {
+  return /^\/workspace\/files\/(.+)\/(?:doc|notes)\.md$/.exec(path)?.[1]
+}
+
 function readEditor(input: Record<string, unknown>): Step {
   const target = basename(text(input.path))
+  const document = ownFileDocument(text(input.path))
   switch (text(input.command)) {
     case 'view': {
       const range = Array.isArray(input.view_range) ? input.view_range : null
@@ -351,24 +395,53 @@ function readEditor(input: Record<string, unknown>): Step {
         kind: 'read',
         target,
         lines: from !== undefined ? { from, to: to === undefined || to === -1 ? null : to } : undefined,
+        document,
       }
     }
     case 'create':
-      return { kind: 'create', target }
+      return { kind: 'create', target, document }
     case 'str_replace':
     case 'insert':
-    case 'undo_edit':
-      return { kind: 'edit', target }
+      return { kind: 'edit', target, document }
     default:
       return { kind: 'tool', target: EDITOR_TOOL }
   }
 }
 
+/**
+ * A library tool's path as the Files page names it (docs/chat.md § The library tools): a
+ * place like `DL/DINO/iBOT.pdf`, or its path under `/workspace/files/`, where a document's
+ * `doc.md` names the document; `''` and `/` are the top.
+ */
+export function filesPath(value: unknown): string {
+  let path = text(value).trim()
+  const workspace = /^\/workspace\/files(?:\/|$)/.exec(path)
+  if (workspace) {
+    path = path.slice(workspace[0].length).replace(/\/doc\.md$/, '')
+  }
+  return path.replace(/^\/+|\/+$/g, '')
+}
+
+/** A batch tool's items: one is named by its path, more by how many. */
+function libraryBatch(kind: StepKind, paths: unknown): Step {
+  const items = Array.isArray(paths) ? paths : []
+  return items.length === 1 ? { kind, target: filesPath(items[0]) } : { kind, target: '', items: items.length }
+}
+
 /** One tool call as a step: what the thread draws instead of the raw call. */
 export function readStep(name: string, input: Record<string, unknown>): Step {
   switch (name) {
-    case 'bash':
-      return input.restart ? { kind: 'restart', target: '' } : readShell(text(input.command))
+    case 'bash': {
+      if (input.restart) {
+        return { kind: 'restart', target: '' }
+      }
+      const step = readShell(text(input.command))
+      // The file it read, counted, edited or searched — a run's target is a program — from
+      // where it `cd`'d when it is relative.
+      const file = (step.kind === 'search' ? step.file : step.kind === 'run' ? undefined : step.target) ?? ''
+      const document = ownFileDocument(file.startsWith('/') || !step.cwd ? file : `${step.cwd}/${file}`)
+      return document ? { ...step, document } : step
+    }
     case EDITOR_TOOL:
       return readEditor(input)
     case 'view_page':
@@ -377,8 +450,6 @@ export function readStep(name: string, input: Record<string, unknown>): Step {
       return { kind: 'figure', target: '', page: integer(input.page) }
     case 'skill':
       return { kind: 'skill', target: text(input.name) }
-    case 'subagent':
-      return { kind: 'subagent', target: text(input.name) }
     case 'web_search':
       return { kind: 'web', target: text(input.query) }
     case 'search_papers':
@@ -394,7 +465,28 @@ export function readStep(name: string, input: Record<string, unknown>): Step {
       return { kind: input.retry === true ? 'retry' : 'convert', target: basename(text(input.path)) }
     case 'insert_image':
       // The image's name, and the document or the notes it goes into.
-      return { kind: 'image', target: basename(text(input.image)), file: basename(text(input.document)) || undefined }
+      return {
+        kind: 'image',
+        target: basename(text(input.image)),
+        file: basename(text(input.document)) || undefined,
+        document: ownFileDocument(text(input.document)),
+      }
+    case 'list_files':
+      return input.trash === true ? { kind: 'browse', target: '', trash: true } : { kind: 'browse', target: filesPath(input.path) }
+    case 'new_folder':
+      return { kind: 'folder', target: filesPath(input.path) }
+    case 'new_document':
+      return { kind: 'newDocument', target: filesPath(input.path) }
+    case 'rename':
+      return { kind: 'rename', target: filesPath(input.path), name: text(input.name) }
+    case 'move':
+      return { ...libraryBatch('move', input.paths), place: filesPath(input.to) }
+    case 'copy':
+      return { ...libraryBatch('duplicate', input.paths), place: filesPath(input.to) }
+    case 'trash':
+      return libraryBatch('trash', input.paths)
+    case 'put_back':
+      return libraryBatch('putBack', input.paths)
     default:
       return { kind: 'tool', target: name }
   }
@@ -473,7 +565,7 @@ export function parseDiff(diff: string): DiffLine[] {
 /** The diff a stored editor call implies, for a card whose `edit` event is not at hand. */
 export function diffFromInput(input: Record<string, unknown>): DiffLine[] {
   const removed = text(input.old_str)
-  const added = text(input.new_str ?? input.file_text)
+  const added = text(input.new_str ?? input.insert_text ?? input.file_text)
   return [
     ...(removed ? removed.split('\n').map((line) => ({ kind: 'removed' as const, text: line })) : []),
     ...(added ? added.split('\n').map((line) => ({ kind: 'added' as const, text: line })) : []),

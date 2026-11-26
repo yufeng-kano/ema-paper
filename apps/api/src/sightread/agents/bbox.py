@@ -17,8 +17,10 @@ from pathlib import Path
 from PIL import Image
 
 from ..parsing.images import JPEG_QUALITY
-from ..parsing.markdown import BBOX_MAX, PLACEHOLDER_RE
+from ..parsing.markdown import BBOX_MAX, PLACEHOLDER_RE, placeholder
 
+# The coordinate contract every result declares: [ymin, xmin, ymax, xmax], normalized
+# 0-1000, origin top-left.
 CANONICAL_FORMAT = "yxyx_norm1000"
 PIXEL_FORMAT = "xyxy_px"
 
@@ -78,8 +80,9 @@ CLAUDE = BboxConvention(family="claude", format=PIXEL_FORMAT)
 GPT = BboxConvention(family="gpt", format=PIXEL_FORMAT)
 DEFAULT = BboxConvention(family="default", format=CANONICAL_FORMAT)
 
-# A vendor namespace, or the model's own name after any namespace: Kano Proxy lists
-# `anthropic/claude-…`, a connection may list `claude-code/claude-…` or a bare `claude-…`.
+# A vendor namespace, or the model's own name after its last `/`: Kano Proxy names a model
+# `provider/model` (`anthropic/claude-…`, `claude-code/claude-…`), and a bare `claude-…`
+# matches too.
 _FAMILIES: tuple[tuple[str, str, BboxConvention], ...] = (
     ("google/", "gemini-", GEMINI),
     ("anthropic/", "claude-", CLAUDE),
@@ -119,26 +122,21 @@ CLAUDE_MAX_TOKENS = 1568
 _PATCH = 28
 
 
-def claude_input_size(
-    width: int,
-    height: int,
-    max_edge: int = CLAUDE_MAX_EDGE_PX,
-    max_tokens: int = CLAUDE_MAX_TOKENS,
-) -> tuple[int, int]:
+def claude_input_size(width: int, height: int) -> tuple[int, int]:
     """The size Claude resizes a `width x height` image to before padding (the published
     reference implementation): unchanged when it already fits."""
 
     def fits(w: int, h: int) -> bool:
         return (
-            math.ceil(w / _PATCH) * _PATCH <= max_edge
-            and math.ceil(h / _PATCH) * _PATCH <= max_edge
-            and math.ceil(w / _PATCH) * math.ceil(h / _PATCH) <= max_tokens
+            math.ceil(w / _PATCH) * _PATCH <= CLAUDE_MAX_EDGE_PX
+            and math.ceil(h / _PATCH) * _PATCH <= CLAUDE_MAX_EDGE_PX
+            and math.ceil(w / _PATCH) * math.ceil(h / _PATCH) <= CLAUDE_MAX_TOKENS
         )
 
     if fits(width, height):
         return width, height
     if height > width:
-        resized_h, resized_w = claude_input_size(height, width, max_edge, max_tokens)
+        resized_h, resized_w = claude_input_size(height, width)
         return resized_w, resized_h
     aspect = width / height
     low, high = 1, width  # low always fits; high never does
@@ -231,15 +229,16 @@ def canonicalize(markdown: str, convention: BboxConvention, width_px: int, heigh
     def rewrite(match) -> str:
         # The pattern names its groups for the stored order; a pixel answer fills them in
         # the order it was asked for: x1, y1, x2, y2.
-        y_min, x_min, y_max, x_max = to_canonical(
-            tuple(int(match.group(name)) for name in ("ymin", "xmin", "ymax", "xmax")),
-            convention,
-            width_px,
-            height_px,
-        )
-        return (
-            f"![{match.group('alt')}](sightread://p{match.group('page')}/"
-            f"{y_min},{x_min},{y_max},{x_max})"
+        # The page stays the digits the model wrote: the group is an unbounded `\d+`.
+        return placeholder(
+            match.group("alt"),
+            match.group("page"),
+            to_canonical(
+                tuple(int(match.group(name)) for name in ("ymin", "xmin", "ymax", "xmax")),
+                convention,
+                width_px,
+                height_px,
+            ),
         )
 
     return PLACEHOLDER_RE.sub(rewrite, markdown)

@@ -37,9 +37,10 @@ from ..db.models import Document, Folder, Job, User, utcnow
 from ..errors import ApiError
 from ..parsing.attachments import FILE_PREFIX
 from ..parsing.figures import discard_job_figures
+from ..stopping import pause
 from ..workspace import accounts, git, safe_io, trash
 from ..workspace import documents as workspace_documents
-from ..workspace.layout import user_root
+from ..workspace.layout import user_root, workspace_roots
 from ..workspace.locks import workspace_lock
 from .queue import parse_kept
 from .runner import retain_source
@@ -48,20 +49,21 @@ logger = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_SECONDS = 900.0
 
+# A finished library parse whose retention has not run yet (docs/jobs.md § Retention).
+_RETENTION_PENDING = and_(
+    Job.status.in_(("succeeded", "failed")),
+    Job.source_deleted_at.is_(None),
+    select(Document.id).where(Document.job_id == Job.id).exists(),
+)
 
-def sweep_uploads(
-    upload_dir: Path,
-    *,
-    max_age: float,
-    keep: Collection[str] = (),
-    now: float | None = None,
-) -> int:
+
+def sweep_uploads(upload_dir: Path, *, max_age: float, keep: Collection[str] = ()) -> int:
     """Delete upload-directory entries older than `max_age` seconds, but none named for one
     of `keep` — the ids of the jobs still queued or running, or finished with their
     retention still to run, whose source, retry copies and render directories are named
     `{job_id}.…`: a converted file's only copy is its job's source until its original is
     filed (docs/jobs.md § Retention). Returns how many were removed."""
-    now = time.time() if now is None else now
+    now = time.time()
     if not upload_dir.is_dir():
         return 0
 
@@ -102,15 +104,6 @@ def discard_uploads(upload_dir: Path, stems: Collection[str]) -> bool:
             logger.exception("sweeper could not remove the upload entry %s", name)
             removed = False
     return removed
-
-
-def workspace_roots(workspaces_dir: Path) -> list[Path]:
-    """Every user's workspace root under `workspaces_dir`, by user id."""
-    try:
-        names = sorted((name for name in os.listdir(workspaces_dir) if name.isdigit()), key=int)
-    except OSError:
-        return []
-    return [workspaces_dir / name for name in names]
 
 
 async def sweep_staged_uploads(workspaces_dir: Path) -> int:
@@ -168,7 +161,7 @@ async def expire_trash(sessionmaker: async_sessionmaker[AsyncSession], settings:
             # A conversation about a file it would delete still answering, or the
             # workspace recovering from an unconfirmed shell command: the next sweep.
             logger.warning("the Trash of user %d waits for the next sweep: %s", user_id, exc)
-        except Exception:  # noqa: BLE001 - one user's failure never stops the others'
+        except Exception:  # one user's failure never stops the others'
             logger.exception("could not empty the expired Trash of user %d", user_id)
     return deleted
 
@@ -234,7 +227,7 @@ async def purge_parses(sessionmaker: async_sessionmaker[AsyncSession], settings:
         except ApiError as exc:
             # The workspace recovering from an unconfirmed shell command.
             logger.warning("the parses of user %d wait for the next sweep: %s", user_id, exc)
-        except Exception:  # noqa: BLE001 - one user's failure never stops the others'
+        except Exception:  # one user's failure never stops the others'
             logger.exception("could not delete the expired parses of user %d", user_id)
     return purged
 
@@ -295,7 +288,7 @@ async def finish_deletions(
                     continue
                 if await discard_account(settings, user_id, job_ids):
                     finished += 1
-        except Exception:  # noqa: BLE001 - one account's failure never stops the others'
+        except Exception:  # one account's failure never stops the others'
             logger.exception("could not finish the deletion of user %d", user_id)
     return finished
 
@@ -313,10 +306,7 @@ async def finish_retention(
         pending = (
             await db.execute(
                 select(Job.id, Job.source_path).where(
-                    Job.status.in_(("succeeded", "failed")),
-                    Job.source_path.is_not(None),
-                    Job.source_deleted_at.is_(None),
-                    select(Document.id).where(Document.job_id == Job.id).exists(),
+                    _RETENTION_PENDING, Job.source_path.is_not(None)
                 )
             )
         ).all()
@@ -327,7 +317,7 @@ async def finish_retention(
             continue
         try:
             await retain_source(sessionmaker, settings, job_id, source)
-        except Exception:  # noqa: BLE001 - one job's retention never ends the sweep
+        except Exception:  # one job's retention never ends the sweep
             logger.exception("sweeper could not keep the source of job %s", job_id)
             continue
         finished += 1
@@ -350,14 +340,7 @@ async def sweep_once(sessionmaker: async_sessionmaker[AsyncSession], settings: S
             for job_id in (
                 await db.execute(
                     select(Job.id).where(
-                        or_(
-                            Job.status.in_(("queued", "running")),
-                            and_(
-                                Job.status.in_(("succeeded", "failed")),
-                                Job.source_deleted_at.is_(None),
-                                select(Document.id).where(Document.job_id == Job.id).exists(),
-                            ),
-                        )
+                        or_(Job.status.in_(("queued", "running")), _RETENTION_PENDING)
                     )
                 )
             ).scalars()
@@ -395,9 +378,6 @@ async def sweep_forever(
     while not stop.is_set():
         try:
             await sweep_once(sessionmaker, settings)
-        except Exception:  # noqa: BLE001 - the next pass tries again
+        except Exception:  # the next pass tries again
             logger.exception("the sweep failed; the next one runs on schedule")
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=SWEEP_INTERVAL_SECONDS)
-        except TimeoutError:
-            continue
+        await pause(stop, SWEEP_INTERVAL_SECONDS)

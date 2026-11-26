@@ -17,7 +17,7 @@ const STEPS = ['connect.step1', 'connect.step2', 'connect.step3'] as const
     <SettingsGroup :title="t('connect.mcpTitle')">
       <div class="endpoint">
         <span class="endpoint-url mono">{{ mcpUrl }}</span>
-        <UiCopyButton :text="mcpUrl" variant="secondary" size="sm" labelled />
+        <UiCopyButton :text="mcpUrl" size="sm" labelled />
       </div>
     </SettingsGroup>
 

@@ -5,7 +5,6 @@ import {
   commandArguments,
   commandQuery,
   extensionOf,
-  formatBytes,
   isImageFile,
   matchCommands,
   passageTooLong,
@@ -84,16 +83,8 @@ describe('attachments', () => {
     expect(refuseAttachment({ name: 'a.txt', size: 10 }, limits, 1)).toBeNull()
   })
 
-  it('leaves a limit the server did not send to the server', () => {
-    expect(refuseAttachment({ name: 'a.mov', size: 1e12 }, {}, 99)).toBeNull()
+  it('checks nothing while the limits are loading', () => {
     expect(refuseAttachment({ name: 'a.mov', size: 1e12 }, null, 99)).toBeNull()
-  })
-
-  it('formats sizes as a person reads them', () => {
-    expect(formatBytes(20 * 1024 * 1024)).toBe('20 MB')
-    expect(formatBytes(2_400_000)).toBe('2.3 MB')
-    expect(formatBytes(12_400)).toBe('12 KB')
-    expect(formatBytes(10)).toBe('1 KB')
   })
 })
 

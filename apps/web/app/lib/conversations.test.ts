@@ -3,7 +3,18 @@ import type { Conversation } from './api'
 import { byRecency, renamedTitle } from './conversations'
 
 function row(id: number, updated: string): Conversation {
-  return { id, title: `#${id}`, created_at: '2026-10-01T00:00:00Z', updated_at: updated }
+  return {
+    id,
+    title: `#${id}`,
+    created_at: '2026-10-01T00:00:00Z',
+    updated_at: updated,
+    model: null,
+    compactable: false,
+    context_tokens: null,
+    context_window: 200000,
+    cache_warm_until: null,
+    recache_credits: null,
+  }
 }
 
 describe('byRecency', () => {

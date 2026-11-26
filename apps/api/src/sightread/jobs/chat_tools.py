@@ -10,13 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import difflib
 import io
 import math
 import os
 import shlex
-import stat
 import tempfile
 import warnings
 from dataclasses import dataclass, field
@@ -24,12 +22,20 @@ from pathlib import Path, PurePosixPath
 
 from PIL import Image, UnidentifiedImageError
 
+from ..agents.bbox import CLAUDE_MAX_EDGE_PX
 from ..parsing import poppler
-from ..parsing.figures import parse_bbox_path
-from ..parsing.images import JPEG_QUALITY
+from ..parsing.figures import crop_name
+from ..parsing.images import JPEG_QUALITY, flatten_rgb
+from ..parsing.markdown import clean_bbox
 from ..sandbox.client import SandboxClient, SandboxRejected, SandboxUnavailable
 from ..workspace import git, safe_io
-from ..workspace.documents import IMAGE_FORMATS, MARKDOWN_KIND, DocumentPaths, original_of
+from ..workspace.documents import (
+    IMAGE_FORMATS,
+    MARKDOWN_KIND,
+    DocumentPaths,
+    open_capped_original,
+    original_of,
+)
 from ..workspace.layout import (
     CACHE_DIR,
     FIGURES_DIR,
@@ -39,13 +45,13 @@ from ..workspace.layout import (
     inside,
 )
 from ..workspace.locks import workspace_lock
+from .runner import to_the_end
 
 VM_ROOT = PurePosixPath("/workspace")
 # Where the editor tool may not write: history, the workspace's own records, the cache.
 READ_ONLY_NAMES = frozenset({".git", ".gitignore", SIGHTREAD_DIR, META_FILE, CACHE_DIR})
-VIEW_MAX_CHARS = 60_000
-# The long edge a page image is sent at: what Claude would resize to anyway.
-PAGE_IMAGE_LONG_EDGE_PX = 1568
+# The long edge a page image is sent at: Claude's own edge, what it would resize to anyway.
+PAGE_IMAGE_LONG_EDGE_PX = CLAUDE_MAX_EDGE_PX
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -139,6 +145,10 @@ class ToolOutcome:
     # What a `memory` call changed, for its `memory` event: `{action, memory, previous}`
     # (docs/chat.md § Memory). Set on success only.
     memory: dict | None = field(default=None)
+    # What a library tool changed, as the Files page's undo keeps its steps: carried on the
+    # `tool_result` event and the stored block, stripped before the history goes upstream
+    # (docs/chat.md § Library conversations, *The library tools*). None when nothing changed.
+    library: dict | None = field(default=None)
 
 
 def truncate(text: str, max_chars: int) -> str:
@@ -297,7 +307,7 @@ def _edit_sync(
     *,
     max_chars: int,
     max_bytes: int,
-    images: ImageView | None = None,
+    images: ImageView,
 ) -> ToolOutcome | _ImageRead:
     command = tool_input.get("command")
     try:
@@ -320,7 +330,7 @@ def _edit_sync(
         # A file that is not text may be an image, read up to the image cap rather than
         # the text one (docs/chat.md § Tools); it is decoded once the lock is released.
         try:
-            data = safe_io.read_bytes(root, path, max(max_bytes, images.max_bytes if images else 0))
+            data = safe_io.read_bytes(root, path, max(max_bytes, images.max_bytes))
         except safe_io.EntryTooLarge:
             return ToolOutcome(_too_large_to_view(vm_path, images), is_error=True)
         except (safe_io.UnsafeEntry, OSError):
@@ -335,8 +345,6 @@ def _edit_sync(
                 text = None
         if text is not None:
             return ToolOutcome(truncate(_numbered(text, tool_input.get("view_range")), max_chars))
-        if images is None:
-            return ToolOutcome(f"{vm_path} is not a text file", is_error=True)
         return _ImageRead(
             vm_path,
             data,
@@ -357,19 +365,17 @@ def _edit_sync(
         return ToolOutcome(f"{vm_path} is not a plain file", is_error=True)
     except UnicodeDecodeError:
         return ToolOutcome(f"{vm_path} is not a text file", is_error=True)
-    if before is not None and path.name not in git.RECORDED_NAMES:
-        held = before.encode()
-        if len(held) > git.revision_max_file_bytes() or not git.is_text(held):
-            # A file history never recorded — over the cap when it arrived, or binary by
-            # git's test (a NUL byte, which decodes as text all the same) — is not edited
-            # here either, whatever the edit would leave: that revision would read as its
-            # creation, and the card's Revert would delete it rather than put it back
-            # (docs/workspace.md § Revisions, docs/chat.md § Tools).
-            return ToolOutcome(
-                f"{vm_path} is binary or too large for a revision to record, "
-                "so it is not edited here; use bash",
-                is_error=True,
-            )
+    if before is not None and not git.records(path.name, before.encode()):
+        # A file history never recorded — over the cap when it arrived, or binary by git's
+        # test (a NUL byte, which decodes as text all the same) — is not edited here
+        # either, whatever the edit would leave: that revision would read as its creation,
+        # and the card's Revert would delete it rather than put it back
+        # (docs/workspace.md § Revisions, docs/chat.md § Tools).
+        return ToolOutcome(
+            f"{vm_path} is binary or too large for a revision to record, "
+            "so it is not edited here; use bash",
+            is_error=True,
+        )
     if command == "create":
         new_text = tool_input.get("file_text")
         if not isinstance(new_text, str):
@@ -410,9 +416,7 @@ def _edit_sync(
     result = after.encode()
     if len(result) > max_bytes:
         return ToolOutcome(f"the result would make {vm_path} too large; use bash", is_error=True)
-    if path.name not in git.RECORDED_NAMES and (
-        len(result) > git.revision_max_file_bytes() or not git.is_text(result)
-    ):
+    if not git.records(path.name, result):
         # A file history would not record — this large, or binary — is not written here:
         # an edit with no revision has no undo (docs/chat.md § Tools, docs/workspace.md
         # § Revisions).
@@ -453,7 +457,6 @@ def _edit_sync(
         f"{command} applied to {vm_path}",
         edit={
             "path": vm_path,
-            "command": command,
             "commit": commit,
             "diff": truncate(diff, max_chars),
         },
@@ -467,7 +470,7 @@ def _edit_guarded(
     *,
     max_chars: int,
     max_bytes: int,
-    images: ImageView | None = None,
+    images: ImageView,
 ) -> ToolOutcome | _ImageRead:
     """A path that is well-formed but unusable — a directory where a file was expected, a
     parent that is a file, a vanished file — is the model's mistake to correct, not the
@@ -487,10 +490,10 @@ async def run_editor(
     *,
     max_chars: int,
     max_bytes: int,
-    images: ImageView | None = None,
+    images: ImageView,
 ) -> ToolOutcome:
-    """The editor. With `images`, a `view` of an image file answers the image; without,
-    such a file is not text and is refused (docs/chat.md § Tools)."""
+    """The editor. A `view` of an image file answers the image, as `images` allows
+    (docs/chat.md § Tools)."""
     # A view under the lock too: a shell command of another conversation may be
     # rewriting the file, and a read of it half-written would feed the model a mix.
     async with workspace_lock(root):
@@ -504,7 +507,7 @@ async def run_editor(
             images=images,
         )
     # The bytes were read under the lock; the decode waits for nobody's write.
-    if isinstance(outcome, _ImageRead) and images is not None:
+    if isinstance(outcome, _ImageRead):
         return await _view_image(outcome, images)
     return outcome
 
@@ -568,9 +571,7 @@ def _in_steps(vm_path: str, long_edge: int, header: ImageHeader | None, png: boo
     )
 
 
-def _too_large_to_view(vm_path: str, images: ImageView | None) -> str:
-    if images is None:
-        return f"{vm_path} is too large to view; use bash"
+def _too_large_to_view(vm_path: str, images: ImageView) -> str:
     message = (
         f"{vm_path} is larger than this tool reads ({images.max_bytes // (1024 * 1024)} MiB); "
         "use bash."
@@ -590,7 +591,7 @@ async def _view_image(read: _ImageRead, images: ImageView) -> ToolOutcome:
     vm_path, long_edge = read.vm_path, images.long_edge
     try:
         async with images.decode_slot:
-            image = await _settled(
+            image = await to_the_end(
                 asyncio.to_thread(
                     _model_image,
                     read.data,
@@ -647,7 +648,7 @@ def _commit_shell_sync(root: Path, command: str, author: str, *, max_chars: int)
     if commit is None:
         return None
     diff = git.show_commit(root, commit, max_chars * 4)
-    return {"path": "", "command": "bash", "commit": commit, "diff": truncate(diff, max_chars)}
+    return {"path": "", "commit": commit, "diff": truncate(diff, max_chars)}
 
 
 async def commit_shell_changes(
@@ -657,31 +658,29 @@ async def commit_shell_changes(
     author: str,
     *,
     max_chars: int,
-    locked: bool = False,
 ) -> ToolOutcome:
     """After a shell command: whatever it changed under the workspace becomes one
-    revision, under the user's lock like every other write (docs/workspace.md) — a lock
-    the caller may already hold across the command itself (`locked`)."""
+    revision, under the user's lock like every other write (docs/workspace.md). The caller
+    holds the workspace lock, across the command itself."""
     command = tool_input.get("command")
     if not isinstance(command, str):
         return outcome
-    async with contextlib.nullcontext() if locked else workspace_lock(root):
-        try:
-            edit = await asyncio.to_thread(
-                _commit_shell_sync, root, command, author, max_chars=max_chars
-            )
-        except git.GitError as exc:
-            # Not a success: the changes are on disk and unrecorded. The index is reset
-            # so nothing half-staged rides into a later path-scoped commit, and the
-            # model is told (docs/chat.md § Tools).
-            await asyncio.to_thread(git.reset_index, root)
-            reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-            return ToolOutcome(
-                f"{outcome.content}\n\n"
-                f"[The changes this command made could not be recorded as a revision: "
-                f"{reason}]",
-                is_error=True,
-            )
+    try:
+        edit = await asyncio.to_thread(
+            _commit_shell_sync, root, command, author, max_chars=max_chars
+        )
+    except git.GitError as exc:
+        # Not a success: the changes are on disk and unrecorded. The index is reset
+        # so nothing half-staged rides into a later path-scoped commit, and the
+        # model is told (docs/chat.md § Tools).
+        await asyncio.to_thread(git.reset_index, root)
+        reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        return ToolOutcome(
+            f"{outcome.content}\n\n"
+            f"[The changes this command made could not be recorded as a revision: "
+            f"{reason}]",
+            is_error=True,
+        )
     if edit is None:
         return outcome
     return ToolOutcome(outcome.content, is_error=outcome.is_error, edit=edit)
@@ -743,17 +742,7 @@ def _model_image(
         image: Image.Image = opened
         if header.orientation != 1:
             image = opened.transpose(ORIENTATIONS[header.orientation][0])
-        if image.mode in ("I;16", "I;16B", "I;16L", "I"):
-            # 16-bit grey (a microscope's, a depth map's): to 8 bits by its top byte. A
-            # plain conversion to RGB clips everything past 255 to white.
-            image = image.convert("I").point(lambda value: value / 256).convert("L")
-        # A grey or RGB PNG keeps its transparency as one key colour, not a channel.
-        if image.mode in ("RGBA", "LA", "P") or "transparency" in image.info:
-            image = image.convert("RGBA")
-            background = Image.new("RGBA", image.size, (255, 255, 255, 255))
-            image = Image.alpha_composite(background, image).convert("RGB")
-        elif image.mode != "RGB":
-            image = image.convert("RGB")
+        image = flatten_rgb(image)
         long_edge = max(image.width, image.height)
         if long_edge > long_edge_px:
             scale = long_edge_px / long_edge
@@ -775,43 +764,6 @@ def _model_image(
         )
 
 
-async def _settled(coro):
-    """Await `coro` so that a cancel waits for it rather than leaving it running: a
-    decode in a thread is not stopped by cancelling its await, and the slot it holds
-    would be released under a raster still in memory (docs/chat.md § Tools)."""
-    task = asyncio.ensure_future(coro)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await asyncio.wait({task})
-        if not task.cancelled():
-            task.exception()  # retrieved: a decode that failed under a cancel is the cancel's
-        raise
-
-
-def _open_source(root: Path, source: Path, max_bytes: int) -> int | None:
-    """A descriptor on the original: through the workspace's own open when the file is
-    the shell's copy in the tree, a plain open that follows nothing when it is the
-    original kept outside the mount — the service's own directory, which no command
-    reaches (docs/workspace.md § Layout). None when it is gone."""
-    if source.is_relative_to(root):
-        return safe_io.open_for_read(root, source, max_bytes)
-    try:
-        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except FileNotFoundError:
-        return None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise safe_io.UnsafeEntry(f"{source} is not a plain file")
-        if info.st_size > max_bytes:
-            raise safe_io.EntryTooLarge(f"{source} is larger than {max_bytes} bytes")
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
 async def view_page(
     paths: DocumentPaths,
     tool_input: dict,
@@ -830,9 +782,8 @@ async def view_page(
             "This is a markdown document: it has no pages, and doc.md is the text itself.",
             is_error=True,
         )
-    # The original kept outside the mount first; the shell's copy only when there is
-    # none (a document filed before originals were kept there).
-    source = original_of(paths.root, document_id) or paths.source()
+    # The original kept outside the mount, never the shell's `source.*` (docs/chat.md § Tools).
+    source = original_of(paths.root, document_id)
     if source is None:
         return ToolOutcome(
             "This document kept no original file, so its pages cannot be rendered.",
@@ -848,7 +799,6 @@ async def view_page(
         return ToolOutcome("an image document has one page", is_error=True)
     try:
         data = await original_page_png(
-            paths.root,
             source,
             kind=kind,
             page=page,
@@ -868,7 +818,6 @@ class PageUnavailable(Exception):
 
 
 async def original_page_png(
-    root: Path,
     source: Path,
     *,
     kind: str,
@@ -885,7 +834,7 @@ async def original_page_png(
     # Poppler gets the file as a descriptor opened without following anything, not as a
     # path it would resolve again (docs/workspace.md § Revisions).
     try:
-        fd = _open_source(root, source, max_bytes)
+        fd = open_capped_original(source, max_bytes)
     except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
         raise PageUnavailable("the original file could not be opened") from None
     if fd is None:
@@ -904,7 +853,7 @@ async def original_page_png(
                     # The raster, one at a time per turn: a round of four reads must
                     # not hold four decoded pages before the budget sees any of them.
                     async with decode_slot:
-                        page_image = await _settled(
+                        page_image = await to_the_end(
                             asyncio.to_thread(_model_image, rendered, max_pixels, long_edge_px)
                         )
                     return page_image.data
@@ -914,7 +863,7 @@ async def original_page_png(
             with os.fdopen(os.dup(fd), "rb") as reader:
                 raw = await asyncio.to_thread(reader.read, max_bytes + 1)
             async with decode_slot:
-                page_image = await _settled(
+                page_image = await to_the_end(
                     asyncio.to_thread(_model_image, raw, max_pixels, long_edge_px)
                 )
             return page_image.data
@@ -929,16 +878,17 @@ async def original_page_png(
 async def view_figure(paths: DocumentPaths, tool_input: dict, *, max_bytes: int) -> ToolOutcome:
     try:
         page = int(tool_input.get("page"))
-        raw_bbox = tool_input.get("bbox")
-        bbox = parse_bbox_path(",".join(str(int(value)) for value in raw_bbox))
+        values = tuple(int(value) for value in tool_input.get("bbox"))
     except (TypeError, ValueError):
         return ToolOutcome("view_figure needs `page` and a 4-integer `bbox`", is_error=True)
+    # A coordinate past five digits is no box, as on the figure routes (`parse_bbox_path`).
+    usable = len(values) == 4 and all(abs(value) <= 99_999 for value in values)
+    bbox = clean_bbox(values) if usable else None
     if bbox is None or page < 1:
         return ToolOutcome("that bbox is not a usable box", is_error=True)
     # The crops live in the document directory under the same name the figures dir uses
     # (docs/parsing.md § Figure crops): the page and the cleaned box.
-    y_min, x_min, y_max, x_max = bbox
-    crop = paths.figures / f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
+    crop = paths.figures / crop_name(page, bbox)
     try:
         data = await asyncio.to_thread(safe_io.read_bytes, paths.root, crop, max_bytes)
     except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):

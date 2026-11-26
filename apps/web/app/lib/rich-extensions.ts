@@ -9,7 +9,7 @@
  * block closes. Elements carry the same `md-*` classes the rendered block uses, so opening a
  * block moves nothing on screen.
  */
-import { Extension, InputRule, Node, mergeAttributes, type Extensions, type JSONContent } from '@tiptap/core'
+import { Extension, InputRule, Node, mergeAttributes, type Extensions, type JSONContent, type NodeViewRenderer } from '@tiptap/core'
 import type { Node as ProseNode } from '@tiptap/pm/model'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { findWrapping } from '@tiptap/pm/transform'
@@ -20,13 +20,12 @@ import { Superscript } from '@tiptap/extension-superscript'
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
 import { Placeholder } from '@tiptap/extensions'
 import StarterKit from '@tiptap/starter-kit'
-import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE } from './dnd'
-import { inlinePlain, parseInline, parseResultMarkdown, type InlineSegment, type ResultBlock } from './markdown'
+import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE, carries } from './dnd'
+import { inlinePlain, parseBlocks, parseInline, type InlineSegment, type ResultBlock } from './markdown'
 import { renderTexHtml } from './math'
-import { UnitSelection, isLinkLine } from './note-blocks'
+import type { Point } from './menu'
+import { UnitSelection, isLinkLine, noteUnits } from './note-blocks'
 import { inlineMathAtEnd, sliceToMarkdown } from './richdoc'
-
-export type Point = { x: number; y: number }
 
 /**
  * A place in the text as the rendered blocks and the editor both hold it (docs/web.md
@@ -117,10 +116,8 @@ const SourceAttributes = Extension.create({
   // the text, is not drawn for it.
   extendNodeSchema() {
     return {
-      disableDropCursor: (_view: unknown, _pos: unknown, event: DragEvent) => {
-        const types = [...(event.dataTransfer?.types ?? [])]
-        return types.includes(BLOCK_DRAG_TYPE) || types.includes(NOTES_BLOCK_DRAG_TYPE)
-      },
+      disableDropCursor: (_view: unknown, _pos: unknown, event: DragEvent) =>
+        carries(event.dataTransfer, BLOCK_DRAG_TYPE) || carries(event.dataTransfer, NOTES_BLOCK_DRAG_TYPE),
     }
   },
   addGlobalAttributes() {
@@ -139,6 +136,36 @@ const SourceAttributes = Extension.create({
   },
 })
 
+/** A formula drawn typeset: a click opens its TeX field, and an edit of its TeX redraws it. */
+function mathView(options: RichOptions, name: 'inlineMath' | 'blockMath', display: boolean): NodeViewRenderer {
+  return ({ node, getPos }) => {
+    const dom = document.createElement(display ? 'div' : 'span')
+    dom.className = display ? 'md-math-block rich-math' : 'md-inline-math rich-math'
+    dom.contentEditable = 'false'
+    let latex = String(node.attrs.latex)
+    typesetInto(dom, latex, display)
+    dom.addEventListener('mousedown', (event) => {
+      event.preventDefault()
+      const pos = getPos()
+      if (typeof pos === 'number') {
+        options.onEditMath?.({ pos, latex, display, dom })
+      }
+    })
+    return {
+      dom,
+      update(next) {
+        if (next.type.name !== name) {
+          return false
+        }
+        latex = String(next.attrs.latex)
+        typesetInto(dom, latex, display)
+        return true
+      },
+      ignoreMutation: () => true,
+    }
+  }
+}
+
 function inlineMath(options: RichOptions) {
   return Node.create({
     name: 'inlineMath',
@@ -156,32 +183,7 @@ function inlineMath(options: RichOptions) {
       return ['span', mergeAttributes(HTMLAttributes, { 'data-inline-math': '', 'data-latex': node.attrs.latex }), `$${node.attrs.latex}$`]
     },
     addNodeView() {
-      return ({ node, getPos }) => {
-        const dom = document.createElement('span')
-        dom.className = 'md-inline-math rich-math'
-        dom.contentEditable = 'false'
-        let latex = String(node.attrs.latex)
-        typesetInto(dom, latex, false)
-        dom.addEventListener('mousedown', (event) => {
-          event.preventDefault()
-          const pos = getPos()
-          if (typeof pos === 'number') {
-            options.onEditMath?.({ pos, latex, display: false, dom })
-          }
-        })
-        return {
-          dom,
-          update(next) {
-            if (next.type.name !== 'inlineMath') {
-              return false
-            }
-            latex = String(next.attrs.latex)
-            typesetInto(dom, latex, false)
-            return true
-          },
-          ignoreMutation: () => true,
-        }
-      }
+      return mathView(options, 'inlineMath', false)
     },
     addInputRules() {
       // `$x$` becomes a formula the moment its closing dollar is typed — by the viewer's
@@ -223,32 +225,7 @@ function blockMath(options: RichOptions) {
       return ['div', mergeAttributes(HTMLAttributes, { 'data-block-math': '', 'data-latex': node.attrs.latex }), `$$${node.attrs.latex}$$`]
     },
     addNodeView() {
-      return ({ node, getPos }) => {
-        const dom = document.createElement('div')
-        dom.className = 'md-math-block rich-math'
-        dom.contentEditable = 'false'
-        let latex = String(node.attrs.latex)
-        typesetInto(dom, latex, true)
-        dom.addEventListener('mousedown', (event) => {
-          event.preventDefault()
-          const pos = getPos()
-          if (typeof pos === 'number') {
-            options.onEditMath?.({ pos, latex, display: true, dom })
-          }
-        })
-        return {
-          dom,
-          update(next) {
-            if (next.type.name !== 'blockMath') {
-              return false
-            }
-            latex = String(next.attrs.latex)
-            typesetInto(dom, latex, true)
-            return true
-          },
-          ignoreMutation: () => true,
-        }
-      }
+      return mathView(options, 'blockMath', true)
     },
     addInputRules() {
       // `$$` and a space on an empty line: a display formula, its TeX field open.
@@ -277,7 +254,7 @@ function blockMath(options: RichOptions) {
 
 /** The figure or image a raw block's source is, alone, or null. */
 function pictureOf(source: string): Extract<ResultBlock, { kind: 'fig' | 'img' }> | null {
-  const blocks = parseResultMarkdown(source).flatMap((page) => page.blocks)
+  const blocks = parseBlocks(source)
   const only = blocks.length === 1 ? blocks[0]! : null
   return only?.kind === 'fig' || only?.kind === 'img' ? only : null
 }
@@ -519,7 +496,7 @@ function sectionLink(options: RichOptions) {
         dom.contentEditable = 'false'
         dom.dataset.src = String(node.attrs.src)
         let current = node
-        /** The quote right before the paragraph this link is the whole of, as markdown. */
+        /** The quote right before the top-level paragraph this link is the whole of, as markdown. */
         const target = (): SectionLinkTarget => {
           const label = String(current.attrs.label)
           const anchor = String(current.attrs.anchor)
@@ -528,20 +505,10 @@ function sectionLink(options: RichOptions) {
             return { label, anchor, passage: null }
           }
           const $pos = editor.state.doc.resolve(pos)
-          const paragraph = $pos.parent
-          let links = 0
-          let other = false
-          paragraph.forEach((child) => {
-            if (child.type.name === 'sectionLink') {
-              links += 1
-            } else if (!child.isText || (child.text ?? '').trim()) {
-              other = true
-            }
-          })
-          const index = $pos.depth >= 1 ? $pos.index($pos.depth - 1) : 0
-          const before = index > 0 ? $pos.node($pos.depth - 1).child(index - 1) : null
+          const index = $pos.depth === 1 ? $pos.index(0) : 0
+          const before = index > 0 ? $pos.node(0).child(index - 1) : null
           const passage =
-            links === 1 && !other && before?.type.name === 'blockquote'
+            $pos.depth === 1 && isLinkLine($pos.parent) && before?.type.name === 'blockquote'
               ? sliceToMarkdown((before.content.toJSON() ?? []) as JSONContent[])
               : null
           return { label, anchor, passage }
@@ -662,17 +629,11 @@ export const unitLookKey = new PluginKey<UnitLook>('unitLook')
 /** The excerpts' link lines, marked. */
 const excerptLinksKey = new PluginKey<DecorationSet>('excerptLinks')
 
-/** Every paragraph that is an excerpt's link line: right after a quote and only a section link,
- *  the pairing `noteUnits` reads. */
+/** Every excerpt's link line, as `noteUnits` pairs it with its quote. */
 export function markExcerptLinks(doc: ProseNode): DecorationSet {
-  const marks: Decoration[] = []
-  let afterQuote = false
-  doc.forEach((node, pos) => {
-    if (afterQuote && isLinkLine(node)) {
-      marks.push(Decoration.node(pos, pos + node.nodeSize, { class: 'rich-excerpt-link' }))
-    }
-    afterQuote = node.type.name === 'blockquote'
-  })
+  const marks = noteUnits(doc)
+    .filter((unit) => unit.excerpt)
+    .map((unit) => Decoration.node(unit.starts[1]!, unit.to, { class: 'rich-excerpt-link' }))
   return DecorationSet.create(doc, marks)
 }
 

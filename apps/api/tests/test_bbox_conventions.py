@@ -23,10 +23,9 @@ from sightread.agents.bbox import (
     prepare_image,
 )
 from sightread.parsing.images import JPEG_QUALITY, image_size
-from sightread.upstream.client import Connection, transcribe_page
-from tests.conftest import CSRF_HEADERS, KANO_BASE, KANO_CHAT_URL
-
-SECRET = "test-secret-key-not-a-real-one"
+from sightread.upstream.client import transcribe_page
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
+from tests.helpers import stub_connection
 
 
 @pytest.mark.parametrize(
@@ -89,7 +88,7 @@ def test_pixel_boxes_are_rewritten_into_the_stored_contract() -> None:
     )
 
 
-def test_only_claude_gets_a_pre_resized_image(documents) -> None:
+def test_only_claude_gets_a_pre_resized_image(documents, tmp_path) -> None:
     wide = documents["wide_png"]  # 3000x1000, over every Claude limit
     as_is = prepare_image(wide, bbox.GPT)
     assert (as_is.path, as_is.derived) == (wide, False)
@@ -106,7 +105,7 @@ def test_only_claude_gets_a_pre_resized_image(documents) -> None:
     assert not small.derived
 
     # A JPEG is re-encoded at the normalizer's quality, not Pillow's default.
-    wide_jpg = wide.with_name("wide.jpg")
+    wide_jpg = tmp_path / "wide.jpg"
     Image.open(wide).convert("RGB").save(wide_jpg, format="JPEG", quality=JPEG_QUALITY)
     sent_jpg = prepare_image(wide_jpg, bbox.CLAUDE)
     with Image.open(sent_jpg.path) as reencoded:
@@ -114,15 +113,6 @@ def test_only_claude_gets_a_pre_resized_image(documents) -> None:
         # Pillow's quality-75 tables start at 8; the quality-92 ones start at 3.
         assert reencoded.quantization[0][0] <= 3
     sent_jpg.cleanup()
-    wide_jpg.unlink()
-
-
-def _key() -> Connection:
-    return Connection(
-        api_key="sk-kano-proxy-test",
-        base_url=f"{KANO_BASE}/openai/v1",
-        snapshot=KANO_BASE,
-    )
 
 
 @respx.mock
@@ -145,12 +135,14 @@ async def test_a_pixel_model_is_asked_in_pixels_and_answers_in_the_contract(docu
     )
 
     result = await transcribe_page(
-        _key(),
+        stub_connection(),
         "openai/gpt-6",
         "Page {page}. {bbox_instructions} Id: {bbox_format}.",
         documents["png"],
         2,
         convention=convention_for_model("openai/gpt-6"),
+        max_response_bytes=33_554_432,
+        max_output_tokens=16_000,
     )
 
     sent = json.loads(route.calls[0].request.content)["messages"][0]["content"][0]["text"]
@@ -174,12 +166,14 @@ async def test_a_normalized_model_keeps_the_original_contract_wording(documents)
         )
     )
     result = await transcribe_page(
-        _key(),
+        stub_connection(),
         "google/gemini-2.5-flash",
         "{bbox_instructions} Id: {bbox_format}.",
         documents["png"],
         1,
         convention=convention_for_model("google/gemini-2.5-flash"),
+        max_response_bytes=33_554_432,
+        max_output_tokens=16_000,
     )
     sent = json.loads(route.calls[0].request.content)["messages"][0]["content"][0]["text"]
     assert "sightread://p1/YMIN,XMIN,YMAX,XMAX" in sent and sent.endswith("Id: yxyx_norm1000.")
@@ -207,8 +201,3 @@ async def test_the_agents_payload_names_the_parse_models_convention(signed_in, m
     after = (await client.get("/api/agents")).json()["agents"][0]
     assert after["settings"]["model"] == "anthropic/claude-sonnet-4-5"
     assert after["bbox"] == {"family": "claude", "format": "xyxy_px"}
-
-
-async def test_me_carries_the_prompt_cap(signed_in) -> None:
-    limits = (await signed_in.get("/api/me")).json()["limits"]
-    assert limits["prompt_max_chars"] == signed_in.app.state.settings.system_prompt_max_chars

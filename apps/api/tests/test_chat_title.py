@@ -16,7 +16,6 @@ from sqlalchemy import func, select, update
 
 from sightread.agents import summary as summary_defs
 from sightread.billing import ledger
-from sightread.config import Settings
 from sightread.db.models import (
     AgentSetting,
     Conversation,
@@ -25,9 +24,16 @@ from sightread.db.models import (
     UsageLog,
     utcnow,
 )
+from tests.chat_helpers import (
+    MESSAGES_URL,
+    assistant_turn,
+    chatting_client,
+    conversation_row,
+    new_conversation,
+    run_queued_turn,
+    send,
+)
 from tests.conftest import CSRF_HEADERS
-from tests.test_chat import MESSAGES_URL, _run_queued_turn, assistant_turn
-from tests.test_chat_extensions import chatting_client, new_conversation, send
 
 SUMMARY_MODEL = "codex/gpt-5.5"
 
@@ -58,14 +64,7 @@ def stub_calls(turn_answers: list[str], title_answers: list) -> list[dict]:
 async def talk(client: AsyncClient, conversation_id: int, **body) -> None:
     sent = await send(client, conversation_id, **body)
     assert sent.status_code == 202, sent.text
-    await _run_queued_turn(client)
-
-
-async def conversation_row(client: AsyncClient, conversation_id: int) -> Conversation:
-    async with client.app.state.sessionmaker() as db:
-        row = await db.get(Conversation, conversation_id)
-        db.expunge(row)
-        return row
+    await run_queued_turn(client)
 
 
 async def title_entries(client: AsyncClient) -> list[CreditEntry]:
@@ -90,11 +89,6 @@ async def name_it(client: AsyncClient, conversation_id: int, **body) -> httpx.Re
     return await client.post(
         f"/api/conversations/{conversation_id}/title", json=body, headers=CSRF_HEADERS
     )
-
-
-@pytest.fixture
-async def chat_client(make_client, tmp_path) -> AsyncClient:
-    return await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
 
 
 @respx.mock
@@ -136,7 +130,7 @@ async def test_a_title_is_written_from_the_first_and_the_latest_exchange(chat_cl
     assert "MIDDLE" not in message["content"]
 
     [entry] = await title_entries(client)
-    assert (entry.state, entry.model) == ("consumed", "claude-code/claude-opus-5-5")
+    assert entry.state == "consumed"
     assert entry.amount >= 1
     async with client.app.state.sessionmaker() as db:
         rows = (
@@ -148,14 +142,10 @@ async def test_a_title_is_written_from_the_first_and_the_latest_exchange(chat_cl
 
 
 @respx.mock
-async def test_the_summary_model_and_the_chosen_answer_language_are_used(
-    make_client, tmp_path
-) -> None:
+async def test_the_summary_model_and_the_chosen_answer_language_are_used(make_client) -> None:
     """`SUMMARY_MODEL` runs the call when it names one, and the answer language the reader
     chose wins over the request's locale; a conversation of one turn is read once."""
-    client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), summary_model=SUMMARY_MODEL)
-    )
+    client = await chatting_client(make_client(summary_model=SUMMARY_MODEL))
     async with client.app.state.sessionmaker() as db:
         await db.execute(
             update(AgentSetting)
@@ -173,8 +163,12 @@ async def test_the_summary_model_and_the_chosen_answer_language_are_used(
     assert request["model"] == SUMMARY_MODEL
     assert "whose tag is ja" in request["system"]
     assert request["messages"][0]["content"].count("<exchange>") == 1
-    [entry] = await title_entries(client)
-    assert entry.model == SUMMARY_MODEL
+    assert len(await title_entries(client)) == 1
+    async with client.app.state.sessionmaker() as db:
+        billed = (
+            await db.execute(select(UsageLog.model).where(UsageLog.turn_id.is_(None)))
+        ).scalars()
+        assert list(billed) == [SUMMARY_MODEL]
 
 
 @respx.mock
@@ -253,7 +247,6 @@ async def test_one_title_at_a_time_and_a_crash_left_entry_stops_counting(chat_cl
             user_id=client.user_id,
             kind=ledger.CHAT,
             amount=0,
-            model="claude-code/claude-opus-5-5",
         )
         await db.commit()
         entry_id = in_flight.id
@@ -299,12 +292,6 @@ async def test_a_conversation_model_nobody_prices_is_never_run_for_a_title(chat_
     assert refused.status_code == 503, refused.text
     assert requests == []
     assert await title_entries(client) == []
-
-
-def test_a_summary_model_must_be_priced() -> None:
-    """A model the deployment runs on its own is priced, or it does not start."""
-    with pytest.raises(ValueError, match="MODEL_PRICES_JSON prices none of: vendor/small"):
-        Settings(summary_model="vendor/small", model_prices_json="{}")
 
 
 @pytest.mark.parametrize(

@@ -4,7 +4,7 @@
  *
  * One Lucide set on Lucide's own 24 grid (1.75 stroke, round caps and joins) so a Copy in a
  * panel header, a Revoke row and a destination in the sidebar read as one family. Inline
- * rather than an icon package: a dozen glyphs do not justify a dependency, and a remote
+ * rather than an icon package, which the set drawn here does not need, and a remote
  * sprite would be a render-blocking request for chrome that must paint immediately.
  *
  * Size is the call site's — every consumer sets width and height on the element — because
@@ -30,7 +30,7 @@ defineProps<{ name: IconName }>()
     aria-hidden="true"
     focusable="false"
   >
-    <!-- scan-text: the brand mark's glyph — a page being read inside scan corners. Also
+    <!-- scan-text: a page being read inside scan corners — converting a file to text, and
          the figure placeholder's mark in the result viewer. -->
     <template v-if="name === 'scan-text'">
       <path d="M3 7V5a2 2 0 0 1 2-2h2" />
@@ -40,7 +40,8 @@ defineProps<{ name: IconName }>()
       <path d="M7 8h8M7 12h10M7 16h6" />
     </template>
 
-    <!-- chart-column (Usage): bars on a baseline — the page is cost and tokens over time. -->
+    <!-- chart-column (Usage): bars on a baseline — the settings' Usage section (credits and
+         storage) and the console's Usage screen (cost per day). -->
     <template v-else-if="name === 'dashboard'">
       <path d="M3 3v16a2 2 0 0 0 2 2h16" />
       <path d="M18 17V9M13 17V5M8 17v-3" />

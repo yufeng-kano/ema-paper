@@ -1,10 +1,9 @@
-"""The models the deployment offers, the agents' model settings and prompt presets: the
-operator's key on every upstream call and never in a response, everything stubbed
-(docs/testing.md § Cost safety, docs/billing.md § Models)."""
+"""The models the deployment offers and the agents' model settings: the operator's key on
+every upstream call and never in a response, everything stubbed (docs/testing.md § Cost
+safety, docs/billing.md § Models)."""
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 
 import httpx
@@ -13,14 +12,18 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from sightread.db.models import Job
+from sightread.db.models import CreditEntry, Job
 from sightread.errors import ApiError
-from sightread.jobs.queue import claim_next_job
-from sightread.jobs.runner import run_job
 from sightread.upstream.client import fetch_models
-from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_BASE, KANO_MODELS_URL, PARSE_MODEL
-
-FALLBACK = "vendor/fallback-model"
+from tests.conftest import (
+    CSRF_HEADERS,
+    KANO_API_KEY,
+    KANO_BASE,
+    KANO_MODELS_URL,
+    PARSE_MODEL,
+    api_key_client,
+)
+from tests.helpers import FALLBACK, drain_queue, stub_connection, v1_parse
 
 # What Kano Proxy's catalog lists: two of the three offered chat models, and more.
 MODELS_PAYLOAD = {
@@ -74,6 +77,24 @@ async def test_the_parse_and_check_models_are_the_deployments(signed_in, make_cl
     assert (await _settings_of(none, "parse"))["settings"]["model"] is None
 
 
+async def test_v1_models_takes_a_bearer_never_the_session_cookie(signed_in) -> None:
+    """The data plane is bearer-only (docs/api.md): a signed-in browser lists the parse
+    models with GET /api/agents/parse/models instead."""
+    refused = await signed_in.get("/v1/models")
+
+    assert refused.status_code == 401
+    assert refused.json()["error"]["message"] == "Missing bearer token"
+    assert refused.headers["WWW-Authenticate"] == "Bearer"
+
+    key = await signed_in.post("/api/keys", json={"name": "script"}, headers=CSRF_HEADERS)
+    listed = await signed_in.get(
+        "/v1/models", headers={"Authorization": f"Bearer {key.json()['key']}"}
+    )
+
+    assert listed.status_code == 200, listed.text
+    assert listed.json() == {"data": [{"id": PARSE_MODEL, "name": None}]}
+
+
 @pytest.mark.own_catalog
 @respx.mock
 async def test_the_chat_models_are_the_offered_ones_the_catalog_still_lists(signed_in) -> None:
@@ -125,7 +146,7 @@ async def test_an_oversized_model_list_is_an_upstream_error() -> None:
         )
     )
     with pytest.raises(ApiError) as raised:
-        await fetch_models(f"{KANO_BASE}/openai/v1", KANO_API_KEY, max_bytes=64)
+        await fetch_models(stub_connection(api_key=KANO_API_KEY), max_bytes=64)
     assert raised.value.status_code == 502
 
 
@@ -161,7 +182,6 @@ async def test_only_the_chat_agent_takes_a_model_and_only_an_offered_one(signed_
         )
         assert refused.status_code == 400, agent
         assert refused.json()["error"]["message"] == f"The {agent} agent takes no model"
-        assert "connection_id" not in (await _settings_of(signed_in, agent))["settings"]
 
 
 async def test_unknown_agents_are_refused(signed_in) -> None:
@@ -169,85 +189,13 @@ async def test_unknown_agents_are_refused(signed_in) -> None:
         "/api/agents/summarize/settings", json={"model": "x"}, headers=CSRF_HEADERS
     )
     assert put.status_code == 404
-    prompt = await signed_in.post(
-        "/api/prompts",
-        json={"agent": "summarize", "name": "x", "text": "y"},
-        headers=CSRF_HEADERS,
-    )
-    assert prompt.status_code == 400
-
-
-# --- prompt presets -------------------------------------------------------------------
-
-
-async def test_prompt_preset_crud_and_selection(signed_in) -> None:
-    created = await signed_in.post(
-        "/api/prompts",
-        json={"name": "Tables only", "text": "Only tables from page {page}."},
-        headers=CSRF_HEADERS,
-    )
-    assert created.status_code == 201
-    preset = created.json()
-
-    listed = (await signed_in.get("/api/prompts")).json()["prompts"]
-    assert [row["name"] for row in listed] == ["Tables only"]
-
-    # Existing callers that never name an agent get the parse agent's prompts.
-    assert preset["agent"] == "parse"
-
-    selected = await signed_in.put(
-        "/api/agents/parse/settings",
-        json={"prompt_preset_id": preset["id"]},
-        headers=CSRF_HEADERS,
-    )
-    assert selected.json()["prompt_preset_id"] == preset["id"]
-    assert (await _settings_of(signed_in, "parse"))["settings"]["prompt_preset_id"] == preset["id"]
-
-    renamed = await signed_in.put(
-        f"/api/prompts/{preset['id']}", json={"name": "Tables"}, headers=CSRF_HEADERS
-    )
-    assert renamed.json()["name"] == "Tables"
-
-    assert (
-        await signed_in.delete(f"/api/prompts/{preset['id']}", headers=CSRF_HEADERS)
-    ).status_code == 204
-    # Deleting the selected preset falls back to the default prompt.
-    assert (await _settings_of(signed_in, "parse"))["settings"]["prompt_preset_id"] is None
-
-
-async def test_prompt_text_is_capped(signed_in, make_client) -> None:
-    client = make_client(system_prompt_max_chars=10)
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    response = await client.post(
-        "/api/prompts",
-        json={"name": "Long", "text": "x" * 11},
-        headers=CSRF_HEADERS,
-    )
-    assert response.status_code == 400
-
-
-async def test_a_foreign_preset_cannot_be_selected(signed_in) -> None:
-    response = await signed_in.put(
-        "/api/agents/parse/settings", json={"prompt_preset_id": 999}, headers=CSRF_HEADERS
-    )
-    assert response.status_code == 404
 
 
 # --- the parse model at enqueue ---------------------------------------------------------
 
 
-async def _keyed(client: AsyncClient) -> None:
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    key = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
-    client.headers["Authorization"] = f"Bearer {key.json()['key']}"
-
-
 async def _parse(client: AsyncClient, documents, **data) -> httpx.Response:
-    return await client.post(
-        "/v1/parse",
-        files={"file": ("tiny.png", documents["png"].read_bytes(), "image/png")},
-        data=data,
-    )
+    return await v1_parse(client, documents["png"], media_type="image/png", **data)
 
 
 async def test_a_request_model_must_be_one_of_the_parse_agents(
@@ -255,8 +203,7 @@ async def test_a_request_model_must_be_one_of_the_parse_agents(
 ) -> None:
     """The deployment's parse model by default; the fallback by name; anything else
     refused before a job exists (docs/agents.md § Enqueue rules)."""
-    client = make_client(parse_fallback_model=FALLBACK)
-    await _keyed(client)
+    client = await api_key_client(make_client(parse_fallback_model=FALLBACK))
 
     default = await _parse(client, documents)
     named = await _parse(client, documents, model=FALLBACK)
@@ -268,21 +215,16 @@ async def test_a_request_model_must_be_one_of_the_parse_agents(
     async with sessionmaker() as db:
         first = await db.get(Job, uuid.UUID(default.json()["job_id"]))
         second = await db.get(Job, uuid.UUID(named.json()["job_id"]))
-        assert (first.model, first.connection_id, first.connection_base_url) == (
-            PARSE_MODEL,
-            None,
-            KANO_BASE,
-        )
+        assert (first.model, first.connection_base_url) == (PARSE_MODEL, KANO_BASE)
         assert second.model == FALLBACK
-        assert (await db.execute(select(Job.id))).all() == [(first.id,), (second.id,)]
+        assert sorted((await db.execute(select(Job.id))).scalars()) == sorted([first.id, second.id])
 
 
 async def test_no_parse_model_or_no_kano_proxy_refuses_every_parse(
     make_client, sessionmaker, documents
 ) -> None:
     for overrides in ({"parse_model": ""}, {"kano_proxy_api_key": ""}, {"kano_proxy_base_url": ""}):
-        client = make_client(**overrides)
-        await _keyed(client)
+        client = await api_key_client(make_client(**overrides))
         refused = await _parse(client, documents)
         assert refused.status_code == 503, overrides
         assert refused.json()["error"]["type"] == "upstream"
@@ -290,29 +232,40 @@ async def test_no_parse_model_or_no_kano_proxy_refuses_every_parse(
         assert (await db.execute(select(Job.id))).all() == []
 
 
-async def test_a_queued_job_on_a_provider_connection_fails_cleanly(
+@respx.mock
+async def test_a_job_with_no_endpoint_snapshot_never_runs_on_kano_proxy(
     make_client, sessionmaker, documents
 ) -> None:
-    """A job from before the operator's upstream keeps its connection id as history and
-    never runs on the operator's key (docs/database.md § Rules)."""
-    client = make_client()
-    await _keyed(client)
+    """A job of an upstream the deployment no longer has — OpenRouter, a provider
+    connection — has no endpoint snapshot. The worker fails it when it takes it, a retry's
+    included, through the finish that releases its credits, and Kano Proxy is never
+    called: it would transcribe only the pages the other upstream failed, under a Kano
+    Proxy dedup key (docs/database.md § Rules)."""
+    gone = "this parse ran on an upstream this deployment no longer has; upload the file again"
+    client = await api_key_client(make_client())
     accepted = await _parse(client, documents)
     assert accepted.status_code == 202, accepted.text
     job_id = uuid.UUID(accepted.json()["job_id"])
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
-        job.connection_id, job.connection_base_url = 7, "https://llm.example/v1"
+        job.connection_base_url = None
         await db.commit()
 
-    settings = client.app.state.settings
-    async with sessionmaker() as db:
-        assert await claim_next_job(db, settings.max_jobs_per_user) == job_id
-    await run_job(sessionmaker, settings, job_id, asyncio.Semaphore(2))
+    for attempt in ("queued", "retried"):
+        assert await drain_queue(client, sessionmaker) == job_id, attempt
 
-    status = (await client.get(f"/v1/jobs/{job_id}")).json()
-    assert status["status"] == "failed"
-    assert status["error"] == "the provider connection for this job no longer exists"
+        status = (await client.get(f"/v1/jobs/{job_id}")).json()
+        assert (status["status"], status["error"]) == ("failed", gone), attempt
+        async with sessionmaker() as db:
+            job = await db.get(Job, job_id)
+            assert job.connection_base_url is None, attempt
+            entry = await db.execute(select(CreditEntry.state).where(CreditEntry.job_id == job_id))
+            assert entry.scalar_one() == "released", attempt
+        if attempt == "queued":
+            retried = await _parse(client, documents, retry="true")
+            assert retried.status_code == 202, retried.text
+            assert retried.json()["job_id"] == str(job_id)
+    assert respx.calls.call_count == 0
 
 
 @respx.mock
@@ -333,18 +286,14 @@ async def test_a_queued_job_reconciles_its_endpoint_snapshot_at_claim_time(
         )
     )
 
-    client = make_client()
-    await _keyed(client)
+    client = await api_key_client(make_client())
     accepted = await _parse(client, documents)
     assert accepted.status_code == 202, accepted.text
     job_id = uuid.UUID(accepted.json()["job_id"])
 
     # The worker restarted on the moved origin.
     worker = make_client(kano_proxy_base_url=moved_base)
-    settings = worker.app.state.settings
-    async with sessionmaker() as db:
-        assert await claim_next_job(db, settings.max_jobs_per_user) == job_id
-    await run_job(sessionmaker, settings, job_id, asyncio.Semaphore(2))
+    assert await drain_queue(worker, sessionmaker) == job_id
 
     assert moved_chat.called
     assert moved_chat.calls[0].request.headers["authorization"] == f"Bearer {KANO_API_KEY}"

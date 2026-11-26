@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -258,9 +258,7 @@ async def delete_group(db: AsyncSession, operator: Operator, group_id: int) -> N
         after=None,
         ip=operator.ip,
     )
-    # Explicit rather than left to the foreign key, which the SQLite test fallback does
-    # not enforce.
-    await db.execute(delete(GroupMember).where(GroupMember.group_id == group.id))
+    # The members' rows go with it, by the foreign key's cascade.
     await db.delete(group)
     await db.flush()
 

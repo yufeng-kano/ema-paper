@@ -4,7 +4,7 @@
  *
  * Renders as `<button>`, or as `<a>` / `<NuxtLink>` when given `href` / `to` — a link that
  * looks like a button is still a link, and must keep middle-click and "open in new tab".
- * `href` stays same-tab: the one place we use it is the server-redirect sign-in flow.
+ * `href` is a plain same-tab link, such as the file viewer's download.
  *
  * `loading` shows a spinner *in place of* the icon and disables the control, so a pending
  * action can never be fired twice; the label stays put so the button does not resize
@@ -20,8 +20,6 @@ const props = withDefaults(
     size?: 'xs' | 'sm' | 'md' | 'lg'
     /** Round button with an icon and no visible label — `label` becomes its accessible name. */
     iconOnly?: boolean
-    /** Fills its container's width, for a sheet's single primary action. */
-    block?: boolean
     loading?: boolean
     disabled?: boolean
     /**
@@ -71,7 +69,7 @@ const bindings = computed(() => {
     :class="[
       `btn-${variant}`,
       `btn-${size}`,
-      { 'btn-icon': iconOnly, 'btn-block': block, 'is-loading': loading },
+      { 'btn-icon': iconOnly, 'is-loading': loading },
     ]"
     :aria-label="label"
     :title="iconOnly ? label : undefined"
@@ -149,11 +147,6 @@ const bindings = computed(() => {
 
 .btn-icon.btn-xs {
   width: var(--control-height-xs);
-}
-
-/* Fills the column it sits in — a sheet's single primary action. */
-.btn-block {
-  width: 100%;
 }
 
 .btn:disabled,

@@ -1,7 +1,7 @@
 """Job execution: one document, page by page (docs/jobs.md, docs/parsing.md).
 
 This is the `parse` agent's runner (docs/agents.md). Shape of a run: read the job, resolve
-the user's key, work out the pages, then fan the pages out. Poppler work is bounded by the
+the upstream, work out the pages, then fan the pages out. Poppler work is bounded by the
 worker-wide render semaphore; upstream calls are bounded by this job's own vision budget,
 which halves itself when the upstream says 429.
 
@@ -28,12 +28,12 @@ from pathlib import Path
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..agents import CHECK, get_agent
+from ..agents import CHECK
 from ..agents.bbox import convention_for_job, prepare_image
 from ..agents.parse import FIGURE_CHECK_SINCE_PIPELINE
 from ..billing import ledger
 from ..config import Settings
-from ..db.models import EFFORT_DEFAULT, Document, Job, JobPage, Result, UsageLog, utcnow
+from ..db.models import Document, Job, JobPage, Result, UsageLog, utcnow
 from ..errors import ApiError
 from ..parsing import poppler
 from ..parsing.figure_check import (
@@ -50,7 +50,7 @@ from ..parsing.figures import (
     publish_job_figures,
     save_page_figures,
 )
-from ..parsing.images import ImageError, normalize_image
+from ..parsing.images import PARSE_IMAGE_FORMATS, ImageError, normalize_image
 from ..parsing.markdown import (
     ADJUSTED,
     PLACEHOLDER_RE,
@@ -59,7 +59,7 @@ from ..parsing.markdown import (
     PageMarkdown,
     assemble,
 )
-from ..upstream.anthropic import CompletedMessage
+from ..upstream.anthropic import ChatUsage
 from ..upstream.client import (
     Connection,
     EmptyCompletion,
@@ -72,11 +72,12 @@ from ..upstream.client import (
     ask_about_page,
     kano_connection,
     transcribe_page,
+    with_retries,
 )
 from ..workspace.documents import (
     copy_original,
     ensure_within_quota,
-    folder_names,
+    folder_chain,
     is_live,
     keep_source,
     materialize_document,
@@ -88,14 +89,9 @@ from ..workspace.layout import document_relative_dir, user_root
 from ..workspace.locks import backup_shared, workspace_lock
 from . import events
 from .check import CheckFailed, run_check
-from .queue import parse_pages_spec
+from .queue import owned_by, parse_pages_spec
 
 logger = logging.getLogger(__name__)
-
-# Retry policy for one upstream call — 429s and transient failures alike
-# (docs/parsing.md § Upstream usage).
-VISION_MAX_ATTEMPTS = 4
-VISION_BACKOFF_BASE_SECONDS = 1.0
 
 # A second 402 without an intervening success means the key is dead, not the page.
 PAYMENT_FAILURES_BEFORE_ABORT = 2
@@ -175,7 +171,7 @@ class KeptPage:
     figures: dict[str, str] | None = None
 
 
-@dataclass
+@dataclass(kw_only=True)
 class RunState:
     """Cross-page state for one run: what the fan-out has to agree about."""
 
@@ -183,20 +179,19 @@ class RunState:
     # For log lines only: page tasks see the state, not the job row.
     job_id: str = ""
     # UPSTREAM_RESPONSE_MAX_BYTES, carried here so page tasks need no Settings.
-    max_response_bytes: int = 33_554_432
+    max_response_bytes: int
     # VISION_MAX_OUTPUT_TOKENS, likewise (docs/parsing.md § Upstream usage).
-    max_output_tokens: int = 16_000
+    max_output_tokens: int
     payment_failures: int = 0
-    # This job's own directory under FIGURES_DIR; None turns crop persistence off
-    # (docs/parsing.md § Figure crops).
-    figures_dir: Path | None = None
+    # This job's own directory under FIGURES_DIR (docs/parsing.md § Figure crops).
+    figures_dir: Path
     # The worker's generation, the fence on every write to the job's row; None when the
     # caller claimed without one (docs/jobs.md § Queue).
     generation: int | None = None
     # FIGURES_PER_PAGE_MAX — the crop cap one page may spend (docs/parsing.md).
-    figures_per_page: int = 40
+    figures_per_page: int
     # FIGURE_CHECK_ROUNDS — the model rounds one page's figure check may take.
-    figure_check_rounds: int = 2
+    figure_check_rounds: int
     # Crop threads cannot be cancelled from the event loop, so writing and discarding
     # serialize on this guard; once `figures_discarded` is set, a late crop thread writes
     # nothing and cannot recreate a directory the cleanup just removed.
@@ -221,6 +216,20 @@ def result_payload(result: Result, *, reading_copy: bool = False) -> dict:
         "figures": result.figures,
         "errors": result.errors,
         "meta": result.meta,
+    }
+
+
+def _base_meta(job: Job) -> dict:
+    """What every result's `meta` opens with, a running job's partial one included
+    (docs/api.md § GET /v1/jobs/{id}/result)."""
+    return {
+        "job_id": str(job.id),
+        "agent": job.agent,
+        "model": job.model,
+        "bbox_format": job.bbox_format,
+        "pipeline_version": job.pipeline_version,
+        "sha256": job.sha256,
+        "cached": False,
     }
 
 
@@ -252,13 +261,7 @@ def partial_result_payload(job: Job, rows: list[JobPage]) -> dict:
         "figures": document.figures,
         "errors": [{"page": row.page_no, "reason": row.error} for row in rows if row.error],
         "meta": {
-            "job_id": str(job.id),
-            "agent": job.agent,
-            "model": job.model,
-            "bbox_format": job.bbox_format,
-            "pipeline_version": job.pipeline_version,
-            "sha256": job.sha256,
-            "cached": False,
+            **_base_meta(job),
             "partial": True,
             "page_count": job.page_count,
             "pages_done": job.pages_done,
@@ -266,53 +269,39 @@ def partial_result_payload(job: Job, rows: list[JobPage]) -> dict:
     }
 
 
-def job_prompt(job: Job) -> str:
-    """The transcription prompt template this job runs.
-
-    The effective template is stored on the row at enqueue time (docs/parsing.md §
-    Prompts); jobs from before that column exist fall back to the agent's default.
-    """
-    return job.prompt or get_agent(job.agent).default_prompt_template
-
-
-async def _call_upstream(state: RunState, call):
-    """Run one upstream call under the job's budget, backing off on 429 and on transient
-    failures.
-
-    Each rate limit also halves this job's concurrency, so a job that is being throttled
-    stops fighting the throttle. A transient failure does not: a flaky upstream is not
-    asking for less traffic. The backoff sleeps outside the slot, so a waiting page never
-    holds up one that could run.
-    """
-    for attempt in range(VISION_MAX_ATTEMPTS):
-        last = attempt == VISION_MAX_ATTEMPTS - 1
-        async with state.budget.slot():
-            try:
-                return await call()
-            except RateLimited as exc:
-                if last:
-                    raise
-                throttled = True
-                delay = exc.retry_after or VISION_BACKOFF_BASE_SECONDS * (2**attempt)
-            except UpstreamError as exc:
-                if last or not exc.transient:
-                    raise
-                throttled = False
-                delay = VISION_BACKOFF_BASE_SECONDS * (2**attempt)
-        if throttled:
-            await state.budget.halve()
-        await asyncio.sleep(delay)
-    raise RateLimited()
-
-
-async def _guarded_call(state: RunState, outcome: PageOutcome, model: str, call):
+async def _guarded_call(
+    job: Job,
+    state: RunState,
+    outcome: PageOutcome,
+    model: str,
+    call,
+    sessionmaker: async_sessionmaker[AsyncSession],
+):
     """Apply the upstream failure policy of docs/parsing.md to one page's call to `model`.
 
     Returns the call's result, or None when the page failed — the failure is already
     recorded on the outcome. Failures that will repeat for every page abort the job.
+
+    The call runs under the job's budget, backing off on 429 and on transient failures.
+    Each rate limit also halves this job's concurrency, so a job that is being throttled
+    stops fighting the throttle; a transient failure does not, since a flaky upstream is
+    not asking for less traffic. Every answered call is billed, the retried ones too: a
+    retried answer is logged before its backoff, since a later attempt that aborts the
+    job, or a cancel during the wait, ends the page before it is recorded. The last
+    attempt's usage is left on the outcome for the page's record.
     """
+
+    async def bill_retried(exc: UpstreamError) -> None:
+        if exc.usage is not None:
+            await to_the_end(_log_usage(sessionmaker, job, [(model, exc.usage)]))
+
     try:
-        result = await _call_upstream(state, call)
+        result = await with_retries(
+            call,
+            slot=state.budget.slot,
+            on_rate_limited=state.budget.halve,
+            on_retry=bill_retried,
+        )
     except PaymentRequired:
         state.payment_failures += 1
         if state.payment_failures >= PAYMENT_FAILURES_BEFORE_ABORT:
@@ -336,7 +325,9 @@ async def _guarded_call(state: RunState, outcome: PageOutcome, model: str, call)
         return None
     except UpstreamError as exc:
         if exc.fatal:
-            raise JobAborted("the upstream rejected the stored key") from None
+            raise JobAborted("the upstream rejected the operator's key") from None
+        if exc.usage is not None:
+            outcome.usage.append((model, exc.usage))
         # The message is a status code or a fixed phrase — never credentials or content.
         logger.warning("job %s page %d upstream call failed: %s", state.job_id, outcome.page, exc)
         outcome.error = "upstream call failed"
@@ -369,8 +360,8 @@ async def _transcribe(
         if index:
             # The blocked call is logged before the fallback is sent: a fallback that
             # aborts the job, or a cancel while it runs, ends the page before it is
-            # recorded, and must not take a call the user's key paid for with it.
-            await _to_the_end(_log_usage(sessionmaker, job, outcome.usage))
+            # recorded, and must not take a call the user's credits paid for with it.
+            await to_the_end(_log_usage(sessionmaker, job, outcome.usage))
             outcome.usage.clear()
         outcome.error = None
         outcome.model = model
@@ -378,9 +369,10 @@ async def _transcribe(
         # Pillow work, so it runs beside the in-flight HTTP calls rather than under them —
         # and settled under a cancel, so no thread writes the work directory after the
         # requeue has removed it. Prepared per model: each family is sent its own image.
-        sent = await _to_the_end(asyncio.to_thread(prepare_image, image, convention))
+        sent = await to_the_end(asyncio.to_thread(prepare_image, image, convention))
         try:
             transcription = await _guarded_call(
+                job,
                 state,
                 outcome,
                 model,
@@ -388,13 +380,14 @@ async def _transcribe(
                     transcribe_page,
                     connection,
                     model,
-                    job_prompt(job),
+                    job.prompt,
                     sent.path,
                     page_no,
                     convention=convention,
                     max_response_bytes=state.max_response_bytes,
                     max_output_tokens=state.max_output_tokens,
                 ),
+                sessionmaker,
             )
         finally:
             sent.cleanup()
@@ -417,13 +410,13 @@ async def _check_figures(
     outcome, or the page's failure when a call failed."""
     if job.pipeline_version < FIGURE_CHECK_SINCE_PIPELINE:
         return
-    boxes, _ = page_boxes(outcome.markdown, state.figures_per_page)
+    boxes, _ = page_boxes(outcome.markdown, limit=state.figures_per_page)
     if not boxes:
         outcome.figures = {}
         return
     # The transcription is billed before the raster work: a cancel landing in it ends the
-    # page before it is recorded, and must not take a call the user's key paid for.
-    await _to_the_end(_log_usage(sessionmaker, job, outcome.usage))
+    # page before it is recorded, and must not take a call the user's credits paid for.
+    await to_the_end(_log_usage(sessionmaker, job, outcome.usage))
     outcome.usage.clear()
     ink = await asyncio.to_thread(PageInk, image)
     original = boxes
@@ -433,21 +426,20 @@ async def _check_figures(
     settled: set[int] = set() if cut else set(range(len(boxes)))
     asking = set(range(len(boxes))) - settled
     calls = 0
-    model = outcome.model or job.model
+    # Set by the transcription this check follows.
+    model = outcome.model
+    assert model is not None
     convention = convention_for_job(model, job.pipeline_version)
     sent = None
     try:
         while asking and calls < max(1, state.figure_check_rounds):
             if sent is None:
-                sent = await _to_the_end(asyncio.to_thread(prepare_image, image, convention))
-            if calls:
-                # The previous round's call is billed before this one is sent.
-                await _to_the_end(_log_usage(sessionmaker, job, outcome.usage))
-                outcome.usage.clear()
+                sent = await to_the_end(asyncio.to_thread(prepare_image, image, convention))
             marked = sent.path.with_name(f"{sent.path.stem}-check.png")
-            await _to_the_end(asyncio.to_thread(mark_boxes, sent.path, boxes, marked))
+            await to_the_end(asyncio.to_thread(mark_boxes, sent.path, boxes, marked))
             try:
                 answer = await _guarded_call(
+                    job,
                     state,
                     outcome,
                     model,
@@ -460,9 +452,14 @@ async def _check_figures(
                         max_response_bytes=state.max_response_bytes,
                         max_output_tokens=state.max_output_tokens,
                     ),
+                    sessionmaker,
                 )
             finally:
                 marked.unlink(missing_ok=True)
+            # Billed as soon as it is answered: a cancel in the raster work below, or the
+            # next call aborting the job, ends the page before it is recorded.
+            await to_the_end(_log_usage(sessionmaker, job, outcome.usage))
+            outcome.usage.clear()
             calls += 1
             if answer is None:
                 return  # the page failed; the outcome says why
@@ -511,6 +508,51 @@ async def _check_figures(
         )
 
 
+async def _run_page(
+    job: Job,
+    state: RunState,
+    connection: Connection,
+    outcome: PageOutcome,
+    image: Path,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> PageOutcome:
+    """One page on its image, rendered or normalized: transcribed, its figures checked,
+    recorded, then cropped. The image is removed whatever happens; nothing may outlive
+    the call."""
+    try:
+        transcription = await _transcribe(
+            job, state, connection, outcome, image, outcome.page, sessionmaker
+        )
+        if transcription is not None:
+            outcome.markdown = transcription.markdown
+            await _check_figures(job, state, connection, outcome, image, sessionmaker)
+        # Billing before the optional raster work: a SIGTERM landing mid-crop cancels this
+        # task, and the calls that already ran must be in `usage_log` first. A cancel
+        # landing in the record itself waits it out: its calls are logged, and a succeeded
+        # page is kept, never paid twice.
+        await to_the_end(_record_page(sessionmaker, job, outcome, state.generation))
+        if not outcome.error:
+            await _save_figures(state, outcome.markdown, image, outcome.page)
+    finally:
+        image.unlink(missing_ok=True)
+    return outcome
+
+
+def _kept_outcome(
+    job: Job, kept: KeptPage, page_no: int, width_pt: float, height_pt: float
+) -> PageOutcome:
+    """The outcome of a page an earlier attempt finished, as that attempt left it."""
+    return PageOutcome(
+        page=page_no,
+        width_pt=width_pt,
+        height_pt=height_pt,
+        method=kept.method or VISION,
+        markdown=kept.markdown,
+        model=kept.model or job.model,
+        figures=kept.figures,
+    )
+
+
 async def _process_pdf_page(
     job: Job,
     state: RunState,
@@ -536,23 +578,7 @@ async def _process_pdf_page(
         outcome.error = "render failed"
         await _record_page(sessionmaker, job, outcome, state.generation)
         return outcome
-
-    try:
-        transcription = await _transcribe(
-            job, state, connection, outcome, image, page_no, sessionmaker
-        )
-        if transcription is not None:
-            outcome.markdown = transcription.markdown
-            await _check_figures(job, state, connection, outcome, image, sessionmaker)
-        # Billing before the optional raster work: a SIGTERM landing mid-crop cancels this
-        # task, and the calls that already ran must be in `usage_log` first.
-        await _record_page(sessionmaker, job, outcome, state.generation)
-        if not outcome.error:
-            await _save_figures(state, outcome.markdown, image, page_no)
-    finally:
-        # The rendered page has served its purpose; nothing may outlive the call.
-        image.unlink(missing_ok=True)
-    return outcome
+    return await _run_page(job, state, connection, outcome, image, sessionmaker)
 
 
 async def _restore_pdf_page(
@@ -570,16 +596,8 @@ async def _restore_pdf_page(
     figures. An attempt's crops are its own (docs/parsing.md § Figure crops); a render that
     fails costs the page its crops, never the page."""
     size = info.page_size(page_no)
-    outcome = PageOutcome(
-        page=page_no,
-        width_pt=size.width_pt,
-        height_pt=size.height_pt,
-        method=kept.method or VISION,
-        markdown=kept.markdown,
-        model=kept.model or job.model,
-        figures=kept.figures,
-    )
-    if state.figures_dir is None or not PLACEHOLDER_RE.search(kept.markdown):
+    outcome = _kept_outcome(job, kept, page_no, size.width_pt, size.height_pt)
+    if not PLACEHOLDER_RE.search(kept.markdown):
         return outcome
     try:
         async with render_slots:
@@ -603,7 +621,9 @@ async def _process_image(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> PageOutcome:
     try:
-        normalized = normalize_image(source, work_dir)
+        normalized = await to_the_end(
+            asyncio.to_thread(normalize_image, source, work_dir, formats=PARSE_IMAGE_FORMATS)
+        )
     except ImageError:
         outcome = PageOutcome(
             page=1, width_pt=0, height_pt=0, error="the image could not be decoded"
@@ -617,38 +637,19 @@ async def _process_image(
         height_pt=float(normalized.height_px),
         method=VISION,
     )
-    try:
-        transcription = await _transcribe(
-            job, state, connection, outcome, normalized.path, 1, sessionmaker
-        )
-        if transcription is not None:
-            outcome.markdown = transcription.markdown
-            await _check_figures(job, state, connection, outcome, normalized.path, sessionmaker)
-        # Same ordering as the PDF path: the billed call is persisted before crop work.
-        await _record_page(sessionmaker, job, outcome, state.generation)
-        if not outcome.error:
-            await _save_figures(state, outcome.markdown, normalized.path, 1)
-    finally:
-        normalized.path.unlink(missing_ok=True)
-    return outcome
+    return await _run_page(job, state, connection, outcome, normalized.path, sessionmaker)
 
 
 async def _restore_image(
     job: Job, state: RunState, source: Path, work_dir: Path, kept: KeptPage
 ) -> PageOutcome:
     """The image's one page, finished by an earlier attempt: kept as `_restore_pdf_page`
-    keeps a PDF page, its size and its crops taken from the image again."""
-    outcome = PageOutcome(
-        page=1,
-        width_pt=0,
-        height_pt=0,
-        method=kept.method or VISION,
-        markdown=kept.markdown,
-        model=kept.model or job.model,
-        figures=kept.figures,
-    )
+    keeps a PDF page, its size and its crops taken from the image again. Every decoder
+    may read it: the image was accepted and billed by an earlier attempt, and a stored
+    job whose image is in another format keeps its size and crops."""
+    outcome = _kept_outcome(job, kept, 1, 0, 0)
     try:
-        normalized = normalize_image(source, work_dir)
+        normalized = await to_the_end(asyncio.to_thread(normalize_image, source, work_dir))
     except ImageError:
         logger.warning("job %s image no longer decodes; its kept page has no crops", job.id)
         return outcome
@@ -664,9 +665,9 @@ async def _restore_image(
 def _locked_save_figures(state: RunState, markdown: str, image: Path, page_no: int) -> None:
     """Thread body: crop under the guard, unless this job's figures were discarded."""
     with state.figures_guard:
-        if state.figures_discarded or state.figures_dir is None:
+        if state.figures_discarded:
             return
-        save_page_figures(markdown, image, page_no, state.figures_dir, state.figures_per_page)
+        save_page_figures(markdown, image, page_no, state.figures_dir, limit=state.figures_per_page)
 
 
 async def _save_figures(state: RunState, markdown: str, image: Path, page_no: int) -> None:
@@ -675,8 +676,6 @@ async def _save_figures(state: RunState, markdown: str, image: Path, page_no: in
     Pillow work runs off the event loop; the fan-out must not stall behind an image
     decode. The guard it runs under is what lets `_discard_figures` wait it out.
     """
-    if state.figures_dir is None:
-        return
     await asyncio.to_thread(_locked_save_figures, state, markdown, image, page_no)
 
 
@@ -684,8 +683,6 @@ def _publish_figures(state: RunState, figures_root: Path, job_id: uuid.UUID) -> 
     """The attempt's crops under the job's name, once its result is committed. Under the
     guard, so no crop thread writes into a directory being moved; the flag then turns
     away one that has not started (docs/parsing.md § Figure crops)."""
-    if state.figures_dir is None:
-        return
     with state.figures_guard:
         state.figures_discarded = True
         publish_job_figures(figures_root, job_id, state.figures_dir)
@@ -699,16 +696,9 @@ def _discard_figures(state: RunState) -> None:
     guard means a crop thread mid-write finishes first, and the discard flag means one
     that has not started yet writes nothing (docs/parsing.md § Figure crops).
     """
-    if state.figures_dir is None:
-        return
     with state.figures_guard:
         state.figures_discarded = True
         shutil.rmtree(state.figures_dir, ignore_errors=True)
-
-
-def _owned(generation: int | None) -> list:
-    """The fence: the row still holds the caller's generation (docs/jobs.md § Queue)."""
-    return [Job.worker_generation == generation] if generation is not None else []
 
 
 async def _record_page(
@@ -720,13 +710,13 @@ async def _record_page(
     """Persist one finished page: its row, the job's progress and the calls it billed.
     The progress goes first, fenced on the generation: a row another worker has taken
     (this one lost the worker lock) gets no page from here — the other's pages are its
-    own — but the calls are logged whatever happened, since the user's key paid for
+    own — but the calls are logged whatever happened, since the user's credits paid for
     them (docs/jobs.md § Queue)."""
     async with sessionmaker() as db:
         owned = (
             await db.execute(
                 update(Job)
-                .where(Job.id == job.id, *_owned(generation))
+                .where(Job.id == job.id, *owned_by(generation))
                 .values(pages_done=Job.pages_done + 1)
             )
         ).rowcount == 1
@@ -775,19 +765,21 @@ async def _log_usage(
     sessionmaker: async_sessionmaker[AsyncSession], job: Job, usage: list[tuple[str, Usage]]
 ) -> None:
     """Calls a page billed, logged ahead of the page itself — unfenced, as `_record_page`
-    logs them."""
+    logs them. Calls that carried no usage (rate limited, refused for payment) open no
+    session."""
+    if not usage:
+        return
     async with sessionmaker() as db:
         db.add_all(_usage_rows(job, usage))
         await db.commit()
 
 
 async def _record_check_usage(
-    sessionmaker: async_sessionmaker[AsyncSession], job: Job, completed: CompletedMessage
+    sessionmaker: async_sessionmaker[AsyncSession], job: Job, usage: ChatUsage
 ) -> None:
     """One call of the format check, billed as the `check` agent's under the parse's job
     and the model it was sent to — logged whatever happened, like a page's calls
     (docs/parsing.md § Format check)."""
-    usage = completed.usage
     async with sessionmaker() as db:
         db.add(
             UsageLog(
@@ -795,12 +787,7 @@ async def _record_check_usage(
                 job_id=job.id,
                 agent=CHECK.name,
                 model=job.check_model,
-                prompt_tokens=usage.input_tokens,
-                completion_tokens=usage.output_tokens,
-                cache_read_tokens=usage.cache_read_tokens,
-                cache_write_tokens=usage.cache_write_tokens,
-                cost=usage.cost,
-                cost_source=usage.cost_source,
+                **usage.log_fields(),
             )
         )
         await db.commit()
@@ -810,45 +797,47 @@ async def fail_job(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     job_id: uuid.UUID,
-    error: str,
     generation: int | None = None,
 ) -> None:
     """A job whose task raised past `run_job` (a database error while the terminal state
-    was being written, say): failed, never requeued — the parse ran and billed the user's
-    key, and a fault of ours is no reason to run it again. A job no longer `running` (its
-    result committed before what raised), or no longer this worker's (docs/jobs.md
-    § Queue), is left as it is. With settings, like every other terminal path: a library
-    row keeps its original here too."""
+    was being written, say): failed with `internal error`, never requeued — the parse ran
+    and billed the user's credits, and a fault of ours is no reason to run it again. A job
+    no longer `running` (its result committed before what raised), or no longer this
+    worker's (docs/jobs.md § Queue), is left as it is. A library row keeps its original here too."""
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
         if job is None or job.status != "running":
             return
         if generation is not None and job.worker_generation != generation:
             return
-    await _to_the_end(
+    await to_the_end(
         _finish(
             sessionmaker,
             job_id,
             status="failed",
-            error=error,
+            error="internal error",
             settings=settings,
             generation=generation,
         )
     )
 
 
-async def _to_the_end(coro):
+async def to_the_end(coro):
     """Await `coro` so that a cancel of the caller waits for it instead of interrupting
     it; the cancel is raised once it is done. For the finalization of a terminal state,
     a result's or a failure's (docs/jobs.md § Retention): the row is `succeeded` or
     `failed`, so a shutdown's requeue — or a chat turn's Stop, around a conversion it
     drives — would not take it back, and what is half-copied under a lock that a cancel
     released would be nobody's to finish: a converted file whose failed parse never
-    filed its original would have no copy left but the upload. And for a page's image
-    preparation in a thread, which a cancelled await does not stop: the work directory
-    is removed and the job requeued only once nothing writes into it any more. A second
-    cancel while it waits is absorbed too (a turn's end cancels the run it drives, then
-    cancels it again when it stops waiting), so the caller never returns before it."""
+    filed its original would have no copy left but the upload. For a paid call's record,
+    a parse's or a chat turn's `usage_log` row or tool call: a cancelled or timed-out
+    run is billed all the same (docs/chat.md § Conversations, turns, events). And for
+    an image decode or preparation in a thread, which a cancelled await does not stop:
+    a work directory is removed, a job requeued or a decode slot released only once
+    nothing writes into it or holds its raster any more. A second cancel while it waits
+    is absorbed too (a turn's end cancels the run it drives, then cancels it again when
+    it stops waiting), so the caller never returns before it. Work that fails under a
+    cancel is logged, and the cancel is what the caller sees."""
     task = asyncio.ensure_future(coro)
     try:
         return await asyncio.shield(task)
@@ -866,9 +855,9 @@ async def _finish(
     job_id: uuid.UUID,
     *,
     status: str,
+    settings: Settings,
     error: str | None = None,
     result: dict | None = None,
-    settings: Settings | None = None,
     generation: int | None = None,
     publish: Callable[[], Awaitable[None]] | None = None,
 ) -> bool:
@@ -880,8 +869,9 @@ async def _finish(
     result, so no snapshot carries one without them, and before the document copies are
     made, which take their crops from there (docs/workspace.md § Layout).
 
-    A succeeded parse behind a library document keeps its original instead: the source
-    moves into the document's workspace directory (docs/workspace.md). A failed job's crop
+    A parse behind a library document, whatever its terminal state, keeps its original
+    instead: filed as the document's original, with a copy in a directory already
+    materialized (`_retain_source`, docs/jobs.md § Retention). A failed job's crop
     directory goes too — `run_job`'s outermost finally discards it (through the crop
     guard), so a late crop thread cannot write it back.
     """
@@ -890,16 +880,6 @@ async def _finish(
         if job is None:
             return False
         user_id = job.user_id
-    if settings is None:
-        return await _finish_held(
-            sessionmaker,
-            job_id,
-            status=status,
-            error=error,
-            result=result,
-            generation=generation,
-            publish=publish,
-        )
     # The rows that say the parse is done, and the original and copies they describe,
     # land in one backup snapshot: the backup lock is held shared from before the commit
     # until the files are in place, since the upload directory they come from is not
@@ -922,9 +902,9 @@ async def _finish_held(
     job_id: uuid.UUID,
     *,
     status: str,
+    settings: Settings,
     error: str | None = None,
     result: dict | None = None,
-    settings: Settings | None = None,
     generation: int | None = None,
     publish: Callable[[], Awaitable[None]] | None = None,
 ) -> bool:
@@ -953,7 +933,7 @@ async def _finish_held(
                     figures=result["figures"],
                     errors=result["errors"],
                     meta=result["meta"],
-                    reading_markdown=result.get("reading_markdown"),
+                    reading_markdown=result["reading_markdown"],
                 )
             )
         job.status = status
@@ -962,17 +942,15 @@ async def _finish_held(
         # The reservation settles with the state that says what the user got: consumed
         # by a result, released by a failure, in this commit (docs/billing.md § A parse).
         await ledger.settle_parse(db, job.id, status)
-        documents: list[Document] = []
-        if settings is not None:
-            # Whatever the terminal state: a failed parse's row keeps its original as a
-            # finished one does, so the upload is not lost with the error (docs/jobs.md).
-            documents = list(
-                (
-                    await db.execute(
-                        select(Document).where(Document.job_id == job.id).order_by(Document.id)
-                    )
-                ).scalars()
-            )
+        # Whatever the terminal state: a failed parse's row keeps its original as a
+        # finished one does, so the upload is not lost with the error (docs/jobs.md).
+        documents = list(
+            (
+                await db.execute(
+                    select(Document).where(Document.job_id == job.id).order_by(Document.id)
+                )
+            ).scalars()
+        )
         source = Path(job.source_path) if job.source_path else None
         if source is not None and not documents:
             if job.retain_source and source.is_file():
@@ -996,11 +974,13 @@ async def _finish_held(
         # retention then copies from that one for the recipients found above.
         try:
             await _retain_source(sessionmaker, settings, job_id, source)
-        except Exception:  # noqa: BLE001 - retention must not undo a finished parse
+        except Exception:  # retention must not undo a finished parse
             logger.exception("could not keep the source of job %s", job_id)
-    if settings is not None and documents and status == "succeeded":
+    if documents and status == "succeeded":
         # The result is committed: the document directories can take their copies now.
         async with sessionmaker() as db:
+            # Every document of a job is its user's: one parse is deduplicated per user.
+            folders = await user_folders(db, job.user_id)
             for document in documents:
                 try:
                     # The rows again, in this session: the ones above belong to the one
@@ -1008,11 +988,11 @@ async def _finish_held(
                     row = await db.get(Document, document.id)
                     # A document in the Trash gets its directory when it is put back
                     # (docs/workspace.md § The Trash); materialization refuses it anyway.
-                    if row is not None and is_live(row, await user_folders(db, row.user_id)):
+                    if row is not None and is_live(row, folders):
                         await materialize_document(db, settings, row)
-                except Exception:  # noqa: BLE001 - the parse succeeded; the copy can wait
+                except Exception:  # the parse succeeded; the copy can wait
                     logger.exception("could not materialize document %d", document.id)
-    if settings is not None and status == "succeeded":
+    if status == "succeeded":
         # A document re-converted onto this parse takes it now (docs/jobs.md
         # § Re-converting a document). Its pointer landed with the job, so it is read here.
         async with sessionmaker() as db:
@@ -1032,7 +1012,7 @@ async def _finish_held(
                     row = await db.get(Document, document_id)
                     if row is not None:
                         await take_reconvert(db, settings, row)
-                except Exception:  # noqa: BLE001 - the document's next read takes it
+                except Exception:  # the document's next read takes it
                     logger.exception("document %d could not take its re-convert", document_id)
     return True
 
@@ -1046,7 +1026,7 @@ async def retain_source(
     """The sweep's retention of a terminal parse whose worker never ran it, run to its
     end like the worker's: a shutdown's cancel would release the workspace lock under a
     copy still being made (docs/jobs.md § Retention)."""
-    await _to_the_end(_retain_source(sessionmaker, settings, job_id, source))
+    await to_the_end(_retain_source(sessionmaker, settings, job_id, source))
 
 
 async def _retain_source(
@@ -1109,7 +1089,7 @@ async def _retain_source(
                 relative = None
                 if is_live(row, folders):
                     relative = document_relative_dir(
-                        await folder_names(db, row.user_id, row.folder_id), row.name
+                        [folder.name for folder in folder_chain(folders, row.folder_id)], row.name
                     )
                 moved = source.is_file() and index == len(pending) - 1
                 if not moved:
@@ -1160,24 +1140,35 @@ async def run_job(
             return
         if generation is not None and job.worker_generation != generation:
             return
-        # A job queued for a provider connection — history, from before the operator's
-        # upstream — has no upstream to run on (docs/database.md § Rules).
-        connection = None if job.connection_id is not None else kano_connection(settings)
-        if connection is not None and job.connection_base_url != connection.snapshot:
-            # KANO_PROXY_BASE_URL changed while the job sat queued. The dedup key must
-            # name the endpoint that actually produced the result, not the one
-            # snapshotted at submission (docs/jobs.md § Dedup). Fenced
-            # like every write to the row: a replacement that took the job meanwhile
-            # keeps its own snapshot, and this run ends here (docs/jobs.md § Queue).
-            moved = await db.execute(
-                update(Job)
-                .where(Job.id == job_id, Job.status == "running", *_owned(generation))
-                .values(connection_base_url=connection.snapshot)
+        connection = kano_connection(settings)
+        if job.connection_base_url is None:
+            # A job of an upstream the deployment no longer has — OpenRouter, a provider
+            # connection: on Kano Proxy it would transcribe only the pages that upstream
+            # failed, and the mixed result would answer Kano Proxy dedup lookups
+            # (docs/database.md § Rules). It fails through the finish, which releases
+            # its credits.
+            error = (
+                "this parse ran on an upstream this deployment no longer has; upload the file again"
             )
-            if moved.rowcount != 1:
-                return
-            job.connection_base_url = connection.snapshot
-            await db.commit()
+        elif connection is None:
+            error = "Kano Proxy is not configured on this deployment"
+        else:
+            error = None
+            if job.connection_base_url != settings.kano_proxy_base_url:
+                # KANO_PROXY_BASE_URL changed while the job sat queued. The dedup key must
+                # name the endpoint that actually produced the result, not the one
+                # snapshotted at submission (docs/jobs.md § Dedup). Fenced like every
+                # write to the row: a replacement that took the job meanwhile keeps its
+                # own snapshot, and this run ends here (docs/jobs.md § Queue).
+                moved = await db.execute(
+                    update(Job)
+                    .where(Job.id == job_id, Job.status == "running", *owned_by(generation))
+                    .values(connection_base_url=settings.kano_proxy_base_url)
+                )
+                if moved.rowcount != 1:
+                    return
+                job.connection_base_url = settings.kano_proxy_base_url
+                await db.commit()
         # What an earlier attempt finished — before a requeue, or before the failure a
         # retry follows — is kept, never transcribed again (docs/jobs.md § Retrying
         # failed pages). A row with markdown is a page that succeeded; a failed one has
@@ -1195,15 +1186,10 @@ async def run_job(
 
     figures_root = Path(settings.figures_dir)
 
-    if connection is None:
-        error = (
-            "Kano Proxy is not configured on this deployment"
-            if job.connection_id is None
-            else "the provider connection for this job no longer exists"
-        )
+    if error is not None or connection is None:
         # No crop thread ever started for this run; a plain discard covers leftovers.
         discard_job_figures(figures_root, job_id)
-        await _to_the_end(
+        await to_the_end(
             _finish(
                 sessionmaker,
                 job_id,
@@ -1241,7 +1227,7 @@ async def run_job(
                 job, state, connection, source, work_dir, render_slots, sessionmaker, kept
             )
         except JobAborted as exc:
-            await _to_the_end(
+            await to_the_end(
                 _finish(
                     sessionmaker,
                     job_id,
@@ -1253,7 +1239,7 @@ async def run_job(
             )
             return
         except (poppler.PopplerError, ImageError, ValueError):
-            await _to_the_end(
+            await to_the_end(
                 _finish(
                     sessionmaker,
                     job_id,
@@ -1268,7 +1254,7 @@ async def run_job(
             # A worker must not die on one job. The traceback goes to the log; the job row
             # carries no internals and no document content.
             logger.exception("job %s failed unexpectedly", job_id)
-            await _to_the_end(
+            await to_the_end(
                 _finish(
                     sessionmaker,
                     job_id,
@@ -1291,7 +1277,7 @@ async def run_job(
             reasons = "; ".join(f"page {o.page}: {o.error}" for o in failed[:5])
             if len(failed) > 5:
                 reasons += "; …"
-            await _to_the_end(
+            await to_the_end(
                 _finish(
                     sessionmaker,
                     job_id,
@@ -1322,17 +1308,20 @@ async def run_job(
         if job.check_model:
             # The check speaks the Messages API, on Kano Proxy's Anthropic-format route.
             check_connection = kano_connection(settings, anthropic=True)
+            # The run failed before its first page when Kano Proxy is not configured.
+            assert check_connection is not None
 
-            async def bill(completed: CompletedMessage) -> None:
-                await _to_the_end(_record_check_usage(sessionmaker, job, completed))
+            async def bill(usage: ChatUsage) -> None:
+                await to_the_end(_record_check_usage(sessionmaker, job, usage))
 
             try:
                 checked = await run_check(
                     check_connection,
                     settings,
                     model=job.check_model,
-                    effort=job.check_effort or EFFORT_DEFAULT,
-                    system=job.check_prompt or CHECK.default_prompt_template,
+                    # Written with check_model, from one CheckTarget (jobs/queue.py).
+                    effort=job.check_effort,
+                    system=job.check_prompt,
                     markdown=document.markdown,
                     on_usage=bill,
                 )
@@ -1343,7 +1332,7 @@ async def run_job(
                 checked, reason = None, "internal error"
             if checked is None:
                 logger.warning("job %s format check failed: %s", job_id, reason)
-                await _to_the_end(
+                await to_the_end(
                     _finish(
                         sessionmaker,
                         job_id,
@@ -1399,13 +1388,7 @@ async def run_job(
             # and their readers have (docs/api.md).
             "errors": [],
             "meta": {
-                "job_id": str(job.id),
-                "agent": job.agent,
-                "model": job.model,
-                "bbox_format": job.bbox_format,
-                "pipeline_version": job.pipeline_version,
-                "sha256": job.sha256,
-                "cached": False,
+                **_base_meta(job),
                 **({"check": check_meta} if check_meta is not None else {}),
                 **(
                     {
@@ -1426,7 +1409,7 @@ async def run_job(
         # would otherwise drop the workspace and backup locks under a copy still being
         # made, leave the crops unpublished, and hand the worker a job to requeue that
         # is already done.
-        if not await _to_the_end(finish_and_publish()):
+        if not await to_the_end(finish_and_publish()):
             succeeded = False
     finally:
         if not succeeded:
@@ -1476,4 +1459,4 @@ async def _process_job(
     except* JobAborted as aborted:
         # One page hit a job-ending failure; the group has already cancelled the rest.
         raise JobAborted(str(aborted.exceptions[0])) from None
-    return [outcomes[page_no] for page_no in page_numbers if page_no in outcomes]
+    return [outcomes[page_no] for page_no in page_numbers]

@@ -175,14 +175,9 @@ function inside(event: Event): boolean {
   return Boolean(menu.value?.contains(target) || sub.value?.contains(target))
 }
 
-function onPointerdownOutside(event: PointerEvent) {
-  if (!inside(event)) {
-    emit('close', event)
-  }
-}
-
-/** A second right-click closes this menu; the page opens the next one from its own handler. */
-function onContextmenuOutside(event: MouseEvent) {
+/** A press or a right-click outside closes this menu; on a second right-click the page
+ *  opens the next one from its own handler. */
+function closeIfOutside(event: Event) {
   if (!inside(event)) {
     emit('close', event)
   }
@@ -306,7 +301,7 @@ async function place() {
       props.at,
       { width: element.offsetWidth, height: element.offsetHeight },
       { width: window.innerWidth, height: window.innerHeight },
-      { above: props.above },
+      props.above,
     )
     position.value = at
     origin.value = `${at.x < props.at.x ? 'right' : 'left'} ${at.y < props.at.y ? 'bottom' : 'top'}`
@@ -339,8 +334,8 @@ watch(
 onMounted(() => {
   previouslyFocused = document.activeElement as HTMLElement | null
   void place()
-  window.addEventListener('pointerdown', onPointerdownOutside, true)
-  window.addEventListener('contextmenu', onContextmenuOutside, true)
+  window.addEventListener('pointerdown', closeIfOutside, true)
+  window.addEventListener('contextmenu', closeIfOutside, true)
   window.addEventListener('resize', close)
   // Capture, because the scroll that matters happens inside a panel, not on the window.
   window.addEventListener('scroll', onScrollOutside, true)
@@ -348,8 +343,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   clearTimeout(restTimer)
-  window.removeEventListener('pointerdown', onPointerdownOutside, true)
-  window.removeEventListener('contextmenu', onContextmenuOutside, true)
+  window.removeEventListener('pointerdown', closeIfOutside, true)
+  window.removeEventListener('contextmenu', closeIfOutside, true)
   window.removeEventListener('resize', close)
   window.removeEventListener('scroll', onScrollOutside, true)
   previouslyFocused?.focus?.()
@@ -420,7 +415,7 @@ function choose(item: MenuItem, event?: MouseEvent) {
           <UiIcon v-if="item.checked" name="check" />
           <UiIcon v-else-if="item.icon" :name="item.icon" />
           <span v-else class="icon-space" />
-          <span class="label" :class="{ mono: item.labelMono, described: item.description }">{{ item.label }}</span>
+          <span class="label" :class="{ described: item.description }">{{ item.label }}</span>
           <span v-if="item.description" class="description">{{ item.description }}</span>
           <span v-if="item.shortcut" class="shortcut" :class="{ mono: item.shortcutMono }">{{ item.shortcut }}</span>
           <UiIcon v-if="item.children" name="chevron-right" class="chevron" />
@@ -456,7 +451,7 @@ function choose(item: MenuItem, event?: MouseEvent) {
         <UiIcon v-if="child.checked" name="check" />
         <UiIcon v-else-if="child.icon" :name="child.icon" />
         <span v-else class="icon-space" />
-        <span class="label" :class="{ mono: child.labelMono, described: child.description }">{{ child.label }}</span>
+        <span class="label" :class="{ described: child.description }">{{ child.label }}</span>
         <span v-if="child.description" class="description">{{ child.description }}</span>
         <span v-if="child.shortcut" class="shortcut" :class="{ mono: child.shortcutMono }">{{ child.shortcut }}</span>
       </button>
@@ -636,9 +631,9 @@ function choose(item: MenuItem, event?: MouseEvent) {
   text-overflow: ellipsis;
 }
 
-/* A skill's name and what it does on one line: the name keeps its width, up to most of the
+/* A label and its description on one line: the label keeps its width, up to most of the
    row, and the description takes the rest, cut with an ellipsis — shrunk in proportion to
-   their widths, a long description would cut the name to a letter. */
+   their widths, a long description would cut the label to a letter. */
 .label.described {
   flex: 0 0 auto;
   max-width: 70%;

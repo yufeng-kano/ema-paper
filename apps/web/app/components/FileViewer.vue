@@ -12,7 +12,7 @@
  * preview, that the agent can still read it, and Download.
  */
 import type { ComponentPublicInstance } from 'vue'
-import { documentFileUrl, type LibraryDocument } from '~/lib/api'
+import { documentFileUrl, readDocumentFileHead, type LibraryDocument } from '~/lib/api'
 import { formatBytes, formatShortDateTime } from '~/lib/format'
 import { documentGlyph, filePreview, isMarkdownFile } from '~/lib/library'
 import type { MenuFact, Point } from '~/lib/menu'
@@ -58,15 +58,9 @@ const textError = ref<string | null>(null)
 
 async function readText() {
   try {
-    const response = await fetch(url.value, {
-      headers: { Range: `bytes=0-${TEXT_PREVIEW_MAX - 1}` },
-      credentials: 'same-origin',
-    })
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-    textCut.value = response.status === 206 && (props.document.size_bytes ?? 0) > TEXT_PREVIEW_MAX
-    text.value = await response.text()
+    const head = await readDocumentFileHead(props.document.id, TEXT_PREVIEW_MAX)
+    textCut.value = head.partial && (props.document.size_bytes ?? 0) > TEXT_PREVIEW_MAX
+    text.value = head.text
   } catch (error) {
     textError.value = await resolve(error)
   }
@@ -157,22 +151,20 @@ function onMoreSelect(key: string) {
     </template>
 
     <div class="file" :class="preview">
-      <img v-if="preview === 'image'" class="media" :src="url" :alt="document.name">
-      <video v-else-if="preview === 'video'" class="media" :src="url" controls preload="metadata" />
+      <video v-if="preview === 'video'" class="media" :src="url" controls preload="metadata" />
       <div v-else-if="preview === 'audio'" class="sheet">
         <UiIcon :name="glyph" class="sheet-glyph" />
         <p class="sheet-name">{{ document.name }}</p>
         <p class="sheet-facts">{{ facts }}</p>
         <audio class="audio" :src="url" controls preload="metadata" />
       </div>
-      <iframe v-else-if="preview === 'pdf'" class="frame" :src="url" :title="document.name" />
       <template v-else-if="preview === 'text'">
         <UiBanner v-if="textError" tone="error">{{ textError }}</UiBanner>
         <UiSkeleton v-else-if="text === null" class="text-wait" :rows="8" />
         <div v-else class="text-pane">
           <pre class="text mono">{{ text }}</pre>
           <p v-if="textCut" class="text-cut">
-            {{ t('viewer.file.textCut', { size: formatBytes(TEXT_PREVIEW_MAX, locale) }) }}
+            {{ t('viewer.file.textCut', { size: formatBytes(TEXT_PREVIEW_MAX, locale, { limit: true }) }) }}
           </p>
         </div>
       </template>
@@ -233,12 +225,6 @@ function onMoreSelect(key: string) {
   overflow: auto;
 }
 
-.file.pdf {
-  display: block;
-  padding: 0;
-  overflow: hidden;
-}
-
 .file.text {
   place-items: start center;
 }
@@ -248,13 +234,6 @@ function onMoreSelect(key: string) {
   max-height: 100%;
   border-radius: var(--radius-card);
   object-fit: contain;
-}
-
-.frame {
-  display: block;
-  width: 100%;
-  height: 100%;
-  border: 0;
 }
 
 .text-pane,

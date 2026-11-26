@@ -40,11 +40,11 @@ export type ViewerLayout = 'phone' | 'tablet' | 'desktop'
 
 /** Below this width, one pane at a time: the document's minimum beside the smallest card no
  *  longer fits. */
-export const PHONE_MAX_WIDTH = 700
+const PHONE_MAX_WIDTH = 700
 /** Up to this width, one card at a time beside the document. */
-export const TABLET_MAX_WIDTH = 900
+const TABLET_MAX_WIDTH = 900
 /** A touch screen no taller than this is a phone on its side. */
-export const PHONE_MAX_HEIGHT = 500
+const PHONE_MAX_HEIGHT = 500
 
 export function viewerLayout(view: { width: number; height: number }, coarse: boolean): ViewerLayout {
   if (view.width < PHONE_MAX_WIDTH || (coarse && view.height <= PHONE_MAX_HEIGHT)) {

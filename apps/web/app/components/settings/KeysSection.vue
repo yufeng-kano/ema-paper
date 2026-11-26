@@ -132,7 +132,7 @@ async function confirmRevoke() {
             <p>{{ t('keys.createdWarning') }}</p>
           </div>
           <template #actions>
-            <UiCopyButton :text="createdKey.key" variant="secondary" size="sm" labelled />
+            <UiCopyButton :text="createdKey.key" size="sm" labelled />
             <UiButton
               variant="ghost"
               size="sm"
@@ -199,7 +199,7 @@ async function confirmRevoke() {
            example carries the header, so no sentence restates it. -->
       <UiPanel :title="t('keys.restTitle')">
         <template #meta>
-          <UiCopyButton :text="curlExample" variant="secondary" size="xs" labelled />
+          <UiCopyButton :text="curlExample" size="xs" labelled />
         </template>
         <pre class="code mono">{{ curlExample }}</pre>
       </UiPanel>

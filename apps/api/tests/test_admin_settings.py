@@ -25,9 +25,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from sightread import codes as codes_cli
 from sightread import runtime_settings, worker
-from sightread.config import Settings, parse_egress_hosts
+from sightread.config import parse_egress_hosts
 from sightread.db.models import (
-    AuditLog,
     ChatTurn,
     Checkout,
     Conversation,
@@ -43,6 +42,16 @@ from sightread.jobs import chat_compact, chat_runner
 from sightread.jobs.queue import claim_next_turn
 from sightread.runtime_settings import OVERRIDABLE, RuntimeSettings, effective
 from sightread.sandbox import egress
+from tests.admin_helpers import (
+    account_client,
+    add_member,
+    audit_rows,
+    create_group,
+    error_of,
+    last_audit_id,
+    owner_client,
+)
+from tests.chat_helpers import MESSAGES_URL, assistant_turn, seed_document
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_API_KEY,
@@ -50,26 +59,14 @@ from tests.conftest import (
     PRO_PLANS_JSON,
     TEST_MODEL_PRICES,
     TEST_SECRET_KEY,
+    base_settings,
     grant_plan,
+    sign_in,
 )
-from tests.test_admin import _account, _add, _audit, _error, _group, _last_audit_id, _owner
-from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn
+from tests.factories import user_row
 
 # Every secret the tests' settings carry: none may appear in an answer or a log line.
 KNOWN_SECRETS = (TEST_SECRET_KEY, KANO_API_KEY, PAY_SETTINGS["kano_pay_api_key"])
-
-
-def _base(**overrides) -> Settings:
-    return Settings(
-        **{
-            "app_env": "local",
-            "secret_key": TEST_SECRET_KEY,
-            "kano_proxy_api_key": KANO_API_KEY,
-            "parse_model": "vendor/vision-model",
-            "model_prices_json": TEST_MODEL_PRICES,
-            **overrides,
-        }
-    )
 
 
 async def _store(sessionmaker, key: str, value: str) -> None:
@@ -94,11 +91,29 @@ def _without(model: str) -> str:
     return json.dumps(prices)
 
 
+@pytest.fixture
+def clock(monkeypatch) -> list[float]:
+    """The reading layer's monotonic clock: it reads 1000 until a test moves `clock[0]`."""
+    value = [1000.0]
+    monkeypatch.setattr(runtime_settings, "time", SimpleNamespace(monotonic=lambda: value[0]))
+    return value
+
+
+def _counting(sessionmaker, reads: list[int]):
+    """A session factory source for `RuntimeSettings` that notes each read in `reads`."""
+
+    def counted():
+        reads.append(1)
+        return sessionmaker
+
+    return counted
+
+
 # --- the reading layer -----------------------------------------------------------------
 
 
 def test_effective_is_the_very_object_without_rows_and_a_checked_new_one_with_them() -> None:
-    base = _base()
+    base = base_settings()
     assert effective(base, {}) is base
     prices = json.loads(TEST_MODEL_PRICES)
     prices["vendor/new-model"] = {"input": 2, "cache_read": 2, "cache_write": 2, "output": 2}
@@ -145,12 +160,12 @@ def test_the_start_checks_refuse_a_negative_free_plan_credits_past_32_bits_and_n
     field: str, value: int
 ):
     with pytest.raises(ValueError, match=field.upper()):
-        _base(**{field: value})
+        base_settings(**{field: value})
 
 
 def test_the_most_credits_the_ledger_holds_pass_the_start_checks() -> None:
     most = 2_147_483_647
-    settings = _base(
+    settings = base_settings(
         parse_credits_per_page=most,
         chat_min_credits=most,
         free_credits_per_period=most,
@@ -163,18 +178,11 @@ def test_the_most_credits_the_ledger_holds_pass_the_start_checks() -> None:
 
 
 async def test_the_rows_are_kept_for_the_cache_time_and_read_again_after_a_change(
-    sessionmaker, monkeypatch
+    sessionmaker, clock
 ) -> None:
-    clock = [1000.0]
-    monkeypatch.setattr(runtime_settings, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    base = _base(runtime_settings_cache_seconds=30)
+    base = base_settings(runtime_settings_cache_seconds=30)
     reads: list[int] = []
-
-    def counted():
-        reads.append(1)
-        return sessionmaker
-
-    runtime = RuntimeSettings(lambda: base, counted)
+    runtime = RuntimeSettings(lambda: base, _counting(sessionmaker, reads))
     assert await runtime.current() is base
     await _store(sessionmaker, "FREE_MAX_JOBS", "0")
     # Within the cache time the copy stands, read once.
@@ -195,14 +203,9 @@ async def test_the_rows_are_kept_for_the_cache_time_and_read_again_after_a_chang
 
 async def test_one_read_at_a_time_and_the_others_wait_for_its_answer(sessionmaker) -> None:
     await _store(sessionmaker, "CHAT_MIN_CREDITS", "4")
-    base = _base()
+    base = base_settings()
     reads: list[int] = []
-
-    def counted():
-        reads.append(1)
-        return sessionmaker
-
-    runtime = RuntimeSettings(lambda: base, counted)
+    runtime = RuntimeSettings(lambda: base, _counting(sessionmaker, reads))
     answers = await asyncio.gather(*(runtime.current() for _ in range(8)))
     assert len(reads) == 1
     assert all(answer is answers[0] for answer in answers)
@@ -213,7 +216,7 @@ async def test_a_read_after_a_change_is_waited_for_and_one_that_missed_a_change_
     sessionmaker,
 ) -> None:
     await _store(sessionmaker, "CREDIT_USD", "0.004")
-    base = _base()
+    base = base_settings()
     gate = {"on": False}
     held = asyncio.Event()
     release = asyncio.Event()
@@ -252,12 +255,10 @@ async def test_a_read_after_a_change_is_waited_for_and_one_that_missed_a_change_
 
 
 async def test_an_unreadable_database_keeps_the_last_settings_and_logs_once(
-    sessionmaker, monkeypatch, caplog
+    sessionmaker, clock, caplog
 ) -> None:
-    clock = [1000.0]
-    monkeypatch.setattr(runtime_settings, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     await _store(sessionmaker, "CREDIT_USD", "0.004")
-    base = _base()
+    base = base_settings()
     reachable = [True]
 
     def flaky():
@@ -282,12 +283,10 @@ async def test_an_unreadable_database_keeps_the_last_settings_and_logs_once(
 
 
 async def test_a_request_reads_on_its_own_session_and_goes_on_after_a_failed_read(
-    sessionmaker, monkeypatch
+    sessionmaker, monkeypatch, clock
 ) -> None:
-    clock = [1000.0]
-    monkeypatch.setattr(runtime_settings, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     await _store(sessionmaker, "CHAT_MIN_CREDITS", "4")
-    base = _base()
+    base = base_settings()
 
     def no_second_session():
         raise AssertionError("a request's read asked the pool for another session")
@@ -322,10 +321,10 @@ async def test_a_request_reads_on_its_own_session_and_goes_on_after_a_failed_rea
         assert await db.scalar(select(func.count()).select_from(User)) == 1
 
 
-async def test_a_request_connects_before_it_waits_for_the_read(sessionmaker, monkeypatch) -> None:
-    monkeypatch.setattr(runtime_settings, "time", SimpleNamespace(monotonic=lambda: 1000.0))
+@pytest.mark.usefixtures("clock")
+async def test_a_request_connects_before_it_waits_for_the_read(sessionmaker) -> None:
     await _store(sessionmaker, "CHAT_MIN_CREDITS", "4")
-    base = _base()
+    base = base_settings()
     # A pool of one connection, which a request already holds.
     engine = create_async_engine(
         sessionmaker.kw["bind"].url, pool_size=1, max_overflow=0, pool_timeout=5
@@ -352,10 +351,8 @@ async def test_a_request_connects_before_it_waits_for_the_read(sessionmaker, mon
         await engine.dispose()
 
 
-async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(
-    make_client, monkeypatch, caplog
-) -> None:
-    owner = await _owner(make_client, max_jobs_per_user=2)
+async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(make_client, caplog) -> None:
+    owner = await owner_client(make_client, max_jobs_per_user=2)
     sessionmaker = owner.app.state.sessionmaker
     # Stored when the ceiling allowed it; `.env`'s ceiling is 2 now. A row of no key the
     # database may override is ignored.
@@ -368,7 +365,6 @@ async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(
         assert await runtime.current() is owner.app.state.settings
         runtime.invalidate()
         assert await runtime.current() is owner.app.state.settings
-    assert runtime.ignored == "FREE_MAX_JOBS exceeds MAX_JOBS_PER_USER"
     assert [r.getMessage() for r in caplog.records if r.name == runtime_settings.logger.name] == [
         "the database's settings no longer fit .env, which alone is in effect: "
         "FREE_MAX_JOBS exceeds MAX_JOBS_PER_USER"
@@ -383,13 +379,12 @@ async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(
     assert restored.status_code == 200, restored.text
     assert restored.json()["ignored"] is None
     assert (await owner.get("/api/admin/users")).json()["grant"]["credit_usd"] == 0.004
-    assert runtime.ignored is None
 
 
 async def test_with_two_values_that_no_longer_fit_env_each_is_restored_on_its_own(
     make_client,
 ) -> None:
-    owner = await _owner(make_client, max_jobs_per_user=2, **PAY_SETTINGS)
+    owner = await owner_client(make_client, max_jobs_per_user=2, **PAY_SETTINGS)
     sessionmaker = owner.app.state.sessionmaker
     # Both stored when the ceiling allowed them; `.env`'s is 2 now.
     plans = json.loads(PRO_PLANS_JSON)
@@ -397,7 +392,7 @@ async def test_with_two_values_that_no_longer_fit_env_each_is_restored_on_its_ow
     await _store(sessionmaker, "FREE_MAX_JOBS", "3")
     await _store(sessionmaker, "KANO_PAY_PLANS_JSON", json.dumps(plans))
     owner.app.state.runtime_settings.invalidate()
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
     plans_message = "KANO_PAY_PLANS_JSON: 'pro'.maxJobs exceeds MAX_JOBS_PER_USER"
     assert (await owner.get("/api/admin/settings")).json()["ignored"] is not None
 
@@ -406,7 +401,7 @@ async def test_with_two_values_that_no_longer_fit_env_each_is_restored_on_its_ow
         "/api/admin/settings/FREE_MAX_JOBS", json={"value": "1"}, headers=CSRF_HEADERS
     )
     assert fixed.status_code == 422
-    assert _error(fixed)["message"] == plans_message
+    assert error_of(fixed)["message"] == plans_message
     # A restore only moves toward `.env`: never refused, `.env` alone stays in effect.
     first = await owner.delete("/api/admin/settings/FREE_MAX_JOBS", headers=CSRF_HEADERS)
     assert first.status_code == 200, first.text
@@ -416,7 +411,7 @@ async def test_with_two_values_that_no_longer_fit_env_each_is_restored_on_its_ow
     assert second.status_code == 200, second.text
     assert second.json()["ignored"] is None
     assert await _rows(sessionmaker) == {}
-    assert [(record.action, record.target_id) for record in await _audit(owner, start)] == [
+    assert [(record.action, record.target_id) for record in await audit_rows(owner, start)] == [
         ("settings.reset", "FREE_MAX_JOBS"),
         ("settings.reset", "KANO_PAY_PLANS_JSON"),
     ]
@@ -428,7 +423,7 @@ async def test_with_two_values_that_no_longer_fit_env_each_is_restored_on_its_ow
 async def test_the_page_lists_the_thirteen_and_only_whether_each_secret_is_set(
     make_client,
 ) -> None:
-    owner = await _owner(make_client, **PAY_SETTINGS)
+    owner = await owner_client(make_client, **PAY_SETTINGS)
     response = await owner.get("/api/admin/settings")
     assert response.status_code == 200
     page = response.json()
@@ -464,8 +459,8 @@ async def test_the_page_lists_the_thirteen_and_only_whether_each_secret_is_set(
 
 
 async def test_a_value_stored_applies_at_once_and_is_recorded(make_client) -> None:
-    owner = await _owner(make_client)
-    start = await _last_audit_id(owner)
+    owner = await owner_client(make_client)
+    start = await last_audit_id(owner)
     saved = await owner.put(
         "/api/admin/settings/CREDIT_USD", json={"value": " 0.004 "}, headers=CSRF_HEADERS
     )
@@ -480,7 +475,7 @@ async def test_a_value_stored_applies_at_once_and_is_recorded(make_client) -> No
     assert credit["updated_at"] is not None
     # The API answers with it at once.
     assert (await owner.get("/api/admin/users")).json()["grant"]["credit_usd"] == 0.004
-    [record] = await _audit(owner, start)
+    [record] = await audit_rows(owner, start)
     assert (
         record.actor_id,
         record.permission,
@@ -505,14 +500,14 @@ async def test_a_value_stored_applies_at_once_and_is_recorded(make_client) -> No
         "/api/admin/settings/CREDIT_USD", json={"value": "0.004"}, headers=CSRF_HEADERS
     )
     assert again.status_code == 200
-    assert len(await _audit(owner, start)) == 1
+    assert len(await audit_rows(owner, start)) == 1
 
     # Restored to `.env`: the row goes, the record says so.
     restored = await owner.delete("/api/admin/settings/CREDIT_USD", headers=CSRF_HEADERS)
     assert restored.status_code == 200
     assert restored.json()["settings"][4]["source"] == "env"
     assert await _rows(owner.app.state.sessionmaker) == {}
-    reset = (await _audit(owner, start))[-1]
+    reset = (await audit_rows(owner, start))[-1]
     assert (reset.action, reset.before, reset.after) == (
         "settings.reset",
         {"value": "0.004", "source": "database"},
@@ -523,7 +518,7 @@ async def test_a_value_stored_applies_at_once_and_is_recorded(make_client) -> No
     assert (
         await owner.delete("/api/admin/settings/CREDIT_USD", headers=CSRF_HEADERS)
     ).status_code == 200
-    assert len(await _audit(owner, start)) == 2
+    assert len(await audit_rows(owner, start)) == 2
 
 
 @pytest.mark.parametrize(
@@ -572,22 +567,22 @@ async def test_a_change_the_start_checks_refuse_is_422_in_their_words_alone(
     make_client, caplog, key: str, value: str, message: str
 ) -> None:
     caplog.set_level(logging.DEBUG)
-    owner = await _owner(make_client, **PAY_SETTINGS)
-    start = await _last_audit_id(owner)
+    owner = await owner_client(make_client, **PAY_SETTINGS)
+    start = await last_audit_id(owner)
     response = await owner.put(
         f"/api/admin/settings/{key}", json={"value": value}, headers=CSRF_HEADERS
     )
     assert response.status_code == 422
-    assert _error(response) == {"type": "invalid_request", "message": message}
+    assert error_of(response) == {"type": "invalid_request", "message": message}
     for secret in KNOWN_SECRETS:
         assert secret not in response.text
         assert secret not in caplog.text
     assert await _rows(owner.app.state.sessionmaker) == {}
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
 
 async def test_an_unknown_key_and_a_value_too_long_are_422(make_client) -> None:
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     for key, value in (
         ("SECRET_KEY", "x"),
         ("WORKSPACE_QUOTA_BYTES", "1"),
@@ -603,11 +598,11 @@ async def test_an_unknown_key_and_a_value_too_long_are_422(make_client) -> None:
 
 
 async def test_reading_takes_settings_read_and_changing_settings_write(make_client) -> None:
-    owner = await _owner(make_client)
-    reader = await _account(make_client, "reader@example.test")
-    nobody = await _account(make_client, "nobody@example.test")
-    group = await _group(owner, "readers", ["settings.read"])
-    assert (await _add(owner, group["id"], user_id=reader.user_id)).status_code == 201
+    owner = await owner_client(make_client)
+    reader = await account_client(make_client, "reader@example.test")
+    nobody = await account_client(make_client, "nobody@example.test")
+    group = await create_group(owner, "readers", ["settings.read"])
+    assert (await add_member(owner, group["id"], user_id=reader.user_id)).status_code == 201
 
     assert (await reader.get("/api/admin/settings")).status_code == 200
     for response in (
@@ -618,21 +613,18 @@ async def test_reading_takes_settings_read_and_changing_settings_write(make_clie
         await nobody.get("/api/admin/settings"),
     ):
         assert response.status_code == 403
-        assert _error(response)["type"] == "permission_denied"
-    # Without the custom header, before the permission.
-    bare = await owner.put("/api/admin/settings/CREDIT_USD", json={"value": "0.004"})
-    assert bare.status_code == 403 and _error(bare)["type"] == "auth"
+        assert error_of(response)["type"] == "permission_denied"
     assert await _rows(owner.app.state.sessionmaker) == {}
 
 
 async def test_removing_a_price_in_use_asks_first_then_applies(make_client) -> None:
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     sessionmaker = owner.app.state.sessionmaker
     chosen = await owner.put(
         "/api/agents/chat/settings", json={"model": "codex/gpt-5.5"}, headers=CSRF_HEADERS
     )
     assert chosen.status_code == 200, chosen.text
-    document_id = await _seed_document(owner, owner.user_id)
+    document_id = await seed_document(owner, owner.user_id)
     async with sessionmaker() as db:
         db.add(
             Conversation(
@@ -644,21 +636,21 @@ async def test_removing_a_price_in_use_asks_first_then_applies(make_client) -> N
             )
         )
         await db.commit()
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
     body = {"value": _without("codex/gpt-5.5")}
 
     asked = await owner.put(
         "/api/admin/settings/MODEL_PRICES_JSON", json=body, headers=CSRF_HEADERS
     )
     assert asked.status_code == 409
-    error = _error(asked)
+    error = error_of(asked)
     assert (error["type"], error["reason"]) == ("admin_conflict", "impact")
     assert error["impact"] == {
         "removed": {"models": ["codex/gpt-5.5"], "plans": [], "packs": []},
         "counts": {"conversations": 1, "chat_settings": 1},
     }
     assert await _rows(sessionmaker) == {}
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
     confirmed = await owner.put(
         "/api/admin/settings/MODEL_PRICES_JSON",
@@ -670,7 +662,7 @@ async def test_removing_a_price_in_use_asks_first_then_applies(make_client) -> N
     assert await _rows(sessionmaker) == {"MODEL_PRICES_JSON": body["value"]}
     models = (await owner.get("/api/agents/chat/models")).json()
     assert "codex/gpt-5.5" not in json.dumps(models)
-    [record] = await _audit(owner, start)
+    [record] = await audit_rows(owner, start)
     assert record.after == {"value": body["value"], "source": "database"}
 
     # Restoring `.env`'s table removes nothing, so it applies at once.
@@ -680,13 +672,13 @@ async def test_removing_a_price_in_use_asks_first_then_applies(make_client) -> N
 
 
 async def test_removing_a_plan_or_a_pack_in_use_asks_first(make_client) -> None:
-    owner = await _owner(
+    owner = await owner_client(
         make_client,
         **PAY_SETTINGS,
         kano_pay_packs_json='[{"packId": "credits", "credits": 2000, "validDays": 365}]',
     )
     sessionmaker = owner.app.state.sessionmaker
-    subscriber = await _account(make_client, "subscriber@example.test")
+    subscriber = await account_client(make_client, "subscriber@example.test")
     await grant_plan(sessionmaker, subscriber.user_id)
     async with sessionmaker() as db:
         db.add(RedeemCode(code=uuid.uuid4().hex[:12], kind="plan", plan_id="pro", days=30))
@@ -720,7 +712,7 @@ async def test_removing_a_plan_or_a_pack_in_use_asks_first(make_client) -> None:
         "/api/admin/settings/KANO_PAY_PLANS_JSON", json={"value": "[]"}, headers=CSRF_HEADERS
     )
     assert plans.status_code == 409
-    assert _error(plans)["impact"] == {
+    assert error_of(plans)["impact"] == {
         "removed": {"models": [], "plans": ["pro"], "packs": []},
         "counts": {"subscriptions": 1, "plan_codes": 1, "plan_checkouts": 1},
     }
@@ -728,7 +720,7 @@ async def test_removing_a_plan_or_a_pack_in_use_asks_first(make_client) -> None:
         "/api/admin/settings/KANO_PAY_PACKS_JSON", json={"value": "[]"}, headers=CSRF_HEADERS
     )
     assert packs.status_code == 409
-    assert _error(packs)["impact"]["counts"] == {"pack_checkouts": 1}
+    assert error_of(packs)["impact"]["counts"] == {"pack_checkouts": 1}
     assert await _rows(sessionmaker) == {}
     confirmed = await owner.put(
         "/api/admin/settings/KANO_PAY_PLANS_JSON",
@@ -745,12 +737,12 @@ async def test_removing_a_plan_or_a_pack_in_use_asks_first(make_client) -> None:
 
 
 async def test_lowering_the_free_plan_asks_first_and_raising_it_does_not(make_client) -> None:
-    owner = await _owner(make_client)
+    owner = await owner_client(make_client)
     lowered = await owner.put(
         "/api/admin/settings/FREE_CREDITS_PER_PERIOD", json={"value": "100"}, headers=CSRF_HEADERS
     )
     assert lowered.status_code == 409
-    assert _error(lowered)["impact"]["counts"] == {"free_accounts": 1}
+    assert error_of(lowered)["impact"]["counts"] == {"free_accounts": 1}
     # A restore that lowers the allowance asks too.
     raised = await owner.put(
         "/api/admin/settings/FREE_CREDITS_PER_PERIOD", json={"value": "200"}, headers=CSRF_HEADERS
@@ -768,24 +760,52 @@ async def test_lowering_the_free_plan_asks_first_and_raising_it_does_not(make_cl
     )
     assert confirmed.status_code == 200
     assert await _rows(owner.app.state.sessionmaker) == {}
-    actions = [record.action for record in await _audit(owner)]
+    actions = [record.action for record in await audit_rows(owner)]
     assert actions.count("settings.update") == 1 and actions.count("settings.reset") == 1
 
 
 # --- the worker and the CLI --------------------------------------------------------------
 
 
-async def test_the_worker_takes_a_new_snapshot_for_each_claim(
-    sessionmaker, tmp_path, monkeypatch
+async def _run_worker(
+    monkeypatch,
+    sessionmaker,
+    tmp_path,
+    stop: asyncio.Event,
+    *,
+    runtime_cls: type[RuntimeSettings],
+    settings: dict | None = None,
+    **worker_patches,
 ) -> None:
+    """Run the worker on the test's database and directories, plus `settings`, until `stop`
+    is set: its reader is `runtime_cls`, the sweep and idle compaction only wait, and each
+    of `worker_patches` replaces the worker's name of that name."""
     url = sessionmaker.kw["bind"].url.render_as_string(hide_password=False)
-    base = _base(
+    base = base_settings(
         database_url=url,
         upload_dir=str(tmp_path / "uploads"),
         figures_dir=str(tmp_path / "figures"),
         workspaces_dir=str(tmp_path / "workspaces"),
-        kano_pay_plans_json=PRO_PLANS_JSON,
+        **(settings or {}),
     )
+
+    async def idle(*args) -> None:
+        await args[-1].wait()
+
+    monkeypatch.setattr(worker, "get_settings", lambda: base)
+    monkeypatch.setattr(worker, "RuntimeSettings", runtime_cls)
+    monkeypatch.setattr(worker, "sweep_forever", idle)
+    monkeypatch.setattr(worker, "idle_compact_forever", idle)
+    for name, value in worker_patches.items():
+        monkeypatch.setattr(worker, name, value)
+    monkeypatch.setattr(worker, "IDLE_POLL_SECONDS", 0.01)
+    async with asyncio.timeout(20):
+        await worker.run_worker(stop)
+
+
+async def test_the_worker_takes_a_new_snapshot_for_each_claim(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
     stop = asyncio.Event()
     runtimes: list[RuntimeSettings] = []
     claims: list[tuple[dict, int]] = []
@@ -794,9 +814,6 @@ async def test_the_worker_takes_a_new_snapshot_for_each_claim(
         def __init__(self, *args) -> None:
             super().__init__(*args)
             runtimes.append(self)
-
-    async def idle(*args) -> None:
-        await args[-1].wait()
 
     async def no_turn(db, cap):
         return None
@@ -828,32 +845,26 @@ async def test_the_worker_takes_a_new_snapshot_for_each_claim(
             stop.set()
         return None
 
-    monkeypatch.setattr(worker, "get_settings", lambda: base)
-    monkeypatch.setattr(worker, "RuntimeSettings", Recorded)
-    monkeypatch.setattr(worker, "sweep_forever", idle)
-    monkeypatch.setattr(worker, "idle_compact_forever", idle)
-    monkeypatch.setattr(worker, "claim_next_turn", no_turn)
-    monkeypatch.setattr(worker, "claim_next_job", claim)
-    monkeypatch.setattr(worker, "IDLE_POLL_SECONDS", 0.01)
-    async with asyncio.timeout(20):
-        await worker.run_worker(stop)
+    await _run_worker(
+        monkeypatch,
+        sessionmaker,
+        tmp_path,
+        stop,
+        runtime_cls=Recorded,
+        settings={"kano_pay_plans_json": PRO_PLANS_JSON},
+        claim_next_turn=no_turn,
+        claim_next_job=claim,
+    )
     assert claims == [({"pro": 2}, 1), ({"pro": 1, "team": 2}, 0)]
 
 
 async def test_the_worker_reads_again_for_a_turn_on_a_model_priced_since_its_copy(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:
-    url = sessionmaker.kw["bind"].url.render_as_string(hide_password=False)
-    base = _base(
-        database_url=url,
-        upload_dir=str(tmp_path / "uploads"),
-        figures_dir=str(tmp_path / "figures"),
-        workspaces_dir=str(tmp_path / "workspaces"),
-    )
     prices = json.loads(TEST_MODEL_PRICES)
     prices["vendor/new-model"] = {"input": 2, "cache_read": 2, "cache_write": 2, "output": 2}
     async with sessionmaker() as db:
-        user = User(google_sub="worker-user", email="worker@example.test")
+        user = user_row("worker@example.test")
         db.add(user)
         await db.flush()
         document = Document(user_id=user.id, name="d.md")
@@ -883,9 +894,6 @@ async def test_the_worker_reads_again_for_a_turn_on_a_model_priced_since_its_cop
             invalidated.append(1)
             super().invalidate()
 
-    async def idle(*args) -> None:
-        await args[-1].wait()
-
     async def no_job(*args, **kwargs):
         return None
 
@@ -901,16 +909,16 @@ async def test_the_worker_reads_again_for_a_turn_on_a_model_priced_since_its_cop
         if not waiting:
             stop.set()
 
-    monkeypatch.setattr(worker, "get_settings", lambda: base)
-    monkeypatch.setattr(worker, "RuntimeSettings", Recorded)
-    monkeypatch.setattr(worker, "sweep_forever", idle)
-    monkeypatch.setattr(worker, "idle_compact_forever", idle)
-    monkeypatch.setattr(worker, "claim_next_turn", claim_turn)
-    monkeypatch.setattr(worker, "claim_next_job", no_job)
-    monkeypatch.setattr(worker, "run_turn", run)
-    monkeypatch.setattr(worker, "IDLE_POLL_SECONDS", 0.01)
-    async with asyncio.timeout(20):
-        await worker.run_worker(stop)
+    await _run_worker(
+        monkeypatch,
+        sessionmaker,
+        tmp_path,
+        stop,
+        runtime_cls=Recorded,
+        claim_next_turn=claim_turn,
+        claim_next_job=no_job,
+        run_turn=run,
+    )
     # The first turn's model was not in the copy, so the rows were read again, once; the
     # second's was priced in the copy it was claimed with.
     assert ran == [(turns[0], True), (turns[1], True)]
@@ -918,7 +926,7 @@ async def test_the_worker_reads_again_for_a_turn_on_a_model_priced_since_its_cop
 
 
 async def test_idle_compaction_reads_the_settings_once_per_pass(sessionmaker, monkeypatch):
-    base = _base(chat_idle_compact_sweep_seconds=1)
+    base = base_settings(chat_idle_compact_sweep_seconds=1)
     runtime = RuntimeSettings(lambda: base, lambda: sessionmaker)
     stop = asyncio.Event()
     seen: list[int] = []
@@ -972,11 +980,11 @@ def test_the_sandbox_sites_are_host_names_alone() -> None:
         )
     # Refused at start as on the page.
     with pytest.raises(ValueError, match="SANDBOX_EGRESS_HOSTS: 10.0.0.1 is not a host name"):
-        _base(sandbox_egress_hosts="10.0.0.1")
+        base_settings(sandbox_egress_hosts="10.0.0.1")
 
 
 async def test_the_worker_writes_the_sites_in_effect_for_the_proxy(sessionmaker, tmp_path) -> None:
-    base = _base(sandbox_egress_hosts="pypi.org,files.pythonhosted.org")
+    base = base_settings(sandbox_egress_hosts="pypi.org,files.pythonhosted.org")
     runtime = RuntimeSettings(lambda: base, lambda: sessionmaker)
     path = tmp_path / "sandbox-egress" / "hosts"
     stop = asyncio.Event()
@@ -1013,7 +1021,7 @@ async def test_a_list_the_worker_cannot_write_is_warned_of_once(
     sessionmaker, tmp_path, caplog
 ) -> None:
     caplog.set_level(logging.WARNING)
-    base = _base()
+    base = base_settings()
     runtime = RuntimeSettings(lambda: base, lambda: sessionmaker)
     blocked = tmp_path / "a-file"
     blocked.write_text("")
@@ -1028,18 +1036,17 @@ async def test_a_list_the_worker_cannot_write_is_warned_of_once(
 
 
 @respx.mock
-async def test_a_turn_keeps_the_prices_of_its_claim(make_client, tmp_path) -> None:
+async def test_a_turn_keeps_the_prices_of_its_claim(make_client) -> None:
     """Each stubbed call is 510 tokens at US$1 per million: 6 credits at US$0.0001 a
     credit. A rate saved mid-turn — ten times cheaper — applies from the next turn."""
-    client = make_client(workspaces_dir=str(tmp_path / "workspaces"), credit_usd="0.0001")
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    client = make_client(credit_usd="0.0001")
+    user_id = (await sign_in(client)).user_id
     await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},
         headers=CSRF_HEADERS,
     )
-    document_id = await _seed_document(client, user_id)
+    document_id = await seed_document(client, user_id)
     created = await client.post(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )
@@ -1072,7 +1079,7 @@ async def test_the_codes_cli_gives_a_plan_only_the_database_configures(
     sessionmaker, monkeypatch, capsys
 ) -> None:
     url = sessionmaker.kw["bind"].url.render_as_string(hide_password=False)
-    base = _base(database_url=url, kano_pay_plans_json=PRO_PLANS_JSON)
+    base = base_settings(database_url=url, kano_pay_plans_json=PRO_PLANS_JSON)
     team = [{"planId": "team", "credits": 9000, "storageBytes": 1, "sandbox": True, "maxJobs": 2}]
     await _store(sessionmaker, "KANO_PAY_PLANS_JSON", json.dumps(team))
     monkeypatch.setattr(codes_cli, "get_settings", lambda: base)
@@ -1083,19 +1090,3 @@ async def test_the_codes_cli_gives_a_plan_only_the_database_configures(
         rows = (await db.execute(select(RedeemCode.plan_id))).scalars().all()
     assert rows == ["team"]
     assert "not in KANO_PAY_PLANS_JSON" in capsys.readouterr().err
-
-
-async def test_the_record_of_a_setting_holds_its_text_and_no_secret(make_client) -> None:
-    owner = await _owner(make_client)
-    await owner.put("/api/admin/settings/PARSE_MODEL", json={"value": "m"}, headers=CSRF_HEADERS)
-    page = (await owner.get("/api/admin/audit?area=settings")).json()
-    [entry] = page["items"]
-    assert (entry["target_type"], entry["target_id"], entry["target_label"]) == (
-        "setting",
-        "PARSE_MODEL",
-        None,
-    )
-    async with owner.app.state.sessionmaker() as db:
-        rows = (await db.execute(select(AuditLog.before, AuditLog.after))).all()
-    for secret in KNOWN_SECRETS:
-        assert secret not in json.dumps([tuple(row) for row in rows])

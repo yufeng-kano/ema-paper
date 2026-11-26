@@ -34,14 +34,16 @@ CODE_TTL = timedelta(minutes=5)
 ACCESS_TTL = timedelta(hours=1)
 REFRESH_TTL = timedelta(days=30)
 
-# Two scopes (docs/auth.md § 4): `parse`, the `parse` tool and the job routes, and, since
-# 2026-11-01, `library`, reading the Files library and saving a document's text and notes —
-# and since 2026-11-04 filing a parse into its folders (docs/mcp.md § Filing into Files).
-# A grant is made for both, the consent page saying both; one approved before `library`
-# existed keeps `parse` alone through every refresh until it is approved again.
+# Three scopes (docs/auth.md § 4): `parse`, the `parse` tool and the job routes; `library`,
+# reading the Files library, saving a document's text and notes and filing a parse into its
+# folders (docs/mcp.md § Filing into Files); and `organize`, putting the library in order —
+# folders, moves, renames, copies, the Trash (docs/mcp.md § The organizing tools). A grant
+# is made for all three, the consent page saying all three, and a refresh keeps the scope of
+# the grant it rotates: a grant made before a scope existed is revoked, never widened.
 SCOPE = "parse"
 LIBRARY_SCOPE = "library"
-GRANTED_SCOPE = f"{SCOPE} {LIBRARY_SCOPE}"
+ORGANIZE_SCOPE = "organize"
+GRANTED_SCOPE = f"{SCOPE} {LIBRARY_SCOPE} {ORGANIZE_SCOPE}"
 CODE_CHALLENGE_METHOD = "S256"
 CLIENT_ID_CHARS = 32
 
@@ -133,17 +135,20 @@ async def issue_code(
     return code
 
 
-async def _live_grant(db: AsyncSession, kind: str, presented: str) -> OAuthGrant | None:
-    """Look a grant up by hash and reject anything expired or already spent."""
+async def _live_grant(
+    db: AsyncSession, kind: str, presented: str, *, lock: bool = False
+) -> OAuthGrant | None:
+    """Look a grant up by hash and reject anything expired or already spent.
+
+    `lock` takes the row `FOR UPDATE` for a grant about to be spent: a second redemption
+    waits for the first to commit and then reads the grant spent (docs/auth.md § 4).
+    """
     token_hash = hash_token(presented)
-    row = (
-        await db.execute(
-            select(OAuthGrant).where(OAuthGrant.kind == kind, OAuthGrant.token_hash == token_hash)
-        )
-    ).scalar_one_or_none()
-    if row is None or not hmac.compare_digest(row.token_hash, token_hash):
-        return None
-    if row.revoked_at is not None or row.expires_at <= utcnow():
+    query = select(OAuthGrant).where(OAuthGrant.kind == kind, OAuthGrant.token_hash == token_hash)
+    if lock:
+        query = query.with_for_update()
+    row = (await db.execute(query)).scalar_one_or_none()
+    if row is None or row.revoked_at is not None or row.expires_at <= utcnow():
         return None
     return row
 
@@ -187,7 +192,7 @@ async def exchange_code(
     db: AsyncSession, *, code: str, code_verifier: str, client_id: str, redirect_uri: str | None
 ) -> IssuedTokens | None:
     """Authorization code + PKCE verifier → tokens. None means "invalid_grant"."""
-    grant = await _live_grant(db, CODE, code)
+    grant = await _live_grant(db, CODE, code, lock=True)
     if grant is None or grant.client_id != client_id:
         return None
     if redirect_uri is not None and grant.redirect_uri != redirect_uri:
@@ -208,7 +213,7 @@ async def refresh_tokens(
     db: AsyncSession, *, refresh_token: str, client_id: str
 ) -> IssuedTokens | None:
     """Rotate a refresh token: the presented one dies, a new pair is issued."""
-    grant = await _live_grant(db, REFRESH, refresh_token)
+    grant = await _live_grant(db, REFRESH, refresh_token, lock=True)
     if grant is None or grant.client_id != client_id:
         return None
     grant.revoked_at = utcnow()
@@ -217,11 +222,9 @@ async def refresh_tokens(
     )
 
 
-async def resolve_access_token(db: AsyncSession, presented: str) -> tuple[User, set[str]] | None:
-    """The bearer path for `/v1/*` and `/mcp`: an access token resolves to its user and the
-    scopes its grant holds."""
+async def resolve_access_token(db: AsyncSession, presented: str) -> User | None:
+    """The bearer path for `/v1/*` and `/mcp`: an access token resolves to its user."""
     grant = await _live_grant(db, ACCESS, presented)
     if grant is None:
         return None
-    user = (await db.execute(select(User).where(User.id == grant.user_id))).scalar_one_or_none()
-    return None if user is None else (user, set(grant.scope.split()))
+    return (await db.execute(select(User).where(User.id == grant.user_id))).scalar_one_or_none()

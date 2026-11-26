@@ -4,21 +4,28 @@
 The built-ins live in code (`agents/skills.py`, `agents/subagents.py`); what a user stores
 is a row of their own, or their edit of a built-in under its name. A built-in is never
 deleted or renamed here: deleting its edit restores it, and an edit equal to the built-in
-is removed rather than kept.
+is removed rather than kept. Both kinds follow these rules through one set of helpers,
+each kind described once by a `_Kind`.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+from operator import attrgetter
+from typing import Any
+
 from fastapi import APIRouter, Response, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
 
 from ..agents import skills as skill_defs
 from ..agents import subagents as subagent_defs
 from ..agents.chat import SUBAGENT_TOOL_NAMES
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
+from ..config import Settings
 from ..db.models import Skill, Subagent, utcnow
+from ..db.session import commit_or_conflict
 from ..errors import ApiError
 from ..workspace.trash import lock_user
 
@@ -26,7 +33,9 @@ router = APIRouter(prefix="/api", tags=["extensions"])
 
 
 COMPOSER_COMMAND_TAKEN = (
-    "That name is one of the composer's own commands (/new, /compact, /rename); choose another"
+    "That name is one of the composer's own commands ("
+    + ", ".join(f"/{command}" for command in sorted(skill_defs.COMPOSER_COMMANDS))
+    + "); choose another"
 )
 
 
@@ -49,15 +58,6 @@ def _checked_text(value: str, limit: int, label: str, *, required: bool = False)
     if len(text) > limit:
         raise ApiError(400, "invalid_request", f"The {label} exceeds {limit} characters")
     return text
-
-
-async def _commit_or_taken(db: DbSession, message: str) -> None:
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        # Two requests creating or renaming to one name at once: the constraint decides.
-        await db.rollback()
-        raise ApiError(409, "invalid_request", message) from exc
 
 
 # --- skills -----------------------------------------------------------------------------
@@ -94,10 +94,12 @@ def skill_payload(skill: skill_defs.ResolvedSkill) -> dict:
         "builtin": skill.builtin,
         "modified": skill.modified,
         "default": _skill_values(skill.default) if skill.default is not None else None,
+        # Left out of a library conversation's composer (docs/chat.md § Skills).
+        "document_only": skill.document_only,
     }
 
 
-def _checked_skill_values(values: dict, settings) -> dict:
+def _checked_skill_values(values: dict, settings: Settings) -> dict:
     return {
         "description": _checked_text(
             values["description"], skill_defs.DESCRIPTION_MAX_CHARS, "description"
@@ -111,121 +113,6 @@ def _checked_skill_values(values: dict, settings) -> dict:
         "user_invocable": bool(values["user_invocable"]),
         "model_invocable": bool(values["model_invocable"]),
     }
-
-
-async def _skill_rows(db: DbSession, user_id: int) -> list[Skill]:
-    return list((await db.execute(select(Skill).where(Skill.user_id == user_id))).scalars().all())
-
-
-async def _skill_row(db: DbSession, user_id: int, name: str) -> Skill | None:
-    return (
-        await db.execute(select(Skill).where(Skill.user_id == user_id, Skill.name == name))
-    ).scalar_one_or_none()
-
-
-async def _resolved_skill(db: DbSession, user_id: int, name: str) -> dict:
-    for skill in skill_defs.resolve_skills(await _skill_rows(db, user_id)):
-        if skill.name == name:
-            return skill_payload(skill)
-    raise ApiError(404, "invalid_request", "No such skill")
-
-
-@router.get("/skills")
-async def list_skills(user: SessionUser, db: DbSession):
-    resolved = skill_defs.resolve_skills(await _skill_rows(db, user.id))
-    return {"skills": [skill_payload(skill) for skill in resolved]}
-
-
-@router.post("/skills", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
-async def create_skill(body: SkillCreate, user: SessionUser, db: DbSession, settings: AppSettings):
-    name = _checked_name(body.name)
-    if name in skill_defs.BUILTIN_SKILL_NAMES:
-        raise ApiError(409, "invalid_request", "That name belongs to a built-in skill")
-    if name in skill_defs.COMPOSER_COMMANDS:
-        raise ApiError(400, "invalid_request", COMPOSER_COMMAND_TAKEN)
-    # The user's row, held until the create commits: two creations near the cap must
-    # not both count below it (PostgreSQL; the SQLite fallback runs one request at a
-    # time), the same lock the turn cap takes (docs/chat.md § Conversations).
-    await lock_user(db, user.id)
-    if await _skill_row(db, user.id, name) is not None:
-        raise ApiError(409, "invalid_request", "A skill with this name already exists")
-    own = (
-        await db.execute(
-            select(func.count())
-            .select_from(Skill)
-            .where(
-                Skill.user_id == user.id, Skill.name.notin_(sorted(skill_defs.BUILTIN_SKILL_NAMES))
-            )
-        )
-    ).scalar_one()
-    if own >= settings.chat_skills_max:
-        raise ApiError(
-            400, "invalid_request", f"You can keep at most {settings.chat_skills_max} skills"
-        )
-    values = _checked_skill_values(body.model_dump(), settings)
-    db.add(Skill(user_id=user.id, name=name, **values))
-    await _commit_or_taken(db, "A skill with this name already exists")
-    return await _resolved_skill(db, user.id, name)
-
-
-@router.put("/skills/{name}", dependencies=[CsrfGuard])
-async def update_skill(
-    name: str, body: SkillUpdate, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    provided = {field: getattr(body, field) for field in body.model_fields_set}
-    provided = {field: value for field, value in provided.items() if value is not None}
-    row = await _skill_row(db, user.id, name)
-    default = next((skill for skill in skill_defs.BUILTIN_SKILLS if skill.name == name), None)
-    if default is not None:
-        if "name" in provided and provided["name"].strip() != name:
-            raise ApiError(400, "invalid_request", "A built-in skill cannot be renamed")
-        current = _skill_values(row if row is not None else default)
-        values = _checked_skill_values({**current, **provided}, settings)
-        if skill_defs.same_as_default(values, default):
-            # Nothing the built-in does not say: no edit is kept (docs/api.md).
-            if row is not None:
-                await db.delete(row)
-        elif row is None:
-            db.add(Skill(user_id=user.id, name=name, **values))
-        else:
-            for field, value in values.items():
-                setattr(row, field, value)
-            row.updated_at = utcnow()
-        await _commit_or_taken(db, "The skill was just edited elsewhere; try again")
-        return await _resolved_skill(db, user.id, name)
-
-    if row is None:
-        raise ApiError(404, "invalid_request", "No such skill")
-    new_name = name
-    if "name" in provided:
-        new_name = _checked_name(provided["name"])
-        if new_name != name:
-            if new_name in skill_defs.BUILTIN_SKILL_NAMES:
-                raise ApiError(409, "invalid_request", "That name belongs to a built-in skill")
-            if new_name in skill_defs.COMPOSER_COMMANDS:
-                raise ApiError(400, "invalid_request", COMPOSER_COMMAND_TAKEN)
-            if await _skill_row(db, user.id, new_name) is not None:
-                raise ApiError(409, "invalid_request", "A skill with this name already exists")
-    values = _checked_skill_values({**_skill_values(row), **provided}, settings)
-    row.name = new_name
-    for field, value in values.items():
-        setattr(row, field, value)
-    row.updated_at = utcnow()
-    await _commit_or_taken(db, "A skill with this name already exists")
-    return await _resolved_skill(db, user.id, new_name)
-
-
-@router.delete("/skills/{name}", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT)
-async def delete_skill(name: str, user: SessionUser, db: DbSession) -> Response:
-    """One of the user's own is deleted; a built-in loses the user's edit — *restore
-    default* — and is never itself deleted."""
-    row = await _skill_row(db, user.id, name)
-    if row is None and name not in skill_defs.BUILTIN_SKILL_NAMES:
-        raise ApiError(404, "invalid_request", "No such skill")
-    if row is not None:
-        await db.delete(row)
-        await db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- subagents --------------------------------------------------------------------------
@@ -268,10 +155,11 @@ def subagent_payload(subagent: subagent_defs.ResolvedSubagent) -> dict:
         "builtin": subagent.builtin,
         "modified": subagent.modified,
         "default": _subagent_values(subagent.default) if subagent.default is not None else None,
+        "document_only": subagent.document_only,
     }
 
 
-def _checked_subagent_values(values: dict, settings) -> dict:
+def _checked_subagent_values(values: dict, settings: Settings) -> dict:
     model = (values["model"] or "").strip() or None
     if model is not None and len(model) > 255:
         raise ApiError(400, "invalid_request", "A subagent's model id is at most 255 characters")
@@ -303,111 +191,239 @@ def _checked_subagent_values(values: dict, settings) -> dict:
     }
 
 
-async def _subagent_rows(db: DbSession, user_id: int) -> list[Subagent]:
+# --- both kinds -------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Kind:
+    """What tells a skill from a subagent in the routes; every rule below is shared."""
+
+    # Its plural, the list's key and the cap's word, is the noun with an s.
+    noun: str
+    model: type[Skill] | type[Subagent]
+    builtins: tuple[Any, ...]
+    builtin_names: frozenset[str]
+    resolve: Callable[[list], list]
+    same_as_default: Callable[[dict, Any], bool]
+    # The stored fields of a row, a built-in or a resolved entry.
+    values: Callable[[Any], dict]
+    # The fields as sent, checked and normalized for storing.
+    checked: Callable[[dict, Settings], dict]
+    payload: Callable[[Any], dict]
+    cap: Callable[[Settings], int]
+    # Names refused besides the built-ins', with the 400 message that says why.
+    reserved: frozenset[str] = frozenset()
+    reserved_message: str = ""
+    # Fields whose `null` in an update is a value, not an absent field.
+    nullable: frozenset[str] = frozenset()
+
+
+SKILLS = _Kind(
+    noun="skill",
+    model=Skill,
+    builtins=skill_defs.BUILTIN_SKILLS,
+    builtin_names=skill_defs.BUILTIN_SKILL_NAMES,
+    resolve=skill_defs.resolve_skills,
+    same_as_default=skill_defs.same_as_default,
+    values=_skill_values,
+    checked=_checked_skill_values,
+    payload=skill_payload,
+    cap=attrgetter("chat_skills_max"),
+    # `/compact` must never run a skill in the runner's place (docs/chat.md § Skills).
+    reserved=skill_defs.COMPOSER_COMMANDS,
+    reserved_message=COMPOSER_COMMAND_TAKEN,
+)
+
+SUBAGENTS = _Kind(
+    noun="subagent",
+    model=Subagent,
+    builtins=subagent_defs.BUILTIN_SUBAGENTS,
+    builtin_names=subagent_defs.BUILTIN_SUBAGENT_NAMES,
+    resolve=subagent_defs.resolve_subagents,
+    same_as_default=subagent_defs.same_as_default,
+    values=_subagent_values,
+    checked=_checked_subagent_values,
+    payload=subagent_payload,
+    cap=attrgetter("chat_subagents_max"),
+    # `model: null` is the conversation's model.
+    nullable=frozenset({"model"}),
+)
+
+
+async def _rows(kind: _Kind, db: DbSession, user_id: int) -> list:
     return list(
-        (await db.execute(select(Subagent).where(Subagent.user_id == user_id))).scalars().all()
+        (await db.execute(select(kind.model).where(kind.model.user_id == user_id))).scalars().all()
     )
 
 
-async def _subagent_row(db: DbSession, user_id: int, name: str) -> Subagent | None:
+async def _row(kind: _Kind, db: DbSession, user_id: int, name: str):
     return (
-        await db.execute(select(Subagent).where(Subagent.user_id == user_id, Subagent.name == name))
+        await db.execute(
+            select(kind.model).where(kind.model.user_id == user_id, kind.model.name == name)
+        )
     ).scalar_one_or_none()
 
 
-async def _resolved_subagent(db: DbSession, user_id: int, name: str) -> dict:
-    for subagent in subagent_defs.resolve_subagents(await _subagent_rows(db, user_id)):
-        if subagent.name == name:
-            return subagent_payload(subagent)
-    raise ApiError(404, "invalid_request", "No such subagent")
+async def _resolved(kind: _Kind, db: DbSession, user_id: int, name: str) -> dict:
+    for entry in kind.resolve(await _rows(kind, db, user_id)):
+        if entry.name == name:
+            return kind.payload(entry)
+    raise ApiError(404, "invalid_request", f"No such {kind.noun}")
+
+
+def _refuse_reserved(kind: _Kind, name: str) -> None:
+    """A name the user's own may not take: a built-in's, or one the kind reserves."""
+    if name in kind.builtin_names:
+        raise ApiError(409, "invalid_request", f"That name belongs to a built-in {kind.noun}")
+    if name in kind.reserved:
+        raise ApiError(400, "invalid_request", kind.reserved_message)
+
+
+async def _list(kind: _Kind, user: SessionUser, db: DbSession) -> dict:
+    resolved = kind.resolve(await _rows(kind, db, user.id))
+    return {f"{kind.noun}s": [kind.payload(entry) for entry in resolved]}
+
+
+async def _create(
+    kind: _Kind, sent: dict, user: SessionUser, db: DbSession, settings: Settings
+) -> dict:
+    name = _checked_name(sent["name"])
+    _refuse_reserved(kind, name)
+    # The user's row, held until the create commits: two creations near the cap must
+    # not both count below it, the same lock the turn cap takes (docs/chat.md
+    # § Conversations).
+    await lock_user(db, user.id)
+    taken = f"A {kind.noun} with this name already exists"
+    if await _row(kind, db, user.id, name) is not None:
+        raise ApiError(409, "invalid_request", taken)
+    own = (
+        await db.execute(
+            select(func.count())
+            .select_from(kind.model)
+            .where(
+                kind.model.user_id == user.id,
+                kind.model.name.notin_(sorted(kind.builtin_names)),
+            )
+        )
+    ).scalar_one()
+    cap = kind.cap(settings)
+    if own >= cap:
+        raise ApiError(400, "invalid_request", f"You can keep at most {cap} {kind.noun}s")
+    values = kind.checked(sent, settings)
+    db.add(kind.model(user_id=user.id, name=name, **values))
+    # Two requests creating one name at once: the constraint decides.
+    await commit_or_conflict(db, taken)
+    return await _resolved(kind, db, user.id, name)
+
+
+async def _update(
+    kind: _Kind,
+    name: str,
+    body: BaseModel,
+    user: SessionUser,
+    db: DbSession,
+    settings: Settings,
+) -> dict:
+    provided = {
+        field: value
+        for field in body.model_fields_set
+        if (value := getattr(body, field)) is not None or field in kind.nullable
+    }
+    row = await _row(kind, db, user.id, name)
+    default = next((builtin for builtin in kind.builtins if builtin.name == name), None)
+    if default is not None:
+        if "name" in provided and provided.pop("name").strip() != name:
+            raise ApiError(400, "invalid_request", f"A built-in {kind.noun} cannot be renamed")
+        current = kind.values(row if row is not None else default)
+        values = kind.checked({**current, **provided}, settings)
+        if kind.same_as_default(values, default):
+            # Nothing the built-in does not say: no edit is kept (docs/api.md).
+            if row is not None:
+                await db.delete(row)
+        elif row is None:
+            db.add(kind.model(user_id=user.id, name=name, **values))
+        else:
+            for field, value in values.items():
+                setattr(row, field, value)
+            row.updated_at = utcnow()
+        # Two first edits of one built-in at once: the constraint decides.
+        await commit_or_conflict(db, f"The {kind.noun} was just edited elsewhere; try again")
+        return await _resolved(kind, db, user.id, name)
+
+    if row is None:
+        raise ApiError(404, "invalid_request", f"No such {kind.noun}")
+    taken = f"A {kind.noun} with this name already exists"
+    new_name = name
+    if "name" in provided:
+        new_name = _checked_name(provided.pop("name"))
+        if new_name != name:
+            _refuse_reserved(kind, new_name)
+            if await _row(kind, db, user.id, new_name) is not None:
+                raise ApiError(409, "invalid_request", taken)
+    values = kind.checked({**kind.values(row), **provided}, settings)
+    row.name = new_name
+    for field, value in values.items():
+        setattr(row, field, value)
+    row.updated_at = utcnow()
+    # Two requests renaming to one name at once: the constraint decides.
+    await commit_or_conflict(db, taken)
+    return await _resolved(kind, db, user.id, new_name)
+
+
+async def _delete(kind: _Kind, name: str, user: SessionUser, db: DbSession) -> Response:
+    row = await _row(kind, db, user.id, name)
+    if row is None and name not in kind.builtin_names:
+        raise ApiError(404, "invalid_request", f"No such {kind.noun}")
+    if row is not None:
+        await db.delete(row)
+        await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- routes -----------------------------------------------------------------------------
+
+
+@router.get("/skills")
+async def list_skills(user: SessionUser, db: DbSession):
+    return await _list(SKILLS, user, db)
+
+
+@router.post("/skills", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
+async def create_skill(body: SkillCreate, user: SessionUser, db: DbSession, settings: AppSettings):
+    return await _create(SKILLS, body.model_dump(), user, db, settings)
+
+
+@router.put("/skills/{name}", dependencies=[CsrfGuard])
+async def update_skill(
+    name: str, body: SkillUpdate, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    return await _update(SKILLS, name, body, user, db, settings)
+
+
+@router.delete("/skills/{name}", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT)
+async def delete_skill(name: str, user: SessionUser, db: DbSession) -> Response:
+    """One of the user's own is deleted; a built-in loses the user's edit — *restore
+    default* — and is never itself deleted."""
+    return await _delete(SKILLS, name, user, db)
 
 
 @router.get("/subagents")
 async def list_subagents(user: SessionUser, db: DbSession):
-    resolved = subagent_defs.resolve_subagents(await _subagent_rows(db, user.id))
-    return {"subagents": [subagent_payload(subagent) for subagent in resolved]}
+    return await _list(SUBAGENTS, user, db)
 
 
 @router.post("/subagents", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
 async def create_subagent(
     body: SubagentCreate, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    name = _checked_name(body.name)
-    if name in subagent_defs.BUILTIN_SUBAGENT_NAMES:
-        raise ApiError(409, "invalid_request", "That name belongs to a built-in subagent")
-    await lock_user(db, user.id)
-    if await _subagent_row(db, user.id, name) is not None:
-        raise ApiError(409, "invalid_request", "A subagent with this name already exists")
-    own = (
-        await db.execute(
-            select(func.count())
-            .select_from(Subagent)
-            .where(
-                Subagent.user_id == user.id,
-                Subagent.name.notin_(sorted(subagent_defs.BUILTIN_SUBAGENT_NAMES)),
-            )
-        )
-    ).scalar_one()
-    if own >= settings.chat_subagents_max:
-        raise ApiError(
-            400,
-            "invalid_request",
-            f"You can keep at most {settings.chat_subagents_max} subagents",
-        )
-    values = _checked_subagent_values(body.model_dump(), settings)
-    db.add(Subagent(user_id=user.id, name=name, **values))
-    await _commit_or_taken(db, "A subagent with this name already exists")
-    return await _resolved_subagent(db, user.id, name)
+    return await _create(SUBAGENTS, body.model_dump(), user, db, settings)
 
 
 @router.put("/subagents/{name}", dependencies=[CsrfGuard])
 async def update_subagent(
     name: str, body: SubagentUpdate, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    provided = {field: getattr(body, field) for field in body.model_fields_set}
-    # `model: null` is a value — the conversation's model — not an absent field.
-    provided = {
-        field: value for field, value in provided.items() if value is not None or field == "model"
-    }
-    row = await _subagent_row(db, user.id, name)
-    default = next(
-        (subagent for subagent in subagent_defs.BUILTIN_SUBAGENTS if subagent.name == name), None
-    )
-    if default is not None:
-        if "name" in provided and provided["name"].strip() != name:
-            raise ApiError(400, "invalid_request", "A built-in subagent cannot be renamed")
-        provided.pop("name", None)
-        current = _subagent_values(row if row is not None else default)
-        values = _checked_subagent_values({**current, **provided}, settings)
-        if subagent_defs.same_as_default(values, default):
-            if row is not None:
-                await db.delete(row)
-        elif row is None:
-            db.add(Subagent(user_id=user.id, name=name, **values))
-        else:
-            for field, value in values.items():
-                setattr(row, field, value)
-            row.updated_at = utcnow()
-        await _commit_or_taken(db, "The subagent was just edited elsewhere; try again")
-        return await _resolved_subagent(db, user.id, name)
-
-    if row is None:
-        raise ApiError(404, "invalid_request", "No such subagent")
-    new_name = name
-    if "name" in provided:
-        new_name = _checked_name(provided.pop("name"))
-        if new_name != name:
-            if new_name in subagent_defs.BUILTIN_SUBAGENT_NAMES:
-                raise ApiError(409, "invalid_request", "That name belongs to a built-in subagent")
-            if await _subagent_row(db, user.id, new_name) is not None:
-                raise ApiError(409, "invalid_request", "A subagent with this name already exists")
-    values = _checked_subagent_values({**_subagent_values(row), **provided}, settings)
-    row.name = new_name
-    for field, value in values.items():
-        setattr(row, field, value)
-    row.updated_at = utcnow()
-    await _commit_or_taken(db, "A subagent with this name already exists")
-    return await _resolved_subagent(db, user.id, new_name)
+    return await _update(SUBAGENTS, name, body, user, db, settings)
 
 
 @router.delete(
@@ -415,10 +431,4 @@ async def update_subagent(
 )
 async def delete_subagent(name: str, user: SessionUser, db: DbSession) -> Response:
     """One of the user's own is deleted; a built-in loses the user's edit."""
-    row = await _subagent_row(db, user.id, name)
-    if row is None and name not in subagent_defs.BUILTIN_SUBAGENT_NAMES:
-        raise ApiError(404, "invalid_request", "No such subagent")
-    if row is not None:
-        await db.delete(row)
-        await db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return await _delete(SUBAGENTS, name, user, db)

@@ -1,0 +1,362 @@
+<script setup lang="ts">
+/**
+ * The Files page's Agent card (docs/web.md § The Files page's Agent card): the agent panel in
+ * library mode at the page's right, as the reader's Agent card sits at the document's — the
+ * light-glass card inset from the window's edges, resized by the grip on its left edge as
+ * the reader's cards are (§ Column widths) — or, below 900px or where the page has no room
+ * for the list's minimum beside the card's, a full-screen sheet over the page with a way back.
+ *
+ * Whether it is open and how wide it is are the page's own, remembered in the browser apart
+ * from the reader's cards (`useViewerLayout`). It mounts the first time it opens and then
+ * stays, hidden and inert while closed, so a close keeps the conversation, the draft and the
+ * attachments, and a reader who never opens it costs no conversation read.
+ */
+import type { DocumentIndex } from '~/components/ChatPanel.vue'
+import { COLUMN_WIDTHS, clampWidth, storedWidth } from '~/lib/columns'
+import type { LibraryPlace } from '~/lib/library'
+import type { LibraryStep } from '~/lib/steps'
+
+/** Where the card's state is kept in the browser between visits. */
+const STORAGE_KEY = 'sightread.files.agent'
+/** The list never gets narrower than this to make room for the card, as the document pane
+ *  does not beside the reader's. */
+const LIST_MIN_WIDTH = 360
+/** The card's inset from the window's edge, and the gap its grip sits in: `--space-4`. */
+const CARD_GAP = 16
+/** Matches the 900px breakpoint of this component's stylesheet and the layout's drawer. */
+const SHEET_QUERY = '(max-width: 900px)'
+/** The panel's document here: none, the card being about the library. */
+const NO_DOCUMENT: DocumentIndex = { pages: [], outline: [], placed: [] }
+
+defineProps<{
+  library: LibraryPlace
+  undoLibrary: (step: LibraryStep) => Promise<boolean>
+  /** A document is open in a viewer over the page, whose own Agent card is the one in use. */
+  covered: boolean
+}>()
+
+const emit = defineEmits<{
+  /** The close button, a drag past half the minimum, or the sheet's way back. */
+  close: []
+  library: [records: LibraryStep[]]
+  filed: []
+  'open-files': [target: { kind: 'folder' | 'document'; id: number }]
+  'rows-dropped': []
+}>()
+
+const open = defineModel<boolean>('open', { required: true })
+
+const { t } = useI18n()
+
+function readStored(): { open: boolean; width: number } {
+  const initial = { open: false, width: COLUMN_WIDTHS.agent.initial }
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
+    if (!stored || typeof stored !== 'object') {
+      return initial
+    }
+    const { open: wasOpen, width } = stored as { open?: unknown; width?: unknown }
+    return { open: wasOpen === true, width: storedWidth('agent', width) }
+  } catch {
+    return initial
+  }
+}
+
+const stored = readStored()
+// The page renders on the client alone, so the card opens as it was left before the first paint.
+open.value = stored.open
+/** The width the reader chose — by a drag, a key or a double-click — which is what is kept: a
+ *  width the window clamped is not a width the reader chose. */
+const chosenWidth = ref(stored.width)
+
+function save() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ open: open.value, width: chosenWidth.value }))
+  } catch {
+    // Storage full or blocked: the card still holds for as long as the page is loaded.
+  }
+}
+
+watch(open, save)
+
+const mounted = ref(stored.open)
+watch(open, (value) => {
+  if (value) {
+    mounted.value = true
+  }
+})
+
+// --- the phone's sheet -------------------------------------------------------------------
+
+const narrowWindow = ref(window.matchMedia(SHEET_QUERY).matches)
+let sheetQuery: MediaQueryList | null = null
+
+function onSheetChange(event: MediaQueryListEvent) {
+  narrowWindow.value = event.matches
+}
+
+onMounted(() => {
+  sheetQuery = window.matchMedia(SHEET_QUERY)
+  sheetQuery.addEventListener('change', onSheetChange)
+})
+
+const root = ref<HTMLElement | null>(null)
+const panel = ref<HTMLElement | null>(null)
+/** The sheet stands where the on-screen keyboard leaves room, as the viewer's phone panes do. */
+const keyboard = useKeyboardFrame(root, panel, true)
+
+/** A link followed from the sheet shows the list it leads to: the sheet steps aside. */
+function openFiles(target: { kind: 'folder' | 'document'; id: number }) {
+  emit('open-files', target)
+  if (sheet.value) {
+    emit('close')
+  }
+}
+
+// --- the width ---------------------------------------------------------------------------
+
+/** The page's width, which the list and the card share: what the card is clamped against. */
+const pageWidth = ref(Number.POSITIVE_INFINITY)
+/** A sheet on a phone or a tablet, and also on a window just past the breakpoint where the
+ *  sidebar leaves the page too little for the list's minimum beside the card's: there the
+ *  list would be squeezed under its minimum and its toolbar under the card. That sheet covers
+ *  the page alone (`fill`), the sidebar beside it as reachable as ever. Either sheet is out of
+ *  the page's flow, so turning into one never changes the width this reads. */
+const sheet = computed(
+  () =>
+    narrowWindow.value
+    || pageWidth.value < LIST_MIN_WIDTH + COLUMN_WIDTHS.agent.min + 2 * CARD_GAP,
+)
+/** The card's width as drawn: the width the reader chose, as far as the window allows. */
+const width = ref(stored.width)
+/** The grip on the card's left edge. A release with the card hidden closes it, its chosen width
+ *  the one it had before the drag. */
+const grip = useColumnGrip({
+  column: 'agent',
+  side: 'right',
+  width,
+  setWidth,
+  choose: chooseWidth,
+  card: () => panel.value,
+  close: (startWidth) => {
+    width.value = startWidth
+    emit('close')
+  },
+})
+let pageObserver: ResizeObserver | null = null
+
+// The page is the card's parent: the Files page's row of the list and the card.
+watch(root, (element) => {
+  pageObserver?.disconnect()
+  pageObserver = null
+  const page = element?.parentElement
+  if (page) {
+    // Read now as well: whether the card is a sheet must hold from its first frame.
+    pageWidth.value = page.clientWidth
+    pageObserver = new ResizeObserver(() => {
+      pageWidth.value = page.clientWidth
+    })
+    pageObserver.observe(page)
+  }
+})
+
+/** The widest the card may be now: its own cap, and whatever leaves the list its minimum
+ *  beside the card's grip and its inset from the window's edge. */
+function widthMax(): number {
+  const { min, max } = COLUMN_WIDTHS.agent
+  return Math.max(min, Math.min(max, pageWidth.value - LIST_MIN_WIDTH - 2 * CARD_GAP))
+}
+
+function setWidth(value: number) {
+  width.value = Math.round(Math.min(widthMax(), Math.max(COLUMN_WIDTHS.agent.min, value)))
+}
+
+/** Clamped from the chosen width, never from the width the window last allowed, so a card
+ *  the window narrowed grows back as it widens; the card being dragged follows the pointer. */
+watch([pageWidth, chosenWidth], () => {
+  if (!grip.dragging.value) {
+    setWidth(chosenWidth.value)
+  }
+})
+
+function chooseWidth(value: number) {
+  chosenWidth.value = clampWidth('agent', value)
+  setWidth(chosenWidth.value)
+  save()
+}
+
+onBeforeUnmount(() => {
+  pageObserver?.disconnect()
+  sheetQuery?.removeEventListener('change', onSheetChange)
+})
+
+const chat = ref<{ holds: boolean } | null>(null)
+
+defineExpose({
+  /** The Files page keeps its keys off the card: a key from inside it, or one after a press in
+   *  it that left the focus on the page (docs/web.md § The Files page's Agent card). */
+  contains: (node: Node | null) => !!node && !!root.value?.contains(node),
+  /** What the card holds that a reload would lose — closed too, since it keeps it. */
+  holds: computed(() => chat.value?.holds ?? false),
+  /** Open as the sheet over the whole page: the list under it is out of reach. */
+  sheet: computed(() => open.value && sheet.value),
+})
+</script>
+
+<template>
+  <div
+    v-if="mounted"
+    v-show="open"
+    ref="root"
+    class="files-agent"
+    :class="{ sheet, fill: sheet && !narrowWindow, keyboard: sheet && keyboard }"
+    :inert="!open || covered"
+  >
+    <div
+      v-if="!sheet"
+      class="column-grip"
+      :class="{ dragging: grip.dragging.value }"
+      role="separator"
+      tabindex="0"
+      aria-orientation="vertical"
+      :aria-label="t('viewer.resizeAgent')"
+      :aria-valuenow="width"
+      :aria-valuemin="COLUMN_WIDTHS.agent.min"
+      :aria-valuemax="widthMax()"
+      v-bind="grip.handlers"
+    />
+    <aside
+      v-show="!grip.hidden.value"
+      ref="panel"
+      class="card"
+      :style="
+        sheet
+          ? keyboard
+            ? { marginTop: `${keyboard.top}px`, height: `${keyboard.height}px` }
+            : undefined
+          : { '--column-width': `${width}px` }
+      "
+      :aria-label="t('chat.panel')"
+    >
+      <LazyChatPanel
+        ref="chat"
+        :document-id="null"
+        :document-selection="() => null"
+        :document-index="() => NO_DOCUMENT"
+        :current-section="() => null"
+        :closable="!sheet"
+        :library="library"
+        :undo-library="undoLibrary"
+        @close="emit('close')"
+        @filed="emit('filed')"
+        @library="emit('library', $event)"
+        @open-files="openFiles"
+        @rows-dropped="emit('rows-dropped')"
+      >
+        <template v-if="sheet" #head-start>
+          <button type="button" class="back" @click="emit('close')">
+            <UiIcon name="chevron-left" />
+            <span>{{ t('files.agentBack') }}</span>
+          </button>
+        </template>
+      </LazyChatPanel>
+    </aside>
+  </div>
+</template>
+
+<style scoped>
+/* Beside the list, as tall as it: the grip's gap, then the card inset from the window's top,
+   right and bottom edges, the counterpart of the sidebar's card at the left. */
+.files-agent {
+  display: flex;
+  flex: none;
+  min-height: 0;
+  padding: var(--space-4) var(--space-4) var(--space-4) 0;
+}
+
+/* The grip is the 16px gap between the list and the card, the whole gap the hit area. */
+.column-grip {
+  flex: none;
+  width: var(--space-4);
+}
+
+/* Widths, not flex-bases, here and on the grip: this box sizes itself from what it holds, and
+   Safari leaves a flex-basis out of that size, so a basis alone let the card run past the
+   window's edge. */
+.card {
+  display: flex;
+  flex: none;
+  width: var(--column-width);
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: var(--radius-card);
+  background: var(--glass-pane);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-pane);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .card {
+    background: var(--rail);
+  }
+}
+
+/* The sheet's way back: a glass capsule at the head's left, as tall as a finger needs. */
+.back {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+  height: 44px;
+  margin-right: var(--space-1);
+  padding: 0 14px 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-glass);
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--text-base);
+  cursor: pointer;
+}
+
+.back :deep(svg) {
+  width: 20px;
+  height: 20px;
+}
+
+/* Below 900px, or with no room beside the list, the card is a sheet over the whole page, the
+   paper rather than glass. Its box is the window's, `inset: 0`, which the keyboard never moves. */
+.files-agent.sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  padding: 0;
+  background: var(--paper);
+}
+
+/* Past 900px the sidebar is beside the page, not a drawer: the sheet covers the page alone. */
+.files-agent.sheet.fill {
+  position: absolute;
+}
+
+.files-agent.sheet .card {
+  flex: 1 1 auto;
+  width: auto;
+  border-radius: 0;
+  background: var(--paper);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+
+/* While the on-screen keyboard is up: at the visual viewport's top, at its height. */
+.files-agent.keyboard {
+  align-items: flex-start;
+}
+</style>

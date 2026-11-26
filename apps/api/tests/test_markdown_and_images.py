@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 from PIL import Image
 
-from sightread.parsing.images import MAX_LONG_EDGE_PX, ImageError, normalize_image, probe_image
+from sightread.parsing.images import (
+    MAX_LONG_EDGE_PX,
+    PARSE_IMAGE_FORMATS,
+    ImageError,
+    normalize_image,
+    probe_image,
+)
 from sightread.parsing.markdown import PageMarkdown, assemble, clean_bbox
 
 
@@ -137,12 +143,15 @@ def test_image_normalization_downscales_and_keeps_original_dimensions(documents,
 def test_every_accepted_image_type_normalizes(documents, tmp_path, name: str) -> None:
     if name not in documents:
         pytest.skip("pillow-heif on this platform cannot write the fixture")
-    out_dir = tmp_path / name
-    out_dir.mkdir()
-    normalized = normalize_image(documents[name], out_dir)
+    # Intake's probe and the parse's decode read it under the parse's own decoders too.
+    assert probe_image(documents[name])
+    for formats in (None, PARSE_IMAGE_FORMATS):
+        out_dir = tmp_path / f"{name}-{'parse' if formats else 'any'}"
+        out_dir.mkdir()
+        normalized = normalize_image(documents[name], out_dir, formats=formats)
 
-    assert normalized.path.exists()
-    assert normalized.media_type in ("image/jpeg", "image/png")
+        assert normalized.path.exists()
+        assert normalized.media_type in ("image/jpeg", "image/png")
 
 
 def test_exif_orientation_is_applied(documents, tmp_path) -> None:
@@ -159,3 +168,34 @@ def test_unreadable_image_is_reported(documents, tmp_path) -> None:
         probe_image(documents["corrupt_pdf"])
     with pytest.raises(ImageError):
         normalize_image(documents["corrupt_pdf"], tmp_path)
+
+
+def test_a_16_bit_grey_image_keeps_its_greys(tmp_path) -> None:
+    # A plain conversion to RGB would clip both pixels to white.
+    source = tmp_path / "scan.png"
+    grey = Image.new("I;16", (2, 1), 1000)
+    grey.putpixel((1, 0), 30000)
+    grey.save(source)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    normalized = normalize_image(source, out_dir)
+    with Image.open(normalized.path) as image:
+        shown = image.convert("L")
+    assert shown.getpixel((0, 0)) <= 4
+    assert abs(shown.getpixel((1, 0)) - 30000 // 256) <= 1
+
+
+def test_a_png_key_colour_is_flattened_onto_white(tmp_path) -> None:
+    source = tmp_path / "chart.png"
+    keyed = Image.new("RGB", (2, 1), (0, 0, 0))
+    keyed.putpixel((1, 0), (200, 0, 0))
+    keyed.save(source, transparency=(0, 0, 0))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    normalized = normalize_image(source, out_dir)
+    with Image.open(normalized.path) as image:
+        shown = image.convert("RGB")
+    assert shown.getpixel((0, 0)) == (255, 255, 255)
+    assert shown.getpixel((1, 0)) == (200, 0, 0)

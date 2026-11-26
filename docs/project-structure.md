@@ -1,129 +1,221 @@
 # Project structure
 
+## Layout
+
 ```text
-agent-sightread/
+ema-paper/
   apps/
-    api/                      # FastAPI app + worker (one uv project, one image)
+    api/                          # FastAPI app + worker: one uv project, one image
       src/sightread/
-        main.py               # FastAPI wiring: /v1, /api, /oauth, /mcp, /.well-known
-                              # (/api/admin mounted only while OWNER_EMAILS names one)
-        config.py             # env settings (pydantic-settings)
-        runtime_settings.py   # the thirteen keys the database may override and the cached
-                              # reading layer the API, the worker and the CLI share
-                              # (docs/admin.md § Settings)
-        db/                   # engine, models, session helpers
-        auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py, deps.py, upload_tickets.py, document_tickets.py
-        routes/               # v1.py (data plane), control.py (/api, incl. /api/agents),
-                              # library.py (/api/library — the web file library),
-                              # chat.py (/api/conversations, /api/sandbox),
-                              # attachments.py (/api/attachments), extensions.py
-                              # (/api/skills, /api/subagents), memories.py
-                              # (/api/memories), oauth.py, admin.py (/api/admin —
-                              # the operator console, docs/admin.md)
-        agents/               # the agent registry (docs/agents.md); parse.py holds the
-                              # parse agent's definition: default prompt, pipeline version;
-                              # chat.py the chat agent's system prompt and tool definitions;
-                              # skills.py and subagents.py the built-in skills and subagents;
-                              # memory.py the memory block, its selection and text cleaning;
-                              # check.py the check agent's prompt and tools;
-                              # summary.py the summary model's title prompt and cleaning
-        admin/                # the operator console (docs/admin.md): permissions.py
-                              # (ALL_PERMISSIONS, the areas, normalizing a group's list),
-                              # deps.py (require_console_session, require_permission),
-                              # groups.py (the built-in group, the sign-in owner join,
-                              # members, the no-escalation checks), audit.py (the one
-                              # helper that writes an audit row in the caller's transaction),
-                              # grants.py (an operator's grant of credits or days to an
-                              # account, through billing/ledger.py),
-                              # codes.py (creating and disabling redeem codes through
-                              # billing/codes.py, each with its audit row),
-                              # jobs.py (a stuck job's requeue, the overview's checks of
-                              # Kano Proxy and Kano Pay),
-                              # settings.py (the settings page: a change checked,
-                              # confirmed, stored, recorded)
-        billing/              # plans, periods and credit arithmetic (docs/billing.md):
-                              # credits.py prices a parse and a turn, plans.py reads the
-                              # plans and decides the current period; pure, no HTTP
-        parsing/              # poppler.py (subprocess wrappers),
-                              # images.py (heic/exif/downscale), markdown.py, figures.py,
-                              # joins.py (the format check's program rules),
-                              # attachments.py (the chat composer's files, prepared)
-        workspace/            # the per-user file tree and its git revisions
-                              # (docs/workspace.md): layout.py, git.py, documents.py,
-                              # reconcile.py, trash.py (deleting for good: Empty Trash
-                              # and the Trash's expiry, one function), accounts.py (a
-                              # deleted account's marker and files), filing.py (names,
-                              # the suffixed insert, the folders a path names and the
-                              # filing of a file — what the upload route, the agent's
-                              # download and the connector's filing share — and
-                              # move_then_commit: a row's directory moved, the row
-                              # committed, the move undone when the commit fails, what
-                              # the rename route and markdown_names.py share)
-        sandbox/              # client.py: the HTTP client of the sandbox runner;
-                              # egress.py: the list of sites the worker writes for the
-                              # egress proxy (docs/sandbox.md § Network)
-        upstream/             # anthropic.py (Messages API over Kano Proxy, streaming,
-                              # tools — the chat agent's client, docs/chat.md);
-                              # client.py (httpx client for Kano Proxy's OpenAI-compatible
-                              # route: vision calls, the model catalog, usage capture,
-                              # backoff)
-        jobs/                 # queue.py (claim/enqueue), intake.py (store/dedup/enqueue),
-                              # runner.py, sweeper.py, events.py (SSE + event pairs),
-                              # chat_runner.py (the chat agent's tool loop),
-                              # check.py (the check agent's loop, inside a parse's run),
-                              # chat_subagent.py (a subagent's nested loop),
-                              # chat_tools.py, chat_events.py (the conversation stream),
-                              # chat_memory.py (a turn's memory snapshot, the memory tool),
-                              # chat_web.py (the web tools: Brave search, OpenAlex, the
-                              # guarded fetch, reading a URL, downloading into Files),
-                              # summary.py (one summary-model call: `/rename`'s title)
-        mcp/                  # server.py: thin shell over the service layer — parse (and its Files folder), list_library, read_document, write_document (docs/mcp.md)
-        worker.py             # `python -m sightread.worker`
-        codes.py              # `python -m sightread.codes`: the operator's redeem codes
-        markdown_names.py     # `python -m sightread.markdown_names`: the one-time `.md`
-                              # for markdown documents named before 2026-11-03, through
-                              # the rename `workspace/` shares with routes/library.py
-                              # (docs/self-hosting.md § One-time commands after an update)
-      migrations/             # Alembic
+        main.py                   # the app: /api, /v1, /oauth, /.well-known, /mcp (/api/admin while OWNER_EMAILS names one)
+        worker.py                 # `python -m sightread.worker`: drains the queue, runs the periodic tasks
+        config.py                 # env settings (pydantic-settings); .env.example lists them
+        runtime_settings.py       # the settings in effect: .env with the database's overrides (docs/admin.md § Settings)
+        errors.py                 # the one error shape both planes answer with (docs/api.md)
+        body_limit.py             # the ceiling on request bodies that are not streamed uploads
+        codes.py                  # `python -m sightread.codes`: the operator's redeem codes
+        markdown_names.py         # `python -m sightread.markdown_names`: the one-time `.md` for markdown documents named before 2026-11-03 (docs/self-hosting.md § One-time commands after an update)
+        stopping.py               # pause(): the wait a shutdown cuts short, for the worker's periodic tasks
+        db/
+          models.py               # SQLAlchemy models (docs/database.md)
+          session.py              # engine, request-scoped sessions, commit-or-409 on a constraint race
+        auth/                     # credentials (docs/auth.md)
+          oidc.py                 # Google sign-in
+          sessions.py             # server-side web sessions
+          api_keys.py             # project API keys
+          oauth_as.py             # the OAuth 2.1 authorization server's state
+          crypto.py               # credential hashing and token minting
+          deps.py                 # the FastAPI dependencies both planes share
+          tickets.py              # what upload and document tickets share
+          upload_tickets.py       # single-use upload tickets for the MCP `parse` tool
+          document_tickets.py     # document tickets for the MCP library tools
+        routes/                   # HTTP routes, one module per surface
+          v1.py                   # /v1: the data plane (docs/api.md)
+          control.py              # /api: sign-in, the account, keys, agent settings
+          library.py              # /api/library: the Files library (docs/web.md § Files)
+          multipart.py            # multipart bodies under a cap: the small uploads' form, and the library's streaming reader
+          chat.py                 # /api/conversations and /api/sandbox
+          attachments.py          # /api/attachments: the chat composer's files
+          extensions.py           # /api/skills and /api/subagents
+          memories.py             # /api/memories
+          billing.py              # /api/billing, the Kano Pay webhook among them
+          admin.py                # /api/admin: the operator console (docs/admin.md)
+          oauth.py                # /oauth and /.well-known: the authorization server's endpoints
+        mcp/
+          server.py               # the MCP endpoint at /mcp (docs/mcp.md)
+        agents/                   # the agent registry: what each agent is (docs/agents.md)
+          parse.py                # the parse agent: default prompt, pipeline version
+          bbox.py                 # the box convention each model family is asked for, and its conversion back
+          check.py                # the format check agent: prompt and tools
+          chat.py                 # the chat agent: system prompts and tool definitions
+          skills.py               # the chat agent's built-in skills, merged with a user's
+          subagents.py            # the chat agent's built-in subagents, merged with a user's
+          memory.py               # the memory block: what a memory holds, which load, how text is cleaned
+          summary.py              # the summary model's instructions and the reading of its answer
+        parsing/                  # the parse pipeline's local work (docs/parsing.md)
+          poppler.py              # Poppler subprocess wrappers
+          images.py               # image input normalization
+          markdown.py             # markdown assembly and the `sightread://` placeholder contract
+          figures.py              # figure crops
+          figure_check.py         # the figure check's raster work and what its model call shows
+          joins.py                # the format check's program rules
+          attachments.py          # the chat composer's files, prepared for the model
+        jobs/                     # the queue, the runners and the streams (docs/jobs.md, docs/chat.md)
+          queue.py                # the PostgreSQL queue: enqueue, claim, requeue, the worker lock
+          intake.py               # parse intake: store, hash, probe, dedup, enqueue (`submit_parse`)
+          runner.py               # the parse agent's runner
+          check.py                # the format check's run, inside a parse's run
+          sweeper.py              # the worker's sweep: retention, the Trash's expiry, repairs
+          events.py               # SSE progress streams and the LISTEN/NOTIFY plumbing both streams share
+          chat_runner.py          # the chat agent's runner: one turn, one tool loop
+          chat_tools.py           # what the chat agent's tools do on the host
+          chat_library.py         # a library conversation's library tools
+          chat_web.py             # the web tools: search, reading a URL, downloading into Files
+          chat_subagent.py        # a subagent's nested loop
+          chat_memory.py          # a turn's memory snapshot and the `memory` tool
+          chat_compact.py         # compaction and the worker's idle pass
+          chat_versions.py        # a conversation's turns as a tree of versions
+          chat_events.py          # the conversation's event stream
+          summary.py              # the summary model's one call: `/rename`'s title
+        workspace/                # every user's file tree and its git revisions (docs/workspace.md)
+          layout.py               # where things live in a workspace: path arithmetic and the listings of WORKSPACES_DIR
+          safe_io.py              # opening workspace files without following a link
+          locks.py                # the workspace, shell and backup locks and the writing marker
+          git.py                  # git as the revision store
+          documents.py            # a document's files, and the row lookups beside `is_live`
+          filing.py               # filing into the library, and the Files page's operations
+          organize.py             # those operations by path, in batches: the agent's library tools, the connector's organizing tools, /v1/library/<tool>
+          trash.py                # deleting for good from the Trash (`empty_trash`)
+          reconcile.py            # the rows brought in line with the tree
+          accounts.py             # a deleted account's marker and files
+          memory_file.py          # the chat agent's memory.md
+          agents_file.py          # the AGENTS.md files on a document's path
+        sandbox/                  # the service's side of the sandbox (docs/sandbox.md)
+          client.py               # the runner's HTTP client
+          egress.py               # the sites list the worker writes for the egress proxy
+        upstream/                 # the model upstream: Kano Proxy on the operator's key
+          client.py               # its OpenAI-format route: vision calls, the model catalog
+          anthropic.py            # its Messages API route: the chat, check and summary calls
+        billing/                  # plans, credits and payment (docs/billing.md)
+          plans.py                # plans and allowance periods
+          credits.py              # what a parse and a turn cost
+          ledger.py               # the credit ledger
+          codes.py                # redeem codes
+          pay.py                  # the Kano Pay adapter
+        admin/                    # the operator console's rules and writes (docs/admin.md)
+          permissions.py          # the console's permissions, fixed in code
+          deps.py                 # `require_console_session`, `require_permission`
+          groups.py               # groups, members, the built-in group and the owner join
+          audit.py                # the audit log's one writer
+          grants.py               # an operator's grants of credits or days
+          codes.py                # creating and disabling redeem codes
+          jobs.py                 # a stuck job's requeue, the Kano Proxy and Kano Pay checks
+          settings.py             # the settings page: reads and changes
+      migrations/                 # Alembic (docs/database.md)
+      tests/                      # pytest, every upstream stubbed (docs/testing.md)
+      alembic.ini
+      pyproject.toml, uv.lock     # uv-managed
+      Dockerfile                  # includes poppler-utils and git
+    sandbox/                      # the sandbox runner and the egress proxy: one uv project, one image (docs/sandbox.md)
+      src/sightread_sandbox/
+        main.py                   # the runner's HTTP contract
+        __main__.py               # `python -m sightread_sandbox`: starts the runner
+        backends.py               # where a shell runs: one Docker container per user
+        shell.py                  # a persistent shell session
+        config.py                 # the SANDBOX_* settings
+        egress.py                 # the egress proxy: the VMs' one way out
       tests/
-      pyproject.toml          # uv-managed
-      Dockerfile              # includes poppler-utils
-    sandbox/                  # the sandbox runner (docs/sandbox.md): one uv project, its
-                              # own image; owns the Docker socket, nothing else does.
-                              # The same image runs the egress proxy, sightread_sandbox/
-                              # egress.py: the VMs' one way out, with no socket and no secret
-    web/                      # Nuxt control plane (docs/web.md)
-      app/ or src/            # Nuxt conventions; i18n/ catalog en + zh-TW
-                              # the operator console (docs/admin.md): pages/admin/,
-                              # middleware/admin.ts, composables/useAdminConsole.ts,
-                              # lib/admin.ts (pure: areas, nav, permission checks; vitest),
-                              # lib/chart.ts (the usage chart's geometry; vitest),
-                              # components/admin/
-      server/routes/          # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)
-      shared/                 # framework-free code nuxt.config.ts, the app and server/ all read
-      package.json
+      pyproject.toml, uv.lock
       Dockerfile
+    web/                          # the Nuxt web app (docs/web.md)
+      app/
+        app.vue, error.vue        # the root component and the error page
+        pages/                    # one file per route; pages/admin/ the console's
+        layouts/                  # default.vue: the signed-in shell and the console's nav
+        components/               # Vue components; admin/, agents/, chat/, settings/, ui/ by area
+        composables/              # shared reactive state (useAuth, useAdminConsole, useConversationStream…)
+        lib/                      # framework-free logic with vitest tests; api.ts the typed API client
+        middleware/               # route guards: authed.ts, admin.ts
+        plugins/                  # client start-up: the session, the theme, the build update
+        types/                    # page-meta.d.ts: the `adminArea` page meta
+        assets/css/               # global styles
+      i18n/locales/               # en.ts, zh-TW.ts: the UI catalog
+      shared/                     # seo.ts: framework-free code nuxt.config.ts, the app and server/ all read
+      server/routes/              # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)
+      public/                     # icons and the web manifest
+      nuxt.config.ts, package.json, Dockerfile
   deploy/
-    caddy/Caddyfile           # production routing + TLS
-    sandbox-image/Dockerfile  # what runs inside a user's VM: uv, poppler, rg, jq, pandoc, Noto fonts…
-    sandbox-image/matplotlibrc  # matplotlib's fonts in the VM: Noto first, CJK included
-    sandbox-image/pip         # `pip` in the VM: uv's pip, into the default environment
-  docs/
-  docker-compose.yaml             # local full stack (pg + api + worker + web), HTTP, ports exposed
-  docker-compose.production.yaml  # standalone file (-f): caddy/TLS, backups; NOT an override merge
-  backups/                    # gitignored; the production backup service writes dumps here
-  .env.example                # every env var with placeholder values
-  LICENSE                     # MIT
+    caddy/Caddyfile               # production routing + TLS
+    caddy/Caddyfile.local         # the local stack's single origin, plain HTTP
+    sandbox-image/                # a user's VM image: Dockerfile, matplotlibrc (Noto fonts first), pip (uv's pip)
+  docs/                           # the specification; start at index.md
+  docker-compose.yaml             # the local full stack, plain HTTP, ports exposed
+  docker-compose.production.yaml  # production, standalone (-f): Caddy/TLS, backups; not an override merge
+  docker-compose.only-container-network.yaml  # an overlay onto production for a host behind a front proxy
+  .env.example                    # every local env var, placeholder values
+  .env.production.example         # every production env var, placeholder values
+  backups/                        # gitignored; the production backup service writes its dumps here
+  .rule                           # the agent rules; AGENTS.md and CLAUDE.md link to it
+  README.md, README.zh-TW.md
+  LICENSE                         # MIT
 ```
 
 ## Boundaries
 
-- `routes/*` and `mcp/*` are thin: validation + auth + calls into `jobs`/`parsing` services. MCP owns zero business logic. `jobs/intake.py` is the shared sequence **all three** entry points run (store → hash → probe → dedup → enqueue), so REST, MCP and the web library's upload cannot drift apart — `routes/library.py` adds a name and a folder to the job that sequence returns, nothing more.
-- `parsing/poppler.py` is the **only** place that spawns Poppler; everything else consumes its typed results. No PDF library imports anywhere (AGPL ban, [parsing.md](./parsing.md)).
-- `upstream/` is the only package that talks to the upstream, Kano Proxy on the operator's key: `client.py` for vision calls and the catalog, `anthropic.py` for the chat and check agents' Messages API calls — the only modules that ever read `KANO_PROXY_API_KEY`.
-- Nothing in `jobs/` or `workspace/` imports from `routes/`: what a route and the worker both run — *Empty Trash* and the Trash's expiry, the locks and the commit-then-discard they share — lives in `workspace/`, and the routes import it from there.
-- `workspace/` is the only package that touches `WORKSPACES_DIR` and the only one that runs git; `sandbox/client.py` is the only module that calls the runner. The runner (`apps/sandbox`) is the only process with the Docker socket; the egress proxy beside it reads one file the worker writes (`sandbox/egress.py`) and talks to nothing of the service.
-- `agents/` defines agents and nothing else: no HTTP, no database. Runners and settings consume its definitions ([agents.md](./agents.md)).
-- `jobs/queue.py` is the only module that knows the queue is Postgres.
-- `admin/` is the only package that decides a console permission or writes `groups`, `group_members`, `audit_log` and `runtime_settings`; `routes/admin.py` is thin over it, and the Google callback and the dev login call `admin/groups.py` for the owner join. Every console mutation writes its audit row through `admin/audit.py` before the route's one commit. Nothing outside it compares a group's name. Whether the worker runs and what a requeue does stay in `jobs/queue.py`, the one module that knows the queue is PostgreSQL: `admin/jobs.py` calls it, and reads the worker lock only through it.
-- Web: pages thin, logic in composables; API access through one typed client module. The console's permission logic is the pure `app/lib/admin.ts`, so it is tested without a DOM; its pages read permissions from `useAdminConsole` only.
+### Entry points
+
+- `routes/` and `mcp/` are thin: validation, auth and calls into the service packages; no business logic lives in them.
+- `mcp/server.py` is a shell over the service layer: no parsing decision, no model choice, no queue knowledge and no workspace write lives in it, so an MCP spec change touches that file alone.
+- `jobs/intake.py` (`submit_parse`) is the one intake sequence — store, hash, probe, dedup, enqueue — that REST, MCP and the library's upload all run, so the three cannot drift apart.
+- MCP's `parse` reaches it through `POST /v1/parse`, where its upload lands.
+- `routes/library.py` files the job that sequence returns under a name and a folder, nothing more.
+- The service packages — `jobs/`, `workspace/`, `parsing/`, `agents/`, `billing/`, `upstream/`, `sandbox/`, `admin/` — import neither FastAPI nor Starlette, because the worker and the CLI run the same code with no request.
+- The one exception is `admin/deps.py`, the console's FastAPI dependencies; a route hands an upload to `jobs/intake.py` as a `ChunkReader`, never as a framework type.
+- Nothing in `jobs/` or `workspace/` imports from `routes/`, because the worker never imports a route.
+- What a route and the worker both run lives in `workspace/`, and the routes import it from there.
+- `trash.py` holds *Empty Trash* and the Trash's expiry (`empty_trash`) with the locks and the commit-then-discard they share with the routes (`lock_user`, `refuse_while_answering`, `commit_then_discard`).
+- `filing.py` holds the Files page's operations, which the library routes and the agent's library tools both run.
+- `organize.py` holds the path-based batch layer over them — the resolver, the batch rule, the sentences, the undo records and their replay — which a library conversation's tools (`jobs/chat_library.py`), the connector's organizing tools (`mcp/server.py`) and `/v1/library/<tool>` (`routes/v1.py`) all run, so the three answer alike. It lives in `workspace/` because the worker and the API both run it.
+- The Files page's operations sit in `filing.py`, not `trash.py`, because `filing.py` imports `trash.py`'s locks and the Trash's half needs `filing.py`'s names: one module, no cycle.
+- The routes keep what is theirs: the payloads, the bodies' validation, *Delete Immediately*, and the workspace lock taken around each call.
+
+### PDFs and the upstream
+
+- `parsing/poppler.py` is the only module that spawns Poppler; everything else consumes its typed results.
+- The application imports no PDF library, because PyMuPDF is AGPL and the only PDF engine is Poppler as a separate program ([parsing.md](./parsing.md)).
+- The tests' fixture PDFs are built with `reportlab`, a dev dependency (BSD) the application never imports ([testing.md](./testing.md) § The suite).
+- `upstream/` is the only package that calls the model upstream, Kano Proxy on the operator's key: `client.py` for vision calls and the catalog, `anthropic.py` for every Messages API call.
+- `kano_connection` in `upstream/client.py` is the only code that reads the value of `KANO_PROXY_API_KEY`; its callers hold the `Connection` it returns and hand it back to `upstream/`.
+- Elsewhere only whether the key is set is checked: `config.py`, and the console's settings page, which shows a secret as set or unset.
+
+### The workspace and the sandbox
+
+- `workspace/` is the only package that touches `WORKSPACES_DIR`: everything else reaches a user's files through its functions, because every open there goes through `safe_io.py`, which follows no link a shell could have planted.
+- The one exception is a document's original, kept outside the mount where no command reaches: `jobs/intake.py` copies it for a retry and reads it for a re-convert, at the path `original_of` answers.
+- `workspace/` is the only package that runs git.
+- `sandbox/client.py` is the only module that calls the sandbox runner.
+- The runner (`apps/sandbox`) is the only process with the Docker socket.
+- The egress proxy reads one file the worker writes (`sandbox/egress.py`) and talks to nothing of the service: it holds no secret and no setting of the database.
+
+### Agents, the queue and billing
+
+- `agents/` defines agents: no HTTP, no database; the runners and the settings consume its definitions ([agents.md](./agents.md)).
+- The one file it writes is the resized copy of a page's render that `agents/bbox.py` sends a model whose box convention needs that size; the runner deletes it after the call (`PreparedImage.cleanup`).
+- `jobs/queue.py` is the only module that knows the queue is PostgreSQL: the claim, the requeue, the worker lock and the lock that keeps a user's queued work from being claimed.
+- `billing/plans.py` and `billing/credits.py` are pure: no HTTP, no database session; the rows and the clock are passed in.
+- `billing/pay.py` is the only writer of `subscriptions`, from Kano Pay's canonical answer, never from a notification's body.
+
+### The operator console
+
+- `admin/` is the only package that decides a console permission or writes `groups`, `group_members`, `audit_log` and `runtime_settings`; `routes/admin.py` is thin over it.
+- A route that puts another area's field into its payload asks `Operator.can` (`admin/deps.py`), never the permission list itself.
+- The Google callback and the dev login call `join_owner_group` in `admin/groups.py` for the owner join.
+- Every console mutation writes its audit row through `admin/audit.py`, in the caller's transaction, before the route's one commit, so neither exists without the other.
+- Nothing outside `admin/` compares a group's name: a group counts by its permissions and its `builtin` flag.
+- Whether the worker runs and what a requeue does stay in `jobs/queue.py`: `admin/jobs.py` calls it and reads the worker lock only through it.
+
+### Web
+
+- Pages and components stay thin: a rule that can be pure is a framework-free module in `app/lib/` with a vitest test, and shared reactive state is a composable.
+- All API access goes through the one typed client, `app/lib/api.ts`. Every request is one of its functions, and every API URL the browser requests itself — an `<img>` or `<video>` source, a link or navigation, the `EventSource` of a conversation's stream — comes from one of its URL builders.
+- The console's permission logic is the pure `app/lib/admin.ts`, so it is tested without a DOM; the console reads permissions from `useAdminConsole` only.

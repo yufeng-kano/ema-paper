@@ -5,22 +5,22 @@
  * The confirmation is announced too, not just drawn: a screen-reader user pressing Copy
  * otherwise gets no feedback at all.
  *
- * `labelled` shows the word beside the glyph — for the two places the design puts Copy on
- * its own in a panel header or beside an endpoint, where an unlabelled square would be an
- * unexplained button rather than an obvious action on the value next to it. The word is
- * `label` when one is given — *Copy all* over the console's created codes — else *Copy*.
+ * `labelled` shows the word beside the glyph, on a secondary capsule — for Copy beside a
+ * value in a panel or a dialog (a key, an endpoint, the created codes), where an unlabelled
+ * square would be an unexplained button rather than an obvious action on the value next
+ * to it. The word is `label` when one is given — *Copy all* over the console's created
+ * codes — else *Copy*. Unlabelled, it is a ghost icon button.
  */
 const props = withDefaults(
   defineProps<{
     text: string
-    variant?: 'secondary' | 'ghost'
-    size?: 'xs' | 'sm' | 'md'
+    size: 'xs' | 'sm'
     labelled?: boolean
     /** The icon-only control's name, for a value its glyph alone does not say; with
      *  `labelled`, the word shown. */
     label?: string
   }>(),
-  { variant: 'ghost', size: 'md', label: undefined },
+  { label: undefined },
 )
 
 const { t } = useI18n()
@@ -48,7 +48,7 @@ onUnmounted(() => clearTimeout(resetTimer))
 <template>
   <span class="copy">
     <UiButton
-      :variant="variant"
+      :variant="labelled ? 'secondary' : 'ghost'"
       :size="size"
       :icon-only="!labelled"
       :label="labelled ? undefined : copied ? t('common.copied') : (label ?? t('common.copy'))"
