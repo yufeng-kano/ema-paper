@@ -1316,6 +1316,7 @@ Eight custom tools, declared in this order after `insert_image`. None is `strict
 - All eight run as writes of the turn (§ Tools), one at a time with the shell, the editor, `download_file`, `convert_file` and `insert_image` — `list_files` too, so a listing sees what the round's earlier calls changed, and it may write a document never written yet.
 - Each call runs under the workspace lock and a database session of its own. The seven that change the library run under the backup lock taken shared too, as `convert_file` runs.
 - They are never a subagent's.
+- **Six of them are the connector's too.** `new_folder`, `move`, `rename`, `copy`, `trash` and `put_back` — the path resolver, the batch rule, the sentences and the undo records — live in `workspace/organize.py`, which the connector's organizing tools and `POST /v1/library/<tool>` run as well ([mcp.md](./mcp.md) § The organizing tools). What this section says of them holds there, with `api` as the author. `list_files`, its paths in the VM and `new_document` stay this agent's (`jobs/chat_library.py`).
 
 **An item is named by its place as the Files page shows it** — `DL/DINO/iBOT.pdf`, a folder the same way, `''` or `/` for the top — or by its path under `/workspace/files/`, resolved as `convert_file` resolves its path (§ Tools). A document's directory and its `doc.md` both name the document. A path that names nothing live — nothing there, or something in the Trash — is that item's error.
 

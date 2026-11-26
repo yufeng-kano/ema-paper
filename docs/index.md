@@ -27,10 +27,10 @@ In the order a newcomer should meet them. Each entry says what the doc is the ho
 - **[api.md](./api.md)** — every HTTP route of both planes: the data plane `/v1/*` and the control plane `/api/*`, with their payloads, the one error shape, SSE and the request limits.
   - Read: any change to a route, a payload, an error type or a limit.
   - Not here: the console's routes (admin.md) and the billing routes' answers (billing.md); api.md lists them and points there.
-- **[auth.md](./auth.md)** — the credential kinds and how each is issued, stored and checked: Google sessions, API keys, the operator's upstream key, the OAuth 2.1 server for Claude Connectors, upload and document tickets; and deleting the account.
+- **[auth.md](./auth.md)** — the credential kinds and how each is issued, stored and checked: Google sessions, API keys, the operator's upstream key, the OAuth 2.1 server for Claude Connectors and its scopes, upload and document tickets; and deleting the account.
   - Read: anything that signs a caller in, issues or checks a credential, or deletes an account.
   - Not here: who may use the operator console (admin.md).
-- **[mcp.md](./mcp.md)** — the hosted MCP server: its transport, the `parse` tool and the commands it hands back, filing into Files, and the library tools.
+- **[mcp.md](./mcp.md)** — the hosted MCP server: its transport, the `parse` tool and the commands it hands back, filing into Files, the library tools, and the organizing tools that put Files in order within the call.
   - Read: any change to a tool, its description or what a connector parse does.
   - Not here: the REST routes the commands call (api.md) and the tickets they carry (auth.md).
 

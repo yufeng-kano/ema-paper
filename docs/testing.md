@@ -163,8 +163,8 @@
 - Another account's document 404.
 - A document ticket reading only its own document, and refused on `GET /v1/library`, the job routes, `/v1/parse` and `/mcp`.
 - A `read` ticket refused on a save.
-- A new grant holding both scopes, and a refresh keeping the scope it had.
-- The upgrade revoking a grant without `library` and deleting an unspent ticket minted under one (tests/test_migrations.py).
+- A new grant holding all three scopes, and a refresh keeping the scope it had.
+- The upgrade revoking a grant without `library` and deleting an unspent ticket minted under one, and the upgrade revoking a grant without `organize` (tests/test_migrations.py).
 - A save:
   - without `If-Match`: 428;
   - with a stale one: 409 `revision_conflict`, the file untouched;
@@ -173,6 +173,24 @@
   - crops and inserted images landing under `figures/`;
   - a save following a save;
   - a conflict leaving the local file and its ETag as they were.
+
+### Must-cover: organizing the library through the connector and the data plane
+
+[mcp.md](./mcp.md) § The organizing tools, [api.md](./api.md) § The library on the data plane.
+
+- Each tool through the SDK client, and its route, doing what the Files page does:
+  - a move into a folder, a taken name suffixed, the undo record naming both names;
+  - a rename, a collision refused;
+  - a new folder with the folders on its way, one already there reported;
+  - a copy;
+  - a trash and a put back by the path the Trash listing gives.
+- A move into a folder that does not exist refused, nothing made.
+- A batch doing what it can: one item refused, the others done, the call not an error; every item refused, an error (a tool error, the first refusal's status on the route).
+- `undo` of a suffixed move putting the item back under its old name, of a trash putting it back, of a new folder trashing it; `redo` doing the step again; a record that is not one refused with nothing changed.
+- Another account's items unreachable, by path and by an undo record's ids.
+- A document ticket refused on `GET /v1/library/trash` and the organizing routes.
+- The commits authored `api`.
+- The Files Agent's library tools answering as before (tests/test_chat_library.py).
 
 ### Must-cover: filing a data-plane parse into Files
 

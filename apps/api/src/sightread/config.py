@@ -327,8 +327,9 @@ class Settings(BaseSettings):
     chat_sections_per_message: int = 4
     chat_section_heading_max_chars: int = 512
     # A library conversation's limits (docs/chat.md § Library conversations): the Files-page
-    # items one message carries, the paths one library tool call names, and the lines one
-    # `list_files` answers before it says how many it left out.
+    # items one message carries, the paths one library tool call names — the connector's
+    # organizing tools' and `POST /v1/library/<tool>`'s too (docs/mcp.md § The organizing
+    # tools) — and the lines one `list_files` answers before it says how many it left out.
     chat_library_items_per_message: int = 200
     chat_library_max_paths: int = 100
     chat_list_files_max_entries: int = 500

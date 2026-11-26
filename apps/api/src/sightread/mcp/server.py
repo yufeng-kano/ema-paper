@@ -11,11 +11,15 @@ spec change touches this file alone (docs/project-structure.md § Boundaries). W
 connector parse behave as a Files upload does — the check, the crops, the retry, the
 in-flight join — is the data plane's (docs/mcp.md § The `parse` tool), and so is filing
 one into Files: `parse` with `folder` finds or makes the folder through the data plane's
-own function and mints a ticket that files there (docs/mcp.md § Filing into Files).
+own function and mints a ticket that files there (docs/mcp.md § Filing into Files). The
+organizing tools carry no bytes and no text, so they act within the call: each runs
+`workspace.organize`, the batch layer the Files Agent's library tools and
+`POST /v1/library/<tool>` run, which takes its own locks (docs/mcp.md § The organizing tools).
 """
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -38,9 +42,10 @@ from ..auth import document_tickets, upload_tickets
 from ..auth.deps import bearer_credential, resolve_bearer_identity
 from ..db.models import FILE_KIND, User
 from ..errors import ApiError, error_response
-from ..routes.v1 import FOLDER_PATH_MAX, document_entry, library_index
+from ..routes.v1 import FOLDER_PATH_MAX, document_entry, library_index, trash_index
 from ..upstream.client import offered_models
-from ..workspace import filing
+from ..workspace import documents as workspace_documents
+from ..workspace import filing, git, organize
 from ..workspace.layout import path_segment
 
 MCP_PATH = "/mcp"
@@ -182,6 +187,24 @@ PICTURE_ROUTES = (
 )
 
 
+# The organizing tools' shared inputs, at module level: the SDK resolves a tool's annotations
+# in this module's namespace (docs/mcp.md § The organizing tools).
+PATHS_FIELD = Field(
+    description=(
+        "The items' paths exactly as list_library lists them (documents, files of any kind, "
+        "folders), e.g. ['DL/Attention Is All You Need.pdf']"
+    ),
+    min_length=1,
+)
+TO_FIELD = Field(
+    description=(
+        "An existing folder's path as list_library lists it, or / for the top level; make a "
+        "missing one with new_folder first"
+    ),
+    max_length=FOLDER_PATH_MAX,
+)
+
+
 def _local_name(name: str) -> str:
     """The local name a command lands a document under, as one shell word: the directory
     name the workspace gives it (`path_segment`: no separator, never `.`, `..` or a
@@ -235,9 +258,50 @@ def build_server(app: FastAPI) -> MCPServer:
             "The library tools read the reader's Files library the same way: "
             "`list_library` finds a document or a folder path, `read_document` gives the "
             "commands that land its text, notes and figures on disk, `write_document` the "
-            "command that saves edited text or notes back."
+            "command that saves edited text or notes back. "
+            "The organizing tools put the Files library in order as its Files page does, at "
+            "once and with no shell or browser: `new_folder`, `move`, `rename`, `copy`, "
+            "`trash`, `put_back` and `undo`. Name items by path exactly as `list_library` "
+            "lists them, `/` for the top level, and make a folder with `new_folder` before "
+            "moving anything into it. When the reader asks you to organize, act without "
+            "asking first: every answer says what was done and carries `undo`, which the "
+            "`undo` tool takes back. Nothing is deleted for good: only the reader empties "
+            "the Trash, on the website."
         ),
     )
+
+    # The organizing tools change the library but remove nothing for good: every step comes
+    # back with `undo`, and the Trash keeps what `trash` takes (docs/mcp.md § Annotations).
+    organizing = ToolAnnotations(
+        read_only_hint=False, destructive_hint=False, open_world_hint=False
+    )
+
+    async def organized(name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+        """One organizing tool's call: `workspace.organize` under its own locks, authored
+        `api`, shielded so a client that stops waiting never cuts a batch off between items
+        (docs/mcp.md § The organizing tools). Nothing done and something refused is a tool
+        error with the sentences."""
+        async with app.state.sessionmaker() as db:
+            settings = await app.state.runtime_settings.current(db)
+            user_id = (await _current_user(db)).id
+        outcome = await asyncio.shield(
+            organize.run_locked(
+                app.state.sessionmaker,
+                settings,
+                user_id=user_id,
+                author=git.API_AUTHOR,
+                name=name,
+                tool_input=tool_input,
+            )
+        )
+        if outcome.is_error:
+            raise ValueError(outcome.text)
+        return {
+            "result": outcome.text,
+            "done": outcome.done,
+            "failed": outcome.failed,
+            "undo": outcome.undo,
+        }
 
     @server.tool(
         description=(
@@ -256,7 +320,8 @@ def build_server(app: FastAPI) -> MCPServer:
             "parse with the folder and run upload again with the same file: it is filed "
             "from the earlier parse, not charged again, when it is the same parse (the "
             "notes say when). To retry a failed parse, filed or not, call parse without "
-            "`folder`. " + COORDINATE_CONTRACT
+            "`folder`. A document already in Files is moved, renamed or trashed with the "
+            "organizing tools, never parsed again. " + COORDINATE_CONTRACT
         ),
         # It may make folders and file a document; it never removes or overwrites one.
         annotations=ToolAnnotations(
@@ -394,12 +459,15 @@ def build_server(app: FastAPI) -> MCPServer:
     @server.tool(
         description=(
             "List the reader's Ema Paper Files library: folders and documents (parsed "
-            "PDFs and images, markdown documents, kept files) with their ids and paths. "
-            "Use it to find the `document_id` for read_document or write_document, and a "
-            "folder `path` for parse's `folder`. "
+            "PDFs and images, markdown documents, and files of any kind kept as they are, "
+            "videos too, of kind `file`) with their ids and paths. Use it to find the "
+            "`document_id` for read_document or write_document, a folder `path` for "
+            "parse's `folder` and the organizing tools' `to`, and the paths new_folder, "
+            "move, rename, copy and trash take. "
             "Optional: `folder`, a folder's path as listed (that folder and everything "
-            "below it), and `name`, part of a document's name. When `truncated` is true, "
-            "narrow by folder or name."
+            "below it), and `name`, part of a document's name. `trash: true` lists the "
+            "Trash instead, each item by the path put_back takes. When `truncated` is "
+            "true, narrow by folder or name."
         ),
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
     )
@@ -410,14 +478,31 @@ def build_server(app: FastAPI) -> MCPServer:
         name: Annotated[
             str | None, Field(description="Part of a document's name, any case")
         ] = None,
+        trash: Annotated[
+            bool,
+            Field(description="List the Trash instead: the items put_back can bring back"),
+        ] = False,
     ) -> dict[str, Any]:
         async with app.state.sessionmaker() as db:
             settings = await app.state.runtime_settings.current(db)
             user = await _current_user(db)
-            index = await library_index(db, user.id)
-        folders, documents = index["folders"], index["documents"]
-        if folder and folder.strip("/"):
-            wanted = folder.strip("/")
+            user_id = user.id
+            if trash:
+                # The Trash and the live folders a `folder` must name, from its one snapshot.
+                trashed = await trash_index(db, user_id)
+                rows = await workspace_documents.user_folders(db, user_id)
+                hidden = workspace_documents.trashed_folder_ids(rows.values())
+                folders = [
+                    {"path": workspace_documents.item_path(rows, row.parent_id, row.name)}
+                    for row in rows.values()
+                    if row.id not in hidden
+                ]
+                documents = []
+            else:
+                index = await library_index(db, user_id)
+                folders, documents, trashed = index["folders"], index["documents"], []
+        wanted = folder.strip("/") if folder else ""
+        if wanted:
             if wanted not in {entry["path"] for entry in folders}:
                 raise ValueError(
                     f"No folder of the library has the path {wanted!r}: call list_library "
@@ -429,10 +514,27 @@ def build_server(app: FastAPI) -> MCPServer:
                 if entry["path"] == wanted or entry["path"].startswith(wanted + "/")
             ]
             documents = [entry for entry in documents if entry["path"].startswith(wanted + "/")]
+            trashed = [entry for entry in trashed if entry["path"].startswith(wanted + "/")]
         if name and name.strip():
             needle = name.strip().casefold()
             documents = [entry for entry in documents if needle in entry["name"].casefold()]
+            trashed = [entry for entry in trashed if needle in entry["name"].casefold()]
         cap = settings.mcp_library_list_max_items
+        if trash:
+            return {
+                "trash": [
+                    {
+                        "id": entry["id"],
+                        "kind": entry["kind"],
+                        "name": entry["name"],
+                        "path": entry["path"],
+                        "trashed_at": _stamp(entry["trashed_at"]),
+                    }
+                    for entry in trashed[:cap]
+                ],
+                "total": len(trashed),
+                "truncated": len(trashed) > cap,
+            }
         return {
             "folders": [{"id": entry["id"], "path": entry["path"]} for entry in folders],
             "documents": [
@@ -556,6 +658,138 @@ def build_server(app: FastAPI) -> MCPServer:
             ),
             "notes": WRITE_NOTES,
         }
+
+    # --- the organizing tools (docs/mcp.md § The organizing tools) ---------------------------
+
+    @server.tool(
+        description=(
+            "Make a folder in the reader's Ema Paper Files library, with any missing folders "
+            "on its way, as the Files page's New folder does. A folder already there is "
+            "reported, not made twice. Acts at once, no shell needed; the answer says what "
+            "was done and carries `undo`."
+        ),
+        annotations=organizing,
+    )
+    async def new_folder(
+        path: Annotated[
+            str,
+            Field(
+                description="The new folder's path, e.g. DL/Transformer",
+                max_length=FOLDER_PATH_MAX,
+            ),
+        ],
+    ) -> dict[str, Any]:
+        return await organized("new_folder", {"path": path})
+
+    @server.tool(
+        description=(
+            "Move documents, files of any kind (videos too) or folders of the reader's Ema "
+            "Paper Files library into a folder, as a drag on the Files page does. `to` must "
+            "exist: make it with new_folder first. A name already taken there gets a ' (2)' "
+            "suffix. Acts at once, item by item: the answer says what was done for each and "
+            "carries `undo`, which the undo tool takes back. If a call times out, check "
+            "list_library before calling it again."
+        ),
+        annotations=organizing,
+    )
+    async def move(
+        paths: Annotated[list[str], PATHS_FIELD], to: Annotated[str, TO_FIELD]
+    ) -> dict[str, Any]:
+        return await organized("move", {"paths": paths, "to": to})
+
+    @server.tool(
+        description=(
+            "Rename one document, file or folder of the reader's Ema Paper Files library, as "
+            "the Files page does. `name` is the new name alone, without a folder; keep a "
+            "file's extension unless the reader asks otherwise (a markdown document always "
+            "keeps .md). A name already taken in that folder is refused. The answer carries "
+            "`undo`."
+        ),
+        annotations=organizing,
+    )
+    async def rename(
+        path: Annotated[str, Field(description="The item's path as list_library lists it")],
+        name: Annotated[
+            str,
+            Field(
+                description="The new name alone, e.g. Attention Is All You Need.pdf",
+                min_length=1,
+                max_length=filing.DOCUMENT_NAME_MAX,
+            ),
+        ],
+    ) -> dict[str, Any]:
+        return await organized("rename", {"path": path, "name": name})
+
+    @server.tool(
+        description=(
+            "Copy documents, files or folders of the reader's Ema Paper Files library into a "
+            "folder, as Paste on the Files page does: a document with its text, notes, "
+            "original and images, a folder with everything in it. Copies count against the "
+            "reader's storage. `to` must exist; a name taken there gets ' (2)'. Every call "
+            "makes new copies, so after a timeout check list_library before calling again. "
+            "The answer carries `undo`, which moves the copies to the Trash."
+        ),
+        annotations=organizing,
+    )
+    async def copy(
+        paths: Annotated[list[str], PATHS_FIELD], to: Annotated[str, TO_FIELD]
+    ) -> dict[str, Any]:
+        return await organized("copy", {"paths": paths, "to": to})
+
+    @server.tool(
+        description=(
+            "Move documents, files or folders of the reader's Ema Paper Files library to its "
+            "Trash, as the Files page's Move to Trash does. Nothing is deleted for good: the "
+            "Trash keeps them until the reader empties it or its expiry removes them, and "
+            "put_back or undo brings them back. Only the reader deletes for good, on the "
+            "website. The answer carries `undo`."
+        ),
+        annotations=organizing,
+    )
+    async def trash(paths: Annotated[list[str], PATHS_FIELD]) -> dict[str, Any]:
+        return await organized("trash", {"paths": paths})
+
+    @server.tool(
+        description=(
+            "Put items of the reader's Ema Paper Trash back, as the Files page's Put Back "
+            "does: to the folder each came from, or the nearest one above it that is still "
+            "there, a taken name suffixed ' (2)'. `paths` as list_library with trash=true "
+            "lists them; when two share a path, the one trashed last. The answer carries "
+            "`undo`."
+        ),
+        annotations=organizing,
+    )
+    async def put_back(
+        paths: Annotated[
+            list[str],
+            Field(
+                description="The items' paths as list_library with trash=true lists them",
+                min_length=1,
+            ),
+        ],
+    ) -> dict[str, Any]:
+        return await organized("put_back", {"paths": paths})
+
+    @server.tool(
+        description=(
+            "Take back a step new_folder, move, rename, copy, trash or put_back made in the "
+            "reader's Ema Paper Files library, as ⌘Z on the Files page does: a move goes "
+            "back where it came from, a rename back to the old name, a trash is put back, "
+            "and new folders, copies and put-backs go to the Trash. An item the reader has "
+            "moved or renamed since is refused and left as it is. `step` is the `undo` an "
+            "earlier answer returned, unchanged; `redo: true` does the step again. Take back "
+            "the latest step first."
+        ),
+        annotations=organizing,
+    )
+    async def undo(
+        step: Annotated[
+            dict[str, Any],
+            Field(description="The `undo` an earlier answer returned, unchanged"),
+        ],
+        redo: Annotated[bool, Field(description="Do the step again instead")] = False,
+    ) -> dict[str, Any]:
+        return await organized("undo", {"step": step, "redo": redo})
 
     return server
 

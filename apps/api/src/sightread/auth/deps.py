@@ -176,15 +176,17 @@ TicketJobId = Annotated[uuid.UUID, Depends(require_ticket_job)]
 
 
 async def require_library_user(request: Request, db: DbSession) -> User:
-    """The library on the data plane takes a durable credential: an API key or an OAuth
-    token, never a ticket (docs/api.md § The library on the data plane)."""
+    """The library as a whole on the data plane — its listing, the Trash's, and organizing
+    it — takes a durable credential: an API key or an OAuth token, never a ticket
+    (docs/api.md § The library on the data plane)."""
     credential = bearer_credential(request)
     if credential is not None and credential.startswith(document_tickets.TICKET_PREFIX):
         raise ApiError(
             401,
             "auth",
             "A document ticket reads only its own document; list the library with an API "
-            "key, or with the connector's list_library tool",
+            "key, or with the connector's list_library tool, and organize it with an API "
+            "key or the connector's organizing tools",
         )
     return await require_bearer_user(request, db)
 

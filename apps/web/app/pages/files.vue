@@ -1253,6 +1253,17 @@ function forget(gone: Item[]) {
 /** One request in flight at a time: a second key press while one runs does nothing. */
 const busy = ref(false)
 
+/** A tab that comes back reads the library again, once: Claude may have organized it through
+ *  the connector meanwhile, from another app or device (docs/web.md § Files). Not while an
+ *  action of the page runs, which reads it again itself, nor over a read in flight. */
+function onVisible() {
+  if (document.visibilityState === 'visible' && !busy.value && !pending.value) {
+    void refresh()
+  }
+}
+onMounted(() => document.addEventListener('visibilitychange', onVisible))
+onBeforeUnmount(() => document.removeEventListener('visibilitychange', onVisible))
+
 /**
  * Every operation is the same steps: run it, re-read the library, report what went wrong
  * over the list. The re-read runs on failure too — a batch that stopped halfway has still

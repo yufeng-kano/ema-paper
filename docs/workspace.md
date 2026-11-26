@@ -253,6 +253,8 @@ A copy — *Copy* and *Paste*, *Duplicate*, a drag with ⌥ on the Files page ([
 
 The Files page's operations — a new folder, a new markdown document, a rename or a move, a copy, Move to Trash and Put Back — are functions of `workspace/` (`filing.py`, with the row lookups beside `is_live` in `documents.py`, [project-structure.md](./project-structure.md)). The library routes and the chat agent's library tools ([chat.md](./chat.md) § Library conversations) both call them, since nothing in `jobs/` imports a route.
 
+The agent's tools reach them through `organize.py`, the path-based batch layer: items named by their place in Files, many per call, each its own transaction, answered in sentences with an undo record. The connector's organizing tools and `POST /v1/library/<tool>` run the same layer ([mcp.md](./mcp.md) § The organizing tools), so the three cannot drift apart.
+
 - **The agent's move is the page's move.** Both get:
   - the same live-row checks (what is not live is not found);
   - the same names — cleaned and in NFC, ` (2)` where a move, a copy, a new item or a Put Back meets a taken one, a rename that collides refused;
@@ -263,13 +265,15 @@ The Files page's operations — a new folder, a new markdown document, a rename 
   - the same checks and repairs when a commit raises or the tree refuses (§ Revisions, § The Trash, § Copies).
 - **The caller holds the locks.** Each function runs under the workspace lock its caller took — and, for a copy, the backup lock taken shared around it — and never takes the lock itself, which is not reentrant.
   - A route takes it around its one call, a tool around its whole call, the items of a batch one after another under that one hold.
+  - `organize.run_locked` takes them for a batch caller that holds none — the agent's tools and the connector's — the backup lock shared, then the workspace lock, then a session of its own. `/v1/library/<tool>` takes the same two around `organize.run` on its request's session, as a route takes them.
   - The one exception is the page's *New document* without text: a row and nothing in the tree (its directory is made at its first read), so its route takes no lock. With `text`, or from the agent, whose answer names the `doc.md` it writes at once, it runs under the lock like any filing.
   - Each commits on the session it is given.
 - **The author is the caller's.** Every tree commit these functions make takes an `author`: the move, the Trash's `trash <path>`, `put back <path>`, `copy <from> -> <to>`, the `restore` that undoes one whose commit failed, a new document's first write.
   - The routes pass `user`.
   - The tools pass `agent:<conversation id>`, the author that conversation's shell commands commit under.
+  - The connector's organizing tools and `/v1/library/<tool>` pass `api`.
   - So a revision says who moved a file whichever way it was moved (§ Revisions).
-- **Deleting for good stays the reader's.** *Delete Immediately* and *Empty Trash* are not among them: they belong to the routes and `trash.empty_trash`, and no tool calls them.
+- **Deleting for good stays the reader's.** *Delete Immediately* and *Empty Trash* are not among them: they belong to the routes and `trash.empty_trash`, and no tool calls them — not the agent's, not the connector's, and no route of the data plane.
 
 ## Revisions
 
@@ -349,7 +353,7 @@ Staging consults no other ignore rule. Every commit lists what it stages by the 
 - The commit author names who did it:
   - `user`;
   - `agent` with the conversation id — a shell command, an editor write, or a Files operation the agent's library tools made (§ The page's operations are the agent's);
-  - `api` for a save through the data plane — Claude's through the connector among them ([api.md](./api.md) § The library on the data plane).
+  - `api` for a save or a Files operation through the data plane or the connector — Claude's through the connector among them ([api.md](./api.md) § The library on the data plane, [mcp.md](./mcp.md) § The organizing tools).
 - The message names the file and the tool.
 - A turn a dead worker left between a tool's write and its commit is finished by the next worker, which first commits what it left as `bash: interrupted by a worker restart` in the turn's name ([jobs.md](./jobs.md) § Chat turns), so no revision carries another tool's changes.
 - **A host write commits only the paths it wrote**: the two listings above, limited to those paths. A shell command's half-written files elsewhere in the tree never ride along in a save's revision.

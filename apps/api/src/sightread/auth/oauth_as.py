@@ -34,13 +34,16 @@ CODE_TTL = timedelta(minutes=5)
 ACCESS_TTL = timedelta(hours=1)
 REFRESH_TTL = timedelta(days=30)
 
-# Two scopes (docs/auth.md § 4): `parse`, the `parse` tool and the job routes, and
-# `library`, reading the Files library, saving a document's text and notes and filing a
-# parse into its folders (docs/mcp.md § Filing into Files). A grant is made for both, the
-# consent page saying both, and a refresh keeps the scope of the grant it rotates.
+# Three scopes (docs/auth.md § 4): `parse`, the `parse` tool and the job routes; `library`,
+# reading the Files library, saving a document's text and notes and filing a parse into its
+# folders (docs/mcp.md § Filing into Files); and `organize`, putting the library in order —
+# folders, moves, renames, copies, the Trash (docs/mcp.md § The organizing tools). A grant
+# is made for all three, the consent page saying all three, and a refresh keeps the scope of
+# the grant it rotates: a grant made before a scope existed is revoked, never widened.
 SCOPE = "parse"
 LIBRARY_SCOPE = "library"
-GRANTED_SCOPE = f"{SCOPE} {LIBRARY_SCOPE}"
+ORGANIZE_SCOPE = "organize"
+GRANTED_SCOPE = f"{SCOPE} {LIBRARY_SCOPE} {ORGANIZE_SCOPE}"
 CODE_CHALLENGE_METHOD = "S256"
 CLIENT_ID_CHARS = 32
 

@@ -5,7 +5,7 @@ Two planes, one FastAPI app.
 - **Data plane `/v1/*`** — authenticated by API key (`Authorization: Bearer sr_...`) or an OAuth access token ([auth.md](./auth.md)). This is the product.
   - `POST /v1/parse`, the `GET /v1/jobs/{id}*` routes (status, `/result`, `/result.md`, `/figures/…`, `/events`) and the `last` forms of all but `/events` additionally accept a single-use upload ticket (`srt_...`, [auth.md](./auth.md) § 5): one upload, then reads of the job that upload created, nothing else.
   - The routes under `/v1/library/documents/{id}` additionally accept a document ticket (`srd_...`, [auth.md](./auth.md) § 6) for that one document.
-  - An OAuth access token reaches `/v1/library*` too: every live grant holds `library` ([auth.md](./auth.md) § 4).
+  - An OAuth access token reaches `/v1/library*` too: every live grant holds `library` and `organize` ([auth.md](./auth.md) § 4).
 - **Control plane `/api/*`** — session cookie (Google OIDC), consumed only by the Nuxt web app.
 
 **Upstream.** Every call goes to **Kano Proxy** on the operator's own key ([chat.md](./chat.md), [auth.md](./auth.md) § 3). There are no user-defined upstreams.
@@ -237,9 +237,9 @@ The models a parse may run — `PARSE_MODEL`, then `PARSE_FALLBACK_MODEL` when s
 
 Papers are read and annotated in Ema Paper, then handed to Claude — a deck made in claude.ai, Claude Code's own work — so Claude reads the library and saves a document's text and notes back.
 
-These are the control plane's library reads and its two saves on a data-plane credential, and nothing more: no rename, move, Trash, copy, upload into the library or revert here. The connector's library tools are commands over these routes ([mcp.md](./mcp.md) § The library tools).
+These are the control plane's library reads, its two saves, and the Files page's organizing operations on a data-plane credential. There is no upload into the library, revert, convert, *Delete Immediately* or *Empty Trash* here. The connector's library tools are commands over these routes ([mcp.md](./mcp.md) § The library tools), and its organizing tools run the operations below from the same function ([mcp.md](./mcp.md) § The organizing tools).
 
-Credentials: an API key, an OAuth access token, or — on the routes of its own document only — a document ticket ([auth.md](./auth.md) § 6).
+Credentials: an API key, an OAuth access token, or — on the routes of its own document only — a document ticket ([auth.md](./auth.md) § 6). The organizing routes and `GET /v1/library/trash` take a durable credential only: a document ticket is refused there (**401**), as on `GET /v1/library`.
 
 Every route answers for the caller's live rows only: a document in the Trash, or in a folder that is, is **404** as on the control plane.
 
@@ -266,6 +266,37 @@ Every route answers for the caller's live rows only: a document in the Trash, or
   - `…/images/{name}`: an image inserted into `doc.md` or `notes.md` (`figures/img-….png|jpg`);
   - `…/original`: a parse's original upload;
   - `…/file`: a library file's bytes.
+- `GET /v1/library/trash` — `{trash: [{id, kind, name, path, trashed_at}]}`: each item the Trash holds on its own, newest first, as the Trash tab lists it.
+  - `kind` is `folder`, or a document's kind as in `GET /v1/library`.
+  - `path` is where Put Back returns the item, then its name — the Trash tab's *Original location* — which `put_back` takes.
+  - An item that went to the Trash inside a folder is the folder's, not a row of its own.
+
+**Organizing the library.** `POST /v1/library/new_folder`, `…/move`, `…/rename`, `…/copy`, `…/trash`, `…/put_back` and `…/undo` are the connector's organizing tools as routes: the JSON body is the tool's input, the answer its answer ([mcp.md](./mcp.md) § The organizing tools). They run the Files page's own operations ([workspace.md](./workspace.md) § The page's operations are the agent's) through the path-based batch layer a library conversation's tools run ([chat.md](./chat.md) § Library conversations, *The library tools*).
+
+| Route | Body |
+|-------|------|
+| `POST /v1/library/new_folder` | `{path}` |
+| `POST /v1/library/move` | `{paths, to}` |
+| `POST /v1/library/rename` | `{path, name}` |
+| `POST /v1/library/copy` | `{paths, to}` |
+| `POST /v1/library/trash` | `{paths}` |
+| `POST /v1/library/put_back` | `{paths}`, each as `GET /v1/library/trash` lists it |
+| `POST /v1/library/undo` | `{step, redo?}`: an earlier answer's `undo`, unchanged |
+
+- An item is named by its `path` as `GET /v1/library` lists it, a folder the same way; `/` (or `''`) is the top.
+- `paths` holds at least one path and at most `CHAT_LIBRARY_MAX_PATHS` (100).
+- **200** `{result, done, failed, undo}` when anything was done, or nothing needed doing:
+  - `result` — one sentence per item, what was done or why not (*Moved DL/iBOT.pdf (document 34) to DL/DINO/iBOT.pdf.*);
+  - `done` and `failed` — how many items were done and refused;
+  - `undo` — the undo record of what was done, null when nothing was.
+- **A batch does what it can**: each item is its own transaction, so a refused item is reported in `result` and the next goes on.
+- When nothing was done and something was refused, the answer is the error envelope with the first refusal's status and type, and `message` the sentences. So a call naming one item answers what the control plane's route answers for it:
+  - **404** for an item or a `to` that names nothing live;
+  - **409** for a rename that collides, a document whose conversation is answering, the storage full before a copy (`storage_full`), a workspace that is recovering, or an `undo` whose item was moved (a move) or renamed (a rename) since;
+  - **400** for a folder moved into its own subtree, a path deeper than 64 folders, too many paths, or a `step` that is not an undo record;
+  - **422** for a body that does not parse.
+- Every tree commit is authored `api` ([workspace.md](./workspace.md) § Revisions).
+- Nothing on the data plane deletes for good: *Delete Immediately* and *Empty Trash* stay with the reader on the Files page.
 
 ## Control plane (session cookie, CSRF-safe: SameSite=Lax + custom header check on mutations)
 
@@ -1045,7 +1076,7 @@ Teaching `/v1/parse` to accept a cookie would put a CSRF-shaped hole in the prod
 | `CHAT_SECTIONS_PER_MESSAGE` | 4 | whole sections added to one message ([chat.md](./chat.md) § What a user message carries) |
 | `CHAT_SECTION_HEADING_MAX_CHARS` | 512 | the heading of one such section |
 | `CHAT_LIBRARY_ITEMS_PER_MESSAGE` | 200 | Files-page items one library conversation's message carries ([chat.md](./chat.md) § Library conversations) |
-| `CHAT_LIBRARY_MAX_PATHS` | 100 | paths one library tool call takes |
+| `CHAT_LIBRARY_MAX_PATHS` | 100 | paths one library tool call takes: a library conversation's, the connector's organizing tools' and `POST /v1/library/<tool>`'s |
 | `CHAT_LIST_FILES_MAX_ENTRIES` | 500 | lines one `list_files` answers |
 | `CHAT_ATTACHMENT_MAX_BYTES` | 20971520 (20 MiB) | per attached file ([chat.md](./chat.md)) |
 | `CHAT_ATTACHMENTS_PER_MESSAGE` | 8 | |

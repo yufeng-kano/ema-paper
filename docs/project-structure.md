@@ -83,6 +83,7 @@ ema-paper/
           git.py                  # git as the revision store
           documents.py            # a document's files, and the row lookups beside `is_live`
           filing.py               # filing into the library, and the Files page's operations
+          organize.py             # those operations by path, in batches: the agent's library tools, the connector's organizing tools, /v1/library/<tool>
           trash.py                # deleting for good from the Trash (`empty_trash`)
           reconcile.py            # the rows brought in line with the tree
           accounts.py             # a deleted account's marker and files
@@ -173,6 +174,7 @@ ema-paper/
 - What a route and the worker both run lives in `workspace/`, and the routes import it from there.
 - `trash.py` holds *Empty Trash* and the Trash's expiry (`empty_trash`) with the locks and the commit-then-discard they share with the routes (`lock_user`, `refuse_while_answering`, `commit_then_discard`).
 - `filing.py` holds the Files page's operations, which the library routes and the agent's library tools both run.
+- `organize.py` holds the path-based batch layer over them — the resolver, the batch rule, the sentences, the undo records and their replay — which a library conversation's tools (`jobs/chat_library.py`), the connector's organizing tools (`mcp/server.py`) and `/v1/library/<tool>` (`routes/v1.py`) all run, so the three answer alike. It lives in `workspace/` because the worker and the API both run it.
 - The Files page's operations sit in `filing.py`, not `trash.py`, because `filing.py` imports `trash.py`'s locks and the Trash's half needs `filing.py`'s names: one module, no cycle.
 - The routes keep what is theirs: the payloads, the bodies' validation, *Delete Immediately*, and the workspace lock taken around each call.
 

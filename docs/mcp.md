@@ -5,11 +5,11 @@ A **thin shell over the REST service layer**: no parsing logic of its own, no se
 - an upload ticket for a parse (`parse`), which files the parsed document into a folder of the reader's Files library when the agent names one (§ Filing into Files);
 - a document ticket for reading a document of the library or saving its text and notes (`read_document`, `write_document`).
 
-The one answer it gives inline is the library's index (`list_library`).
+Two kinds of answer come inline, because they carry no file and no text: the library's index (`list_library`), and what the organizing tools did to the reader's Files library (§ The organizing tools), which act within the call.
 
 The document bytes themselves never travel through MCP. Base64 file content in tool arguments burns ~1.37× the file size in model tokens, so uploads go out-of-band over the existing REST data plane (same pattern as S3 presigned URLs).
 
-This assumes the MCP client can run shell commands with network access to this host (Claude Code has it natively; claude.ai chat/cowork need "Allow network egress" enabled in sandbox settings). Clients without a shell are out of scope.
+The commands assume the MCP client can run shell commands with network access to this host (Claude Code has it natively; claude.ai chat/cowork need "Allow network egress" enabled in sandbox settings). `list_library` and the organizing tools need no shell, so a client without one can still find and organize the reader's files; parsing, reading and saving a document stay out of its reach.
 
 ## Transport & auth
 
@@ -140,7 +140,7 @@ The server instructions and the tool description stay short and explicit about t
 - that the path comes from `list_library` exactly as listed, because a name that matches no folder creates one;
 - that a file parsed earlier is filed by sending it again on a ticket with the folder, free when it is the same parse.
 
-`list_library`'s description names the folder `path`s as what `parse`'s `folder` takes.
+`list_library`'s description names the folder `path`s as what `parse`'s `folder` takes (§ The library tools, *`list_library`*).
 
 No base64 source, no MCP-side progress notifications, no result relay — the REST plane already does all three better (SSE, dedup, `-o` to disk).
 
@@ -154,12 +154,19 @@ The connector also reads the Files library and saves a document's text and notes
 
 ### `list_library`
 
-- **Input:** `folder` (optional) — a folder's `path` as this tool shows it, e.g. `Papers/2024`: that folder and everything below it. `name` (optional) — part of a document's name, any case.
+- **Input:** `folder` (optional) — a folder's `path` as this tool shows it, e.g. `Papers/2024`: that folder and everything below it. `name` (optional) — part of a document's name, any case. `trash` (optional, false) — list the Trash instead.
 - **Output, inline:** `{folders: [{id, path}], documents: [{id, name, path, kind, status, page_count}], total, truncated}`.
   - The live library (no Trash), ordered by path.
   - At most `MCP_LIBRARY_LIST_MAX_ITEMS` (300) documents. `truncated` says more matched, with `total` how many, and the description says to narrow by `folder` or `name`.
+- **With `trash: true`:** `{trash: [{id, kind, name, path, trashed_at}], total, truncated}`, the rows of `GET /v1/library/trash` ([api.md](./api.md) § The library on the data plane).
+  - Each item trashed on its own, newest first, as the Trash tab lists it. An item that went to the Trash inside a folder is the folder's, not a row of its own.
+  - `kind` is `folder`, or a document's kind as above.
+  - `path` is where Put Back returns the item, then its name: the Trash tab's *Original location*, and what `put_back` takes (§ The organizing tools).
+  - `folder` keeps the items whose `path` is under that folder, `name` those whose name holds it; a `folder` that names no live folder is the tool error above.
+  - At most `MCP_LIBRARY_LIST_MAX_ITEMS` items, with `total` and `truncated` as above.
 - **Why inline:** it is the index the agent picks a document from — rows, never content.
 - **Unknown folder:** a `folder` that matches no live folder is a tool error that says to call the tool without it and use a `path` under `folders`.
+- **The description** names the folder `path`s as what `parse`'s `folder` and the organizing tools' `to` take, documents of every kind as what the organizing tools' `paths` take (a video kept in Files is a document of kind `file`), and `trash` as what lists `put_back`'s paths.
 
 ### `read_document`
 
@@ -196,7 +203,54 @@ Input: `document_id`. Output: a `write` document ticket, `expires_at`, `document
 - Each save's revision is authored `api`.
 - A file of the library is a tool error: it has no text to save.
 
-### Annotations
+## The organizing tools
+
+The connector also puts the reader's Files library in order, as the Files page does: `new_folder`, `move`, `rename`, `copy`, `trash`, `put_back`, and `undo`. A reader who asked Claude to tidy their papers into folders otherwise watched it drive a browser through the Files page.
+
+- **They act within the call.** A move carries no file and no text, so there is no ticket and no command: the tool does it and answers what it did. They need no shell.
+- **They are the Files Agent's tools.** The first six take the inputs, run the operations and answer the sentences of a library conversation's library tools ([chat.md](./chat.md) § Library conversations, *The library tools*), from the same code (`workspace/organize.py`). What holds there holds here, and this section says only what differs.
+  - An item is named by its place as `list_library` lists it — `DL/DINO/iBOT.pdf`, a folder the same way, `/` for the top. A path under `/workspace/files/` names it too, as there, though only a library conversation's agent sees one.
+  - The website's guards hold: live rows only; ` (2)` where a move, a copy or a Put Back meets a taken name; a rename that collides refused; a markdown document's `.md` kept; the quota before a copy; a folder never into its own subtree; the refusal while a conversation about a document an item holds is answering.
+  - Every path is looked up before the first item changes, and each item is its own transaction: a refused item is reported and the next goes on.
+  - A call names at most `CHAT_LIBRARY_MAX_PATHS` (100) paths.
+  - `move` and `copy` take a folder that exists: a `to` that names none refuses the whole call and makes nothing, and the description says to make it with `new_folder` first. `parse`'s `folder` makes what is missing because a paper filed somewhere new is the point of the call; a move names items the reader already has, and a typo should not grow a folder.
+  - Every tree commit they make is authored `api` ([workspace.md](./workspace.md) § Revisions).
+- **The answer** is `{result, done, failed, undo}`:
+  - `result` — the sentences, one per item: *Moved DL/iBOT.pdf (document 34) to DL/DINO/iBOT.pdf.*, *Could not move DL/x.pdf: nothing is there.*
+  - `done`, `failed` — how many items changed and how many were refused.
+  - `undo` — the undo record of what the call changed, in the shapes the Files page's undo keeps its steps in ([web.md](./web.md) § Files, *Undo*); null when it changed nothing.
+  - A call that changed nothing because it was refused — the whole call, or every item it named — is a tool error with those sentences.
+
+| Tool | Input | What it does |
+|------|-------|--------------|
+| `new_folder` | `{path}` | Makes every folder of `path` that is missing. |
+| `move` | `{paths, to}` | Each item into the folder `to` names (`/` the top). |
+| `rename` | `{path, name}` | The item renamed; `name` is the new name alone. |
+| `copy` | `{paths, to}` | Each item copied into `to`. |
+| `trash` | `{paths}` | Each item to the Trash. |
+| `put_back` | `{paths}` | Each item of the Trash put back, named as `list_library` with `trash: true` lists it. |
+| `undo` | `{step, redo?}` | An earlier answer's `undo` taken back, or done again. |
+
+- **`undo`** takes `step`, an earlier answer's `undo` unchanged, and replays its inverse as the Files page's ⌘Z replays a step, by the ids the record names:
+  - a move goes back where it came from, under its old name when the destination had suffixed it;
+  - a rename goes back to its old name;
+  - a trash is put back;
+  - an `appear` — a new folder, a copy, a Put Back — goes to the Trash, never deleted for good.
+  - Its items go in reverse order, each its own transaction; an item gone or changed since is that item's error, as a step the page cannot replay is dropped with its message.
+  - A change the reader made since is never taken back with it. A move replays only an item still in the folder the record left it in, else *Could not move document 34: it was moved since.*; a name the reader gave it since stays, and the old name comes back only when the record's suffixed name is still the item's. A rename replays only an item still named what the record left it, else *…: it was renamed since.* A trash or an `appear` replays by id alone: what it moves to the Trash can be put back. An agent may keep a record a while, and the reader may have changed the library since.
+  - `redo: true` does the step again, as ⇧⌘Z does.
+  - Its answer carries no record of its own: the same `step`, with `redo` flipped, reverses it.
+  - `step` is checked against the four record shapes before anything changes, at most `CHAT_LIBRARY_MAX_PATHS` items; anything else is a tool error.
+  - It is a tool of the connector's alone. A library conversation has the card's Undo, which runs the page's own code ([web.md](./web.md) § The Files page's Agent card).
+  - Why by id: a path-based inverse can reach the wrong item, since the old place may hold a new item of the old name and `put_back` by path takes the newest of a name.
+- **Nothing is deleted for good.** No tool reaches *Delete Immediately* or *Empty Trash* ([workspace.md](./workspace.md) § The page's operations are the agent's). The Trash keeps an item until the reader empties it or `TRASH_RETENTION_DAYS` pass ([workspace.md](./workspace.md) § The Trash), and `trash`'s description says so.
+- **A call runs to its end.** It waits for the workspace lock, which a conversation's shell command can hold for up to `CHAT_BASH_TIMEOUT_SECONDS`, so a call may outlast the client's wait. A client that stops waiting never cuts a batch off between items: the call is shielded from the request's cancellation. The descriptions say to check `list_library` before repeating a call that timed out, since a `copy` repeated copies again.
+- **Scope.** The tools are the grant's `organize` scope ([auth.md](./auth.md) § 4), which every live grant holds, as an API key does.
+- **The data plane has the same operations**: `POST /v1/library/<tool>` with the tool's input as the JSON body, answered from the same function ([api.md](./api.md) § The library on the data plane).
+
+The server instructions say the connector organizes the Files library with these tools; that they need no shell or browser and do what the Files page does; that items are named by path exactly as `list_library` lists it, `/` for the top, and a folder is made with `new_folder` before anything moves into it; that when the reader asks, the agent acts without asking first, since each step comes back with `undo`; and that nothing is deleted for good — the reader empties the Trash in the Trash tab. The `parse` description adds that a document already in Files is moved or renamed with these tools, never parsed again.
+
+## Annotations
 
 | Tool (`ToolAnnotations`) | `read_only_hint` | `destructive_hint` | `open_world_hint` |
 |---|---|---|---|
@@ -204,11 +258,13 @@ Input: `document_id`. Output: a `write` document ticket, `expires_at`, `document
 | `read_document` | true | — | false |
 | `write_document` | false | false | false |
 | `parse` | false | false | false |
+| `new_folder`, `move`, `rename`, `copy`, `trash`, `put_back`, `undo` | false | false | false |
 
 - `list_library` and `read_document` are read-only, so a client may run them without asking: neither changes the library. `read_document` still records the ticket it mints and counts against its mint rate.
 - `write_document` is not read-only and not destructive: the save its command makes is a revision, revertible.
 - `parse` is marked the same way, since it may make folders and file a document: nothing it does removes or overwrites anything.
-- All four are closed-world: they reach this deployment only.
+- The organizing tools are not destructive either: each step is taken back with `undo`, and `trash` keeps what it takes in the Trash, as the Files page's *Move to Trash* does without asking ([web.md](./web.md) § Files).
+- All are closed-world: they reach this deployment only.
 
 ## Claude Connectors flow (the reason the OAuth AS exists)
 
@@ -226,6 +282,10 @@ Input: `document_id`. Output: a `write` document ticket, `expires_at`, `document
   - They read the library through the control plane's own reads (the one snapshot, the live rows, the document's own liveness).
   - They mint through the document ticket module ([auth.md](./auth.md) § 6).
   - The commands use options of any `curl` the `parse` commands may meet (`--etag-save` since 7.68), are written for bash, dash and zsh, and quote every name the reader gave as one shell word.
+- **The organizing tools** resolve the caller in the same guard, then call `workspace.organize.run_locked`: the one function a library conversation's tools call, which takes the backup lock shared, the workspace lock and a session of its own, in that order, and runs the operation by its name.
+  - `mcp/server.py` takes no lock and writes nothing itself; `/v1/library/<tool>` runs the same operation under the same locks.
+  - The call is awaited through `asyncio.shield`, so a client that goes away leaves the batch to finish.
+  - Its author is `api`.
 - **`parse`** does these things and nothing else:
   - resolves the caller to a user;
   - with `folder`, finds or makes the destination through the library's own filing function (`workspace.filing.find_or_make_folder_path`, the one `POST /v1/parse`'s `folder` field takes);

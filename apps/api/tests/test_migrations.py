@@ -697,6 +697,68 @@ async def test_the_upgrade_revokes_every_grant_without_the_library(scratch_url) 
         await engine.dispose()
 
 
+async def test_the_upgrade_revokes_every_grant_that_cannot_organize(scratch_url) -> None:
+    """697e710bbdda: a live grant whose scope lacks `organize` is revoked — its connector
+    goes through the consent page again, which says it can move and trash — and a grant
+    already holding it, or already revoked, is left as it was (docs/auth.md § 4)."""
+    _alembic(scratch_url, "upgrade", "49f93a27d36f")
+    engine = create_async_engine(scratch_url)
+    revoked_before = datetime(2026, 11, 2, tzinfo=UTC)
+    grant = (
+        "INSERT INTO oauth_grants (client_id, user_id, kind, token_hash, scope, expires_at, "
+        "revoked_at, created_at) VALUES ('c', :user, :kind, :hash, :scope, "
+        "now() + interval '1 day', :revoked, now())"
+    )
+    try:
+        async with engine.begin() as db:
+            user = await _user(db, 1)
+            await db.execute(
+                text(
+                    "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, "
+                    "created_at) VALUES ('c', 'Claude', '[]'::jsonb, now())"
+                )
+            )
+            for kind, scope, revoked in (
+                ("access", "parse library", None),
+                ("refresh", "parse library", None),
+                ("code", "library parse", None),
+                ("refresh", "parse library", revoked_before),
+                ("access", "parse library organize", None),
+                ("refresh", "organize parse library", None),
+                ("code", "parse library organizer", None),
+            ):
+                await db.execute(
+                    text(grant),
+                    {
+                        "user": user,
+                        "kind": kind,
+                        "hash": f"{kind}-{scope}-{revoked}",
+                        "scope": scope,
+                        "revoked": revoked,
+                    },
+                )
+
+        _alembic(scratch_url, "upgrade", "697e710bbdda")
+        async with engine.connect() as db:
+            grants = {
+                (kind, scope, revoked_at is None, revoked_at == revoked_before)
+                for kind, scope, revoked_at in await db.execute(
+                    text("SELECT kind, scope, revoked_at FROM oauth_grants")
+                )
+            }
+        assert grants == {
+            ("access", "parse library", False, False),
+            ("refresh", "parse library", False, False),
+            ("code", "library parse", False, False),
+            ("refresh", "parse library", False, True),
+            ("access", "parse library organize", True, False),
+            ("refresh", "organize parse library", True, False),
+            ("code", "parse library organizer", False, False),
+        }
+    finally:
+        await engine.dispose()
+
+
 async def test_a_code_pack_keeps_its_redemption_through_its_id(scratch_url) -> None:
     """49f93a27d36f: `credit_packs.redemption_id` goes and every pack stays; the downgrade
     gives each code pack `redeem-<n>` whose redemption still exists `redemption_id` n back,
