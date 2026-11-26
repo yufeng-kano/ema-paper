@@ -68,7 +68,10 @@ In the order a newcomer should meet them. Each entry says what the doc is the ho
 
 - **[web.md](./web.md)** — the Nuxt app: its stack, pages, settings dialog, design system, the Files library, the result viewer with its editor, notes and agent panel, phones and tablets, and search engines.
   - Read: any screen, component, interaction or piece of copy.
-  - Not here: the console's pages (admin.md); the contract the Usage section renders (billing.md).
+  - Not here: the console's pages (admin.md); the contract the Usage section renders (billing.md); how a PDF's pages are drawn (pdf-viewer.md).
+- **[pdf-viewer.md](./pdf-viewer.md)** — the web app's own PDF viewer: what reads the file and what draws it, the stages it is built in and the one the code is at, what it takes from other engines and under which licences, the fallback, the room kept for editing, and the device check at `/pdf-probe`.
+  - Read: anything that draws a PDF in the browser, a library added for it, or the device check.
+  - Not here: where the Original view sits in the result viewer (web.md); the server's PDF work (parsing.md).
 - **[admin.md](./admin.md)** — the operator console: permissions and groups, signing in, the audit log, what an operator sees, the settings the database may override, and the console's routes and pages.
   - Read: anything under `/api/admin` or `/admin`, a new permission, or a setting the console may change.
   - Not here: the rules of the grants and codes it makes (billing.md).
@@ -91,7 +94,8 @@ In the order a newcomer should meet them. Each entry says what the doc is the ho
 ## Stack (fixed)
 
 - **API / worker:** Python 3.12+, FastAPI, SQLAlchemy 2 async + asyncpg, Alembic, httpx, Authlib, the official `mcp` SDK. Managed with **uv**.
-- **PDF engine:** Poppler CLI (`pdfinfo`, `pdftoppm`, `pdftotext`) via subprocess — never a linked PDF library. See [parsing.md](./parsing.md).
+- **PDF engine:** Poppler CLI (`pdfinfo`, `pdftoppm`, `pdftotext`) via subprocess — the API and the worker never link a PDF library. See [parsing.md](./parsing.md).
+  - The browser draws a PDF with the web app's own viewer, on permissively licensed libraries only ([pdf-viewer.md](./pdf-viewer.md)).
 - **Web:** Nuxt (latest stable) + TypeScript + `@nuxtjs/i18n` (en, zh-TW), pnpm ([web.md](./web.md) § Stack).
 - **Data:** PostgreSQL only — relational state **and** job queue (`FOR UPDATE SKIP LOCKED`). No Redis, no message broker.
 - **Upstream:** Kano Proxy (`KANO_PROXY_BASE_URL`) on the operator's own key (`KANO_PROXY_API_KEY`, [auth.md](./auth.md) § 3); users connect none of their own.

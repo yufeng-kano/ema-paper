@@ -41,6 +41,7 @@ The origin spec is the "sightread MCP" spec (v0.1): vision-based extraction, coo
    - The web result viewer shows those crops, and `/v1/jobs/{id}/figures/…` serves the same ones, so the connector gets the figures the web reader shows ([mcp.md](./mcp.md)).
    - The result JSON itself carries no image bytes.
 7. **Poppler, not PyMuPDF.** PyMuPDF is AGPL; Poppler is used via subprocess, which gives crash isolation for free. This repo is MIT-licensed open source.
+   - That is the server's PDF work. The browser draws a PDF with the web app's own viewer, which takes permissively licensed code only ([pdf-viewer.md](./pdf-viewer.md) § Licences).
 
 ## Tenants and trust model
 
