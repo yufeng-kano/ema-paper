@@ -40,7 +40,7 @@ from tests.chat_helpers import (
     send,
     stub_messages,
 )
-from tests.conftest import CSRF_HEADERS, postgres_only, sign_in
+from tests.conftest import CSRF_HEADERS, sign_in
 from tests.factories import filed_parse, user_row
 
 
@@ -446,7 +446,6 @@ async def test_a_memory_is_checked_capped_and_the_callers_own(make_client) -> No
     assert left == [theirs.memory_id]
 
 
-@postgres_only  # row locks only block on PostgreSQL
 async def test_the_readers_memory_writes_wait_for_a_call_in_flight(chat_client) -> None:
     """A Pause, an edit, a delete and *Clear all* each take the reader's row before they
     act, as the `memory` tool does before it reads the switch, so none lands under a call

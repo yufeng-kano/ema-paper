@@ -393,6 +393,11 @@ class Settings(BaseSettings):
             if self.app_env != "local":
                 raise ValueError("SECRET_KEY is required when APP_ENV is not 'local'")
             self.secret_key = LOCAL_FALLBACK_SECRET_KEY
+        # PostgreSQL through asyncpg is the only database (docs/deployment.md): refused here
+        # in one line, not as a driver error at the first connection. The URL itself is
+        # never quoted, since it carries the password.
+        if not self.database_url.startswith("postgresql+asyncpg://"):
+            raise ValueError("DATABASE_URL must be a postgresql+asyncpg:// URL")
         # One spelling of each origin everywhere it is joined or compared — the Google
         # redirect URI and the dedup snapshot included (docs/jobs.md § Dedup).
         self.app_url = self.app_url.strip().rstrip("/")

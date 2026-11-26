@@ -34,7 +34,7 @@ from tests.chat_helpers import (
     tool_results,
     turn_credits,
 )
-from tests.conftest import PARSE_MODEL, TEST_MODEL_PRICES, postgres_only, sign_in
+from tests.conftest import PARSE_MODEL, TEST_MODEL_PRICES, sign_in
 
 PUBLIC_IP = "1.2.3.4"
 HOSTS = {
@@ -1128,8 +1128,6 @@ async def test_a_signed_urls_query_never_reaches_a_result(tmp_path, monkeypatch)
     )
 
 
-# The round's results land together, which the SQLite fallback cannot sequence (`one_call`).
-@postgres_only
 @respx.mock
 @pytest.mark.parametrize("granted", [4, 100])
 async def test_the_searches_of_one_round_never_run_on_the_overdraft(make_client, granted) -> None:

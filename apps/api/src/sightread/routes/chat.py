@@ -615,9 +615,9 @@ async def _admitted(
     # reader is told at once, rather than as a turn that fails after it was accepted.
     await ensure_within_quota(db, settings, user.id, user_root(settings.workspaces_dir, user.id))
     # Enforced where the decisions are made, under row locks held until this transaction
-    # commits (PostgreSQL; the SQLite fallback runs one request at a time): the user's row
-    # for the per-user cap, so two sends to different conversations cannot both slip under
-    # it, then the conversation's for one turn at a time — always in that order.
+    # commits: the user's row for the per-user cap, so two sends to different
+    # conversations cannot both slip under it, then the conversation's for one turn at a
+    # time — always in that order.
     await lock_user(db, user.id)
     # The title read under the lock too: a rename that landed after `row` was read must
     # not be overwritten by the first line of a first message.

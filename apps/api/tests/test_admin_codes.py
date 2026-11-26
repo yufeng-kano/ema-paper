@@ -29,7 +29,7 @@ from tests.admin_helpers import (
     owner_client,
 )
 from tests.billing_helpers import PRINTED, PRO_PLANS
-from tests.conftest import CSRF_HEADERS, postgres_only
+from tests.conftest import CSRF_HEADERS
 
 CODES = "/api/admin/codes"
 
@@ -470,7 +470,6 @@ async def test_disabling_records_once_and_the_code_stops_working(make_client) ->
     assert (redeemed.status_code, error_of(redeemed)["type"]) == (404, "code_invalid")
 
 
-@postgres_only
 async def test_two_disables_at_once_record_once(make_client) -> None:
     owner = await owner_client(make_client, **PRO_PLANS)
     [created] = (await _create(owner, kind="credits", credits=5))["codes"]

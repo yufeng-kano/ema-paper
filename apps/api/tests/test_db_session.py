@@ -8,24 +8,39 @@ from sqlalchemy import text as sql
 from sqlalchemy.exc import DBAPIError
 
 from sightread.db.models import User
-from sightread.db.session import commit_or_conflict, create_engine
+from sightread.db.session import commit_or_conflict
 from sightread.errors import ApiError
+from tests.conftest import base_settings
 from tests.factories import user_row
 
 
-async def test_a_failed_statement_never_carries_the_readers_text(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite+aiosqlite:///sightread.db",
+        "postgresql+psycopg://sightread:a-password-never-shown@pg:5432/sightread",
+        "postgresql://sightread:a-password-never-shown@pg:5432/sightread",
+    ],
+)
+def test_a_database_other_than_postgresql_through_asyncpg_is_refused_at_start(url: str) -> None:
+    """One line at start, not a driver error at the first connection, and never the URL
+    itself: it carries the password (docs/deployment.md)."""
+    with pytest.raises(ValueError, match="postgresql\\+asyncpg://") as refused:
+        base_settings(database_url=url)
+    assert "a-password-never-shown" not in str(refused.value)
+    assert "sightread.db" not in str(refused.value)
+
+
+async def test_a_failed_statement_never_carries_the_readers_text(sessionmaker) -> None:
     """The engine hides bound values, so a database error logged with its traceback cannot
-    write a memory's text — or instructions, or a message — into the log."""
-    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'hidden.db'}")
-    try:
-        async with engine.connect() as connection:
-            with pytest.raises(DBAPIError) as failed:
-                await connection.execute(
-                    sql("insert into no_such_table (text) values (:text)"),
-                    {"text": "the reader reads with a screen reader"},
-                )
-    finally:
-        await engine.dispose()
+    write a memory's text — or instructions, or a message — into the log. The fixture's
+    engine is the app's own (`create_engine`)."""
+    async with sessionmaker.kw["bind"].connect() as connection:
+        with pytest.raises(DBAPIError) as failed:
+            await connection.execute(
+                sql("insert into no_such_table (text) values (:text)"),
+                {"text": "the reader reads with a screen reader"},
+            )
     assert "screen reader" not in str(failed.value)
 
 

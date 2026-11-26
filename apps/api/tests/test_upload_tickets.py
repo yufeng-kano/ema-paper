@@ -25,7 +25,7 @@ from sightread.db.models import CreditEntry, Document, Job, UploadTicket, User, 
 from sightread.errors import ApiError
 from sightread.jobs.intake import Submission, file_chunks, submit_parse
 from sightread.jobs.sweeper import purge_parses
-from tests.conftest import KANO_CHAT_URL, PARSE_MODEL, mcp_running, postgres_only
+from tests.conftest import KANO_CHAT_URL, PARSE_MODEL, mcp_running
 from tests.helpers import (
     Upstream,
     bearer,
@@ -278,7 +278,6 @@ async def test_a_dedup_hit_binds_the_ticket_to_the_cached_job(
     assert result.json()["markdown"]
 
 
-@postgres_only
 @respx.mock
 async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads_it(
     api_client, sessionmaker, documents
@@ -320,7 +319,6 @@ async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads
         assert await db.get(Job, job_id) is None
 
 
-@postgres_only
 async def test_two_uploads_racing_on_one_ticket_start_one_parse(
     api_client, sessionmaker, documents
 ) -> None:
@@ -351,7 +349,6 @@ async def test_two_uploads_racing_on_one_ticket_start_one_parse(
     assert staged_uploads(api_client) == [Path(job.source_path).name]
 
 
-@postgres_only
 @respx.mock
 async def test_two_kept_uploads_of_a_cached_parse_racing_on_one_ticket_keep_one_copy(
     api_client, sessionmaker, documents
@@ -386,7 +383,6 @@ async def test_two_kept_uploads_of_a_cached_parse_racing_on_one_ticket_keep_one_
     assert staged_uploads(api_client) == sorted([*before, kept.upload.name])
 
 
-@postgres_only
 async def test_a_kept_upload_joining_a_parse_on_a_ticket_spent_meanwhile_changes_nothing(
     api_client, sessionmaker, documents
 ) -> None:
@@ -422,7 +418,6 @@ async def test_a_kept_upload_joining_a_parse_on_a_ticket_spent_meanwhile_changes
     assert staged_uploads(api_client) == [Path(job.source_path).name]
 
 
-@postgres_only
 @respx.mock
 async def test_two_retries_racing_on_one_ticket_put_the_parse_back_once(
     api_client, sessionmaker, documents
@@ -451,7 +446,6 @@ async def test_two_retries_racing_on_one_ticket_put_the_parse_back_once(
     assert [name.split(".retry-")[0] for name in staged_uploads(api_client)] == [str(job_id)]
 
 
-@postgres_only
 @respx.mock
 async def test_a_retry_on_a_ticket_spent_meanwhile_leaves_the_parse_failed(
     api_client, sessionmaker, documents

@@ -273,13 +273,11 @@ async def library_snapshot(db: DbSession) -> None:
     consistent. An isolation level applies to a transaction's first statement, and the
     request's session has already spent one on authentication, so that transaction is
     ended first and the snapshot asked for on the next one — on the same session, so a
-    request holds one connection, never two (docs/api.md). The SQLite test fallback has no
-    such isolation level and one writer, so it is asked for only where it exists. The
-    rollback expires every row the session holds: read what is needed of them first.
+    request holds one connection, never two (docs/api.md). The rollback expires every row
+    the session holds: read what is needed of them first.
     """
     await db.rollback()
-    if db.get_bind().dialect.name == "postgresql":
-        await db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    await db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
 
 
 # A job's prompt and check prompt, which no library listing shows: left in the database
@@ -498,10 +496,6 @@ async def delete_folder(
     subtree — the documents in it are entries, so they go too. What in it was trashed on
     its own is moved up to the folder's parent first and stays in the Trash
     (docs/database.md § Rules).
-
-    The subtree is deleted explicitly rather than left to `ON DELETE CASCADE`: the same
-    rows disappear on PostgreSQL and on the SQLite test fallback, which does not enforce
-    foreign keys unless asked to.
     """
     user_id = user.id
     async with workspace_lock(user_root(settings.workspaces_dir, user_id)):
@@ -540,10 +534,16 @@ async def delete_folder(
             if folder.parent_id in doomed and folder.id not in doomed:
                 folder.parent_id = row.parent_id
         await db.flush()
-        await db.execute(
-            delete(Document).where(Document.user_id == user_id, Document.id.in_(document_ids))
-        )
-        await db.execute(delete(Folder).where(Folder.user_id == user_id, Folder.id.in_(doomed)))
+        # The folder's row alone: its subtree and their documents go with it by the
+        # foreign keys' cascade, which is now exactly `doomed` and `document_ids`.
+        await db.execute(delete(Folder).where(Folder.user_id == user_id, Folder.id == row.id))
+        # The cascade's rows leave the session with the database: the statement above
+        # synchronizes the folder it names, never the rows its foreign keys took.
+        for subfolder_id in doomed - {row.id}:
+            db.expunge(folders[subfolder_id])
+        for document in documents:
+            if document.trashed_at is None:
+                db.expunge(document)
         if row.trashed_at is None:
             await remove_then_commit(
                 db, settings, user_id, relative, document_ids, gone=(Folder, row.id)

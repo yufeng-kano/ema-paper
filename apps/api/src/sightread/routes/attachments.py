@@ -122,7 +122,7 @@ async def upload_attachment(
         await form.close()
 
     # Under the user's row, held until the insert commits: two uploads at the cap must not
-    # both count below it (PostgreSQL; the SQLite fallback runs one request at a time).
+    # both count below it.
     await lock_user(db, user_id)
     # The caller's rows the sweeper has taken the files of are no attachments any more:
     # they go with this upload, so the never-sent ones do not pile up (docs/jobs.md

@@ -50,7 +50,6 @@ from tests.conftest import (
     TEST_MODEL_PRICES,
     base_settings,
     grant_plan,
-    postgres_only,
     sign_in,
 )
 from tests.factories import user_row
@@ -58,9 +57,6 @@ from tests.helpers import read_library
 from tests.library_helpers import ready_to_parse, upload_png
 
 
-# Row locks only block on PostgreSQL; on SQLite the database-wide write lock
-# serializes the two transactions with or without them.
-@postgres_only
 async def test_two_parses_racing_for_the_last_credits(sessionmaker) -> None:
     settings = base_settings(free_credits_per_period=3)
     user_id = await make_user(sessionmaker)
@@ -356,7 +352,6 @@ async def test_a_send_into_a_full_workspace_is_refused(make_client) -> None:
     assert (await client.get("/api/billing")).json()["period"]["spent"] == 0
 
 
-@postgres_only
 @respx.mock
 @pytest.mark.parametrize("last_stop", ["end_turn", "tool_use"])
 async def test_a_turn_that_runs_out_of_credits_finishes_within_the_allowance(
@@ -533,7 +528,6 @@ async def test_a_turn_the_worker_fails_closes_its_entry(sessionmaker) -> None:
     assert (await credit_period(sessionmaker, user_id)).spent == 2
 
 
-@postgres_only
 async def test_a_deleted_conversation_leaves_its_entries_in_the_ledger(sessionmaker) -> None:
     """docs/billing.md § The ledger: the record outlives the thread it was charged for;
     the period's `spent` and the entries keep agreeing."""

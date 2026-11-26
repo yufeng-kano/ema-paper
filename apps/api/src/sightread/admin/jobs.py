@@ -60,8 +60,6 @@ async def requeue(
     if job.status != "running":
         raise _refused("not_running", f"The job is {job.status}, not running")
     worker = await queue.worker_status(db)
-    if worker.state == "unknown":
-        raise _refused("worker_unknown", "Whether the worker runs cannot be read here")
     if not queue.job_is_stuck(job, worker):
         raise _refused("not_stuck", "The live worker is running this job")
 

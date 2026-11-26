@@ -396,14 +396,12 @@ async def subtree_ids(
     """`root_id` and every folder under it.
 
     Walked in Python over the account's own (id, parent_id) pairs rather than with a
-    recursive CTE: a library is a handful of rows, and this is the same walk on PostgreSQL
-    and on the SQLite test fallback.
+    recursive CTE: a library is a handful of rows.
 
-    `for_update` locks those rows for the rest of the transaction (a PostgreSQL row lock;
-    compiled away on the SQLite fallback). A move needs it: two tabs moving A into B and B
-    into A can each pass the "not inside itself" check against a tree the other has not
-    committed yet, and the pair of updates then commits a cycle — a subtree with no root,
-    so every folder and file in it vanishes from the library.
+    `for_update` locks those rows for the rest of the transaction. A move needs it: two
+    tabs moving A into B and B into A can each pass the "not inside itself" check against a
+    tree the other has not committed yet, and the pair of updates then commits a cycle — a
+    subtree with no root, so every folder and file in it vanishes from the library.
     """
     query = select(Folder.id, Folder.parent_id).where(Folder.user_id == user_id)
     if for_update:

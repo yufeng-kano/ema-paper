@@ -137,9 +137,7 @@ def stub_messages(main: list, sub: list | None = None) -> tuple[list[dict], list
 
 
 def one_call(call_id: str, name: str, tool_input: dict) -> tuple[list[dict], str]:
-    """A round of one tool call. The tests make one call a round: SQLite takes the events'
-    sequence numbers without the row lock PostgreSQL holds (chat_events.append), so calls
-    finishing together would collide on the fallback database only."""
+    """A round of one tool call."""
     return [{"type": "tool_use", "id": call_id, "name": name, "input": tool_input}], "tool_use"
 
 

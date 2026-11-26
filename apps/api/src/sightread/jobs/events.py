@@ -2,7 +2,7 @@
 
 The database is the only source of truth: `NOTIFY` merely wakes a stream up, and a stream
 that never hears a notification still makes progress by polling. That keeps the contract
-identical on a backend without LISTEN/NOTIFY, and makes a missed notification a latency
+identical when no listener can be opened, and makes a missed notification a latency
 problem rather than a correctness one.
 """
 
@@ -44,10 +44,8 @@ def sse(event: str, data: dict) -> str:
 
 
 async def notify_channel(db: AsyncSession, channel: str) -> None:
-    """Wake every stream listening on `channel`, when the backend can do it. Sent in the
-    caller's transaction, so it is delivered when that commits."""
-    if db.get_bind().dialect.name != "postgresql":
-        return
+    """Wake every stream listening on `channel`. Sent in the caller's transaction, so it
+    is delivered when that commits."""
     await db.execute(text("SELECT pg_notify(:channel, '')"), {"channel": channel})
 
 
@@ -65,8 +63,6 @@ async def open_listener(database_url: str, channel: str, wakeup: asyncio.Event, 
     Shared by the job streams and the conversation streams (`chat_events`).
     """
     url = make_url(database_url)
-    if url.get_backend_name() != "postgresql":
-        return None
     connection = None
     try:
         connection = await asyncpg.connect(

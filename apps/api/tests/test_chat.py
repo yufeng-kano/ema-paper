@@ -85,7 +85,6 @@ from tests.conftest import (
     grant_plan,
     image_view,
     path_settings,
-    postgres_only,
     sign_in,
 )
 from tests.factories import filed_parse, user_row
@@ -1173,10 +1172,7 @@ async def test_an_answer_under_an_unpriced_name_is_kept_as_the_model_asked_for(
     assert all(turn["credits"] > 0 for turn in turns_now)
 
 
-@postgres_only
 async def test_the_history_cap_counts_bytes_not_characters(chat_client) -> None:
-    """PostgreSQL only: SQLite stores non-ASCII JSON escaped, so there a message's bytes
-    equal its characters and the test could not tell the two apart."""
     settings = chat_client.app.state.settings
     conversation_id = await new_conversation(chat_client)
     # 2000 two-byte characters: about 2040 characters stored, about 4040 bytes.

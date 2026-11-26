@@ -1931,9 +1931,9 @@ interface AdminUsageFigures {
 }
 
 /** Whether a worker runs, as the worker lock says: `since` and `generation` only while
- *  `running` (`generation` null also before any worker took one); `unknown` off PostgreSQL. */
+ *  `running` (`generation` null also before any worker took one). */
 interface AdminWorker {
-  state: 'running' | 'stopped' | 'unknown'
+  state: 'running' | 'stopped'
   since: string | null
   generation: number | null
 }
@@ -1990,8 +1990,7 @@ export interface AdminOverviewResponse {
   jobs: {
     queued: number
     running: number
-    /** Null while the worker's state is unknown. */
-    stuck: number | null
+    stuck: number
     /** The oldest queued job's `created_at`, which a retry or a requeue keeps. */
     oldest_queued_at: string | null
     /** Failed in the last `failed_hours`. */
@@ -2026,8 +2025,8 @@ export function listAdminJobs(query: { page: number; status?: JobStatus }): Prom
   return listQuery('/api/admin/jobs', query)
 }
 
-/** A stuck job back in the queue; 409 `admin_conflict` (`not_running`, `not_stuck`,
- *  `worker_unknown`) for any other, 404 for one gone. */
+/** A stuck job back in the queue; 409 `admin_conflict` (`not_running`, `not_stuck`) for
+ *  any other, 404 for one gone. */
 export function requeueAdminJob(id: string): Promise<AdminJob> {
   return request('POST', `/api/admin/jobs/${encodeURIComponent(id)}/requeue`)
 }

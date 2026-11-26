@@ -137,7 +137,7 @@ async def running_turns(
     `(conversation_id, turn_ids, entry_ids)`. With `settle`, each turn has made one call of
     2,000 tokens, settled."""
     async with sessionmaker() as db:
-        # The turns' foreign keys, which PostgreSQL enforces: a document and its thread.
+        # The turns' foreign keys: a document and its thread.
         document = Document(user_id=user_id, name="d.md")
         db.add(document)
         await db.flush()

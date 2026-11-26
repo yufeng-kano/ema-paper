@@ -338,7 +338,6 @@ export const CONFLICT_KEYS: ReadonlyMap<string, string> = new Map([
   ['plan_conflict', 'admin.users.grant.planConflict'],
   ['not_running', 'admin.jobs.refusals.not_running'],
   ['not_stuck', 'admin.jobs.refusals.not_stuck'],
-  ['worker_unknown', 'admin.jobs.refusals.worker_unknown'],
 ])
 
 /** The catalog key for a conflict's reason, or null for one the catalog does not word. */

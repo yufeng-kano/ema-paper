@@ -31,7 +31,7 @@ There is **one worker per deployment**. The worker enforces it by holding a Post
 
 The loss of the lock is noticed seconds late. In those seconds the replacement has already requeued — and may have claimed — the job the stale worker is still running. So every worker takes a **generation** with the lock:
 
-- The generation is the next value of the `worker_generation_seq` sequence. The SQLite fallback takes the highest on record plus one.
+- The generation is the next value of the `worker_generation_seq` sequence.
 - The worker writes it onto every job it claims (`jobs.worker_generation`, the `:generation` above).
 - It carries it on every write it makes to a running job, each fenced on the row still holding that generation: a page recorded, the terminal state and the retention that follows it, the requeue on shutdown, and the endpoint snapshot a run updates at its start. A run whose snapshot update fences out ends there.
 - A requeue clears it.
@@ -327,7 +327,7 @@ The rules:
 - `force: true` always reparses: a new job, with a result row of its own.
 - **A retry must not buy a second parse.** The cache answers with *finished* work only, which leaves one gap: a browser cannot tell a lost response from a lost request, so it retries an upload that may already have landed, and the same bytes become a second job that charges the user's credits twice for one document.
   - Every upload that is not `force` (the web library, `/v1/parse`, a chat conversion) answers such a retry with the job already queued or running for that exact key instead of starting another: the in-flight join.
-  - The lookup is serialized by a transaction-level advisory lock on the dedup key (`hold_dedup_key`, PostgreSQL only), because reading before inserting protects a retry that arrives *after* the first upload committed, but not two that overlap: both would find nothing and both would enqueue.
+  - The lookup is serialized by a transaction-level advisory lock on the dedup key (`hold_dedup_key`), because reading before inserting protects a retry that arrives *after* the first upload committed, but not two that overlap: both would find nothing and both would enqueue.
   - A retry that arrives after the first request's job has already finished — failed, or succeeded outside the cache's retention — is answered with that job too, when it finished within `UPLOAD_RETRY_WINDOW_SECONDS` (60) of the retry. The browser retries within seconds, and the same bytes filed twice in that window are one upload whatever became of it.
   - Past the window the normal rule holds, and the same bytes parse again.
   - `/v1/parse` joins as the library does, though an API client posting the same file twice might mean it: the connector re-runs a command the shell cut off, and its notes tell it to upload the same file again after a spent ticket.

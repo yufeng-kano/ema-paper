@@ -1738,7 +1738,6 @@ export default {
       running: 'Running',
       stuck: '{n} stuck',
       noneStuck: 'None stuck',
-      workerUnknown: 'Worker state unknown',
       seeJobs: 'See jobs',
       failed: 'Failed in the last hour | Failed in the last {n} hours',
       lastFailed: 'Last at {time}',
@@ -1753,7 +1752,6 @@ export default {
       states: {
         running: 'Running',
         stopped: 'Stopped',
-        unknown: 'Unknown',
         ok: 'Connected',
         unconfigured: 'Not configured',
         failed: 'Can’t connect',
@@ -1761,7 +1759,6 @@ export default {
       workerSince: 'Generation {generation} · since {time}',
       workerNoGeneration: 'No generation taken yet · since {time}',
       workerStopped: 'No worker holds the queue lock. Jobs wait until one starts.',
-      workerUnknownLine: 'Only PostgreSQL can say whether the worker runs.',
       holdsLock: 'Holds the queue lock',
       proxyModels: '{n} model in the catalog, {priced} priced | {n} models in the catalog, {priced} priced',
       proxyUnconfigured: 'KANO_PROXY_BASE_URL and its key aren’t set, so no model can be called.',
@@ -1786,7 +1783,6 @@ export default {
       workerRunning: 'Worker running, generation {generation}',
       workerRunningNoGeneration: 'Worker running',
       workerStopped: 'Worker stopped',
-      workerUnknown: 'Worker state unknown',
       filter: 'Status',
       all: 'All',
       statuses: {
@@ -1812,7 +1808,6 @@ export default {
       refusals: {
         not_running: 'This job isn’t running any more, so there’s nothing to requeue.',
         not_stuck: 'The live worker is running this job, so it can’t be requeued.',
-        worker_unknown: 'Whether the worker runs can’t be read here, so no job can be requeued.',
       },
       gone: 'This job no longer exists.',
       hint: 'Only a running job no live worker drives can be requeued. File names and document content are never shown here.',

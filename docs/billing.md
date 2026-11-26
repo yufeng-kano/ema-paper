@@ -607,13 +607,13 @@ Unit tests, stubbed HTTP, no Pay or model call ever ([testing.md](./testing.md))
   - Free's month and a paid period from a subscription row and a clock;
   - a lapsed row falls back;
   - a plan change raises and never lowers `granted`.
-- Web searches (PostgreSQL for the ledger parts):
+- Web searches:
   - an answered search adds `WEB_SEARCH_CREDITS` to the turn's entry at once, settled through the period and the packs like tokens;
   - a search Brave failed adds nothing;
   - a search is refused once the balance is gone;
   - the per-turn and per-day caps refuse with an error result;
   - `rates.web_search_per_call` follows the configuration and is null without the key.
-- The ledger (PostgreSQL):
+- The ledger:
   - two parses racing for the last credits — one reserves, one gets 402;
   - settlement idempotent (consume twice, release after consume);
   - a release restores the balance;
@@ -635,7 +635,7 @@ Unit tests, stubbed HTTP, no Pay or model call ever ([testing.md](./testing.md))
   - the idempotency key stable across a retry;
   - a plan not on sale refused;
   - checkout closed refused.
-- Packs (PostgreSQL for the ledger parts):
+- Packs:
   - a charge takes the period first and the packs by expiry, and is refused on the sum;
   - a release restores each share where it came from, and a retry takes again;
   - a turn's settlement spills from the period into the packs before the overdraft;

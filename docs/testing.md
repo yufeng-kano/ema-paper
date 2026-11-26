@@ -11,31 +11,43 @@
   - the chat agent's web tools — Brave, OpenAlex, every URL it reads or downloads ([chat.md](./chat.md) § Tools). The tests resolve a host to a fixed public address and stub the connection to it.
 - The sandbox runner is stubbed the same way from the API's side. It is tested on its own with a local bash stand-in for its Docker backend (`apps/sandbox/tests/local_backend.py`, a bash process in a temp dir, injected into the app by the tests), never with Docker.
   - The runner's tests remove every `SANDBOX_*` variable and `APP_ENV` from the environment before each test (`apps/sandbox/tests/conftest.py`).
-- The suite must pass with no network.
+- The suite must pass with no network beyond its PostgreSQL test database.
 - A live smoke test requires the operator's explicit per-instance approval: one tiny document, one cheap model, never a loop or sweep.
 
 ## Backend (`apps/api`)
 
 ### The suite
 
-- `uv run pytest`. pytest + pytest-asyncio.
-- Without `TEST_DATABASE_URL` the suite runs on a throwaway SQLite file per test, with no services and no network: each test makes the schema in a new file under its `tmp_path`.
-- `TEST_DATABASE_URL` (a `postgresql+asyncpg://` URL) runs it on PostgreSQL instead. It is the only variable the suite reads to choose a database; the app's `DATABASE_URL` is never read.
-- On PostgreSQL a run makes the schema once, from a clean database (`Base.metadata.drop_all` then `create_all`), in the database `TEST_DATABASE_URL` names, and drops it at the run's end.
-- Before each test on PostgreSQL every table is truncated (`TRUNCATE ... RESTART IDENTITY CASCADE`) and `worker_generation_seq` restarted, so every test starts on empty tables with ids counting from 1.
-- So `TEST_DATABASE_URL` names a dedicated test database, never the app's own (its tables are dropped): e.g. `sightread_test` on the compose `pg` server, made once with `docker compose exec pg createdb -U sightread sightread_test`.
-- The test engine is built with the app's own `sightread.db.session.create_engine`, so a PostgreSQL run has production's session settings (the UTC pin day buckets rely on, `hide_parameters`).
+- `TEST_DATABASE_URL=postgresql+asyncpg://… uv run pytest`. pytest + pytest-asyncio.
+- The suite runs on the PostgreSQL database `TEST_DATABASE_URL` names (a `postgresql+asyncpg://` URL).
+- It is the only variable the suite reads to choose a database; the app's `DATABASE_URL` is never read.
+- Without it the run stops before collecting anything, with one line saying how to set it (a pytest usage error, exit code 4).
+- `TEST_DATABASE_URL` names a dedicated test database, never the app's own: its tables are dropped.
+- Its role may create databases: the migration tests make scratch databases on the same server (§ Migrations).
+- On the compose `pg` server, make `sightread_test` once and run against it:
+  - `docker compose up -d pg`
+  - `docker compose exec pg createdb -U sightread sightread_test`
+  - `TEST_DATABASE_URL=postgresql+asyncpg://sightread:sightread@127.0.0.1:5432/sightread_test uv run pytest` (the host port is `PG_PORT`).
+- Or on a one-off server, removed when it stops:
+  - `docker run --rm -d --name sightread-test-pg -e POSTGRES_USER=sightread -e POSTGRES_PASSWORD=sightread -e POSTGRES_DB=sightread_test -p 127.0.0.1:55432:5432 postgres:16`
+  - `TEST_DATABASE_URL=postgresql+asyncpg://sightread:sightread@127.0.0.1:55432/sightread_test uv run pytest`
+  - `docker stop sightread-test-pg`
+- Two runs at once need two databases: a run empties the tables the other is using.
+- A run makes the schema once, from a clean database (`Base.metadata.drop_all` then `create_all`), and drops it at the run's end.
+- Before each test every table is truncated (`TRUNCATE ... RESTART IDENTITY CASCADE`) and `worker_generation_seq` restarted, so every test starts on empty tables with ids counting from 1.
+- The test engine is built with the app's own `sightread.db.session.create_engine`, so the tests have production's session settings (the UTC pin day buckets rely on, `hide_parameters`).
+- The test apps' `database_url` is `TEST_DATABASE_URL` too, so their event streams LISTEN for NOTIFY as production's do.
 - The test `Settings` put uploads, figures and workspaces under the test's `tmp_path`; no test touches `/data`.
 - No test reads a setting from the developer's environment. An autouse fixture in `tests/conftest.py` (`hermetic_settings`) removes every environment variable that names a `Settings` field (matched without regard to case) before each test and clears the `get_settings()` cache.
 - So a shell that exported `.env`, or the compose api container's `env_file`, changes no result; each test passes the settings it needs.
 - `TEST_DATABASE_URL` is not a `Settings` field; it is read once, at import, before that fixture runs.
-- Tests of PostgreSQL-only behavior (foreign-key actions, row locks, SKIP LOCKED, `pg_locks`, the migrations) skip on the SQLite fallback, so run with `TEST_DATABASE_URL` set before shipping a change they cover.
 - What several test modules share lives in `tests/conftest.py` and the plain helper modules beside it (`helpers.py`, `factories.py` and one `*_helpers.py` per area); no test module imports from another.
 - `tests/__init__.py` registers the helper modules for pytest's assertion rewriting, so a failing assert in one shows its values as a test module's does.
 - Fixture documents in `tests/fixtures/`: a small text-layer PDF, a scanned-style PDF (rendered-only), a multi-page mix, one corrupt file, tiny jpg/png/webp/heic images. Generate or vendor tiny files — keep fixtures under a few hundred KB each.
 - The fixture PDFs are built with `reportlab`, a dev dependency (BSD). The application imports no PDF library ([parsing.md](./parsing.md) § PDF engine: Poppler via subprocess — this is a hard rule).
 - Poppler is a real dependency of the test environment. Subprocess wrappers are tested against real fixtures, not mocked.
 - The reference environment is a Linux container: `ghcr.io/astral-sh/uv:python3.12-bookworm` with `poppler-utils` and `git` installed. Linux because the suite needs `os.O_PATH` and `/proc/self/fd`. Every run is bounded by `timeout`.
+- In that container `TEST_DATABASE_URL` names the server as the container reaches it: the server container's name on a Docker network both join (`docker run --network <network>`), or `host.docker.internal` for a server published on the host (Docker Desktop).
 
 ### Migrations
 
@@ -49,7 +61,6 @@
 - The upgraded head holds the seed rows a fresh database needs (the built-in `owner` group), and refuses what its constraints forbid.
 - `alembic downgrade base` leaves no table, sequence or type.
 - A migration that rewrites existing rows adds a test there. The test upgrades from the previous head with synthetic existing rows in place and checks what it left. It goes at the next squash.
-- PostgreSQL only: the module skips on the SQLite fallback, so run it with `TEST_DATABASE_URL` set before shipping a migration.
 
 ### Must-cover: the chat agent and the workspace
 
@@ -116,12 +127,12 @@
   - the impact confirmation;
   - the worker's snapshot per claim, and a turn's prices kept to its end;
   - the codes CLI reading the database's plans.
-- On PostgreSQL: account deletion removing memberships and keeping audit rows with `actor_id` NULL.
+- Account deletion removing memberships and keeping audit rows with `actor_id` NULL.
 - Redeem codes:
   - the plaintext only in the create answer — never in the list, a record or a log line;
   - the batch rules, `REDEEM_CODES_MAX_COUNT` among them, refused alike by the console (422) and the CLI (exit 2).
 - Its jobs and usage:
-  - the worker's state read from `pg_locks` against a real advisory lock held by another connection (PostgreSQL), and never taken;
+  - the worker's state read from `pg_locks` against a real advisory lock held by another connection, and never taken;
   - the requeue of a stuck job only, 409 for any other, audited;
   - the jobs list's address only with `users.read`;
   - usage per UTC day and model across a midnight.
