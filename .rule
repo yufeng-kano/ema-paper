@@ -18,7 +18,7 @@ Canonical project rules (`.rule`; AGENTS.md / CLAUDE.md symlink here). This file
 
 ## Hard technical rules
 
-- PDF work only via Poppler CLI subprocesses. No PyMuPDF, no linked PDF libraries (AGPL) — `docs/parsing.md`.
+- The API and the worker do PDF work only via Poppler CLI subprocesses and link no PDF library — `docs/parsing.md`. No PyMuPDF. The web app's PDF viewer may use permissively licensed libraries (Apache-2.0, MIT, BSD) and never takes AGPL or GPL code — `docs/pdf-viewer.md`.
 - The queue is PostgreSQL; do not introduce Redis or a message broker — `docs/jobs.md`.
 - Uploads stream to disk with size caps, never buffered whole in memory; no `file path` source on hosted endpoints; uploads and SSE never route through the Nuxt server.
 - Schema changes only via Alembic migrations (`alembic revision`, never hand-built files), `docs/database.md` updated first.

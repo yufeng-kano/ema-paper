@@ -2,7 +2,7 @@
 
 ## PDF engine: Poppler via subprocess — this is a hard rule
 
-All PDF work goes through Poppler CLI tools in short-lived subprocesses:
+All PDF work of the API and the worker goes through Poppler CLI tools in short-lived subprocesses:
 
 - `pdfinfo` — page count + page dimensions (points).
 - `pdftoppm -png -r <dpi>` — page rendering for vision calls, scaled so the long edge ≤ **2000 px** (large images destabilize VLM detection).
@@ -19,7 +19,9 @@ Why subprocess, not a linked library:
 - Free multi-core parallelism.
 - Licensing: Poppler is GPL — fine to invoke as a separate program; PyMuPDF is AGPL and banned here.
 
-The rule binds the application, which imports no PDF library. The tests build their fixture PDFs with a dev dependency ([testing.md](./testing.md) § The suite).
+The rule binds the API and the worker, which import no PDF library. The tests build their fixture PDFs with a dev dependency ([testing.md](./testing.md) § The suite).
+
+The browser is the other side of the rule: the web app draws a PDF's pages itself, with libraries under permissive licences only ([pdf-viewer.md](./pdf-viewer.md)).
 
 Every subprocess gets a timeout (default 60 s/page) and runs against the job's temp directory only.
 

@@ -34,9 +34,10 @@ export const PUBLIC_PATHS = PUBLIC_PAGES.flatMap((page) => PAGE_LOCALES.map(({ p
 
 /**
  * The authed pages, client-rendered shells that send a signed-out visitor to sign in — the
- * operator console's among them. Under every locale: nothing is served without one.
+ * operator console's and the PDF viewer's device check (docs/pdf-viewer.md) among them.
+ * Under every locale: nothing is served without one.
  */
-const AUTHED_PAGES = ['/files', '/admin'] as const
+const AUTHED_PAGES = ['/files', '/admin', '/pdf-probe'] as const
 
 /**
  * Kept off every crawler: the authed pages in each locale, the sign-in redirect, the data

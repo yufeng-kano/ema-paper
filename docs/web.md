@@ -17,6 +17,7 @@ The web app also *renders* a finished result, because reading what came back is 
 - Two libraries do one job each:
   - KaTeX typesets math.
   - TipTap 3 (headless, over ProseMirror) is the in-place editor (§ Editing). It brings no styles or components, and draws with the same `md-*` classes as the renderer (`app/assets/css/markdown.css`).
+- The PDF viewer's libraries are listed in their own doc ([pdf-viewer.md](./pdf-viewer.md) § Libraries).
 
 ## Pages
 
@@ -40,6 +41,7 @@ The one exception is the operator console (`/admin`, [admin.md](./admin.md)): an
 | `?settings=mcp` MCP Connector | client-side, authed | A section of the settings dialog: the MCP endpoint URL with Copy and the three numbered steps that connect it — OAuth, no key to paste. The third says what Claude can then do: parse files and file them into a folder of Files, read the library and save a document's text and notes, every byte over short-lived tickets, never through MCP; and put Files in order — folders, moves, renames, copies, the Trash — never deleting for good ([mcp.md](./mcp.md)) |
 | `?settings=usage` Usage | client-side, authed | A section of the settings dialog: the plan, the usage limits, the extra credits, the rates and the sandbox (§ The Usage section) |
 | `?settings=agent` Agent | client-side, authed | A section of the settings dialog: one tab per agent of the registry, the selected agent's settings below (§ The Agent section) |
+| `/pdf-probe` | client-side, authed (`ssr: false` in `routeRules`, both locales) — kept off crawlers (§ Search engines), linked from nowhere | **The WebGPU device check** of the PDF viewer ([pdf-viewer.md](./pdf-viewer.md) § The device check) |
 | `/admin`, `/admin/users`, `/admin/codes`, `/admin/jobs`, `/admin/usage`, `/admin/groups`, `/admin/audit`, `/admin/settings` | client-side, authed (`ssr: false` in `routeRules`, both locales) — kept off crawlers (§ Search engines) | **The operator console** ([admin.md](./admin.md) § Pages), for the accounts the operator gives a permission (§ The account menu; § The operator console below) |
 
 ### The sign-in page
@@ -446,7 +448,7 @@ What a crawler reads is built with the public pages, at `nuxt build`, from one v
   - `/` is never prerendered and never in the sitemap.
   - The `x-default` alternate is the English page everywhere — on the pages (`useLocaleHead`, the default locale's) and in the sitemap.
 - **`/robots.txt`** (prerendered, from `shared/seo.ts`): one rule for every crawler, none named — AI search and training crawlers are treated like any other.
-  - It keeps them off the authed pages (`/files` and `/admin` under `/en` and `/zh-TW`, shells that send a signed-out visitor to sign in), the sign-in redirect (`/api/auth/`), the data plane (`/v1/`), the authorization server (`/oauth/`) and the MCP endpoint (`/mcp`).
+  - It keeps them off the authed pages (`/files`, `/admin` and `/pdf-probe` under `/en` and `/zh-TW`, shells that send a signed-out visitor to sign in), the sign-in redirect (`/api/auth/`), the data plane (`/v1/`), the authorization server (`/oauth/`) and the MCP endpoint (`/mcp`).
   - It points them at the sitemap.
   - The rest of `/api/` stays open on purpose: the pricing and policy pages render from `/api/billing/catalog` and `/api/site`, and a crawler that runs scripts needs them to see the plans and the contact line.
 - **`/sitemap.xml`** (prerendered, from `shared/seo.ts`): the public pages — the sign-in page, `/pricing`, `/rates`, `/terms`, `/privacy`, `/refund` — under `/en` and `/zh-TW`.

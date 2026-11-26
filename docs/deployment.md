@@ -173,7 +173,7 @@ The policy, one line in the Caddyfile:
 default-src 'self'; script-src 'self' 'unsafe-inline';
 style-src 'self' 'unsafe-inline'; font-src 'self' data:;
 img-src 'self' data: blob: https://*.googleusercontent.com;
-connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
 ```
 
 - `script-src 'unsafe-inline'`: Nuxt writes inline scripts into every page — the import map and `window.__NUXT__.config` — and their content changes with each build, so a hash list here would break on the next build. Scripts still load from this origin only.
@@ -185,6 +185,8 @@ connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
   - `data:` is inline images.
   - A remote image in a document is not rendered (it stays text), so no other host is listed.
 - `connect-src 'self'`: the app calls only its own origin — `/api/*`, `/v1/*` and their SSE streams.
+- `worker-src 'self'`: the PDF viewer's workers are chunks of the build, served from this origin ([pdf-viewer.md](./pdf-viewer.md)). No worker starts from a `blob:` or `data:` URL. It is named, not left to fall back to `script-src`, so the rule for workers is read in one place.
+- No `'wasm-unsafe-eval'` in `script-src`: nothing in the app compiles WebAssembly, the PDF viewer included ([pdf-viewer.md](./pdf-viewer.md) § Who does what).
 - No `form-action`: the consent screen's form posts to `/oauth/authorize`, which redirects to the connector's `redirect_uri` — another origin, or `http://localhost` for a CLI client — and browsers hold that redirect to `form-action` too. Checkout and the portal are full-page navigations to Kano Pay, which no directive restricts.
 - No `Cross-Origin-Opener-Policy` or `Cross-Origin-Resource-Policy`: a connector opens the consent screen in a popup and keeps its handle, and a connector's page loads this site's icon from its own origin.
 

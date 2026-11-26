@@ -85,12 +85,14 @@ export default defineNuxtConfig({
     // Control-plane pages are per-user and session-authenticated: client-rendered only, under
     // each locale. The operator console (docs/admin.md § Pages) is client-rendered like the rest
     // of the control plane; its bare path is listed beside its subtree, which `/**` alone may
-    // not match.
+    // not match. The PDF viewer's device check (docs/pdf-viewer.md) asks the browser for a GPU,
+    // which no server has.
     ...Object.fromEntries(
       PAGE_LOCALES.flatMap(({ prefix }) => [
         [`${prefix}/files`, { ssr: false }],
         [`${prefix}/admin`, { ssr: false }],
         [`${prefix}/admin/**`, { ssr: false }],
+        [`${prefix}/pdf-probe`, { ssr: false }],
       ]),
     ),
   },

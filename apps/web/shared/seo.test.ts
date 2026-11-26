@@ -76,6 +76,8 @@ describe('robots.txt', () => {
       '/en/admin/groups',
       '/zh-TW/admin',
       '/zh-TW/admin/audit',
+      '/en/pdf-probe',
+      '/zh-TW/pdf-probe',
       '/api/auth/login',
     ]) {
       expect(rules.some((rule) => path.startsWith(rule))).toBe(true)
