@@ -237,7 +237,7 @@ The connector also puts the reader's Files library in order, as the Files page d
   - a trash is put back;
   - an `appear` — a new folder, a copy, a Put Back — goes to the Trash, never deleted for good.
   - Its items go in reverse order, each its own transaction; an item gone or changed since is that item's error, as a step the page cannot replay is dropped with its message.
-  - An item moved or renamed since the record is refused, never put back: *Could not move document 34: it was moved or renamed since.* A move replays only an item still in the folder, and under the name, the record left it; a rename only one still named what it left it. An agent may keep a record a while, and the reader may have changed the library since.
+  - A change the reader made since is never taken back with it. A move replays only an item still in the folder the record left it in, else *Could not move document 34: it was moved since.*; a name the reader gave it since stays, and the old name comes back only when the record's suffixed name is still the item's. A rename replays only an item still named what the record left it, else *…: it was renamed since.* A trash or an `appear` replays by id alone: what it moves to the Trash can be put back. An agent may keep a record a while, and the reader may have changed the library since.
   - `redo: true` does the step again, as ⇧⌘Z does.
   - Its answer carries no record of its own: the same `step`, with `redo` flipped, reverses it.
   - `step` is checked against the four record shapes before anything changes, at most `CHAT_LIBRARY_MAX_PATHS` items; anything else is a tool error.

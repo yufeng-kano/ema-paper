@@ -729,10 +729,9 @@ async def _undo(
         document = await workspace_documents.live_document(db, user_id, row_id)
         return document.folder_id, document.name
 
-    # A record kept a while may be older than a change made since: an item no longer where
-    # the record left it, or no longer named what it left it, is refused, never put back.
-    moved_since = ApiError(409, "invalid_request", "It was moved or renamed since")
-
+    # A record kept a while may be older than the reader's own changes: a move replays only
+    # an item still in the folder the record left it in, a rename only one still named what
+    # it left it, so a later move or rename is never taken back with it.
     if isinstance(step, ItemsStep):
         hide = (step.type == "trash") != back
         for item in reversed(step.items) if back else step.items:
@@ -751,13 +750,15 @@ async def _undo(
     elif isinstance(step, MoveStep):
         for move in reversed(step.moves) if back else step.moves:
             kind = kind_of(move.item)
-            # Back under its old name too, when the destination had suffixed it.
-            name = move.fromName if back and move.toName != move.fromName else None
 
-            async def place(kind=kind, row_id=move.item.id, move=move, name=name) -> str | None:
-                left = (move.to, move.toName) if back else (move.from_, move.fromName)
-                if await now(kind, row_id) != left:
-                    raise moved_since
+            async def place(kind=kind, row_id=move.item.id, move=move) -> str | None:
+                folder, named = await now(kind, row_id)
+                if folder != (move.to if back else move.from_):
+                    raise ApiError(409, "invalid_request", "It was moved since")
+                # Back under its old name too, when the destination had suffixed it and the
+                # suffixed name is still its own; a name the reader gave it since stays.
+                suffixed = move.toName != move.fromName and named == move.toName
+                name = move.fromName if back and suffixed else None
                 to = move.from_ if back else move.to
                 line, moved = await _move_item(
                     db, settings, user_id, author, kind, row_id, to, name
@@ -771,9 +772,9 @@ async def _undo(
         kind = kind_of(step.item)
 
         async def rename() -> str | None:
-            _, name = await now(kind, step.item.id)
-            if name != (step.to if back else step.from_):
-                raise moved_since
+            _, named = await now(kind, step.item.id)
+            if named != (step.to if back else step.from_):
+                raise ApiError(409, "invalid_request", "It was renamed since")
             line, record = await _rename_item(
                 db, settings, user_id, author, kind, step.item.id, step.from_ if back else step.to
             )

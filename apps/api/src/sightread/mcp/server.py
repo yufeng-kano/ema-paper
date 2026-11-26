@@ -774,8 +774,9 @@ def build_server(app: FastAPI) -> MCPServer:
         description=(
             "Take back a step new_folder, move, rename, copy, trash or put_back made in the "
             "reader's Ema Paper Files library, as ⌘Z on the Files page does: a move goes "
-            "back under its old name, a rename back to the old name, a trash is put back, "
-            "and new folders, copies and put-backs go to the Trash. `step` is the `undo` an "
+            "back where it came from, a rename back to the old name, a trash is put back, "
+            "and new folders, copies and put-backs go to the Trash. An item the reader has "
+            "moved or renamed since is refused and left as it is. `step` is the `undo` an "
             "earlier answer returned, unchanged; `redo: true` does the step again. Take back "
             "the latest step first."
         ),

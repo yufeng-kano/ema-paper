@@ -204,31 +204,59 @@ async def test_undo_takes_a_step_back_by_its_ids_and_redo_does_it_again(
     assert "`step` is not an undo record" in nonsense.content[0].text
 
 
-async def test_undo_refuses_an_item_changed_since_its_record(reader: AsyncClient) -> None:
-    dl = await _folder(reader, "DL")
+async def test_undo_never_takes_back_a_change_the_reader_made_since(reader: AsyncClient) -> None:
+    await _folder(reader, "DL")
+    other = await _folder(reader, "Other")
     paper = await _file(reader, "paper.txt")
     notes = await _file(reader, "notes.txt")
+    report = await _file(reader, "report.txt")
 
     async with mcp_running(reader), mcp_session(reader) as session:
         moved = tool_payload(await session.call_tool("move", {"paths": ["paper.txt"], "to": "DL"}))
         renamed = tool_payload(
             await session.call_tool("rename", {"path": "notes.txt", "name": "draft.txt"})
         )
-        # The reader changes both again before the agent takes its records back.
-        await session.call_tool("rename", {"path": "DL/paper.txt", "name": "kept.txt"})
+        filed = tool_payload(await session.call_tool("move", {"paths": ["report.txt"], "to": "DL"}))
+        # The reader moves, renames and renames again before the agent takes its records back.
+        await session.call_tool("move", {"paths": ["DL/paper.txt"], "to": "Other"})
         await session.call_tool("rename", {"path": "draft.txt", "name": "final.txt"})
+        await session.call_tool("rename", {"path": "DL/report.txt", "name": "report-v2.txt"})
         stale_move = await session.call_tool("undo", {"step": moved["undo"]})
         stale_rename = await session.call_tool("undo", {"step": renamed["undo"]})
+        unfiled = tool_payload(await session.call_tool("undo", {"step": filed["undo"]}))
 
     assert stale_move.is_error is True
     assert stale_move.content[0].text.endswith(
-        f"Could not move document {paper}: it was moved or renamed since."
+        f"Could not move document {paper}: it was moved since."
     )
     assert stale_rename.is_error is True
-    assert "it was moved or renamed since" in stale_rename.content[0].text
+    assert stale_rename.content[0].text.endswith(
+        f"Could not rename document {notes}: it was renamed since."
+    )
+    # A move taken back still brings the item back, under the name the reader gave it.
+    assert unfiled["result"] == f"Moved DL/report-v2.txt (document {report}) to report-v2.txt."
     _, documents = await _rows(reader)
-    assert (documents[paper].folder_id, documents[paper].name) == (dl, "kept.txt")
+    assert (documents[paper].folder_id, documents[paper].name) == (other, "paper.txt")
     assert (documents[notes].folder_id, documents[notes].name) == (None, "final.txt")
+    assert (documents[report].folder_id, documents[report].name) == (None, "report-v2.txt")
+
+
+async def test_a_step_replayed_under_another_name_still_flips_back(reader: AsyncClient) -> None:
+    dl = await _folder(reader, "DL")
+    first = await _file(reader, "a.txt")
+
+    async with mcp_running(reader), mcp_session(reader) as session:
+        moved = tool_payload(await session.call_tool("move", {"paths": ["a.txt"], "to": "DL"}))
+        await _file(reader, "a.txt")  # the reader's new a.txt takes the old name
+        undone = tool_payload(await session.call_tool("undo", {"step": moved["undo"]}))
+        redone = tool_payload(
+            await session.call_tool("undo", {"step": moved["undo"], "redo": True})
+        )
+
+    assert undone["result"] == f"Moved DL/a.txt (document {first}) to a (2).txt."
+    assert redone["result"] == f"Moved a (2).txt (document {first}) to DL/a (2).txt."
+    _, documents = await _rows(reader)
+    assert documents[first].folder_id == dl
 
 
 async def test_another_accounts_items_are_out_of_reach(reader: AsyncClient) -> None:

@@ -292,7 +292,7 @@ Every route answers for the caller's live rows only: a document in the Trash, or
 - **A batch does what it can**: each item is its own transaction, so a refused item is reported in `result` and the next goes on.
 - When nothing was done and something was refused, the answer is the error envelope with the first refusal's status and type, and `message` the sentences. So a call naming one item answers what the control plane's route answers for it:
   - **404** for an item or a `to` that names nothing live;
-  - **409** for a rename that collides, a document whose conversation is answering, the storage full before a copy (`storage_full`), a workspace that is recovering, or an `undo` whose item was moved or renamed since;
+  - **409** for a rename that collides, a document whose conversation is answering, the storage full before a copy (`storage_full`), a workspace that is recovering, or an `undo` whose item was moved (a move) or renamed (a rename) since;
   - **400** for a folder moved into its own subtree, a path deeper than 64 folders, too many paths, or a `step` that is not an undo record;
   - **422** for a body that does not parse.
 - Every tree commit is authored `api` ([workspace.md](./workspace.md) § Revisions).
