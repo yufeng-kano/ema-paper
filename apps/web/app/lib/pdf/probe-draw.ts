@@ -5,6 +5,8 @@
  * (docs/pdf-viewer.md § The device check): a canvas cleared to one opaque color.
  */
 
+import type { ProbeNoteCode } from './probe'
+
 /** The side of every check canvas, in device pixels. */
 export const PROBE_CANVAS_SIZE = 64
 
@@ -13,15 +15,13 @@ export interface ProbeWorkerRequest {
   color: readonly number[]
 }
 
-/** The worker's answer: the frame it drew, or why it could not. */
+/** The worker's answer: the frame it drew and how long that took, or why it could not. */
 export interface ProbeWorkerReply {
   bitmap?: ImageBitmap
+  /** From asking for an adapter to the frame drawn, timed in the worker: no script load in it. */
+  ms?: number
+  note?: ProbeNoteCode
   error?: string
-}
-
-/** A thrown value's message; the browser's own words go into the report as they are. */
-export function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
 }
 
 /** Clears the context's current texture to `color` (RGBA bytes) and submits the pass. */

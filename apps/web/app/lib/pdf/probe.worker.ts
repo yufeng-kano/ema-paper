@@ -8,33 +8,34 @@
  * The app's type check has the DOM library, not the worker one, so the worker's globals are
  * reached through the names both share: `addEventListener`, `postMessage`, `navigator`.
  */
-import { PROBE_CANVAS_SIZE, clearTo, errorText, type ProbeWorkerReply, type ProbeWorkerRequest } from './probe-draw'
+import { errorText } from './probe'
+import { PROBE_CANVAS_SIZE, clearTo, type ProbeWorkerReply, type ProbeWorkerRequest } from './probe-draw'
 
 async function draw(request: ProbeWorkerRequest): Promise<ProbeWorkerReply> {
   const gpu = navigator.gpu
   if (!gpu) {
-    return { error: 'navigator.gpu is missing in a worker' }
+    return { note: 'noGpu' }
   }
   if (typeof OffscreenCanvas === 'undefined') {
-    return { error: 'OffscreenCanvas is missing' }
+    return { note: 'noOffscreenCanvas' }
   }
+  const started = performance.now()
   const adapter = await gpu.requestAdapter()
   if (!adapter) {
-    return { error: 'requestAdapter() returned null in a worker' }
+    return { note: 'noAdapter' }
   }
+  // Never destroyed here: the page reads the frame first and then ends the worker, which
+  // releases the device with it.
   const device = await adapter.requestDevice()
-  try {
-    const canvas = new OffscreenCanvas(PROBE_CANVAS_SIZE, PROBE_CANVAS_SIZE)
-    const context = canvas.getContext('webgpu')
-    if (!context) {
-      return { error: 'OffscreenCanvas has no webgpu context' }
-    }
-    context.configure({ device, format: gpu.getPreferredCanvasFormat(), alphaMode: 'opaque' })
-    clearTo(device, context, request.color)
-    return { bitmap: canvas.transferToImageBitmap() }
-  } finally {
-    device.destroy()
+  const canvas = new OffscreenCanvas(PROBE_CANVAS_SIZE, PROBE_CANVAS_SIZE)
+  const context = canvas.getContext('webgpu')
+  if (!context) {
+    return { note: 'noContext' }
   }
+  context.configure({ device, format: gpu.getPreferredCanvasFormat(), alphaMode: 'opaque' })
+  clearTo(device, context, request.color)
+  const bitmap = canvas.transferToImageBitmap()
+  return { bitmap, ms: performance.now() - started }
 }
 
 addEventListener('message', (event: MessageEvent<ProbeWorkerRequest>) => {

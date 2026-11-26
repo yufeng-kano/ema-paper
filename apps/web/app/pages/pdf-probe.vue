@@ -8,7 +8,7 @@
  * The page only draws and lists: the checks are `app/lib/pdf/probe-gpu.ts`, and what they
  * record and how it is copied is `app/lib/pdf/probe.ts`.
  */
-import { PROBE_COLORS, reportText, type ProbeReport, type ProbeStatus } from '~/lib/pdf/probe'
+import { PROBE_COLORS, errorText, reportText, type ProbeReport, type ProbeStatus } from '~/lib/pdf/probe'
 import type { ProbeRun } from '~/lib/pdf/probe-gpu'
 
 definePageMeta({ middleware: 'authed' })
@@ -18,6 +18,8 @@ const { t } = useI18n()
 const canvases = useTemplateRef<HTMLCanvasElement[]>('canvases')
 const state = ref<'idle' | 'running' | 'done' | 'failed'>('idle')
 const report = ref<ProbeReport | null>(null)
+/** Why a run could not finish, in the browser's own words. */
+const failure = ref('')
 let run: ProbeRun | null = null
 let left = false
 
@@ -44,6 +46,9 @@ async function start() {
     return
   }
   state.value = 'running'
+  // The last run's answers go before the canvases are drawn again: nothing stale to copy.
+  report.value = null
+  failure.value = ''
   run?.dispose()
   run = null
   try {
@@ -57,7 +62,8 @@ async function start() {
     }
     report.value = run.report
     state.value = 'done'
-  } catch {
+  } catch (error) {
+    failure.value = errorText(error)
     state.value = 'failed'
   }
 }
@@ -79,10 +85,12 @@ onBeforeUnmount(() => {
         <p class="intro">{{ t('pdfProbe.intro') }}</p>
         <div class="actions">
           <UiButton variant="primary" :loading="state === 'running'" @click="start">
-            {{ report ? t('pdfProbe.runAgain') : t('pdfProbe.run') }}
+            {{ state === 'idle' ? t('pdfProbe.run') : t('pdfProbe.runAgain') }}
           </UiButton>
           <UiCopyButton v-if="report" :text="text" size="sm" labelled :label="t('pdfProbe.copy')" />
         </div>
+        <!-- The browser's own words, printed as they are. -->
+        <p v-if="failure" class="note">{{ failure }}</p>
 
         <section class="group" :aria-label="t('pdfProbe.canvasesTitle')">
           <h2 class="group-title">{{ t('pdfProbe.canvasesTitle') }}</h2>
@@ -107,6 +115,9 @@ onBeforeUnmount(() => {
               <UiStatusDot :tone="TONES[check.status]" :label="t(`pdfProbe.status.${check.status}`)" />
               <span v-if="check.ms !== undefined" class="check-time">
                 {{ t('pdfProbe.duration', { ms: Math.round(check.ms) }) }}
+              </span>
+              <span v-for="note in check.notes" :key="note.code" class="check-detail">
+                {{ t(`pdfProbe.notes.${note.code}`, note.params ?? {}) }}
               </span>
               <!-- The browser's own words, printed as they are. -->
               <span v-if="check.detail" class="check-detail">{{ check.detail }}</span>

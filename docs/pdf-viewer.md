@@ -115,14 +115,19 @@ The checks, in the order they are listed:
 | Graphics device created | Whether `requestDevice()` gives one, and in how long |
 | Half-float arrays | Whether `Float16Array` exists, which packs the renderer's half-float data |
 | Five canvases at once | Whether one device can draw to five canvases together — one canvas per visible page |
-| Drawing in a background worker | Whether a worker can draw with WebGPU into an `OffscreenCanvas` and hand the frame back |
+| Drawing in a background worker | Whether a worker can draw with WebGPU into an `OffscreenCanvas` and hand the frame back, and in how long by the worker's own clock |
 | Recovery after the device is lost | Whether, after the device is destroyed, a new adapter and device draw every canvas again without a reload, and in how long |
 
+- **The checks run one at a time**, so no check's time includes another's work.
 - **A check passes by reading back what it drew.** Each canvas is cleared to its own color and its middle pixel is compared with that color; the five canvases stay on the page, so the reader sees the same thing the check read.
+  - The pixel is read in the task that drew it, and again once the frame has been shown if the first read failed. The check notes when only the second read answered.
 - **A check that could not run is shown as skipped**, with the earlier failure above it.
-- **The page lists**, under the checks, the browser's user agent, the device pixel ratio, the processor count, the preferred canvas format, the adapter's name, the adapter limits the renderer is sized by and the adapter's features.
-- ***Copy results*** copies all of it as plain text: one `name: value` line per fact, the checks first, in English whatever the page's language, so that a pasted report reads the same from every device.
-- **The code.** `app/pages/pdf-probe.vue` draws and lists. `app/lib/pdf/probe.ts` holds what a run records and the copied text, and is unit tested. `probe-gpu.ts` runs the checks, `probe.worker.ts` is the worker's half and `probe-draw.ts` what the two share. The page loads `probe-gpu.ts` only when a check is started, so no other page asks for a GPU device.
+- **What a check adds to its status is a note**, said in the page's language: how many canvases drew, why the device was lost, that the browser gave no adapter. An error's message is the browser's own words and is printed as it is.
+- **A page that is not on HTTPS has no WebGPU**, on any device. The check says so in place of *no WebGPU*, and the report carries whether the page was a secure context.
+- **The page lists**, under the checks, the browser's user agent, whether the page is a secure context, the device pixel ratio, the processor count, the preferred canvas format, the adapter's name, the adapter limits the renderer is sized by and the adapter's features.
+- ***Copy results*** copies all of it as plain text: one `name: value` line per fact and no name twice, the checks first. It is in English whatever the page's language, a note as its code (`drawn(count=5, total=5)`), so that a pasted report reads the same from every device.
+- **A run that starts clears the last run's answers**, so nothing copied is older than the colors on the page. A run that cannot finish shows the error's message.
+- **The code.** `app/pages/pdf-probe.vue` draws and lists. `app/lib/pdf/probe.ts` holds what a run records and the copied text, and is unit tested. `probe-gpu.ts` runs the checks, `probe.worker.ts` is the worker's half and `probe-draw.ts` what the two share: the one drawing and the worker's messages. The page loads `probe-gpu.ts` only when a check is started, so no other page asks for a GPU device.
 
 ### Recorded devices
 

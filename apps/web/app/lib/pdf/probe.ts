@@ -14,12 +14,40 @@ export type ProbeCheckId = (typeof PROBE_CHECKS)[number]
 /** `skipped` is a check that could not run because an earlier one failed. */
 export type ProbeStatus = 'pass' | 'fail' | 'skipped'
 
+/**
+ * What a check has to say beside its status. A code, not a sentence: the page says it in the
+ * reader's language (`pdfProbe.notes.<code>`) and the copied report prints the code itself.
+ */
+export const PROBE_NOTES = [
+  'drawn',
+  'afterPresent',
+  'timedOut',
+  'wrongColor',
+  'noFrame',
+  'noGpu',
+  'insecureContext',
+  'noAdapter',
+  'noContext',
+  'noOffscreenCanvas',
+  'lost',
+  'lostUnreported',
+] as const
+
+export type ProbeNoteCode = (typeof PROBE_NOTES)[number]
+
+export interface ProbeNote {
+  code: ProbeNoteCode
+  /** The note's numbers and names: `drawn` has `count` and `total`, `lost` the browser's `reason`. */
+  params?: Record<string, string | number>
+}
+
 export interface ProbeCheck {
   id: ProbeCheckId
   status: ProbeStatus
-  /** How long the check took, where a duration says something (adapter, device, recovery). */
+  /** How long the check took, where a duration says something (adapter, device, worker, recovery). */
   ms?: number
-  /** The browser's own words: an error message, a reason, a count. Data, never translated. */
+  notes?: ProbeNote[]
+  /** The browser's own words, an error's message. Data, never translated. */
   detail?: string
 }
 
@@ -32,6 +60,8 @@ export interface ProbeAdapter {
 
 export interface ProbeReport {
   userAgent: string
+  /** `navigator.gpu` exists in a secure context only, so a plain-HTTP page says nothing of the device. */
+  secureContext: boolean
   devicePixelRatio: number
   hardwareConcurrency: number
   /** `navigator.gpu.getPreferredCanvasFormat()`, absent without WebGPU. */
@@ -95,6 +125,11 @@ export function pixelMatches(actual: ArrayLike<number>, expected: ArrayLike<numb
   return true
 }
 
+/** A thrown value's message; the browser's own words go into the report as they are. */
+export function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 /** A check that every later step of a failed run is recorded as. */
 export function skipped(id: ProbeCheckId): ProbeCheck {
   return { id, status: 'skipped' }
@@ -102,8 +137,9 @@ export function skipped(id: ProbeCheckId): ProbeCheck {
 
 /**
  * The report as plain text, for pasting into a message: one `key: value` line per fact, the
- * checks first. English and stable on purpose — it is read by whoever debugs the renderer, and
- * the page's own labels are the translated ones.
+ * checks first, a note as its code and what it carries (`drawn(count=3, total=5)`). English and
+ * stable on purpose — it is read by whoever debugs the renderer, and the page's own labels are
+ * the translated ones.
  */
 export function reportText(report: ProbeReport): string {
   const lines: string[] = []
@@ -112,12 +148,17 @@ export function reportText(report: ProbeReport): string {
     if (check.ms !== undefined) {
       parts.push(`${Math.round(check.ms)} ms`)
     }
+    for (const { code, params } of check.notes ?? []) {
+      const carried = Object.entries(params ?? {}).map(([name, value]) => `${name}=${value}`)
+      parts.push(carried.length > 0 ? `${code}(${carried.join(', ')})` : code)
+    }
     if (check.detail) {
       parts.push(check.detail)
     }
     lines.push(`${check.id}: ${parts.join(', ')}`)
   }
   lines.push(`userAgent: ${report.userAgent}`)
+  lines.push(`secureContext: ${report.secureContext}`)
   lines.push(`devicePixelRatio: ${report.devicePixelRatio}`)
   lines.push(`hardwareConcurrency: ${report.hardwareConcurrency}`)
   if (report.canvasFormat) {
@@ -125,7 +166,7 @@ export function reportText(report: ProbeReport): string {
   }
   if (report.adapter) {
     const { vendor, architecture, device, description } = report.adapter
-    lines.push(`adapter: ${[vendor, architecture, device, description].filter(Boolean).join(' / ') || 'unnamed'}`)
+    lines.push(`adapterInfo: ${[vendor, architecture, device, description].filter(Boolean).join(' / ') || 'unnamed'}`)
   }
   for (const [name, value] of Object.entries(report.limits)) {
     lines.push(`${name}: ${value}`)

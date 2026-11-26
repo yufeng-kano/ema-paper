@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import en from '../../../i18n/locales/en'
-import { PROBE_CHECKS, PROBE_COLORS, pickLimits, pixelMatches, reportText, skipped, type ProbeReport } from './probe'
+import {
+  PROBE_CHECKS,
+  PROBE_COLORS,
+  PROBE_NOTES,
+  errorText,
+  pickLimits,
+  pixelMatches,
+  reportText,
+  skipped,
+  type ProbeReport,
+} from './probe'
 
 describe('pickLimits', () => {
   it('keeps the listed limits that are numbers and drops the rest', () => {
@@ -43,6 +53,7 @@ describe('PROBE_COLORS', () => {
 describe('reportText', () => {
   const report: ProbeReport = {
     userAgent: 'TestAgent/1.0',
+    secureContext: true,
     devicePixelRatio: 3,
     hardwareConcurrency: 6,
     canvasFormat: 'bgra8unorm',
@@ -52,22 +63,33 @@ describe('reportText', () => {
     checks: [
       { id: 'gpu', status: 'pass' },
       { id: 'adapter', status: 'pass', ms: 12.4 },
-      { id: 'canvases', status: 'fail', detail: '3 of 5 drawn' },
+      {
+        id: 'canvases',
+        status: 'fail',
+        notes: [{ code: 'drawn', params: { count: 3, total: 5 } }, { code: 'afterPresent' }],
+        detail: 'Device is lost',
+      },
       skipped('worker'),
     ],
   }
 
-  it('lists the checks first, then the device facts, one per line', () => {
+  it('lists the checks first, then the device facts, one per line and no name twice', () => {
+    const names = reportText(report)
+      .split('\n')
+      .map((line) => line.slice(0, line.indexOf(':')))
+    expect(names).toHaveLength(new Set(names).size)
+
     expect(reportText(report).split('\n')).toEqual([
       'gpu: pass',
       'adapter: pass, 12 ms',
-      'canvases: fail, 3 of 5 drawn',
+      'canvases: fail, drawn(count=3, total=5), afterPresent, Device is lost',
       'worker: skipped',
       'userAgent: TestAgent/1.0',
+      'secureContext: true',
       'devicePixelRatio: 3',
       'hardwareConcurrency: 6',
       'canvasFormat: bgra8unorm',
-      'adapter: apple / metal-3',
+      'adapterInfo: apple / metal-3',
       'maxTextureDimension2D: 8192',
       'features: depth-clip-control texture-compression-astc',
     ])
@@ -76,17 +98,40 @@ describe('reportText', () => {
   it('leaves out what a browser without WebGPU cannot report', () => {
     const bare: ProbeReport = {
       userAgent: 'Old/1.0',
+      secureContext: false,
       devicePixelRatio: 2,
       hardwareConcurrency: 4,
       features: [],
       limits: {},
-      checks: [{ id: 'gpu', status: 'fail' }],
+      checks: [{ id: 'gpu', status: 'fail', notes: [{ code: 'insecureContext' }] }],
     }
-    expect(reportText(bare)).toBe('gpu: fail\nuserAgent: Old/1.0\ndevicePixelRatio: 2\nhardwareConcurrency: 4')
+    expect(reportText(bare).split('\n')).toEqual([
+      'gpu: fail, insecureContext',
+      'userAgent: Old/1.0',
+      'secureContext: false',
+      'devicePixelRatio: 2',
+      'hardwareConcurrency: 4',
+    ])
+  })
+})
+
+describe('errorText', () => {
+  it("is an error's message, and anything else as a string", () => {
+    expect(errorText(new TypeError('Device is lost'))).toBe('Device is lost')
+    expect(errorText('plain')).toBe('plain')
   })
 })
 
 describe('the page’s words', () => {
+  it('say every note, with the numbers and names the note carries', () => {
+    for (const code of PROBE_NOTES) {
+      expect(en.pdfProbe.notes[code]).toBeTruthy()
+    }
+    expect(en.pdfProbe.notes.drawn).toContain('{count}')
+    expect(en.pdfProbe.notes.drawn).toContain('{total}')
+    expect(en.pdfProbe.notes.lost).toContain('{reason}')
+  })
+
   it('name every check and every status', () => {
     for (const id of PROBE_CHECKS) {
       expect(en.pdfProbe.checks[id]).toBeTruthy()
