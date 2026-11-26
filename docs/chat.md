@@ -664,7 +664,7 @@ The built-ins end their reports the same way:
 
 A page range the reader gives `check-figures` or `fix-math` as arguments still means pages, since the reader read those off the original. With a passage or sections in the message, those are their range rather than any page, never the whole document (§ Skills, *A command keeps to what it was sent with*).
 
-**A markdown document has no parse to describe.** Its facts read `none` for `{page_count}` and `{bbox_format}` and `not parsed (a markdown document)` for `{parse_model}`, the same five tokens, so a reader's own prompt renders unchanged. The default prompt's workspace section says such a document has no pages, no crops and no `source.*`, that `doc.md` is the reader's own text rather than a transcription, and that `view_page` has nothing to show for it.
+**A markdown document has no parse to describe.** Its facts read `none` for `{page_count}` and `{bbox_format}` and `not parsed (a markdown document)` for `{parse_model}`, the same five tokens, so a reader's own prompt renders unchanged. The default prompt's workspace section says such a document has no pages, no crops and no `source.*`, that `doc.md` is the reader's own text rather than a transcription, and that `view_page` has nothing to show for it. Since 2026-11-04 the same section says that a markdown document's directory name ends in `.md` — `Notes/summary.md/doc.md` — and is still a directory, while a plain `.md` directly in a folder is a file of the library: with every markdown document named `….md` ([workspace.md](./workspace.md) § Markdown documents), the name alone no longer tells the agent which of the two it is looking at.
 
 **Inserted images are named as such.** The default prompt's workspace tree lists them in `figures/`, and its markdown contract says:
 
@@ -902,8 +902,8 @@ An **`AGENTS.md`** is the reader's standing instructions for the documents of on
 
 It is a file of the library like any other (`documents.kind` `file`, [workspace.md](./workspace.md) § Files):
 
-- the Files page lists it in its folder;
-- the file viewer shows it as text;
+- the Files page lists it in its folder as a *Markdown document*;
+- the reader opens it in the result viewer and edits it in place, each save a revision of the reader's (since 2026-11-04; until then the file viewer showed it as plain text, [web.md](./web.md) § Result viewer, *A markdown file opens on its text*);
 - the shell sees it at `/workspace/files/<folder>/AGENTS.md`;
 - every change to it is a revision.
 
@@ -932,7 +932,7 @@ The reader's instructions on the Agent page (§ Instructions) are about the read
   - It stores the rendered body on the conversation (`conversations.agents_file`, [database.md](./database.md)): NULL until a turn took one, `''` for none.
   - Every turn renders that snapshot, so the agent's own writes to an AGENTS.md during the conversation never cost it its cache: the agent has them in its history.
   - A successful compaction, which drops that history, takes the snapshot again (§ Compaction, § Prompt caching).
-  - An edit by the reader, by the shell or by another conversation reaches new conversations and compacted ones; so does a move of the document to another folder.
+  - An edit by the reader in the result viewer, by the shell or by another conversation reaches new conversations and compacted ones; so does a move of the document to another folder.
   - The Agent page's drawer shows the root file alone (`GET /api/agents/chat/context`, [api.md](./api.md)): no document is open there.
 - **When the agent writes one.**
   - The default prompt says:

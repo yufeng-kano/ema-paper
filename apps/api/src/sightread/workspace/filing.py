@@ -29,6 +29,7 @@ from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job, utcnow
 from ..errors import ApiError
 from . import documents as workspace_documents
 from . import safe_io
+from .agents_file import AGENTS_FILE
 from .documents import (
     STORAGE_FULL,
     live_document,
@@ -124,11 +125,14 @@ async def sibling_names(
     *,
     exclude_folder: int | None = None,
     exclude_document: int | None = None,
+    markdown: bool = False,
 ) -> set[str]:
     """Every name taken in one folder — the folders and the documents in it alike. The
     workspace gives each name one directory, so a folder and a file cannot share one
     (docs/workspace.md § Layout); the caller holds the user's row so the set is current.
-    What is in the Trash takes no name (docs/database.md § Rules)."""
+    What is in the Trash takes no name (docs/database.md § Rules). For a markdown document,
+    `AGENTS.md` too, which is a folder's instructions file and never one's name
+    (docs/workspace.md § Markdown documents)."""
     folders = select(Folder.name).where(
         Folder.user_id == user_id,
         placed_in(Folder.parent_id, place),
@@ -145,6 +149,8 @@ async def sibling_names(
         documents = documents.where(Document.id != exclude_document)
     taken = set((await db.execute(folders)).scalars().all())
     taken.update((await db.execute(documents)).scalars().all())
+    if markdown:
+        taken.add(AGENTS_FILE)
     return taken
 
 
@@ -560,7 +566,9 @@ async def move_then_commit(
     puts the directory back where the row stayed — unless the row shows the commit
     landed after all (the connection dropped after PostgreSQL made it durable), which
     `landed` (the model, the id, the values the committed row holds) is read for on a
-    fresh connection: then the files stay where the row points (docs/workspace.md)."""
+    fresh connection: then the files stay where the row points (docs/workspace.md). Here,
+    not in a route: the one-time `markdown_names` command renames through it too, and
+    nothing imports a route (docs/project-structure.md)."""
     try:
         moved = await workspace_documents.move_path(settings, user_id, before, after, author=author)
     except BaseException:
@@ -617,10 +625,14 @@ async def new_document(
     original as an uploaded `.md` is: the caller holds the backup lock shared and the
     workspace lock, as for a filing. Either way the committed row is all it makes: the
     agent's `new_document` writes the directory next, as its own step, so a directory that
-    cannot be written is told apart from no document made."""
+    cannot be written is told apart from no document made. `AGENTS.md`, typed or made by
+    the `.md` rule, is refused: it is a folder's instructions file, never a document's name
+    (docs/workspace.md § Markdown documents)."""
+    wanted = markdown_name(clean_name(name, DOCUMENT_NAME_MAX), DOCUMENT_NAME_MAX)
+    if wanted == AGENTS_FILE:
+        raise ApiError(409, "invalid_request", workspace_documents.RESERVED_NAME)
     if folder_id is not None:
         await live_folder(db, user_id, folder_id)
-    wanted = markdown_name(clean_name(name, DOCUMENT_NAME_MAX), DOCUMENT_NAME_MAX)
     row = await insert_named(
         db,
         user_id=user_id,
@@ -628,7 +640,7 @@ async def new_document(
         build=lambda name: Document(
             user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
         ),
-        taken=lambda: sibling_names(db, user_id, folder_id),
+        taken=lambda: sibling_names(db, user_id, folder_id, markdown=True),
         wanted=wanted,
         limit=DOCUMENT_NAME_MAX,
         message=FILE_CLASH,
@@ -732,7 +744,9 @@ async def move_document(
 ) -> Document:
     """Rename a document or a file (`name`), move it into `folder_id` (`move`), or both,
     its directory with it. Same rule as a folder: a rename refuses, a move suffixes; a
-    markdown document keeps `.md`; refused while a conversation about it is answering."""
+    markdown document keeps `.md`, and so does a markdown file; a markdown document is
+    refused `AGENTS.md` (docs/workspace.md § Markdown documents, § Files); refused while a
+    conversation about it is answering."""
     # A turn holds the document's path for its whole run (docs/chat.md § Tools).
     await refuse_while_answering(db, user_id, select(Document.id).where(Document.id == document_id))
     renaming = name is not None
@@ -743,10 +757,13 @@ async def move_document(
             await live_folder(db, user_id, place)
 
         wanted = clean_name(name, DOCUMENT_NAME_MAX) if renaming else row.name
-        if renaming and row.kind == MARKDOWN_KIND:
+        markdown = row.kind == MARKDOWN_KIND
+        if renaming and (markdown or workspace_documents.is_markdown_file(row)):
             wanted = markdown_name(wanted, DOCUMENT_NAME_MAX)
+        if renaming and markdown and wanted == AGENTS_FILE:
+            raise ApiError(409, "invalid_request", workspace_documents.RESERVED_NAME)
         await lock_user(db, user_id)
-        taken = await sibling_names(db, user_id, place, exclude_document=row.id)
+        taken = await sibling_names(db, user_id, place, exclude_document=row.id, markdown=markdown)
         if renaming and wanted in taken:
             raise ApiError(409, "invalid_request", FILE_CLASH)
 
@@ -937,7 +954,9 @@ async def _put_back(
         place = nearest_live(
             await workspace_documents.user_folders(db, user_id), getattr(row, parent)
         )
-        taken = await sibling_names(db, user_id, place)
+        taken = await sibling_names(
+            db, user_id, place, markdown=not folder and row.kind == MARKDOWN_KIND
+        )
         setattr(row, parent, place)
         row.name = free_name(taken, row.name, limit)
         row.trashed_at = None
@@ -1082,7 +1101,7 @@ async def copy_document(
     job = await job_of(db, source.job_id) if source.job_id is not None else None
     if job is not None:
         await keep_parses(db, [job])
-    taken = await sibling_names(db, user_id, folder_id)
+    taken = await sibling_names(db, user_id, folder_id, markdown=source.kind == MARKDOWN_KIND)
     row = Document(
         user_id=user_id,
         folder_id=folder_id,

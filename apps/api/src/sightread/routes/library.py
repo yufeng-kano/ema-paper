@@ -74,6 +74,7 @@ from ..workspace.documents import (
     STORAGE_FULL,
     live_document,
     live_folder,
+    live_markdown_file,
     live_text_document,
     markdown_name,
     nearest_live,
@@ -1074,7 +1075,7 @@ async def file_markdown(
             build=lambda name: Document(
                 user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
             ),
-            taken=lambda: sibling_names(db, user_id, folder_id),
+            taken=lambda: sibling_names(db, user_id, folder_id, markdown=True),
             wanted=wanted,
             limit=DOCUMENT_NAME_MAX,
             message=FILE_CLASH,
@@ -1110,7 +1111,9 @@ async def create_document(
 ):
     """A new, empty markdown document: a row with no job and no original — its baseline is
     empty (docs/workspace.md § Markdown documents). Its directory is made the first time it
-    is read, like any document's. A taken name is suffixed, as a new folder's is."""
+    is read, like any document's. A taken name is suffixed, as a new folder's is; `AGENTS.md`,
+    typed or made by the `.md` rule, is refused, since it is a folder's instructions file
+    (docs/workspace.md § Markdown documents)."""
     row = await filing.new_document(db, settings, user.id, body.folder_id, body.name)
     return document_payload(row, None)
 
@@ -1910,6 +1913,46 @@ async def put_document_notes(
         db, settings, row, text=body.text, base_revision=body.base_revision
     )
     return {"revision": revision}
+
+
+@router.get("/documents/{document_id}/text")
+async def document_text(document_id: int, user: SessionUser, db: DbSession, settings: AppSettings):
+    """A markdown file's text as stored, for the result viewer to read and edit in place;
+    `editable` false when history would not record a save of it (docs/api.md)."""
+    row = await live_markdown_file(db, user.id, document_id)
+    text = await workspace_documents.read_file_text(db, settings, row)
+    return {"markdown": text.markdown, "revision": text.revision, "editable": text.editable}
+
+
+@router.put("/documents/{document_id}/text", dependencies=[CsrfGuard])
+async def put_document_text(
+    document_id: int, body: ContentPut, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    row = await live_markdown_file(db, user.id, document_id)
+    revision = await workspace_documents.write_file_text(
+        db, settings, row, markdown=body.markdown, base_revision=body.base_revision
+    )
+    return {"revision": revision}
+
+
+@router.get("/documents/{document_id}/revisions")
+async def document_revisions(
+    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    row = await live_text_document(db, user.id, document_id)
+    history = await workspace_documents.revisions(db, settings, row)
+    return {
+        "revisions": [
+            {
+                "commit": entry.commit,
+                "author": entry.author,
+                "message": entry.message,
+                "created_at": entry.created_at,
+                "files": list(entry.files),
+            }
+            for entry in history
+        ]
+    }
 
 
 @router.post("/documents/{document_id}/revisions/{commit}/revert", dependencies=[CsrfGuard])

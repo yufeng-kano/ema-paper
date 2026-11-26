@@ -168,6 +168,10 @@ export interface UploadLimits {
   upload_max_bytes: number
   /** The cap of a file kept as it is (docs/api.md § Limits). */
   file_max_bytes: number
+  /** The largest file a revision records, and so the largest markdown file the result viewer
+   *  edits: its read-only note names it (docs/web.md § Result viewer, *A markdown file opens
+   *  on its text*). */
+  revision_max_bytes: number
   accepted_media_types: string[]
   /** What intake accepts by extension when the browser reports a generic media type. */
   accepted_extensions: string[]
@@ -549,6 +553,15 @@ interface DocumentContent {
   revision: string
   notes: string
   notes_revision: string
+}
+
+/** A markdown file's text, as stored (docs/api.md § `GET /api/library/documents/{id}/text`). */
+interface DocumentText {
+  markdown: string
+  revision: string
+  /** False for a file larger than `REVISION_MAX_FILE_BYTES`, which history does not record:
+   *  read here, never saved. */
+  editable: boolean
 }
 
 // --- chat (docs/chat.md) -------------------------------------------------------
@@ -1402,6 +1415,21 @@ export function putDocumentContent(
   body: { markdown: string; base_revision: string },
 ): Promise<{ revision: string }> {
   return request('PUT', `/api/library/documents/${id}/content`, body)
+}
+
+/** A markdown file of the library — `AGENTS.md`, a `.md` the agent wrote — read in the result
+ *  viewer (docs/web.md § Result viewer, *A markdown file opens on its text*); a 404 for any
+ *  other row. */
+export function getDocumentText(id: number): Promise<DocumentText> {
+  return request('GET', `/api/library/documents/${id}/text`)
+}
+
+/** Its save, as `putDocumentContent`'s: a stale `base_revision` answers 409 `revision_conflict`. */
+export function putDocumentText(
+  id: number,
+  body: { markdown: string; base_revision: string },
+): Promise<{ revision: string }> {
+  return request('PUT', `/api/library/documents/${id}/text`, body)
 }
 
 export function putDocumentNotes(

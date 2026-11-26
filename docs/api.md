@@ -318,7 +318,7 @@ Every route answers for the caller's live rows only: a document in the Trash, or
 - `auto_convert` (top level, beside `plan`) is the parse agent's switch ([agents.md](./agents.md)), so the Files page applies to a PDF or an image the cap the server will: `upload_max_bytes` while it converts them, `file_max_bytes` while it keeps them.
 - `default_view` (`original` or `markdown`, the row's `users.default_view`) is the view a converted PDF or image opens on the first time it is read ([web.md](./web.md) § Result viewer, *Original and Markdown*).
 - `console` (top level) is true while the operator console is on (`OWNER_EMAILS` names an address) and the account holds any of its permissions. The account menu's *Admin console* item is shown on it. No re-login window applies to it ([admin.md](./admin.md) § Signing in).
-- `limits`: `upload_max_bytes`, `accepted_media_types`, `accepted_extensions`, `markdown_media_types`, `markdown_extensions`, `markdown_max_bytes`, `image_media_types`, `image_max_bytes`, `prompt_max_chars`, `attachment_max_bytes`, `attachments_per_message`, `attachment_extensions`, `instructions_max_chars`, `memory_max_chars`, `sections_per_message`, `section_heading_max_chars`, `selection_max_chars`, `conversation_title_max_chars`, `idle_compact_lead_seconds`, `trash_retention_days`, `file_max_bytes`.
+- `limits`: `upload_max_bytes`, `accepted_media_types`, `accepted_extensions`, `markdown_media_types`, `markdown_extensions`, `markdown_max_bytes`, `image_media_types`, `image_max_bytes`, `prompt_max_chars`, `attachment_max_bytes`, `attachments_per_message`, `attachment_extensions`, `instructions_max_chars`, `memory_max_chars`, `sections_per_message`, `section_heading_max_chars`, `selection_max_chars`, `conversation_title_max_chars`, `idle_compact_lead_seconds`, `trash_retention_days`, `file_max_bytes`, `revision_max_bytes`.
   - The upload UI, the prompt dialog, the instructions and memory editors, the composer and a conversation's rename field enforce the server's numbers rather than their own.
   - The composer clips a section's heading to `section_heading_max_chars` before it sends, rather than have one long heading refuse the whole message.
   - The extensions matter because intake accepts a file by extension when the browser reports a generic media type for it.
@@ -327,6 +327,7 @@ Every route answers for the caller's live rows only: a document in the Trash, or
   - `image_media_types` and `image_max_bytes` (`DOCUMENT_IMAGE_MAX_BYTES`) are what an image inserted into a document may be ([workspace.md](./workspace.md) § Inserted images).
   - `trash_retention_days` (`TRASH_RETENTION_DAYS`, 0 = never) is how long the Trash keeps an item, which the Trash tab states beside its count ([workspace.md](./workspace.md) § The Trash).
   - `file_max_bytes` (`FILE_MAX_BYTES`) is the most a file of any other kind may be ([workspace.md](./workspace.md) § Files).
+  - `revision_max_bytes` (`REVISION_MAX_FILE_BYTES`) is the largest markdown file the result viewer edits, which its read-only note names (`…/text`, below; [web.md](./web.md) § Result viewer).
 
 **`PUT /api/me/preferences`**
 
@@ -738,6 +739,7 @@ Refusals:
 | `POST /api/library/documents/{id}/copy`, `POST /api/library/folders/{id}/copy` | **a copy** |
 | *a document in the Trash* | 404 on every document route but `restore` and `DELETE` |
 | `GET /api/library/documents/{id}/file` | **a file's bytes** ([workspace.md](./workspace.md) § Files) |
+| `GET/PUT /api/library/documents/{id}/text` | **a markdown file's text**, read and saved in place |
 | `GET /api/library/documents/{id}/original` | **a parsed document's original** ([workspace.md](./workspace.md) § Layout) |
 | `POST /api/library/documents/{id}/convert` | **convert a file into a document** ([jobs.md](./jobs.md) § Converting a file) |
 | `PUT /api/library/documents/{id}/view` | remember the view the reader switched a PDF or an image to |
@@ -775,7 +777,7 @@ Refusals:
   - between a finished parse's end and the filing of its original (its retention not yet run, `source_deleted_at` unset, [jobs.md](./jobs.md) § Retention), the upload it is filed from is still there and the row is the one it is filed for: the last row naming the parse that holds no original, which retention moves it to whatever the quota. The others take a copy only while the quota lets them, and read `false` until they hold one.
 - The upload is looked at before the listing, so a reader is never told a failed parse kept none in that moment.
 - A markdown document has no parse: `job_id`, `status`, `model`, `page_count`, `pages_done`, `size_bytes`, `error`, `failed_pages` and `reconvert` are `null`, `checking` is `false` and `kind` is `markdown` ([workspace.md](./workspace.md) § Markdown documents).
-- A file ([workspace.md](./workspace.md) § Files) reads the same way with `kind` `file`, `size_bytes` its size in the tree and `media_type` the type its bytes are served as (`null` on the other kinds).
+- A file ([workspace.md](./workspace.md) § Files) reads the same way with `kind` `file`, `size_bytes` its size in the tree and `media_type` the type its bytes are served as (`null` on the other kinds). So does a markdown file, which the Files page reads as a *Markdown document* by its name and type ([web.md](./web.md) § Files).
 - Which of the three a row is, the row itself says (`documents.kind`, [database.md](./database.md)).
 - `folders` and `documents` are the live rows only.
 - `trash` lists what was put in the Trash: each item that was trashed itself, never what sits inside a trashed folder ([database.md](./database.md) § Rules).
@@ -823,11 +825,13 @@ A `.md` or `.markdown` file, or one sent as `text/markdown`, other than an `AGEN
 - JSON `{name, folder_id?}` → 201 with the document: a row with no job and no original, empty until it is written.
 - A name without `.md` or `.markdown` gets `.md` ([workspace.md](./workspace.md) § Markdown documents).
 - A name already taken in that folder is suffixed ` (2)`, as a new folder's is.
+- **409** `invalid_request` for a name that is, or with `.md` becomes, exactly `AGENTS.md`, with a message saying why, which the Files page shows as it shows a taken name's: the folder's instructions file is a file, never a markdown document (since 2026-11-04, [workspace.md](./workspace.md) § Markdown documents).
 - 404 for a folder that is not the caller's.
 
 **`PUT/DELETE /api/library/documents/{id}`**
 
-- A markdown document renamed without `.md` or `.markdown` gets `.md` ([workspace.md](./workspace.md) § Markdown documents).
+- A markdown document renamed without `.md` or `.markdown` gets `.md`, and so does a markdown file (since 2026-11-04, [workspace.md](./workspace.md) § Markdown documents, § Files).
+- A markdown document renamed to exactly `AGENTS.md`, typed or made by that rule, is refused with **409** `invalid_request`, as a taken name is.
 - Both answer 409 while a conversation about the file is still answering, as does deleting a folder that holds such a file.
 - Deleting removes the entry, not the job or its result, which then fall under the parse retention ([jobs.md](./jobs.md) § Retention).
 - `DELETE` is *Delete Immediately*: it takes a live file, or one in the Trash for good (the Trash's own copy of it with it).
@@ -880,6 +884,28 @@ A `.md` or `.markdown` file, or one sent as `text/markdown`, other than an `AGEN
   - plus `X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`.
 - One `Range` answers 206 (**416** past the end; several ranges are answered whole), for the video and audio a browser seeks in.
 - 404 for a parse or a markdown document, which have no file of this kind: a parse's original is `…/original` whole and `…/pages/{n}/image` one page at a time, and their text `…/content`.
+
+**`GET /api/library/documents/{id}/text`**
+
+A markdown file's text (since 2026-11-04, [workspace.md](./workspace.md) § Files) → `{markdown, revision, editable}`.
+
+- The file as stored, read from the tree under the workspace lock through `safe_io` as `…/content` reads `doc.md`, no line end changed.
+- `revision` is its SHA-256, as `content`'s is.
+- `editable` is false when the file is larger than `REVISION_MAX_FILE_BYTES` or binary by git's test (a NUL byte in its first 8 KiB), which history does not record: a save there would leave no revision, and a save with no revision is not a save ([workspace.md](./workspace.md) § Revisions).
+- Only a live row of the caller's of kind `file` that is a markdown file — a name ending in `.md` or `.markdown`, any case, or the type `text/markdown` — answers. Anything else is the **404** the other document routes answer: a markdown document (its text is `…/content`), a parse, any other file, a document in the Trash or a row that is not there, and a file missing from the tree, as `…/file` answers it.
+- **413** when the file is larger than `CONTENT_MAX_BYTES` (`limits.markdown_max_bytes`; the Files page opens such a file in the file viewer, [web.md](./web.md) § Files).
+- **400** when it is not UTF-8 text; **409** when what stands at its path is not a regular file, as for `…/file`.
+- Control plane only: the data plane and the connector read the file's bytes as before.
+
+**`PUT /api/library/documents/{id}/text`**
+
+`{markdown, base_revision}` → `{revision}`: the reader's edit of a markdown file, saved as `…/content` saves `doc.md`.
+
+- Under the workspace lock, replaced atomically, committed as one revision `edit <path>` authored `user`; the file put back and **409** when that revision cannot be recorded.
+- The row's `size_bytes` is set to the new length. An unchanged text writes nothing.
+- The GET's 404s, **413** and **400**.
+- **409** `revision_conflict` when `base_revision` is not the file's current revision (the agent or the shell changed it), which the viewer answers by reloading, as for `content`.
+- **409** when the file is not editable (`editable` false above), and when the new text would be one history does not record either: larger than `REVISION_MAX_FILE_BYTES`, or with a NUL byte.
 
 **`GET /api/library/documents/{id}/original`**
 
@@ -1028,7 +1054,7 @@ Teaching `/v1/parse` to accept a cookie would put a CSRF-shaped hole in the prod
 |---|---|---|
 | `UPLOAD_MAX_BYTES` | 134217728 (128 MiB) | a file uploaded to be parsed; enforced in the app |
 | `FILE_MAX_BYTES` | 2000000000 (2 GB) | the most a file of any other kind may be when uploaded to the library ([workspace.md](./workspace.md) § Files) |
-| `REVISION_MAX_FILE_BYTES` | 1048576 (1 MiB) | the largest file a revision records, beside the binary test ([workspace.md](./workspace.md) § Revisions) |
+| `REVISION_MAX_FILE_BYTES` | 1048576 (1 MiB) | the largest file a revision records, beside the binary test ([workspace.md](./workspace.md) § Revisions), and so the largest markdown file the reader edits in the result viewer (`…/text`; `limits.revision_max_bytes` in `GET /api/me`) |
 | `DOCUMENT_IMAGE_MAX_BYTES` | 20971520 (20 MiB) | one image inserted into a document ([workspace.md](./workspace.md) § Inserted images) |
 | `DOCUMENT_IMAGE_LONG_EDGE` | 2400 px | the long edge an inserted image is kept at |
 | `WORKSPACE_QUOTA_BYTES` | 10 GiB | the ceiling every plan's storage must fit under; a user's cap is their plan's ([workspace.md](./workspace.md) § Quota, [billing.md](./billing.md) § Plans) |

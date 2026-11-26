@@ -154,6 +154,31 @@ Redeeming:
 - Granted days are spent only while no subscription pays for the account.
 - A code's credits are never refunded.
 
+## One-time commands after an update
+
+An update that needs something done once to existing data comes with a command for it. You run it in the api container, like the codes CLI, after the deploy; the update never runs it by itself.
+
+**Markdown documents' names** (the update of 2026-11-04). A markdown document's name ends in `.md` since 2026-11-03 ([workspace.md](./workspace.md) § Markdown documents):
+
+- the ones written before then — *summary*, *Untitled* — get it from this command, once;
+- one already called `AGENTS.md`, the name of a folder's instructions file, becomes `AGENTS (2).md`.
+
+Look at the plan first: `--dry-run` prints it and writes nothing.
+
+```sh
+docker compose exec api python -m sightread.markdown_names --dry-run
+docker compose exec api python -m sightread.markdown_names
+```
+
+What it prints and does:
+
+- One line per markdown document it renames or skips, tab-separated: the user id, the document id and `old name → new name`, or the old name and `skipped: <reason>`.
+- It skips a document whose conversation is still answering, a document inside a folder in the Trash, and a workspace recovering from a shell command a worker died in.
+- A rename that fails prints `failed: <reason>`, and the run goes on.
+- Each is renamed as a rename on the Files page renames it — its directory with it, as one revision — with ` (2)` where the folder already holds the new name. Nothing else changes, since conversations, memories and tickets name a document by its id.
+- It exits 0 unless something unexpected failed.
+- Running it again renames nothing already renamed, so a run after the skipped conversations have answered — or the trashed folders were put back — picks up what was skipped.
+
 ## The operator console
 
 The console is your own pages inside the app ([admin.md](./admin.md)):
@@ -235,6 +260,7 @@ How a saved value behaves:
   - before the pull, the commit and the database revision to note and the dump to take;
   - how to tell the update finished, the worker included;
   - how to go back.
+- **A one-time command:** an update that needs one says so in § One-time commands after an update, and you run it after the deploy.
 - **An install whose containers are named `sightread-*`** runs compose files that name the project after the checkout directory, and its containers, its sandbox network and its VMs `sightread-*`. The current files name all of them `ema-paper` ([deployment.md](./deployment.md) § Compose files). Before its first update:
   1. Read the old project's name, which prefixes its volumes: `docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' sightread-api`. Compose made it from the checkout directory's name, lowercased and stripped of every character other than `a-z`, `0-9`, `-` and `_`, so it can differ from what the directory is called.
   2. Bring the old stack down, which keeps its volumes and stops the old runner, so no new VM starts: before the pull, `docker compose -f … down` with the files it was started with; after it, `docker compose -p <project> -f … down`. While VMs are attached to `sightread-sandbox`, `down` reports that network still in use.

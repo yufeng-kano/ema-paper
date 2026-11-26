@@ -763,7 +763,7 @@ A file manager over everything the reader keeps — parse results, markdown docu
   - **Rename** turns the name into a field in its row, with the name before its extension selected (a folder's whole name).
     - Return or a click anywhere else keeps the new name; Esc puts the old one back; an empty or unchanged name sends nothing.
     - The window losing focus — another app, a system dialog — does not end the edit; the field has focus again on the way back.
-    - A name already taken in the folder keeps the field open, the name selected for retyping, with the server's message over the list.
+    - A name already taken in the folder — or `AGENTS.md` for a markdown document (*A markdown document is written here or uploaded*) — keeps the field open, the name selected for retyping, with the server's message over the list.
   - **Move to Trash** happens at once, with no question, and the status note says so with *Undo*.
   - Only the two deletes nothing can undo — *Delete Immediately* and *Empty Trash* — ask first, in a strip over the Trash's list rather than a dialog (*The Trash*).
 - **Copy and paste.**
@@ -793,10 +793,14 @@ A file manager over everything the reader keeps — parse results, markdown docu
   - *Kind* (*種類*) says in words what a row is, as Finder's column does:
     - *Folder*;
     - *PDF document* (*PDF 文件*) for a PDF and *JPEG image* for an image, converted or not;
-    - *Markdown document* for one;
+    - *Markdown document* (*Markdown 文件*) for one, and for a markdown file too;
     - for any other file the name of its type, from its `media_type` and extension — *MPEG-4 video*, *Excel spreadsheet*, *PowerPoint presentation*, *ZIP archive*, else *<EXT> file*.
+  - **Every markdown text reads the same, whichever way it is stored** (since 2026-11-04).
+    - A markdown file — a file whose name ends in `.md` or `.markdown` (any case) or whose type is `text/markdown`, `AGENTS.md` or a `.md` the agent wrote or downloaded ([workspace.md](./workspace.md) § Files) — reads *Markdown document* with a document's glyph, as a markdown document does, on Files, in the Trash, in the upload queue and wherever else a row's kind or glyph is drawn (`fileKind`, `documentGlyph`, `useKindLabel`).
+    - Until then `AGENTS.md` read *MD file* (*MD 檔案*) with a plain file's glyph beside *summary*, a *Markdown document*, and the reader took them for two kinds of thing. Both are text read and edited in the same viewer (§ Result viewer, *A markdown file opens on its text*).
+    - The page reads it from the name and the type; the row stays `file`, so the API, the data plane and the connector are unchanged.
   - **A PDF or an image is one item whether it has been converted or not**: the row reads the same, its glyph is the same, and the column never says *converted*. What differs is which views its viewer offers (§ Result viewer, *Original and Markdown*).
-  - The glyph before the name says the type at a glance: a folder's, a document's, and for a file a plain file, an image, a video, an audio file, a spreadsheet, a slide deck or an archive — a PDF or a Word file kept as a file takes the document's.
+  - The glyph before the name says the type at a glance: a folder's, a document's — a markdown file's too —, and for any other file a plain file, an image, a video, an audio file, a spreadsheet, a slide deck or an archive — a PDF or a Word file kept as a file takes the document's.
   - A row's state is no column of its own. A document that is simply ready shows nothing beside its name; a row that is not shows one small glyph right after the name, inside the name cell:
     - a muted `UiSpinner` while something is in flight: a parse or a re-convert `queued` or `running`, a format check under way (`checking`), or an upload still sending or waiting its turn;
     - the `circle-alert` glyph in the danger tone when the parse or the re-convert failed, the name keeping its failed styling.
@@ -862,7 +866,8 @@ A file manager over everything the reader keeps — parse results, markdown docu
   - The dialog is `CreditsDialog`, the same one the agent panel opens on a refused send.
 - **A markdown document is written here or uploaded.**
   - *New document* makes *Untitled.md* in the folder that is open and opens its name for editing, the stem selected and the extension left (*Nothing pops up for a file operation*); a name already taken takes the ` (2)` suffix a new folder would.
-  - A markdown document's name always ends in `.md`: the server adds it to a name typed without it, new or renamed ([workspace.md](./workspace.md) § Markdown documents).
+  - A markdown document's name always ends in `.md`: the server adds it to a name typed without it, new or renamed, and to a markdown file's renamed ([workspace.md](./workspace.md) § Markdown documents, § Files). One named before that rule gets it once, from the operator's command, not from this page.
+  - **No markdown document is called `AGENTS.md`**, the name of the folder's instructions file: the server refuses it, new or renamed, and the field stays open with its message, as for a taken name (*Rename*).
   - A `.md` or `.markdown` file goes up through the same queue as a PDF and becomes a markdown document instead of a parse. It is capped at `markdown_max_bytes` rather than `upload_max_bytes`, refused here first from `GET /api/me` like any other file, and opened by itself like a single upload.
   - Its row never carries a state glyph once it is uploaded — there is no parse to report on — and its size is its share of the storage, as any document's is.
 - **Any file is uploaded here, and kept as it is** ([workspace.md](./workspace.md) § Files).
@@ -873,17 +878,19 @@ A file manager over everything the reader keeps — parse results, markdown docu
 
 ### Opening a file
 
-- **A PDF or an image opens in the result viewer; every other file in the file viewer.**
+- **A PDF or an image opens in the result viewer, and so does a markdown file; every other file in the file viewer.**
   - A PDF or an image kept as it is opens in the result viewer on its *Original* view (§ Result viewer, *Original and Markdown*) — the one screen it has, converted or not. Its More menu holds the file's facts (*Kind*, *Size*, *Date added*, *Location*) over the two views, and *Markdown* there is what converts it (below).
+  - A markdown file opens in the result viewer on its text, editable there as a markdown document is (§ Result viewer, *A markdown file opens on its text*, since 2026-11-04). One larger than `limits.markdown_max_bytes` (`CONTENT_MAX_BYTES`), which the text route does not read, opens in the file viewer as text.
+  - Where a row opens is one small pure function in `app/lib/`, unit-tested, used wherever the page opens a row: a double click, ⌘↓, the menu's *Open*, `?doc=` in the URL, a single upload opening itself.
   - Every other file opens in the file viewer: the result viewer's shell with the document's panes left out.
     - At the left, in the capsule: the way back and the name, with its kind and size.
     - At the right: **Download** and the *More* button, whose menu opens on the file's facts over *Rename*, *Duplicate*, *Show in Files* and *Move to Trash*.
   - The file viewer shows what a browser shows safely on its own, from `…/file` ([api.md](./api.md)):
     - a video or audio file with the browser's controls;
-    - plain text in a monospace pane;
+    - plain text in a monospace pane, its first 256 KiB — a markdown file too large for the result viewer among it, read as text by its name or its `text/markdown` type, since a `.md` the shell wrote may carry only `application/octet-stream` (Python 3.12's own table has no `.md`);
     - for anything else, a sheet with the file's glyph, its name, kind and size, *There is no preview for this kind of file*, that the agent can still read it in any conversation, and **Download** with the size on it.
   - `?doc=<id>` names it in the URL as it names a document's viewer.
-- **A file's menu** is a document's without the document's items: **Open** (⌘↓), **Download**, **Rename** (↩, or F2) · **Convert to document…** (a PDF or an image only) · **Copy** (⌘C), **Duplicate** (⌘D) · **Move to Trash** (⌘⌫). Everything that acts on the selection — move, copy, paste, drag, the Trash, undo — treats a file as any row.
+- **A file's menu** is a document's without the document's items: **Open** (⌘↓), **Download**, **Rename** (↩, or F2) · **Convert to document…** (a PDF or an image only — what intake parses; never a markdown file, which is text already: the upload lists `GET /api/me` sends hold markdown too, and until 2026-11-04 the page read them for this item, so every `.md` file offered it and the server answered 409 `not_convertible`) · **Copy** (⌘C), **Duplicate** (⌘D) · **Move to Trash** (⌘⌫). Everything that acts on the selection — move, copy, paste, drag, the Trash, undo — treats a file as any row.
 - **Convert to document…** opens a dialog over the list: the file's name, kind and size; one paragraph — it becomes a document the reader can read, mark and talk to, it stays where it is under its name, the parse agent's model converts it and each page costs the plan's credits, as an upload converted on arrival does; *Cancel* and **Convert**.
   - The row's spinner says *Queued* at once, and the document opens by itself when the parse succeeds, as a single upload does; a failed one opens on its original (*A failed parse opens on its original*, below) ([jobs.md](./jobs.md) § Converting a file).
   - A balance that cannot cover it (402) opens the credits dialog, and the file stays a file.
@@ -957,7 +964,7 @@ A file manager over everything the reader keeps — parse results, markdown docu
 - **Names behave like a file system's.**
   - Unique within their folder — folders and files in one namespace, so a folder cannot be called what a file beside it is called.
   - A collision is resolved rather than rejected: the server appends ` (2)` on upload, on a new folder or document, on a copy and on a move, and on Put Back.
-  - A rename that would collide is the one case that answers 409, because there the name is the thing the user just typed and silently changing it would be a lie.
+  - A rename that would collide is the one case that answers 409 for a taken name, because there the name is the thing the user just typed and silently changing it would be a lie. A markdown document named `AGENTS.md`, new or renamed, is refused the same way.
   - A name in the Trash takes no room: a new file can take the name of a trashed one at once.
 - **A drop lands where the page said it would.** While files are being dragged, the overlay names the open folder, so a folder row or a breadcrumb under the pointer does not quietly take them somewhere else — it lets the drop through to the list. Rows of the library itself are the opposite: they are exactly what a folder row accepts.
 - **A failure is said over the list.** A rename that collides, a move that races, a paste the server refuses: the message is a banner at the top of the list, closed by its own button or replaced by the next action's — nothing on this screen has a dialog to hold it.
@@ -1064,7 +1071,8 @@ The card is `components/FilesAgent.vue`, holding `ChatPanel` in library mode ([p
 The result viewer opens from a document on `/files` (`GET /api/library/documents/{id}/result`), however the document was started. It also opens:
 
 - from a PDF or an image kept as it is, which has no result yet and opens on its original (*Original and Markdown*, below);
-- from a failed parse, which has none either and opens on its original with the failure said under the header (§ Files, *A failed parse opens on its original*).
+- from a failed parse, which has none either and opens on its original with the failure said under the header (§ Files, *A failed parse opens on its original*);
+- from a markdown file, which opens on its text (§ Views and editability, *A markdown file opens on its text*).
 
 **A full-screen dialog** (`UiModal size="full"`). Every other dialog in the app is a box over the page you were on, except the file viewer, which is this dialog's shell with the document's panes left out (§ Files). This one is not an interruption to a screen — it is the thing you came to read, and a 1040px box in the middle of a 27" display makes a document look like a receipt.
 
@@ -1238,6 +1246,15 @@ The result viewer opens from a document on `/files` (`GET /api/library/documents
   - It has no parse facts and no original, so More stays disabled — except on a phone, where it holds Find (§ Result viewer, *On a phone and a tablet*) over the two views, Original disabled with its reason.
   - It has no figure route: a `sightread://` placeholder pasted in reads as the dashed placeholder.
   - **Pages it never had are not added.** `app/lib/markdown.ts` reads text before the first `<!-- page: N -->` marker as an unmarked first page and writes it back unmarked, so a document with no markers saves with none: an edit never puts `<!-- page: 1 -->` at the top of a reader's own file. A marker the reader types is a page like any parsed one.
+- **A markdown file opens on its text** (since 2026-11-04; until then the file viewer showed it as plain text).
+  - A markdown file — `AGENTS.md`, a `.md` the agent wrote or downloaded ([workspace.md](./workspace.md) § Files) — is read and edited here block by block exactly as a markdown document is, with the same reading aids, Find and editing (§ Editing).
+  - It is a file, not a document, so the viewer opens it in its **markdown file mode**: its text from `GET …/text` and each save to `PUT …/text` ([api.md](./api.md)) instead of `…/content`, one revision as any save is, a 409 `revision_conflict` reloading it as it reloads a document.
+  - Nothing a document has beside its text: no Notes card, no Agent card or composer (so no diff card or *Revert* either), nothing that asks the agent or writes to the notes (*Ask the agent*, *Translate*, *Quote in notes*, the skills in the slash menu), no inserted images (the slash menu has no *Image* row, and a paste or a drop of a picture inserts none: an inserted image is a document's, kept beside its directory, [workspace.md](./workspace.md) § Inserted images), no figures, no *Original* or *Markdown* view.
+  - **The header** is the way back at the left, the filename centred, and at the right the capsule of **Find**, **Download** (the file's bytes, `…/file?download=1`) and **More**, with the *Outline* button after Find while the outline's ticks have no room beside the text, as on any document. More is enabled at once; its menu opens on the file's facts — *Kind*, *Size*, *Date Added*, *Location* — over *Rename*, *Duplicate*, *Show in Files* and *Move to Trash*, the file viewer's own (§ Files), each handled by the Files page as it handles them there.
+  - **A file the reader cannot save** — larger than `REVISION_MAX_FILE_BYTES`, `editable: false` in the read, since history records no larger file and a save with no revision is not a save ([workspace.md](./workspace.md) § Files) — opens read-only, as a copy that cannot be edited does (*Reading aids at once*, above), with a note under the header: *This file is over {size}: it can be read here, not edited.* (「這個檔案超過 {size}，在這裡只能閱讀，不能修改。」), `{size}` being `limits.revision_max_bytes` from `GET /api/me`. One refused for a NUL byte, which history does not record at any size, says *This file can be read here, not edited.* (「這個檔案在這裡只能閱讀，不能修改。」) instead, the viewer telling the two apart by the size of the text it read.
+  - A pending edit is saved before *Rename*, *Duplicate*, *Show in Files* or *Move to Trash* acts on the file, so a copy carries it and the Trash never takes a file whose save is still on its way; a save that fails keeps the file where it is, with the failure said.
+  - Its first save lays the file out as a document's is laid out (§ Editing: the blocks one blank line apart, `\n` line ends), except that a file that ended with a newline keeps it: it is a file of the tree, read by the agent's shell and by git, where a missing final newline is a change of its own.
+  - On a phone the header is the filename alone, with no *Text · Notes · Agent* switch, and Find is More's first item, as on any document (§ On a phone and a tablet).
 - **Original and Markdown.** A PDF or an image has two views, chosen from the header's More menu.
   - **Original** is the file itself — a PDF in the browser's own viewer, in a frame; an image as a picture. It is read from `…/file` while the row is a file kept as it is, and from `…/original` once it is a parsed document ([api.md](./api.md)).
   - **Markdown** is the document.
@@ -1349,7 +1366,7 @@ A jump — an outline row, a section link in an answer, an excerpt's link in the
 
 ### Editing
 
-The document is editable as soon as it opens; there is no mode to enter. What the viewer renders is the document's **editable copy** from the user's workspace (`GET /api/library/documents/{id}/content`, [workspace.md](./workspace.md)), not the parse result. The result stays the API's contract (`…/result`).
+The document is editable as soon as it opens; there is no mode to enter. What the viewer renders is the document's **editable copy** from the user's workspace (`GET /api/library/documents/{id}/content`, [workspace.md](./workspace.md)), not the parse result. The result stays the API's contract (`…/result`). For a markdown file it is the file itself (`GET …/text`, § Views and editability, *A markdown file opens on its text*), saved with `PUT …/text` where a document's saves below send `PUT …/content`.
 
 **Editing is in place, never in source** — the way Typora or Notion edit, not a textarea of markdown.
 
@@ -1743,6 +1760,7 @@ So the stack holds spans rather than copies of a book that may be 8 MiB.
   - *Ask the Agent* puts it in the composer as the selection chip (`ask({selection})`). The notes keep focus when a running turn leaves the composer unfocused, since the toolbar took none.
   - *Copy* says *Copied* on the status note at the document pane's foot, where the notes' menu's copy says it.
   - **Its surface.** The notes card is a glass pane, so there the toolbar is the opaque menu surface (`--menu-surface`, `--menu-edge`, `--shadow-menu`), as the agent panel's reply toolbar is: nothing glass sits on glass (§ Design system).
+- **A markdown file's has Copy alone.** A markdown file has no agent, no notes and runs no skill (§ Views and editability, *A markdown file opens on its text*), so its toolbar offers **Copy** and nothing else — no *Ask the agent*, no *Quote in notes*, no *Skills* — under the same rules as the document's (`ViewerToolbar`'s `ask` and `quote` false, no skills listed).
 
 #### The slash menu
 
@@ -2414,7 +2432,7 @@ Under 900px the document's column is the whole pane, whatever *Body margins* say
 - On a phone turned sideways (no taller than 500px), which has width to spare and little height, the header is one line, the filename beside the control.
 - The filename stays in the header (§ Result viewer); a press on it opens the outline (below).
 - The control is a `tablist` named *Reading panes* (*閱讀區塊*): each segment a `tab` controlling its pane (`aria-controls`), ← and → moving between them, and the track's full 44px height its hit area.
-- Notes and Agent are drawn from the first paint wherever the document can become editable, disabled until it is, so the header does not change shape under the reader's thumb. A viewer whose document can never be edited draws the filename alone.
+- Notes and Agent are drawn from the first paint wherever the document can become editable, disabled until it is, so the header does not change shape under the reader's thumb. A viewer whose document can never be edited draws the filename alone, and so does a markdown file's, which has no notes and no agent (§ Views and editability, *A markdown file opens on its text*).
 - The control is not drawn on the Original view, which is the file alone.
 - Find, the *Outline* button and the Notes and Agent toggles leave the header: **More's first item is *Find*** (*搜尋*), above the facts, and the outline is the filename's.
 - A save that failed says *Not saved* after the filename, in the danger colour, as it does beside the title on the desktop.

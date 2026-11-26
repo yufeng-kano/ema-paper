@@ -89,13 +89,27 @@ The workspace is deleted with the account and never otherwise:
 
 ### Markdown documents
 
-A markdown document is a library entry with no parse behind it (`documents.kind` `markdown`, `job_id` NULL, [database.md](./database.md)): a `.md` file uploaded on the Files page, or a document written new there. Everything after the row is the workspace's ordinary path — the same directory, `doc.md`, `notes.md`, revisions, reconciliation, the agent — with these differences:
+A markdown document is a library entry with no parse behind it (`documents.kind` `markdown`, `job_id` NULL, [database.md](./database.md)): a `.md` file uploaded on the Files page, or a document written new there — never a `.md` the shell or the agent writes into a folder, which is a markdown file (§ Files, *A markdown file is read and written in place*). Everything after the row is the workspace's ordinary path — the same directory, `doc.md`, `notes.md`, revisions, reconciliation, the agent — with these differences:
 
 - **Its name ends in `.md`**: one look for every markdown document, beside the files of the tree that carry their extensions, `AGENTS.md` among them.
   - A name without `.md` or `.markdown` gets `.md` when the document is written new, uploaded or renamed: *Untitled* becomes `Untitled.md`, a `text/markdown` upload named `readme` becomes `readme.md`, a rename to *summary* lands as `summary.md`.
   - At the name's limit the stem gives up the room the extension needs, as it does for a ` (2)` suffix.
   - A name that already ends in one of the two keeps it.
   - The directory follows the name, as always (`files/summary.md/doc.md`).
+- **Documents named before the rule take `.md` too, once, by the operator's command** (the owner's decision of 2026-11-04, which replaced *documents named before the rule keep their names until they are renamed: nothing moves a reader's files on an upgrade* — a reader saw *summary* beside `AGENTS.md` and read them as two kinds of thing).
+  - `python -m sightread.markdown_names` ([self-hosting.md](./self-hosting.md) § One-time commands after an update) is run by the operator once after the deploy, never as an automatic step of an upgrade.
+  - For every user, each `markdown` row whose name ends in neither `.md` nor `.markdown` (any case) takes the name `markdown_name` gives it, with the library's ` (2)` where its folder already holds that name — folders and documents in one namespace — and never `AGENTS.md` itself (below).
+  - A markdown document already called `AGENTS.md` — the name could be written new or given by a rename until this rule — is renamed by the same run, to `AGENTS (2).md`.
+  - A live document moves as a rename on the Files page moves it: its directory renamed and committed under the workspace lock, the row committed last, the move undone when the commit fails (§ Revisions). It is one implementation in `workspace/filing.py`, which the rename route and the command both call, since nothing in `workspace/` imports a route.
+  - A document with no directory yet changes its row alone, and so does one in the Trash, whose entry is `document-<id>`, named by its id (§ The Trash).
+  - Skipped and reported, each renamed by a later run: a document whose conversation is answering, refused as a move to the Trash is (409); one inside a trashed folder, whose directory waits in the folder's entry under its old name until Put Back brings it out; and every document of a workspace whose lock refuses while it recovers from a shell command (§ Revisions).
+  - A second run renames nothing. Conversations, memories and tickets name a document by its id and need nothing.
+- **No markdown document is called `AGENTS.md`** (since 2026-11-04).
+  - Its directory would stand where the folder's instructions file belongs — `files/<folder>/AGENTS.md/doc.md`, which the AGENTS.md chain never reads, since it reads the file ([chat.md](./chat.md) § AGENTS.md), and which keeps the agent from writing the real one there. On the Files page it would look exactly like the instructions it is not.
+  - Writing one new (`POST …/documents/new`) and renaming one answer **409** for the name, typed as it or made by the `.md` rule (*AGENTS* → `AGENTS.md`), as a taken name is answered.
+  - A copy, a duplicate, a move, a Put Back, the command and a markdown upload that would take the name (*AGENTS* sent as `text/markdown`) take ` (2)` instead (`AGENTS (2).md`), as they do for a taken name: `sibling_names(…, markdown=True)` counts `AGENTS.md` among the taken.
+  - A copy of a whole folder keeps the names inside it, so a copy made of a document named so before the command ran keeps the name until a run of the command renames it.
+  - An upload named `AGENTS.md` stays a file (below).
 - **Its baseline is its original.**
   - An uploaded `.md` is kept as the document's original, `{document_id}.md` in the sources directory beside the other originals, under the same rules: outside the mount, deleted with the row, counted against the quota, refused whole when the quota has no room.
   - Materialization writes `doc.md` from it — decoded as UTF-8, a leading byte-order mark dropped and `\r\n` line ends made `\n` — where a parsed document's comes from its result.
@@ -113,7 +127,7 @@ A markdown document is a library entry with no parse behind it (`documents.kind`
 
 ### Files
 
-A file is a library entry that is neither parsed nor markdown (`documents.kind` `file`, [database.md](./database.md)): anything the reader uploads on the Files page that is not a PDF or an image to convert — a spreadsheet, a slide deck, an archive, a video, a text file. While the parse agent's `auto_convert` switch is off ([agents.md](./agents.md)) — which it is unless the reader turns it on — a PDF or an image is kept as it is too. Such a PDF or image is one item on the Files page whether converted or not, read in the result viewer on its original until the reader asks for Markdown ([web.md](./web.md) § Result viewer, *Original and Markdown*).
+A file is a library entry that is neither a parse nor a markdown document (`documents.kind` `file`, [database.md](./database.md)): anything the reader uploads on the Files page that is not a PDF or an image to convert or a markdown document — a spreadsheet, a slide deck, an archive, a video, a text file, an upload named `AGENTS.md` — and whatever the shell writes directly into a folder, a `.md` included. While the parse agent's `auto_convert` switch is off ([agents.md](./agents.md)) — which it is unless the reader turns it on — a PDF or an image is kept as it is too. Such a PDF or image is one item on the Files page whether converted or not, read in the result viewer on its original until the reader asks for Markdown ([web.md](./web.md) § Result viewer, *Original and Markdown*).
 
 **One copy, in the tree, whole.** A file is `files/<folder>/<file name>`: the upload itself, at the place the Files page shows it, which the VM mounts read-write like the rest of `files/`. There is no original beside the git directory, no `source.*` copy and no `.meta.json`: its row is found by its path. The shell reads it with its tools (`pandoc` for a Word file, Python for a spreadsheet), changes it and deletes it as it would any file, and what it writes directly into a folder is a file of the library (§ The tree is the truth). What the reader sees on the Files page and what the agent sees under `/workspace/files` are the same bytes at the same path.
 
@@ -148,6 +162,17 @@ A file is a library entry that is neither parsed nor markdown (`documents.kind` 
   - Its directory is materialized at the same path when the parse lands, `source.*` standing there for the shell as for any document.
   - A parse that fails leaves a failed document to retry, its original kept: the file is never lost to the error, the quota or a long wait in the queue ([jobs.md](./jobs.md) § Retention).
   - Converting costs what a parse costs ([billing.md](./billing.md) § A parse).
+  - A markdown file (below) is never converted: it is text already (**409** `not_convertible`, as for any file that is not a PDF or an image).
+- **A markdown file is read and written in place** (since 2026-11-04).
+  - A file whose name ends in `.md` or `.markdown` (any case) or whose type is `text/markdown` — `AGENTS.md`, a `.md` the agent wrote or downloaded — stays a file: its row `file`, its one copy in the tree, its bytes what `…/file`, the data plane and the connector serve.
+  - Only the reader's view of it changes: the Files page reads it as a *Markdown document* and opens it in the result viewer on its text, editable as a markdown document is ([web.md](./web.md) § Result viewer, *A markdown file opens on its text*), through `GET` and `PUT …/text` ([api.md](./api.md)).
+  - One predicate, `is_markdown_file`, beside `markdown_name`, decides for every route which file is one.
+  - The text is read under the workspace lock through `safe_io`, as `doc.md` is, and returned as stored: no byte-order mark dropped, no line end changed.
+  - A save is written as a save of `doc.md` is: the base revision checked, the file replaced atomically, one revision `edit <path>` by `user`, the file put back when the revision cannot be recorded, nothing written when the text is unchanged. The row's `size_bytes` follows the new length.
+  - **A file larger than `REVISION_MAX_FILE_BYTES` is read-only there**, and so is one binary by git's test (a NUL byte in its first 8 KiB): history does not record it (§ Revisions), and a save with no revision is not a save. So the route refuses a save of it, and of a text that would grow past that size or hold a NUL byte.
+  - One larger than `CONTENT_MAX_BYTES` is not read as text at all (**413**): the file viewer shows its head.
+  - **Its rename keeps `.md`**, as a markdown document's does (§ Markdown documents): a name typed without `.md` or `.markdown` gets `.md`.
+  - An `AGENTS.md` the reader edits there is read by the conversations that read the tree after the save, new and compacted ones ([chat.md](./chat.md) § AGENTS.md).
 - **The quota counts it once**, as part of the tree, and its row's `storage_bytes` is its size (§ Quota).
 
 ### Inserted images

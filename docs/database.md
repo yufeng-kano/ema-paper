@@ -149,12 +149,14 @@ documents        id PK, user_id FK, folder_id FK folders NULL, job_id FK jobs NU
                  name, trashed_at NULL,           -- as for folders
                  kind parse|markdown|file NOT NULL DEFAULT 'parse',
                                                   -- what the row is: a parse, a markdown
-                                                  -- document, or a file kept as it was
-                                                  -- uploaded (workspace.md § Files)
+                                                  -- document, or a file kept as it is
+                                                  -- (workspace.md § Files)
                  media_type VARCHAR(255) NULL,    -- file: the type its bytes are served
                                                   -- as, from its name; NULL otherwise
                  size_bytes BIGINT NULL,          -- file: its size in the tree, refreshed
-                                                  -- by reconciliation; NULL otherwise
+                                                  -- by reconciliation and by a save of a
+                                                  -- markdown file's text (api.md); NULL
+                                                  -- otherwise
                  view VARCHAR(16) NULL,           -- original | markdown: the view the reader
                                                   -- last switched a PDF or image to; NULL
                                                   -- never (web.md § Result viewer)
@@ -174,8 +176,10 @@ documents        id PK, user_id FK, folder_id FK folders NULL, job_id FK jobs NU
                                                   -- as for folders
                  -- one row = one item in the library: a parse result (kind parse),
                  -- a markdown document uploaded as .md or written new (markdown,
-                 -- job_id NULL), or a file of any other kind kept once in the tree
-                 -- (file, job_id NULL; workspace.md § Files). folder_id NULL = root
+                 -- job_id NULL), or a file kept once in the tree — any other upload,
+                 -- an upload named AGENTS.md, what the shell writes into a folder, a
+                 -- .md among them (file, job_id NULL; workspace.md § Files).
+                 -- folder_id NULL = root
 usage_log        id PK, user_id FK, job_id FK NULL, turn_id FK chat_turns NULL,
                  agent,                           -- parse | check | chat (§ Jobs and usage)
                  model, prompt_tokens, completion_tokens,
@@ -572,7 +576,7 @@ runtime_settings key VARCHAR(64) PK,              -- one of the thirteen keys th
   - `kind` says which of the three a row is. For `parse` and `markdown`, `job_id` agrees: a parse has one, a markdown document none.
     - `parse`: a parse, named by `job_id`.
     - `markdown`: a markdown document has no parse. `job_id` is NULL, and its baseline is the `.md` it was uploaded as, kept as its original, or nothing for one written new ([workspace.md](./workspace.md) § Markdown documents).
-    - `file` ([workspace.md](./workspace.md) § Files): no parse, no baseline, the one copy of its bytes in the tree at `files/<folder>/<name>`. Its `media_type` and `size_bytes` are on the row because the file itself is the only other place they could be read from. Reconciliation removes the row when the file is gone from the tree — the one row it removes ([workspace.md](./workspace.md) § The tree is the truth).
+    - `file` ([workspace.md](./workspace.md) § Files) — a markdown file among them, `AGENTS.md` or a `.md` the agent wrote, which the Files page reads as a markdown document and the reader edits in place while its row stays `file`: no parse, no baseline, the one copy of its bytes in the tree at `files/<folder>/<name>`. Its `media_type` and `size_bytes` are on the row because the file itself is the only other place they could be read from. Reconciliation removes the row when the file is gone from the tree — the one row it removes ([workspace.md](./workspace.md) § The tree is the truth).
   - Deleting a document deletes the entry only. Its parse then falls under the retention ([jobs.md](./jobs.md) § Retention): kept while any document of the user names a parse of the same original or an upload ticket that has not expired names it, else deleted `PARSE_RETENTION_DAYS` after it finished.
   - The parse's `usage_log` rows and its ledger entry outlive it with `job_id` NULL, because they are the billing record of something that really ran.
   - Deleting a folder cascades to its subfolders and their documents, the way removing a directory does.

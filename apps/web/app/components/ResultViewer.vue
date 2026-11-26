@@ -8,10 +8,13 @@ import type { DragCardControls } from '~/components/DragCard.vue'
 import type { ToolbarRect, ToolbarSkill } from '~/components/ViewerToolbar.vue'
 import {
   ApiRequestError,
+  documentFileUrl,
   getDocumentContent,
+  getDocumentText,
   listSkills,
   putDocumentContent,
   putDocumentNotes,
+  putDocumentText,
   uploadDocumentImage,
   type DocumentView,
   type JobResult,
@@ -207,6 +210,12 @@ type Slot = { element: Element | null; atom: boolean }
  * format — and the two views sit in the More menu: read once, not every time the document
  * is open.
  *
+ * A markdown file of the library — `AGENTS.md`, a `.md` the agent wrote — opens here too, on
+ * its text (`markdownFile`): read and saved through `…/text`, edited block by block as a
+ * document is, and nothing else a document has — `hasDocument` is the one gate on the notes,
+ * the agent, the skills and inserted images (docs/web.md § Result viewer, *A markdown file
+ * opens on its text*).
+ *
  * The find bar, the outline, the selection toolbar and the pieces at the pane's foot **float
  * over** the document: opening one leaves every line of text where it was. The notes and the
  * agent columns take their width from the document instead, so the column stays centered in
@@ -228,8 +237,9 @@ const props = defineProps<{
   /** Where the document's figure crops live (`…/figures`); null hides images entirely. */
   figureBase: string | null
   /** Where the document's inserted images live (`…/images`): what lets a picture be drawn
-   *  and inserted (docs/web.md § Editing, *Images*). */
-  imageBase: string
+   *  and inserted (docs/web.md § Editing, *Images*). Null for a markdown file, which has
+   *  no such route. */
+  imageBase: string | null
   /** The library document, null for a file not yet converted and a failed parse: what
    *  makes the viewer editable. */
   documentId: number | null
@@ -238,6 +248,12 @@ const props = defineProps<{
   /** A markdown document: no parse result to wait for, its copy is the document
    *  (docs/web.md § Result viewer). */
   markdownDocument: boolean
+  /** A markdown file of the library, `documentId` its row: its text is the document, read
+   *  and saved through `…/text`, and it has nothing a document has beside its text — no
+   *  notes, no agent, no skills, no inserted images, no figures, no views; its header has
+   *  Download, and More holds the file's facts over the file viewer's actions (docs/web.md
+   *  § Result viewer, *A markdown file opens on its text*). */
+  markdownFile: boolean
   /** Said under the header while the document is being re-converted: what happens to the
    *  version open now (docs/web.md § Files). */
   reconvertNote: string | null
@@ -248,8 +264,8 @@ const props = defineProps<{
    *  a PDF in a frame, an image as a picture. Null where none is kept: *Original* in the
    *  menu is then disabled, with the reason under it. */
   original: { url: string; kind: 'pdf' | 'image' } | null
-  /** The row's facts for the More menu while the file is not converted: kind, size, date
-   *  added, location. */
+  /** The row's facts for the More menu while the file is not converted, and for a markdown
+   *  file: kind, size, date added, location. */
   facts: MenuFact[]
   /** Whether a file not yet converted can be — the parse agent accepts PDFs and JPEG, PNG,
    *  WebP and HEIC images (`accepted_media_types`); false leaves *Markdown* disabled with
@@ -273,6 +289,11 @@ const emit = defineEmits<{
   filed: []
   /** *Retry* on a failed parse: the retry dialog, over the viewer. */
   retry: []
+  /** A markdown file's More menu: the file viewer's actions, which the Files page handles. */
+  rename: []
+  duplicate: []
+  show: []
+  trash: []
 }>()
 
 const { t, locale } = useI18n()
@@ -282,6 +303,13 @@ const localePath = useLocalePath()
 const { apple, label: keyLabel, matches } = useShortcuts()
 const auth = useAuth()
 const { notesOpen, agentOpen, chosenWidth, chooseWidth, paperMargin } = useViewerLayout()
+const fileMenu = useFileMenu()
+
+/** A document of the library, not a markdown file: what the notes, the agent, the skills and
+ *  inserted images need — every route behind them answers 404 for a file, so nothing of theirs
+ *  is mounted, listed or sent without this (docs/web.md § Result viewer, *A markdown file opens
+ *  on its text*). */
+const hasDocument = computed(() => props.documentId !== null && !props.markdownFile)
 
 /** False for a PDF or an image not yet converted and for a failed parse — the rows Files
  *  hands no document id: the viewer has the original alone, the More menu holds `facts`
@@ -294,7 +322,7 @@ const converted = computed(() => props.documentId !== null)
  *  original alone; a converted document opens on Markdown for a block link, which names a
  *  place in it. */
 const tab = ref<DocumentView>(
-  props.original && (!converted.value || (props.initialView === 'original' && !props.initialBlock))
+  !props.markdownFile && props.original && (!converted.value || (props.initialView === 'original' && !props.initialBlock))
     ? 'original'
     : 'markdown',
 )
@@ -315,15 +343,25 @@ const contentError = ref<string | null>(null)
 /** The one-line notice a 409 leaves: the document moved under the reader. */
 const notice = ref<string | null>(null)
 
-/** The viewer edits when it has a document and that document's copy has been read. */
-const editable = computed(() => props.documentId !== null && contentLoaded.value)
+/** False for a markdown file larger than `REVISION_MAX_FILE_BYTES` (`editable` in `GET …/text`):
+ *  history records no larger file and a save with no revision is not a save, so its text is
+ *  read here, never edited (docs/web.md § Result viewer, *A markdown file opens on its text*). */
+const writable = ref(true)
+/** Whether the markdown file ended with a newline as it was last read: a save keeps it. */
+let fileEndsWithNewline = false
+/** The markdown file's size as last read, for the read-only note's reason. */
+const loadedBytes = ref(0)
+
+/** The viewer edits when it has a document, that document's copy has been read, and it can be
+ *  saved. */
+const editable = computed(() => props.documentId !== null && contentLoaded.value && writable.value)
 
 /** The copy exists only once the parse is final: a running job has nothing to edit yet. A
- *  markdown document has no parse: its copy is all there is. */
+ *  markdown document has no parse: its copy is all there is — and a markdown file's text is. */
 const contentWanted = computed(
   () =>
     props.documentId !== null &&
-    (props.markdownDocument || (props.result !== null && !partial.value)),
+    (props.markdownDocument || props.markdownFile || (props.result !== null && !partial.value)),
 )
 
 let contentSeq = 0
@@ -353,7 +391,8 @@ async function loadContent(replaceDirty: Replace = false) {
   contentPending.value = true
   contentError.value = null
   try {
-    const content = await getDocumentContent(id)
+    // A markdown file has its text alone, and whether it can be saved.
+    const content = props.markdownFile ? await getDocumentText(id) : await getDocumentContent(id)
     if (seq !== contentSeq) {
       return
     }
@@ -375,12 +414,18 @@ async function loadContent(replaceDirty: Replace = false) {
         joined.value = false
         draft.value = ''
       }
-      if (content.markdown !== markdown.value) {
+      // A markdown file's final newline is held apart, as the blocks' serialization drops
+      // it: the working text then matches what a save of it sends back, and a reload of
+      // unchanged text is not taken for a change made elsewhere.
+      const loaded = props.markdownFile ? content.markdown.replace(/\r?\n$/, '') : content.markdown
+      if (loaded !== markdown.value) {
         undo.clear('document')
         closeOverBlocks()
       }
-      markdown.value = content.markdown
+      markdown.value = loaded
       revision.value = content.revision
+      fileEndsWithNewline = loaded !== content.markdown
+      loadedBytes.value = props.markdownFile ? new TextEncoder().encode(content.markdown).length : 0
       saveState.value = 'saved'
     } else if (saveState.value === 'saving') {
       // The save in flight was made against an older revision than what was just read:
@@ -388,7 +433,9 @@ async function loadContent(replaceDirty: Replace = false) {
       // after it reloads. So this reload is repeated once the save has settled.
       contentSaves.reloadAfterSave = true
     }
-    if (takeNotes || notesState.value === 'saved') {
+    if (!('notes' in content)) {
+      writable.value = content.editable
+    } else if (takeNotes || notesState.value === 'saved') {
       notesSaves.reloadAfterSave = false
       if (content.notes !== notes.value) {
         undo.clear('notes')
@@ -412,7 +459,8 @@ async function loadContent(replaceDirty: Replace = false) {
 }
 
 const pages = computed(() => {
-  if (editable.value) {
+  // Loaded, not editable: a markdown file too large to save is read from its text.
+  if (contentLoaded.value) {
     return parseResultMarkdown(markdown.value)
   }
   return props.result ? parseResultMarkdown(props.result.markdown) : []
@@ -455,7 +503,13 @@ const contentSaves = new Autosave({
   // The open block's draft goes too: a reader can type in one block for minutes without
   // leaving it, and a reload in that time must not lose it.
   snapshot: documentWithDraft,
-  put: (id, text, base) => putDocumentContent(id, { markdown: text, base_revision: base }),
+  // A markdown file is a file of the tree, read by the agent's shell and by git: the final
+  // newline it was loaded with stays, where the blocks' serialization drops it.
+  put: (id, text, base) => {
+    const markdown = fileEndsWithNewline && !text.endsWith('\n') ? `${text}\n` : text
+    const write = props.markdownFile ? putDocumentText : putDocumentContent
+    return write(id, { markdown, base_revision: base })
+  },
   isConflict: isRevisionConflict,
   // Another tab, or the agent: what is on disk wins, and the reader is told — only the file
   // that conflicted reloads; an unsaved notes draft is still the reader's.
@@ -474,7 +528,8 @@ const notesSaves = new Autosave({
   state: notesState,
   error: notesError,
   revision: notesRevision,
-  documentId: () => props.documentId,
+  // A markdown file has no notes: nothing of theirs is ever sent for it.
+  documentId: () => (hasDocument.value ? props.documentId : null),
   snapshot: () => notes.value,
   put: (id, text, base) => putDocumentNotes(id, { text, base_revision: base }),
   isConflict: isRevisionConflict,
@@ -1705,25 +1760,29 @@ function blockMenuItems(keys: readonly string[]): MenuItem[] {
   const which = askWhich(blocks)
   const kinds = blocks.map(blockKindName)
   const single = keys.length === 1 ? keys[0]! : null
-  const items: MenuItem[] = [{ key: 'ask', label: t(`viewer.block.ask.${which}`), icon: 'message-circle' }]
-  if (translateSkill.value && blocks.some(translatable)) {
+  const items: MenuItem[] = []
+  // Asking and quoting are a document's: a markdown file has no agent and no notes.
+  if (hasDocument.value) {
+    items.push({ key: 'ask', label: t(`viewer.block.ask.${which}`), icon: 'message-circle' })
+    if (translateSkill.value && blocks.some(translatable)) {
+      items.push({
+        key: 'translate',
+        label: t(`viewer.block.translate.${which === 'formula' ? 'block' : which}`),
+        icon: 'languages',
+        shortcut: '/translate',
+        shortcutMono: true,
+      })
+    }
     items.push({
-      key: 'translate',
-      label: t(`viewer.block.translate.${which === 'formula' ? 'block' : which}`),
-      icon: 'languages',
-      shortcut: '/translate',
-      shortcutMono: true,
+      key: 'quote',
+      label: t('viewer.block.quote'),
+      icon: 'notebook-pen',
+      separated: true,
+      disabled: excerptPassage(blocks.map((block) => block.src).join('\n\n')) === null,
     })
-  }
-  items.push({
-    key: 'quote',
-    label: t('viewer.block.quote'),
-    icon: 'notebook-pen',
-    separated: true,
-    disabled: excerptPassage(blocks.map((block) => block.src).join('\n\n')) === null,
-  })
-  if (single !== null && markers.value.has(single)) {
-    items.push({ key: 'excerpt', label: t('viewer.block.excerpt'), icon: 'quote' })
+    if (single !== null && markers.value.has(single)) {
+      items.push({ key: 'excerpt', label: t('viewer.block.excerpt'), icon: 'quote' })
+    }
   }
   items.push(
     { key: 'copy', label: t('viewer.block.copy'), icon: 'copy', shortcut: keyLabel('mod+shift+c') },
@@ -2608,6 +2667,10 @@ const skillsLoaded = ref(false)
 let skillsSeq = 0
 
 async function loadSkills() {
+  // A markdown file runs no skill: nothing is listed for it.
+  if (!hasDocument.value) {
+    return
+  }
   const seq = ++skillsSeq
   try {
     const { skills: list } = await listSkills()
@@ -2633,6 +2696,10 @@ function slashSkills(text: string): SlashSkill[] | null {
     .filter((skill) => skill.name !== 'translate' || translates)
     .map((skill) => ({ name: skill.name, description: skill.description }))
 }
+
+/** The block editors' skills: none at all for a markdown file, whose slash menu then has no
+ *  skills section rather than one loading for ever. */
+const editorSkills = computed(() => (hasDocument.value ? slashSkills : undefined))
 
 /** The agent panel: the reader's view asks it (`ask`) to take a passage, a section or a
  *  command (docs/web.md § The agent panel). */
@@ -3467,14 +3534,15 @@ function onDocumentScroll() {
 // --- a block link ---------------------------------------------------------------------------
 
 /**
- * `/files?document=…&block=…`, followed once the copy can be edited — a running parse is
- * followed until it can be: the block near the pane's top, washed, a fold holding it opened,
- * and the way back set to the top of the document (docs/web.md § Files).
+ * `/files?document=…&block=…`, followed once the copy has loaded — a running parse is
+ * followed until it has: the block near the pane's top, washed, a fold holding it opened,
+ * and the way back set to the top of the document (docs/web.md § Files). A markdown file too
+ * large to save is followed as well, read-only.
  */
 let linkFollowed = false
 
 watch(
-  editable,
+  contentLoaded,
   async (now) => {
     if (!now || linkFollowed || !props.initialBlock) {
       return
@@ -3519,23 +3587,23 @@ async function revealBlock(at: BlockAt) {
  * the old folds. Slugs the document no longer has are forgotten once its copy has loaded: a copy
  * is the whole document, never a partial result.
  */
-let shown: { placed: PlacedBlock[]; outline: OutlineEntry[]; editable: boolean } | null = null
+let shown: { placed: PlacedBlock[]; outline: OutlineEntry[]; loaded: boolean } | null = null
 
 watch(
   [placed, outline],
   ([nextPlaced, nextOutline]) => {
     const before = shown
-    shown = { placed: nextPlaced, outline: nextOutline, editable: editable.value }
-    if (before && before.editable === editable.value) {
+    shown = { placed: nextPlaced, outline: nextOutline, loaded: contentLoaded.value }
+    if (before && before.loaded === contentLoaded.value) {
       collapsed.value = followFolds(before.placed, before.outline, nextPlaced, nextOutline, collapsed.value)
       keepFolds(followFolds(before.placed, before.outline, nextPlaced, nextOutline, rememberedFolds))
       // A partial result growing page by page is not an edit: only the copy's changes open.
-      if (editable.value) {
+      if (contentLoaded.value) {
         openFoldsOver(changedBlocks(before.placed, nextPlaced))
       }
       followSelection(before.placed, nextPlaced)
     }
-    if (editable.value) {
+    if (contentLoaded.value) {
       const slugs = new Set(nextOutline.map((entry) => entry.slug))
       if ([...collapsed.value].some((slug) => !slugs.has(slug))) {
         collapsed.value = new Set([...collapsed.value].filter((slug) => slugs.has(slug)))
@@ -3575,17 +3643,20 @@ const uid = useId()
 const cardsShown = computed(() => shownCards(layout.value, { notes: notesOpen.value, agent: agentOpen.value }, front.value))
 /** The notes are mounted with the editable copy on a phone, where they are a pane; the agent the
  *  first time it is shown or asked, then kept — not because a wider screen left its card open. */
-const notesMounted = computed(() => editable.value && (notesOpen.value || phone.value))
-const agentMounted = computed(() => editable.value && ((agentOpen.value && !phone.value) || agentKept.value))
+const notesMounted = computed(() => editable.value && hasDocument.value && (notesOpen.value || phone.value))
+const agentMounted = computed(
+  () => editable.value && hasDocument.value && ((agentOpen.value && !phone.value) || agentKept.value),
+)
 /** What shows: a phone's one pane; elsewhere the document, and each card shown beside it. */
 const documentShown = computed(() => !phone.value || pane.value === 'document')
 const notesShown = computed(() => (phone.value ? pane.value === 'notes' : cardsShown.value.notes))
 const agentShown = computed(() => (phone.value ? pane.value === 'agent' : cardsShown.value.agent))
 
 /** The phone's switch: the text always, the notes and the agent wherever the document can
- *  become editable — drawn from the first paint, disabled until it is. Not on the original. */
+ *  become editable — drawn from the first paint, disabled until it is. Not on the original,
+ *  nor for a markdown file, which has neither: its header is the filename alone. */
 const paneTabs = computed(() => {
-  if (!phone.value || tab.value !== 'markdown' || props.documentId === null) {
+  if (!phone.value || tab.value !== 'markdown' || !hasDocument.value) {
     return []
   }
   return [
@@ -4010,26 +4081,27 @@ const parseFacts = computed<MenuFact[]>(() => {
   return facts
 })
 
-/** The facts over the views: the parse's, or the row's while the file is not converted. */
-const moreFacts = computed<MenuFact[]>(() => (converted.value ? parseFacts.value : props.facts))
+/** The facts over the views: the parse's, or the row's while the file is not converted — and
+ *  a markdown file's, which is a file however it is read. */
+const fileFacts = computed(() => props.markdownFile || !converted.value)
+const moreFacts = computed<MenuFact[]>(() => (fileFacts.value ? props.facts : parseFacts.value))
 
 /** More holds Find on a phone's Markdown view, above the facts. */
 const moreFind = computed(() => phone.value && tab.value === 'markdown')
 
 /** Whether More has what its menu is made of: the result, for a converted document — a menu
  *  that grew under the pointer when the facts arrived would no longer fit where it was
- *  placed — and, for a file not yet converted, its row's facts, which it has at once. A
- *  markdown document has no parse to wait for and nothing to choose, so its More stays
- *  disabled, except on a phone, where it holds Find. */
-const moreReady = computed(() => (props.markdownDocument ? moreFind.value : converted.value ? props.result !== null : true))
+ *  placed — and, for a file not yet converted or a markdown file, its row's facts, which it
+ *  has at once. A markdown document has no parse to wait for and nothing to choose, so its
+ *  More stays disabled, except on a phone, where it holds Find. */
+const moreReady = computed(() =>
+  fileFacts.value ? true : props.markdownDocument ? moreFind.value : props.result !== null,
+)
 
 /** The two views, as a pair of choices (docs/web.md § Result viewer, *Original and
  *  Markdown*): Original is disabled where no original was kept, with the reason under it;
  *  Markdown, on a file not yet converted, is the conversion. */
-const moreItems = computed<MenuItem[]>(() => [
-  // On a phone Find leaves the header for More, first (docs/web.md § Result viewer, *On a
-  // phone and a tablet*).
-  ...(moreFind.value ? [{ key: 'find', label: t('viewer.findLabel'), icon: 'search' as const }] : []),
+const viewItems = computed<MenuItem[]>(() => [
   {
     key: 'original',
     label: t('viewer.view.original'),
@@ -4052,22 +4124,69 @@ const moreItems = computed<MenuItem[]>(() => [
   },
 ])
 
-/** A failed parse's original, saved. A button rather than a link: the dialog gives its first
- *  link the focus on open, and Enter must not start a download. */
-function downloadOriginal() {
-  if (!props.failure) {
-    return
-  }
+/** More's items under the facts: the two views — or, for a markdown file, which has none, the
+ *  file viewer's actions, each handed to the Files page (docs/web.md § Result viewer, *A
+ *  markdown file opens on its text*). */
+const moreItems = computed<MenuItem[]>(() => [
+  // On a phone Find leaves the header for More, first (docs/web.md § Result viewer, *On a
+  // phone and a tablet*).
+  ...(moreFind.value ? [{ key: 'find', label: t('viewer.findLabel'), icon: 'search' as const }] : []),
+  ...(props.markdownFile ? fileMenu.value : viewItems.value),
+])
+
+/** A markdown file's bytes, saved from the header. */
+const fileDownload = computed(() =>
+  props.markdownFile && props.documentId !== null ? documentFileUrl(props.documentId, true) : null,
+)
+
+/** A failed parse's original, or a markdown file, saved. A button rather than a link: the
+ *  dialog gives its first link the focus on open, and Enter must not start a download. */
+function download(url: string) {
   const anchor = document.createElement('a')
-  anchor.href = props.failure.download
+  anchor.href = url
   anchor.download = ''
   anchor.click()
 }
 
-function onMoreSelect(key: string) {
-  if (key === 'find') {
-    void openFind()
+/**
+ * A markdown file's action from More: what the reader typed is saved first, so a copy
+ * carries it and a move to the Trash does not leave its save with no live file to land on.
+ * A save that failed, or did not settle, keeps the file where it is: the reader sees why,
+ * and the edit stays theirs to retry.
+ */
+async function fileAction(key: 'rename' | 'duplicate' | 'show' | 'trash') {
+  commitEdit()
+  // A save that settles with another asked for meanwhile sends that one next; a few
+  // rounds at most, as a save that keeps finding new text is a reader still typing.
+  for (let round = 0; round < 3 && saveState.value !== 'saved' && saveState.value !== 'failed'; round++) {
+    await contentSaves.save()
+  }
+  if (saveState.value !== 'saved') {
     return
+  }
+  switch (key) {
+    case 'rename':
+      return emit('rename')
+    case 'duplicate':
+      return emit('duplicate')
+    case 'show':
+      return emit('show')
+    case 'trash':
+      return emit('trash')
+  }
+}
+
+function onMoreSelect(key: string) {
+  switch (key) {
+    case 'find':
+      void openFind()
+      return
+    case 'rename':
+    case 'duplicate':
+    case 'show':
+    case 'trash':
+      void fileAction(key)
+      return
   }
   if (key === 'markdown' && !converted.value) {
     if (props.convertible) {
@@ -4120,7 +4239,7 @@ function pictureAddress(block: ResultBlock): string | null {
     return props.figureBase ? `${props.figureBase}/${block.page}/${block.bbox.join(',')}` : null
   }
   if (block.kind === 'img') {
-    return `${props.imageBase}/${block.name}`
+    return props.imageBase ? `${props.imageBase}/${block.name}` : null
   }
   return null
 }
@@ -4259,10 +4378,11 @@ function landWaitingImages() {
 
 watch([editing, blockMenu, toolbar], scheduleWaitingImages)
 
-/** What the editors insert images with: only for a library document, which has an images route. */
+/** What the editors insert images with: only for a library document, which has an images
+ *  route — never a markdown file, which has none. */
 const editorImages = computed(() => {
   const id = props.documentId
-  return id !== null
+  return id !== null && hasDocument.value
     ? {
         upload: uploadImage,
         accept: (limits.value?.image_media_types ?? ['image/*']).join(','),
@@ -4457,6 +4577,20 @@ const failedPages = computed(() => props.result?.errors ?? [])
 /** The skeleton while the editable copy is being read for the first time. */
 const awaitingContent = computed(() => contentWanted.value && !contentLoaded.value && !contentError.value)
 
+/** Said under the header while a markdown file is too large to save, with the cap from
+ *  `GET /api/me` (docs/web.md § Result viewer, *A markdown file opens on its text*). */
+const readOnlyNote = computed(() => {
+  if (!props.markdownFile || !contentLoaded.value || writable.value) {
+    return null
+  }
+  // Over the cap is the usual reason; the server refuses a file history would not record
+  // for a NUL byte too, at any size, and that one is not said to be too large.
+  const cap = limits.value?.revision_max_bytes
+  return cap !== undefined && loadedBytes.value > cap
+    ? t('viewer.file.readOnly', { size: formatBytes(cap, locale.value, { limit: true }) })
+    : t('viewer.file.readOnlyOther')
+})
+
 // --- the viewer's lifetime ----------------------------------------------------------------
 
 /** A press anywhere: the reader's next action, which a note carrying *Undo* waited for — and,
@@ -4526,8 +4660,9 @@ watch(
     if (now) {
       void loadSkills()
       matchNow()
-      // A markdown document opened empty — just made — is opened to be written in.
-      if (props.markdownDocument && !markdown.value.trim()) {
+      // A markdown document opened empty — just made — is opened to be written in, and so
+      // is an empty markdown file.
+      if ((props.markdownDocument || props.markdownFile) && !markdown.value.trim()) {
         startNewBlock()
       }
     }
@@ -4568,7 +4703,7 @@ watch(
             :filename="title"
             :entries="outline"
             :current="currentHeading"
-            :actions="editable"
+            :actions="editable && hasDocument"
             :translate="translateSkill"
             @jump="jumpToHeading"
             @translate="askAboutHeading($event, true)"
@@ -4645,13 +4780,14 @@ watch(
             v-if="showOutlineButton"
             :entries="outline"
             :current="currentHeading"
-            :actions="editable"
+            :actions="editable && hasDocument"
             :translate="translateSkill"
             @jump="jumpToHeading"
             @translate="askAboutHeading($event, true)"
             @context="askAboutHeading($event, false)"
           />
-          <template v-if="editable">
+          <!-- A markdown file has neither (*A markdown file opens on its text*). -->
+          <template v-if="editable && hasDocument">
             <UiButton
               ref="notesToggle"
               variant="ghost"
@@ -4683,7 +4819,18 @@ watch(
           variant="ghost"
           icon-only
           :label="t('viewer.failed.download')"
-          @click="downloadOriginal"
+          @click="download(failure.download)"
+        >
+          <template #icon><UiIcon name="download" /></template>
+        </UiButton>
+        <!-- A markdown file's own bytes (docs/web.md § Result viewer, *A markdown file opens on
+             its text*). -->
+        <UiButton
+          v-if="fileDownload"
+          variant="ghost"
+          icon-only
+          :label="t('viewer.file.download')"
+          @click="download(fileDownload)"
         >
           <template #icon><UiIcon name="download" /></template>
         </UiButton>
@@ -4707,7 +4854,7 @@ watch(
         :at="moreMenu"
         :items="moreItems"
         :label="t('viewer.more')"
-        :header="moreFacts.length ? t(converted ? 'viewer.details' : 'viewer.file.details') : undefined"
+        :header="moreFacts.length ? t(fileFacts ? 'viewer.file.details' : 'viewer.details') : undefined"
         :facts="moreFacts"
         :lead="moreFind ? 1 : 0"
         :focus-first="moreFromKey"
@@ -4748,9 +4895,9 @@ watch(
 
       <UiBanner v-else-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
       <UiSkeleton v-else-if="pending || awaitingContent" class="state" :rows="5" />
-      <!-- A markdown document is its copy alone: one that cannot be read has nothing
-           else to show. -->
-      <UiBanner v-else-if="markdownDocument && !editable && contentError" class="state" tone="error">
+      <!-- A markdown document is its copy alone, and a markdown file its text: one that
+           cannot be read has nothing else to show. -->
+      <UiBanner v-else-if="(markdownDocument || markdownFile) && !contentLoaded && contentError" class="state" tone="error">
         {{ contentError }}
       </UiBanner>
 
@@ -4770,6 +4917,7 @@ watch(
              parsing, and the failure must not silence the live progress. -->
         <div class="doc-notes">
           <UiBanner v-if="reconvertNote">{{ reconvertNote }}</UiBanner>
+          <UiBanner v-if="readOnlyNote">{{ readOnlyNote }}</UiBanner>
           <UiBanner v-if="failedPages.length" tone="error">
             {{
               t('viewer.degraded', {
@@ -4983,7 +5131,7 @@ watch(
                         :label="t('viewer.blockSource')"
                         :on-navigate="navigateFrom"
                         :on-merge="mergeBack"
-                        :skills="slashSkills"
+                        :skills="editorSkills"
                         :figures="editorFigures"
                         :images="blockImages"
                         @change="onEditorChange"
@@ -5084,7 +5232,7 @@ watch(
                     :caret="editorCaret"
                     :placeholder="t('viewer.blockPlaceholder')"
                     :label="t('viewer.blockSource')"
-                    :skills="slashSkills"
+                    :skills="editorSkills"
                     :figures="editorFigures"
                     :images="blockImages"
                     @change="onEditorChange"
@@ -5110,7 +5258,7 @@ watch(
               :current="currentHeading"
               :room="outlineRoom"
               :panel-height="outlinePanelHeight"
-              :actions="editable"
+              :actions="editable && hasDocument"
               :translate="translateSkill"
               @jump="jumpToHeading"
               @translate="askAboutHeading($event, true)"
@@ -5124,6 +5272,8 @@ watch(
               :bounds="toolbar.bounds"
               :coarse="coarse"
               :skills="toolbarSkills"
+              :ask="hasDocument"
+              :quote="hasDocument"
               @ask="onToolbarAction('ask')"
               @quote="onToolbarAction('quote')"
               @copy="onToolbarAction('copy')"

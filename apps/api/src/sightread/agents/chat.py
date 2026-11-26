@@ -587,7 +587,7 @@ DEFAULT_SYSTEM_PROMPT = "".join(
 """,
         _WORKSPACE,
         """
-A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Ema Paper, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it.
+A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Ema Paper, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it. Its directory's name ends in .md (Notes/summary.md/doc.md) and is still a directory; a plain .md directly in a folder, AGENTS.md among them, is a file of the library.
 
 A file of the library is any plain file directly in a folder, outside the document directories: the user's own bytes, the only copy there is. Read it with your tools (pandoc for a Word file, Python for a spreadsheet) and change it when the user asks. A binary or a large file has no revision to undo a change, so rewrite one only when the user asks for exactly that, and never delete one. In your replies it is "your file <name>", never a path.
 

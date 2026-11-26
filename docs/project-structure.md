@@ -14,6 +14,7 @@ ema-paper/
         errors.py                 # the one error shape both planes answer with (docs/api.md)
         body_limit.py             # the ceiling on request bodies that are not streamed uploads
         codes.py                  # `python -m sightread.codes`: the operator's redeem codes
+        markdown_names.py         # `python -m sightread.markdown_names`: the one-time `.md` for markdown documents named before 2026-11-03 (docs/self-hosting.md § One-time commands after an update)
         stopping.py               # pause(): the wait a shutdown cuts short, for the worker's periodic tasks
         db/
           models.py               # SQLAlchemy models (docs/database.md)
