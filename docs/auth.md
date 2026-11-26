@@ -64,7 +64,7 @@ Claude custom connectors assume OAuth 2.1 on remote MCP servers and attempt Dyna
   - English only; it is the one user-facing surface outside the i18n catalog.
 - `POST /oauth/token` — code + PKCE → access token (opaque random, stored hashed, 1 h) + refresh token (30 d, rotating).
   - Access tokens authenticate `/mcp` and `/v1/*` like an API key, resolved to the same user.
-  - Every live grant holds both scopes (below), so a token reaches what an API key reaches, and no request is checked against a scope.
+  - Every live grant holds all three scopes (below), so a token reaches what an API key reaches, and no request is checked against a scope.
 
 Result: adding the connector in Claude is "paste URL → Google login → consent" — no manual key copying.
 
@@ -73,13 +73,15 @@ Implementation notes:
 - **Public clients only.** DCR issues no client secret, and `token_endpoint_auth_method` is `none`.
   - PKCE S256 is the only client authentication. That is what Claude does anyway, and it leaves no shared secret to leak.
   - Authlib supplies the PKCE primitives. Its Flask/Django authorization-server framework is sync, so the endpoints themselves are plain FastAPI routes over `oauth_grants`.
-- **Two scopes, `parse` and `library`.**
+- **Three scopes, `parse`, `library` and `organize`.**
   - `parse` is the `parse` tool and the job routes.
   - `library` is reading the Files library and saving a document's text and notes — the library tools of the connector ([mcp.md](./mcp.md)) and `/v1/library*` ([api.md](./api.md) § The library on the data plane).
   - Filing is part of `library` ([mcp.md](./mcp.md) § Filing into Files): it adds documents and folders to the reader's own library and removes or overwrites nothing.
-  - A grant is made for both, whatever the client asks: `scopes_supported` lists both, and the token answer names what was granted. The reason is that the consent page says both: *It will be able to submit documents and file them into your Files folders, read your Files library and save the text and notes of its documents. It cannot reach your settings, API keys or billing.*
-  - A refresh keeps the scope of the grant it rotates, so every live grant holds both scopes. A scope is never widened without the consent page.
-  - An API key carries both, as the account's own.
+  - `organize` is putting the Files library in order: making folders, moving, renaming and copying items, moving them to the Trash and putting them back — the connector's organizing tools and `POST /v1/library/<tool>` ([mcp.md](./mcp.md) § The organizing tools). It is a scope of its own because it moves the reader's items and sends them to the Trash, which `library` promised it would not. Nothing it does deletes for good.
+  - A grant is made for all three, whatever the client asks: `scopes_supported` lists them, and the token answer names what was granted. The reason is that the consent page says all three: *It will be able to submit documents and file them into your Files folders, read your Files library, save the text and notes of its documents, and organize your Files: make folders, move, rename and copy items, move them to the Trash and put them back. It cannot delete anything for good, or reach your settings, API keys or billing.*
+  - A refresh keeps the scope of the grant it rotates, so every live grant holds all three scopes. A scope is never widened without the consent page.
+  - So a grant approved before `organize` existed is revoked, with its codes, access and refresh tokens, by a data-only migration ([database.md](./database.md) § Migrations): its connector is answered 401 and goes through the consent page again, once. The grants approved before `library` existed went the same way.
+  - An API key carries all three, as the account's own.
 - **Error shapes.** `/oauth/register` and `/oauth/token` answer in RFC form (`{"error": "...", "error_description": "..."}`), because OAuth clients parse that.
   - The app's own error envelope stays on `/v1` and `/api`.
   - `/oauth/authorize` answers a browser, so it renders HTML or redirects.
@@ -131,7 +133,7 @@ The connector's library tools hand the agent `curl` commands, as `parse` does, a
   - A `write` ticket adds the two saves, `PUT …/doc.md` and `PUT …/notes.md`.
   - Neither is spent by use: within its lifetime it serves any number of requests, so a download fetches every crop on one ticket.
   - A ticket that expired, names another document, or is a `read` ticket on a save gets 401 *Document ticket expired or for another document — call read_document (or write_document to save) again for a fresh one.*
-  - `GET /v1/library` refuses a ticket with a 401 that says to list the library with an API key or the `list_library` tool.
+  - `GET /v1/library`, `GET /v1/library/trash` and the organizing routes (`POST /v1/library/<tool>`) refuse a ticket with a 401 that says to use an API key or the connector's tools: a ticket never lists the library or changes where anything is.
   - Every other endpoint — the job routes, `/v1/parse`, `/mcp` — refuses `srd_` as any unknown bearer (401; `/v1/jobs/last*` its 400 for anything but an upload ticket).
 - **The ticket only names what the account may reach.** Each request still resolves the document as the account's own and live. A document put in the Trash after the mint answers 404. A document deleted for good takes its tickets with its row, and the ticket then gets the 401 above.
 - **Lifetime** `DOCUMENT_TICKET_TTL_SECONDS` (default 3600). Recovery from an expired ticket is calling the tool again. The revision a save sends is the file's content hash, not the ticket's, so a copy downloaded on one ticket saves on another.

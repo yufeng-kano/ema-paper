@@ -354,8 +354,9 @@ oauth_clients    client_id PK, client_name, redirect_uris JSONB, created_at
 oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,
                  token_hash UNIQUE, pkce_challenge NULL, redirect_uri NULL,
                  scope, expires_at, revoked_at NULL, created_at
-                 -- scope is space-separated, `parse library` on every live grant; a
-                 -- refresh carries it over (auth.md § 4)
+                 -- scope is space-separated, `parse library organize` on every live
+                 -- grant; a refresh carries it over (auth.md § 4). A grant made before
+                 -- a scope existed is revoked by a data-only migration, never widened
                  -- redirect_uri is set on `code` rows only: the token endpoint
                  -- checks a code came back from the URI it was issued for
 subscriptions    user_id PK/FK, subscription_id UNIQUE, status, plan_id,

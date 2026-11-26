@@ -25,6 +25,7 @@ from ..auth.oauth_as import (
     CODE_CHALLENGE_METHOD,
     GRANTED_SCOPE,
     LIBRARY_SCOPE,
+    ORGANIZE_SCOPE,
     SCOPE,
     RegistrationError,
     exchange_code,
@@ -180,7 +181,7 @@ async def authorization_server_metadata(settings: AppSettings) -> JSONResponse:
             "authorization_endpoint": f"{issuer}/oauth/authorize",
             "token_endpoint": f"{issuer}/oauth/token",
             "registration_endpoint": f"{issuer}/oauth/register",
-            "scopes_supported": [SCOPE, LIBRARY_SCOPE],
+            "scopes_supported": [SCOPE, LIBRARY_SCOPE, ORGANIZE_SCOPE],
             "response_types_supported": ["code"],
             "response_modes_supported": ["query"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
@@ -203,7 +204,7 @@ async def protected_resource_metadata(settings: AppSettings) -> JSONResponse:
         {
             "resource": f"{issuer}{MCP_PATH}",
             "authorization_servers": [issuer],
-            "scopes_supported": [SCOPE, LIBRARY_SCOPE],
+            "scopes_supported": [SCOPE, LIBRARY_SCOPE, ORGANIZE_SCOPE],
             "bearer_methods_supported": ["header"],
         }
     )
@@ -316,7 +317,7 @@ async def authorize(
     """Consent screen for a signed-in user; anything else is a redirect or an error page.
 
     `resource` (RFC 8707) is accepted and ignored: this AS protects exactly one resource.
-    So is `scope`: a grant always holds both scopes (docs/auth.md § 4).
+    So is `scope`: a grant always holds all three scopes (docs/auth.md § 4).
     """
     client = await _validated_request(db, client_id, redirect_uri)
     if isinstance(client, HTMLResponse):
@@ -347,8 +348,10 @@ async def authorize(
         f"<p><strong>{html.escape(client.client_name)}</strong> wants to use Ema Paper as "
         f"<code>{html.escape(user.email)}</code>.</p>"
         "<p class='note'>It will be able to submit documents and file them into your Files "
-        "folders, read your Files library and save the text and notes of its documents. It "
-        "cannot reach your settings, API keys or billing.</p>"
+        "folders, read your Files library, save the text and notes of its documents, and "
+        "organize your Files: make folders, move, rename and copy items, move them to the "
+        "Trash and put them back. It cannot delete anything for good, or reach your "
+        "settings, API keys or billing.</p>"
         "<p class='terms'>Every page it parses uses credits from your plan, the same as a "
         "parse in the app.</p>"
         f"<form method='post' action='/oauth/authorize'>{hidden}"

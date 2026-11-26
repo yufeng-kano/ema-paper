@@ -325,7 +325,7 @@ async def test_an_expired_ticket_and_a_trashed_document_are_refused(reader: Asyn
 async def test_a_new_grant_reaches_the_library(make_client) -> None:
     client = make_client()
     _, tokens = await oauth_connected(client)
-    assert tokens["scope"] == "parse library"
+    assert tokens["scope"] == "parse library organize"
     listed = await client.get("/v1/library", headers=bearer(tokens["access_token"]))
     assert listed.status_code == 200, listed.text
 
@@ -340,8 +340,10 @@ async def test_a_new_grant_reaches_the_library(make_client) -> None:
         },
     )
     assert "read your Files library" in consent.text
+    assert "organize your Files" in consent.text
+    assert "cannot delete anything for good" in consent.text
     metadata = (await client.get("/.well-known/oauth-authorization-server")).json()
-    assert metadata["scopes_supported"] == ["parse", "library"]
+    assert metadata["scopes_supported"] == ["parse", "library", "organize"]
 
 
 # --- the connector's tools --------------------------------------------------------------------

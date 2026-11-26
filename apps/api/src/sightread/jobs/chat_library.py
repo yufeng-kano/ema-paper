@@ -1,22 +1,19 @@
 """A library conversation's library tools (docs/chat.md § Library conversations, *The
 library tools*): the library listed as the Files page lists it, and changed by the Files
-page's own operations — `workspace/filing.py`, the functions the library routes call — each
-call under the workspace lock and a database session of its own, and the seven that change
-the library also under the backup lock taken shared, as `convert_file` runs. Every answer
-says what was done, a sentence per item, and a call that changed something carries its undo
-record, in the shapes the Files page's undo keeps its steps in (docs/web.md § Files, *Undo*).
+page's own operations. The six that the connector shares — new_folder, move, rename, copy,
+trash and put_back — are `workspace/organize.py`'s, run under its locks; `list_files`, the
+paths in the VM and `new_document` are this agent's alone. Every answer says what was done,
+a sentence per item, and a call that changed something carries its undo record, in the
+shapes the Files page's undo keeps its steps in (docs/web.md § Files, *Undo*).
 
-Also the path resolver `convert_file` shares: an item named by its place as the Files page
-shows it (`DL/DINO/iBOT.pdf`), or by its path under `/workspace/files/`.
+Also the path resolver `convert_file` shares (`organize.resolve`): an item named by its place
+as the Files page shows it (`DL/DINO/iBOT.pdf`), or by its path under `/workspace/files/`.
 """
 
 from __future__ import annotations
 
 import logging
-import unicodedata
 import uuid
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -26,118 +23,24 @@ from ..config import Settings
 from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job
 from ..errors import ApiError
 from ..workspace import documents as workspace_documents
-from ..workspace import filing, safe_io
+from ..workspace import filing, organize, safe_io
 from ..workspace.agents_file import AGENTS_FILE
 from ..workspace.documents import folder_path, item_path
-from ..workspace.layout import DOC_FILE, FILES_DIR, document_relative_dir, path_segment, user_root
+from ..workspace.layout import DOC_FILE, document_relative_dir, user_root
 from ..workspace.locks import backup_shared, workspace_lock
+from ..workspace.organize import library_segments, resolve
 from .chat_tools import VM_ROOT, ToolOutcome
 
 logger = logging.getLogger(__name__)
 
-VM_FILES = VM_ROOT / FILES_DIR
-
 
 # --- naming an item ---------------------------------------------------------------------
-
-
-def library_segments(raw: str) -> list[str] | None:
-    """The names a library path gives, as the Files page shows them (`Papers/2017/x.pdf`)
-    or under `/workspace/files/`: `[]` for the top (`''`, `/`), None for a path with a `.`
-    or `..` component."""
-    text = raw.strip().replace("\\", "/")
-    if text == VM_FILES.as_posix():
-        text = ""
-    prefix = f"{VM_FILES.as_posix()}/"
-    if text.startswith(prefix):
-        text = text[len(prefix) :]
-    # Names are stored NFC (`clean_name`): a decomposed é from a macOS name still names them.
-    segments = [
-        unicodedata.normalize("NFC", part.strip()) for part in text.split("/") if part.strip()
-    ]
-    if any(part in (".", "..") for part in segments):
-        return None
-    return segments
-
-
-def _named[RowT: (Folder, Document)](rows: list[RowT], segment: str) -> RowT | None:
-    """The row a segment names: by its name as the Files page shows it, else by the name of
-    its directory in the workspace (`path_segment`)."""
-    return next((row for row in rows if row.name == segment), None) or next(
-        (row for row in rows if path_segment(row.name) == segment), None
-    )
-
-
-async def _documents_in(db: AsyncSession, user_id: int, folder_id: int | None) -> list[Document]:
-    """The documents and files a folder holds, the Trash's left out."""
-    return list(
-        (
-            await db.execute(
-                select(Document).where(
-                    Document.user_id == user_id,
-                    filing.placed_in(Document.folder_id, folder_id),
-                    Document.trashed_at.is_(None),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-
-@dataclass(frozen=True)
-class Found:
-    """What a path names: a live folder, a live document or file, or — both None — the top."""
-
-    folder: Folder | None = None
-    document: Document | None = None
-
-
-async def resolve(
-    db: AsyncSession, user_id: int, segments: list[str], folders: dict[int, Folder] | None = None
-) -> Found | None:
-    """The live item a path of names leads to, folder by folder; None for nothing live
-    there. A document's directory and its `doc.md` both name the document (docs/chat.md
-    § Library conversations, *The library tools*). `folders`: the user's, when the caller
-    resolves many paths against one reading."""
-    if folders is None:
-        folders = await workspace_documents.user_folders(db, user_id)
-    trashed = workspace_documents.trashed_folder_ids(folders.values())
-    place: Folder | None = None
-    for index, segment in enumerate(segments):
-        parent_id = place.id if place is not None else None
-        children = [
-            row for row in folders.values() if row.parent_id == parent_id and row.id not in trashed
-        ]
-        folder = _named(children, segment)
-        if folder is not None:
-            place = folder
-            continue
-        document = _named(await _documents_in(db, user_id, parent_id), segment)
-        rest = segments[index + 1 :]
-        if document is None or not (
-            rest == [] or (rest == [DOC_FILE] and document.kind != FILE_KIND)
-        ):
-            return None
-        return Found(document=document)
-    return Found(folder=place)
 
 
 def vm_path(folders: dict[int, Folder], folder_id: int | None, name: str) -> str:
     """Where an item of a folder is in the VM: a document's directory, a file itself."""
     names = [row.name for row in workspace_documents.folder_chain(folders, folder_id)]
     return (VM_ROOT / document_relative_dir(names, name).as_posix()).as_posix()
-
-
-def _item(kind: str, row_id: int) -> dict:
-    """An item as the Files page's undo names it: `file` is any documents row."""
-    return {"kind": "folder" if kind == "folder" else "file", "id": row_id}
-
-
-def _reason(exc: ApiError) -> str:
-    """A refusal's message as the end of a sentence."""
-    message = exc.message.rstrip(".")
-    return message[:1].lower() + message[1:]
 
 
 # --- what the Files page shows ----------------------------------------------------------
@@ -388,30 +291,8 @@ async def _materialized(
         logger.warning("document %d could not be written for list_files: %s", row.id, exc.message)
 
 
-async def _trash_entries(db: AsyncSession, user_id: int) -> list[tuple[str, Folder | Document]]:
-    """What the Trash holds, each item trashed on its own, newest first, with the place
-    Put Back returns it to — the Trash tab's *Original location* — and its name."""
-    folders = await workspace_documents.user_folders(db, user_id)
-    documents = (
-        await db.execute(
-            select(Document).where(Document.user_id == user_id, Document.trashed_at.is_not(None))
-        )
-    ).scalars()
-    trashed = workspace_documents.trashed_folder_ids(folders.values())
-    entries: list[tuple[str, Folder | Document]] = []
-    for row in folders.values():
-        if row.trashed_at is not None:
-            home = workspace_documents.nearest_live(folders, row.parent_id, trashed=trashed)
-            entries.append((item_path(folders, home, row.name), row))
-    for row in documents:
-        home = workspace_documents.nearest_live(folders, row.folder_id, trashed=trashed)
-        entries.append((item_path(folders, home, row.name), row))
-    entries.sort(key=lambda entry: entry[1].trashed_at, reverse=True)
-    return entries
-
-
 async def _list_trash(db: AsyncSession, user_id: int, limit: int) -> str:
-    entries = await _trash_entries(db, user_id)
+    entries = await organize.trash_entries(db, user_id)
     if not entries:
         return "The Trash is empty."
     lines = []
@@ -438,90 +319,9 @@ async def _list_trash(db: AsyncSession, user_id: int, limit: int) -> str:
 # --- the seven that change the library ----------------------------------------------------
 
 
-@dataclass
-class Batch:
-    """What a call did, item by item: its sentences, the undo record's parts, and whether
-    anything was done at all."""
-
-    lines: list[str]
-    done: int = 0
-    failed: int = 0
-
-    def outcome(self, library: dict | None) -> ToolOutcome:
-        return ToolOutcome(
-            "\n".join(self.lines),
-            is_error=self.done == 0 and self.failed > 0,
-            library=library if self.done else None,
-        )
-
-
-def _paths(tool_input: dict, settings: Settings) -> list[str] | ToolOutcome:
-    paths = tool_input.get("paths")
-    if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
-        return ToolOutcome("`paths` is a list of the items' places, at least one.", is_error=True)
-    if len(paths) > settings.chat_library_max_paths:
-        return ToolOutcome(
-            f"At most {settings.chat_library_max_paths} paths go in one call; nothing was done.",
-            is_error=True,
-        )
-    return paths
-
-
-async def _destination(db: AsyncSession, user_id: int, raw: object) -> tuple[bool, int | None]:
-    """The folder `to` names: `(found, id)`, the id None for the top."""
-    segments = library_segments(raw) if isinstance(raw, str) else None
-    found = await resolve(db, user_id, segments) if segments is not None else None
-    if found is None or found.document is not None:
-        return False, None
-    return True, found.folder.id if found.folder is not None else None
-
-
-async def _each(
-    db: AsyncSession, batch: Batch, what: str, step: Callable[[], Awaitable[str | None]]
-) -> None:
-    """One item of a batch, its own transaction: done, it says what it did; refused, it is
-    rolled back and says why — `what` is the item's action, as in "move DL/x.pdf" — and the
-    next goes on (docs/chat.md § Library conversations, *A batch does what it can*)."""
-    try:
-        line = await step()
-    except ApiError as exc:
-        await db.rollback()
-        batch.failed += 1
-        batch.lines.append(f"Could not {what}: {_reason(exc)}.")
-        return
-    except Exception:  # this item's failure, never the others'
-        logger.exception("a library tool failed to %s", what)
-        await db.rollback()
-        batch.failed += 1
-        batch.lines.append(f"Could not {what}: it failed unexpectedly.")
-        return
-    if line is not None:
-        batch.lines.append(line)
-
-
-async def _resolved_items(
-    db: AsyncSession, user_id: int, paths: list[str], batch: Batch, action: str
-) -> list[tuple[str, str, int]]:
-    """Each path's item as `(the item's action, kind, id)` — `action` is a template such
-    as "move {}" — resolved before anything changes: the items named are the ones the call
-    works on, whatever an earlier one moves. A path that names nothing live is that item's
-    error."""
-    named = []
-    folders = await workspace_documents.user_folders(db, user_id)
-    for raw in paths:
-        what = action.format(raw.strip() or "/")
-        segments = library_segments(raw)
-        found = await resolve(db, user_id, segments, folders) if segments else None
-        if found is None:
-            batch.failed += 1
-            reason = "the top of the library is no item" if segments == [] else "nothing is there"
-            batch.lines.append(f"Could not {what}: {reason}.")
-        elif found.document is not None:
-            named.append((what, "document", found.document.id))
-        else:
-            assert found.folder is not None
-            named.append((what, "folder", found.folder.id))
-    return named
+# The six the connector shares, run by `organize`; `new_document` is this agent's alone.
+SHARED_TOOL_NAMES = frozenset({"new_folder", "move", "rename", "copy", "trash", "put_back"})
+WRITE_TOOL_NAMES = SHARED_TOOL_NAMES | {"new_document"}
 
 
 async def run_tool(
@@ -536,310 +336,28 @@ async def run_tool(
     """One call of a library tool that changes the library, under the backup lock taken
     shared, the workspace lock and a session of its own; a refusal of the whole call — the
     lock, a destination that is not a folder — is an error result with its reason."""
+    if name in SHARED_TOOL_NAMES:
+        outcome = await organize.run_locked(
+            sessionmaker, settings, user_id=user_id, author=author, name=name, tool_input=tool_input
+        )
+        return ToolOutcome(outcome.text, is_error=outcome.is_error, library=outcome.undo)
     root = user_root(settings.workspaces_dir, user_id)
     try:
         async with backup_shared(root), workspace_lock(root), sessionmaker() as db:
-            run = TOOLS[name]
-            return await run(db, settings, user_id, author, tool_input)
+            return await _new_document(db, settings, user_id, author, tool_input)
     except ApiError as exc:
         return ToolOutcome(f"Nothing was done: {_reason(exc)}.", is_error=True)
 
 
-async def _new_folder(
-    db: AsyncSession, settings: Settings, user_id: int, author: str, tool_input: dict
-) -> ToolOutcome:
-    raw = tool_input.get("path")
-    segments = library_segments(raw) if isinstance(raw, str) else None
-    if not segments:
-        return ToolOutcome("`path` is the new folder's place, as in 'DL/DINO/old'.", is_error=True)
-    made, parent_id, refusal = await _make_folders(db, settings, user_id, segments)
-    if not made and refusal is not None:
-        return ToolOutcome(f"No folder was made: {refusal}.", is_error=True)
-    folders = await workspace_documents.user_folders(db, user_id)
-    if not made:
-        return ToolOutcome(
-            f"The folder {folder_path(folders, parent_id)} (folder {parent_id}) already exists."
-        )
-    listed = [f"{folder_path(folders, row_id)} (folder {row_id})" for row_id in made]
-    answer = f"Made the folder{'s' if len(made) > 1 else ''} {', '.join(listed)}"
-    # Folders made before a refusal stand: said, with their undo, as a batch says what it
-    # did (docs/chat.md § Library conversations, *A batch does what it can*).
-    return ToolOutcome(
-        f"{answer}, but {refusal}." if refusal is not None else f"{answer}.",
-        library={"type": "appear", "items": [_item("folder", made[0])]},
-    )
+def _reason(exc: ApiError) -> str:
+    """A refusal's message as the end of a sentence."""
+    message = exc.message.rstrip(".")
+    return message[:1].lower() + message[1:]
 
 
-async def _make_folders(
-    db: AsyncSession, settings: Settings, user_id: int, names: list[str]
-) -> tuple[list[int], int | None, str | None]:
-    """Every folder of a path that is missing, each as the page's *New folder* makes one:
-    `(the ids made, outermost first; the last folder's id; a refusal)`. A folder already
-    there is found as `resolve` finds one, by its name or its directory's; a file holding
-    a name on the way is a refusal. Every name is cleaned before the first folder is made,
-    so a name refused leaves nothing made; a folder refused after others were made leaves
-    them, and the refusal says why, for the caller to report with them."""
-    if len(names) > filing.FOLDER_PATH_DEPTH_MAX:
-        return [], None, f"a folder path is at most {filing.FOLDER_PATH_DEPTH_MAX} folders deep"
-    wanted = [filing.clean_name(raw, filing.FOLDER_NAME_MAX) for raw in names]
-    folders = await workspace_documents.user_folders(db, user_id)
-    trashed = workspace_documents.trashed_folder_ids(folders.values())
-    parent_id: int | None = None
-    made: list[int] = []
-    for name in wanted:
-        if not made:
-            children = [
-                row
-                for row in folders.values()
-                if row.parent_id == parent_id and row.id not in trashed
-            ]
-            found = _named(children, name)
-            if found is not None:
-                parent_id = found.id
-                continue
-            document = _named(await _documents_in(db, user_id, parent_id), name)
-            if document is not None:
-                place = folder_path(folders, parent_id) or LIBRARY_INIT_TOP
-                return [], None, f"{place} holds a file named {document.name}"
-        try:
-            row = await filing.make_folder(db, settings, user_id, parent_id, name)
-        except ApiError as exc:
-            await db.rollback()
-            path = item_path(await workspace_documents.user_folders(db, user_id), parent_id, name)
-            return made, parent_id, f"the folder {path} could not be made ({_reason(exc)})"
-        made.append(row.id)
-        parent_id = row.id
-    return made, parent_id, None
-
-
-async def _move(
-    db: AsyncSession, settings: Settings, user_id: int, author: str, tool_input: dict
-) -> ToolOutcome:
-    paths = _paths(tool_input, settings)
-    if isinstance(paths, ToolOutcome):
-        return paths
-    found, to = await _destination(db, user_id, tool_input.get("to"))
-    if not found:
-        return ToolOutcome(
-            f"Nothing was moved: {tool_input.get('to')!r} names no folder.", is_error=True
-        )
-    batch = Batch([])
-    moves: list[dict] = []
-
-    for what, kind, row_id in await _resolved_items(db, user_id, paths, batch, "move {}"):
-
-        async def step(kind=kind, row_id=row_id) -> str | None:
-            folders = await workspace_documents.user_folders(db, user_id)
-            if kind == "folder":
-                folder = await workspace_documents.live_folder(db, user_id, row_id)
-                origin, old = folder.parent_id, folder.name
-            else:
-                document = await workspace_documents.live_document(db, user_id, row_id)
-                origin, old = document.folder_id, document.name
-            shown = item_path(folders, origin, old)
-            if origin == to:
-                return f"{shown} ({kind} {row_id}) is there already."
-            if kind == "folder":
-                moved: Folder | Document = await filing.move_folder(
-                    db, settings, user_id, row_id, name=None, parent_id=to, move=True, author=author
-                )
-            else:
-                moved = await filing.move_document(
-                    db, settings, user_id, row_id, name=None, folder_id=to, move=True, author=author
-                )
-            landed = item_path(folders, to, moved.name)
-            batch.done += 1
-            moves.append(
-                {
-                    "item": _item(kind, row_id),
-                    "from": origin,
-                    "to": to,
-                    "fromName": old,
-                    "toName": moved.name,
-                }
-            )
-            return f"Moved {shown} ({kind} {row_id}) to {landed}."
-
-        await _each(db, batch, what, step)
-    return batch.outcome({"type": "move", "moves": moves})
-
-
-async def _rename(
-    db: AsyncSession, settings: Settings, user_id: int, author: str, tool_input: dict
-) -> ToolOutcome:
-    raw, wanted = tool_input.get("path"), tool_input.get("name")
-    if not isinstance(raw, str) or not isinstance(wanted, str) or not wanted.strip():
-        return ToolOutcome("`rename` takes the item's `path` and its new `name`.", is_error=True)
-    batch = Batch([])
-    record: dict | None = None
-    for what, kind, row_id in await _resolved_items(db, user_id, [raw], batch, "rename {}"):
-
-        async def step(kind=kind, row_id=row_id) -> str | None:
-            nonlocal record
-            folders = await workspace_documents.user_folders(db, user_id)
-            if kind == "folder":
-                folder = await workspace_documents.live_folder(db, user_id, row_id)
-                old, place = folder.name, folder.parent_id
-                renamed: Folder | Document = await filing.move_folder(
-                    db,
-                    settings,
-                    user_id,
-                    row_id,
-                    name=wanted,
-                    parent_id=None,
-                    move=False,
-                    author=author,
-                )
-            else:
-                document = await workspace_documents.live_document(db, user_id, row_id)
-                old, place = document.name, document.folder_id
-                renamed = await filing.move_document(
-                    db,
-                    settings,
-                    user_id,
-                    row_id,
-                    name=wanted,
-                    folder_id=None,
-                    move=False,
-                    author=author,
-                )
-            new = renamed.name
-            if new == old:
-                return f"{item_path(folders, place, old)} ({kind} {row_id}) is named {new} already."
-            batch.done += 1
-            record = {"type": "rename", "item": _item(kind, row_id), "from": old, "to": new}
-            return (
-                f"Renamed {item_path(folders, place, old)} ({kind} {row_id}) to "
-                f"{item_path(folders, place, new)}."
-            )
-
-        await _each(db, batch, what, step)
-    return batch.outcome(record)
-
-
-async def _copy(
-    db: AsyncSession, settings: Settings, user_id: int, author: str, tool_input: dict
-) -> ToolOutcome:
-    paths = _paths(tool_input, settings)
-    if isinstance(paths, ToolOutcome):
-        return paths
-    found, to = await _destination(db, user_id, tool_input.get("to"))
-    if not found:
-        return ToolOutcome(
-            f"Nothing was copied: {tool_input.get('to')!r} names no folder.", is_error=True
-        )
-    batch = Batch([])
-    copies: list[dict] = []
-    for what, kind, row_id in await _resolved_items(db, user_id, paths, batch, "copy {}"):
-
-        async def step(kind=kind, row_id=row_id) -> str | None:
-            folders = await workspace_documents.user_folders(db, user_id)
-            if kind == "folder":
-                shown = folder_path(folders, row_id)
-                made: Folder | Document = await filing.copy_folder(
-                    db, settings, user_id, row_id, to, author=author
-                )
-            else:
-                document = await workspace_documents.live_document(db, user_id, row_id)
-                shown = item_path(folders, document.folder_id, document.name)
-                made = await filing.copy_document(db, settings, user_id, row_id, to, author=author)
-            batch.done += 1
-            copies.append(_item(kind, made.id))
-            return (
-                f"Copied {shown} ({kind} {row_id}) to "
-                f"{item_path(folders, to, made.name)} ({kind} {made.id})."
-            )
-
-        await _each(db, batch, what, step)
-    return batch.outcome({"type": "appear", "items": copies})
-
-
-async def _trash(
-    db: AsyncSession, settings: Settings, user_id: int, author: str, tool_input: dict
-) -> ToolOutcome:
-    paths = _paths(tool_input, settings)
-    if isinstance(paths, ToolOutcome):
-        return paths
-    batch = Batch([])
-    items: list[dict] = []
-    for what, kind, row_id in await _resolved_items(
-        db, user_id, paths, batch, "move {} to the Trash"
-    ):
-
-        async def step(kind=kind, row_id=row_id) -> str | None:
-            folders = await workspace_documents.user_folders(db, user_id)
-            if kind == "folder":
-                shown = folder_path(folders, row_id)
-                await filing.trash_folder(db, settings, user_id, row_id, author=author)
-            else:
-                document = await workspace_documents.live_document(db, user_id, row_id)
-                shown = item_path(folders, document.folder_id, document.name)
-                await filing.trash_document(db, settings, user_id, row_id, author=author)
-            batch.done += 1
-            items.append(_item(kind, row_id))
-            return f"Moved {shown} ({kind} {row_id}) to the Trash."
-
-        await _each(db, batch, what, step)
-    return batch.outcome({"type": "trash", "items": items})
-
-
-async def _put_back(
-    db: AsyncSession, settings: Settings, user_id: int, author: str, tool_input: dict
-) -> ToolOutcome:
-    paths = _paths(tool_input, settings)
-    if isinstance(paths, ToolOutcome):
-        return paths
-    batch = Batch([])
-    items: list[dict] = []
-    # The Trash as `list_files {trash: true}` named it when the call began — where Put Back
-    # returns an item, then its name, newest first — read once before anything is put back,
-    # since putting one back can change where the next returns: each path takes the newest
-    # item of that name not taken by an earlier path, each name in it as the Files page
-    # shows it or as its directory is named, as `resolve` reads a name.
-    entries = await _trash_entries(db, user_id)
-    named: list[tuple[str, str, int]] = []
-    for raw in paths:
-        what = f"put back {raw.strip() or '/'}"
-        segments = library_segments(raw) or []
-        entry = next(
-            (
-                (path, row)
-                for path, row in entries
-                if len(path.split("/")) == len(segments)
-                and all(
-                    segment in (name, path_segment(name))
-                    for name, segment in zip(path.split("/"), segments, strict=True)
-                )
-            ),
-            None,
-        )
-        if entry is None:
-            batch.failed += 1
-            batch.lines.append(f"Could not {what}: the Trash holds nothing there.")
-            continue
-        entries.remove(entry)
-        row = entry[1]
-        named.append((what, "folder" if isinstance(row, Folder) else "document", row.id))
-
-    for what, kind, row_id in named:
-
-        async def step(kind=kind, row_id=row_id) -> str | None:
-            if kind == "folder":
-                back: Folder | Document = await filing.put_back_folder(
-                    db, settings, user_id, row_id, author=author
-                )
-                place = back.parent_id
-            else:
-                back = await filing.put_back_document(db, settings, user_id, row_id, author=author)
-                place = back.folder_id
-            folders = await workspace_documents.user_folders(db, user_id)
-            batch.done += 1
-            items.append(_item(kind, row_id))
-            landed = item_path(folders, place, back.name)
-            return f"Put back {back.name} ({kind} {row_id}): it is at {landed}."
-
-        await _each(db, batch, what, step)
-    return batch.outcome({"type": "appear", "items": items})
+def _item(kind: str, row_id: int) -> dict:
+    """An item as the Files page's undo names it: `file` is any documents row."""
+    return {"kind": "folder" if kind == "folder" else "file", "id": row_id}
 
 
 async def _new_document(
@@ -863,7 +381,8 @@ async def _new_document(
     *names, name = segments
     # Cleaned before any folder is made, so a name refused leaves nothing made.
     name = filing.clean_name(name, filing.DOCUMENT_NAME_MAX)
-    made, folder_id, refusal = await _make_folders(db, settings, user_id, names)
+    made, folder_id, refused = await organize.make_folders(db, settings, user_id, names)
+    refusal = refused.message if refused is not None else None
     row: Document | None = None
     if refusal is None:
         try:
@@ -900,15 +419,3 @@ async def _new_document(
         f"{vm_path(folders, folder_id, row.name)}/{DOC_FILE}{written}.",
         library={"type": "appear", "items": [_item("document", row.id)]},
     )
-
-
-TOOLS: dict[str, Callable[..., Awaitable[ToolOutcome]]] = {
-    "new_folder": _new_folder,
-    "move": _move,
-    "rename": _rename,
-    "copy": _copy,
-    "trash": _trash,
-    "put_back": _put_back,
-    "new_document": _new_document,
-}
-WRITE_TOOL_NAMES = frozenset(TOOLS)

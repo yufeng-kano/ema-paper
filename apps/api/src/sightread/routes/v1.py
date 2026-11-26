@@ -10,7 +10,9 @@ flight joined — so the connector, whose commands are these routes, behaves as 
 The library here is the control plane's reads and its two saves on a data-plane credential
 (docs/api.md § The library on the data plane): the same functions, a different door. A parse
 filed into Files is the library's own upload filing, `library.file_parse` (docs/mcp.md
-§ Filing into Files).
+§ Filing into Files). Organizing it — `POST /v1/library/<tool>` — runs the connector's
+organizing tools, `workspace.organize`, under the locks a route takes (docs/mcp.md § The
+organizing tools).
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ from ..auth.deps import (
 )
 from ..billing import ledger
 from ..body_limit import is_multipart
-from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Job, Result, User
+from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job, Result, User
 from ..errors import ApiError
 from ..jobs import events
 from ..jobs.intake import (
@@ -53,8 +55,9 @@ from ..jobs.intake import (
 from ..jobs.runner import result_payload
 from ..upstream.client import agent_models
 from ..workspace import documents as workspace_documents
-from ..workspace import filing, git
+from ..workspace import filing, git, organize
 from ..workspace.layout import user_root
+from ..workspace.locks import backup_shared, workspace_lock
 from . import library
 from .multipart import capped_form, form_file
 
@@ -488,6 +491,153 @@ async def library_index(db, user_id: int) -> dict:
 @router.get("/library")
 async def read_library(user: LibraryUser, db: DbSession):
     return await library_index(db, user.id)
+
+
+async def trash_index(db, user_id: int) -> list[dict]:
+    """What the Trash holds, each item trashed on its own, newest first, by where Put Back
+    returns it — `GET /v1/library/trash`, and the rows the connector's `list_library` lists
+    with `trash` (docs/api.md § The library on the data plane). From one snapshot, as
+    `library_index` reads."""
+    await library.library_snapshot(db)
+    entries = await organize.trash_entries(db, user_id)
+    job_ids = [
+        row.job_id for _, row in entries if isinstance(row, Document) and row.job_id is not None
+    ]
+    kinds = (
+        dict((await db.execute(select(Job.id, Job.kind).where(Job.id.in_(job_ids)))).all())
+        if job_ids
+        else {}
+    )
+
+    def kind(row: Folder | Document) -> str:
+        """`folder`, or a document's kind as `library_entry` gives it."""
+        if isinstance(row, Folder):
+            return "folder"
+        if row.kind == FILE_KIND:
+            return FILE_KIND
+        if row.job_id is None:
+            return MARKDOWN_KIND
+        return kinds.get(row.job_id, row.kind)
+
+    return [
+        {
+            "id": row.id,
+            "kind": kind(row),
+            "name": row.name,
+            "path": path,
+            "trashed_at": row.trashed_at,
+        }
+        for path, row in entries
+    ]
+
+
+@router.get("/library/trash")
+async def read_trash(user: LibraryUser, db: DbSession):
+    return {"trash": await trash_index(db, user.id)}
+
+
+# --- organizing the library (docs/api.md § The library on the data plane) -----------------
+
+
+class OrganizeNewFolder(BaseModel):
+    path: str = Field(max_length=FOLDER_PATH_MAX)
+
+
+class OrganizePaths(BaseModel):
+    paths: list[str] = Field(min_length=1)
+
+
+class OrganizeInto(OrganizePaths):
+    to: str = Field(max_length=FOLDER_PATH_MAX)
+
+
+class OrganizeRename(BaseModel):
+    path: str
+    name: str = Field(min_length=1, max_length=filing.DOCUMENT_NAME_MAX)
+
+
+class OrganizeUndo(BaseModel):
+    step: dict
+    redo: bool = False
+
+
+async def _organized(db: DbSession, settings, user_id: int, name: str, body: BaseModel) -> dict:
+    """The connector's organizing tool `name` as a route: the body is its input, the answer
+    its answer, under the locks a route takes around a Files operation — the backup lock
+    shared, then the workspace lock. Nothing done and something refused is the first
+    refusal's status, with every sentence as the message."""
+    root = user_root(settings.workspaces_dir, user_id)
+    # The wait for the lock can be long (a conversation's shell command holds it), and an
+    # agent may send calls side by side: the session's connection, which the credential's
+    # lookup opened and wrote nothing on, goes back to the pool while it waits.
+    await db.rollback()
+    async with backup_shared(root), workspace_lock(root):
+        outcome = await organize.run(
+            db,
+            settings,
+            user_id=user_id,
+            author=git.API_AUTHOR,
+            name=name,
+            tool_input=body.model_dump(),
+        )
+    if outcome.is_error:
+        assert outcome.refusal is not None
+        raise ApiError(outcome.refusal.status_code, outcome.refusal.error_type, outcome.text)
+    return {
+        "result": outcome.text,
+        "done": outcome.done,
+        "failed": outcome.failed,
+        "undo": outcome.undo,
+    }
+
+
+@router.post("/library/new_folder")
+async def organize_new_folder(
+    body: OrganizeNewFolder, user: LibraryUser, db: DbSession, settings: AppSettings
+):
+    return await _organized(db, settings, user.id, "new_folder", body)
+
+
+@router.post("/library/move")
+async def organize_move(
+    body: OrganizeInto, user: LibraryUser, db: DbSession, settings: AppSettings
+):
+    return await _organized(db, settings, user.id, "move", body)
+
+
+@router.post("/library/rename")
+async def organize_rename(
+    body: OrganizeRename, user: LibraryUser, db: DbSession, settings: AppSettings
+):
+    return await _organized(db, settings, user.id, "rename", body)
+
+
+@router.post("/library/copy")
+async def organize_copy(
+    body: OrganizeInto, user: LibraryUser, db: DbSession, settings: AppSettings
+):
+    return await _organized(db, settings, user.id, "copy", body)
+
+
+@router.post("/library/trash")
+async def organize_trash(
+    body: OrganizePaths, user: LibraryUser, db: DbSession, settings: AppSettings
+):
+    return await _organized(db, settings, user.id, "trash", body)
+
+
+@router.post("/library/put_back")
+async def organize_put_back(
+    body: OrganizePaths, user: LibraryUser, db: DbSession, settings: AppSettings
+):
+    return await _organized(db, settings, user.id, "put_back", body)
+
+
+@router.post("/library/undo")
+async def organize_undo(
+    body: OrganizeUndo, user: LibraryUser, db: DbSession, settings: AppSettings
+):
+    return await _organized(db, settings, user.id, "undo", body)
 
 
 async def document_entry(db, settings, user_id: int, document_id: int) -> tuple[dict, Path | None]:

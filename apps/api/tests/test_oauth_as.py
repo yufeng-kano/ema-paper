@@ -57,7 +57,7 @@ async def test_the_connector_flow_ends_in_a_working_bearer(client: AsyncClient) 
 
     assert tokens["token_type"] == "Bearer"
     assert tokens["expires_in"] == 3600
-    assert tokens["scope"] == "parse library"
+    assert tokens["scope"] == "parse library organize"
 
     # Same rights as a project API key: the data plane accepts either (docs/auth.md).
     # An unknown job is a 404 to an authenticated caller and a 401 to anyone else.
@@ -93,7 +93,7 @@ async def test_refresh_rotates_and_burns_the_old_token(client: AsyncClient) -> N
     assert rotated["refresh_token"] != tokens["refresh_token"]
     assert rotated["access_token"] != tokens["access_token"]
     # A refresh keeps the scope of the grant it rotates (docs/auth.md § 4).
-    assert rotated["scope"] == tokens["scope"] == "parse library"
+    assert rotated["scope"] == tokens["scope"] == "parse library organize"
 
     replayed = await token_request(
         client,
