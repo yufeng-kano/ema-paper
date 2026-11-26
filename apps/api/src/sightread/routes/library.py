@@ -537,6 +537,13 @@ async def delete_folder(
         # The folder's row alone: its subtree and their documents go with it by the
         # foreign keys' cascade, which is now exactly `doomed` and `document_ids`.
         await db.execute(delete(Folder).where(Folder.user_id == user_id, Folder.id == row.id))
+        # The cascade's rows leave the session with the database: the statement above
+        # synchronizes the folder it names, never the rows its foreign keys took.
+        for subfolder_id in doomed - {row.id}:
+            db.expunge(folders[subfolder_id])
+        for document in documents:
+            if document.trashed_at is None:
+                db.expunge(document)
         if row.trashed_at is None:
             await remove_then_commit(
                 db, settings, user_id, relative, document_ids, gone=(Folder, row.id)

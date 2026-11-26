@@ -392,7 +392,7 @@ Two routes keep a policy of their own: `GET /api/library/documents/{id}/file` an
 
 | Var | Notes |
 |-----|-------|
-| `DATABASE_URL` | `postgresql+asyncpg://...` |
+| `DATABASE_URL` | `postgresql+asyncpg://...`: PostgreSQL through asyncpg is the only database the app runs on, so any other URL is refused at start |
 | `PG_PORT` | local compose only: host port for `pg` (default 5432); change it when that port is taken |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | the `pg` container's credentials; the password is required in production |
 | `DOMAIN` / `ACME_EMAIL` | production only, required: the host Caddy serves, and the Let's Encrypt contact address |

@@ -10,7 +10,25 @@ from sqlalchemy.exc import DBAPIError
 from sightread.db.models import User
 from sightread.db.session import commit_or_conflict
 from sightread.errors import ApiError
+from tests.conftest import base_settings
 from tests.factories import user_row
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite+aiosqlite:///sightread.db",
+        "postgresql+psycopg://sightread:a-password-never-shown@pg:5432/sightread",
+        "postgresql://sightread:a-password-never-shown@pg:5432/sightread",
+    ],
+)
+def test_a_database_other_than_postgresql_through_asyncpg_is_refused_at_start(url: str) -> None:
+    """One line at start, not a driver error at the first connection, and never the URL
+    itself: it carries the password (docs/deployment.md)."""
+    with pytest.raises(ValueError, match="postgresql\\+asyncpg://") as refused:
+        base_settings(database_url=url)
+    assert "a-password-never-shown" not in str(refused.value)
+    assert "sightread.db" not in str(refused.value)
 
 
 async def test_a_failed_statement_never_carries_the_readers_text(sessionmaker) -> None:
