@@ -140,8 +140,14 @@ export function usePdfPages(options: PdfPagesOptions) {
    * changes in place, which moves nothing in view.
    */
   function applySizes(column: Layout, scrollTop: number, hold: boolean): number | null {
-    const now = hold ? pendingSizes.filter(({ index }) => column.tops[index]! >= scrollTop) : pendingSizes
-    pendingSizes = hold ? pendingSizes.filter(({ index }) => column.tops[index]! < scrollTop) : []
+    // A size equal to the guess moves nothing, so it is never held: the page would otherwise
+    // stay blank for the whole touch, since a page is drawn only once its size is read.
+    const held = (change: PageSizeChange) =>
+      hold &&
+      column.tops[change.index]! < scrollTop &&
+      (change.size.width !== column.pointWidths[change.index] || change.size.height !== column.pointHeights[change.index])
+    const now = pendingSizes.filter((change) => !held(change))
+    pendingSizes = pendingSizes.filter(held)
     return now.length > 0 ? setPageSizes(column, now, scrollTop) : null
   }
 
@@ -182,7 +188,12 @@ export function usePdfPages(options: PdfPagesOptions) {
       for (const [index, failure] of failures) {
         if (!failure.announced && index >= visible.first && index <= visible.last) {
           failures.set(index, { ...failure, announced: true })
-          options.announce(`${t('viewer.pdf.pageError.title', { page: index + 1 })} ${options.failureText(failure.kind)}`)
+          options.announce(
+            t('viewer.pdf.announce.failed', {
+              title: t('viewer.pdf.pageError.title', { page: index + 1 }),
+              reason: options.failureText(failure.kind),
+            }),
+          )
         }
       }
     }

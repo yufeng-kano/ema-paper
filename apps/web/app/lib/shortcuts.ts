@@ -114,7 +114,7 @@ export function hasMod(event: KeyEventLike, apple: boolean): boolean {
 }
 
 /** The `KeyboardEvent.code` a character key sits on, so a shortcut is read on any layout. */
-const CODES: Record<string, string> = { '/': 'Slash', '[': 'BracketLeft', '=': 'Equal', '-': 'Minus', '0': 'Digit0' }
+const CODES: Record<string, string> = { '/': 'Slash', '[': 'BracketLeft', '0': 'Digit0' }
 
 /** Whether a key event is the shortcut: its modifiers exactly, and its key by name or by the
  *  physical key — `⌘⇧C` arrives as `C`, and `⌘/` as `?` where Shift is part of the slash. */
@@ -148,19 +148,21 @@ export function matchesShortcut(event: KeyEventLike, spec: string, apple: boolea
 export const ZOOM_SHORTCUTS = { in: 'mod+plus', out: 'mod+minus', reset: 'mod+0' } as const
 
 /**
- * Which zoom key an event is, if any: in for the command key with `=`, with Shift and `=`, or
- * with any key that types `+` (a German keyboard's own `+`, the keypad's); out with `-`; reset
- * with `0`. Never with Alt, which types other characters on these keys. The caller cancels
- * the event's default, which is the browser zooming the whole page.
+ * Which zoom key an event is, if any: in for the command key with a key that types `=` or `+`
+ * (Shift or not, a German keyboard's own `+`, the keypad's); out with one that types `-`; reset
+ * with `0`. In and out go by the character alone, since another layout has other characters
+ * on the US keyboard's minus and equals keys. Never with Alt, which types other characters on
+ * these keys. The caller cancels the event's default, which is the browser zooming the whole
+ * page.
  */
 export function zoomKey(event: KeyEventLike, apple: boolean): 'in' | 'out' | 'reset' | null {
   if (!hasMod(event, apple) || event.altKey) {
     return null
   }
-  if (event.key === '+' || matchesShortcut(event, 'mod+=', apple) || matchesShortcut(event, 'mod+shift+=', apple)) {
+  if (event.key === '+' || event.key === '=') {
     return 'in'
   }
-  if (matchesShortcut(event, 'mod+-', apple)) {
+  if (event.key === '-') {
     return 'out'
   }
   return matchesShortcut(event, 'mod+0', apple) ? 'reset' : null

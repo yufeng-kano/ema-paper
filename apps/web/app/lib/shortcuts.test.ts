@@ -118,4 +118,10 @@ describe('the PDF viewer’s zoom keys', () => {
     expect(zoomKey(key('9', { meta: true }, 'Digit9'), true)).toBeNull()
     expect(zoomKey(key('f', { meta: true }, 'KeyF'), true)).toBeNull()
   })
+
+  it('goes by the character for in and out, not the US key it sits on', () => {
+    expect(zoomKey(key('ß', { ctrl: true }, 'Minus'), false)).toBeNull()
+    expect(zoomKey(key('´', { ctrl: true }, 'Equal'), false)).toBeNull()
+    expect(zoomKey(key(')', { ctrl: true }, 'Minus'), false)).toBeNull()
+  })
 })

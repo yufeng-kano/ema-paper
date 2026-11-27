@@ -108,7 +108,9 @@ function enableSharedListeners(): void {
       }
 
       if (selfSteadying === undefined) {
-        const first = layers.keys().next().value
+        // pdf.js reads this from the end-of-content element, the one Firefox gives
+        // `-moz-user-select: none`.
+        const first = layers.values().next().value
         selfSteadying = !!first && getComputedStyle(first).getPropertyValue('-moz-user-select') === 'none'
         if (!selfSteadying) {
           const { userAgentData } = navigator as Navigator & NavigatorWithBrands

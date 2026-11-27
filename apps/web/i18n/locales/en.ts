@@ -580,10 +580,10 @@ export default {
       zoomLevel: 'Zoom {percent}',
       fitWidth: 'Fit width',
       fitPage: 'Fit page',
-      zoomGroup: 'Zoom',
       magnify: 'Zoom to {n}×',
       openInNewTab: 'Open in new tab',
       page: 'Page {page} of {total}',
+      pageOf: '{page} / {total}',
       indicator: '{page} / {total}, page {page} of {total}',
       indicatorHint: 'Type a page number to go to it',
       pageField: 'Page',
@@ -612,6 +612,7 @@ export default {
       announce: {
         opening: 'Opening {name}',
         opened: 'Opened, {total} page | Opened, {total} pages',
+        failed: '{title}. {reason}',
       },
       link: {
         page: 'Page {page}',

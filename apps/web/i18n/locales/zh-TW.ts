@@ -565,10 +565,10 @@ export default {
       zoomLevel: '縮放比例 {percent}',
       fitWidth: '符合寬度',
       fitPage: '符合整頁',
-      zoomGroup: '縮放',
       magnify: '放大 {n} 倍',
       openInNewTab: '在新分頁開啟',
       page: '第 {page} 頁，共 {total} 頁',
+      pageOf: '{page} / {total}',
       indicator: '{page} / {total}，第 {page} 頁，共 {total} 頁',
       indicatorHint: '輸入頁碼以跳頁',
       pageField: '頁',
@@ -597,6 +597,7 @@ export default {
       announce: {
         opening: '正在開啟 {name}',
         opened: '已開啟，共 {total} 頁',
+        failed: '{title}：{reason}',
       },
       link: {
         page: '第 {page} 頁',

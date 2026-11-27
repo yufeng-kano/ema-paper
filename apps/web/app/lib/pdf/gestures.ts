@@ -193,7 +193,7 @@ export function attachPinch(pane: HTMLElement, handlers: GestureHandlers, signal
         startSpread = spread(a, b)
         begin('touch', midpoint(a, b))
         touchMoves = new AbortController()
-        pane.addEventListener('touchmove', onTouchMove, { signal: AbortSignal.any([controller.signal, touchMoves.signal]), passive: false })
+        pane.addEventListener('touchmove', onTouchMove, { signal: touchMoves.signal, passive: false })
       }
     },
     blocking,
@@ -240,6 +240,7 @@ export function attachPinch(pane: HTMLElement, handlers: GestureHandlers, signal
   function detach(): void {
     clearTimeout(wheelTimer)
     controller.abort()
+    touchMoves?.abort()
     touchMoves = null
     source = null
   }

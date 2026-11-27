@@ -169,12 +169,17 @@ export function openPdf(options: OpenPdfOptions): PdfOpening {
   let task: PDFDocumentLoadingTask | null = null
   let destroyed = false
   let destroying: Promise<void> | null = null
-  const stop = Promise.withResolvers<never>()
-  stop.promise.catch(() => {})
+  // Not `Promise.withResolvers`: this runs before pdf.js is chosen, on engines the legacy
+  // build is for.
+  let stopNow: (reason: unknown) => void = () => {}
+  const stopped = new Promise<never>((_, reject) => {
+    stopNow = reject
+  })
+  stopped.catch(() => {})
 
   /** `promise`, unless the document is destroyed first. */
   async function guard<T>(promise: Promise<T>): Promise<T> {
-    const value = await Promise.race([promise, stop.promise])
+    const value = await Promise.race([promise, stopped])
     if (destroyed) {
       throw cancelled()
     }
@@ -184,7 +189,7 @@ export function openPdf(options: OpenPdfOptions): PdfOpening {
   function destroy(): Promise<void> {
     destroying ??= (async () => {
       destroyed = true
-      stop.reject(cancelled())
+      stopNow(cancelled())
       // A viewer that destroys a document has moved on and may never look at `promise` again;
       // its cancel must not surface as an unhandled rejection.
       promise.catch(() => {})

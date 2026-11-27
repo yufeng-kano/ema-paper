@@ -132,8 +132,11 @@ const { failures, slow } = pages
 const ready = computed(() => status.value === 'open' && layout.value !== null)
 /** The password prompt or a document error fills the pane in place of the pages. */
 const showsState = computed(() => status.value === 'password' || status.value === 'failed')
-/** Until a page is drawn the pane is busy and the progress bar runs. */
-const busy = computed(() => !pages.drawn.value && (status.value === 'opening' || status.value === 'open'))
+/** Until a page is drawn the pane is busy and the progress bar runs. A page that failed ends
+ *  the wait too: its message and its retry must not sit in a busy region for ever. */
+const busy = computed(
+  () => !pages.drawn.value && pages.failures.size === 0 && (status.value === 'opening' || status.value === 'open'),
+)
 
 /** What every zoom is measured from; null until page 1's size is known. */
 function context(): ZoomContext | null {
@@ -248,6 +251,10 @@ async function opened() {
   if (back > 0 && pane.value) {
     pane.value.scrollTop = jumpOffset(column, back)
   }
+  // The password prompt took focus with it when it went; the pane's scrolling keys need it back.
+  if (!document.activeElement || document.activeElement === document.body) {
+    pane.value?.focus({ preventScroll: true })
+  }
   indicator.value?.reveal()
   schedule()
 }
@@ -261,7 +268,7 @@ async function failed() {
   }
   const active = document.activeElement
   const lost = !active || active === document.body || (root.value?.contains(active) ?? false)
-  announce(`${t('viewer.pdf.error.title')} ${causeText(kind)}`)
+  announce(t('viewer.pdf.announce.failed', { title: t('viewer.pdf.error.title'), reason: causeText(kind) }))
   if (kind === 'signed-out') {
     // An ended session is ended as everywhere else in the app (docs/web.md § Rules).
     void apiError.resolve(new ApiRequestError(401, 'auth', 'Not signed in'))
@@ -347,6 +354,10 @@ async function update() {
       el.scrollTop = before + correction
     }
   }
+  if (landing && column.measured[landing.index]) {
+    el.scrollTop = destinationOffset(column, landing.index, landing.fraction)
+    landing = null
+  }
   const top = el.scrollTop
   const height = el.clientHeight
   current.value = currentPage(column, top, height)
@@ -354,6 +365,9 @@ async function update() {
 }
 
 // --- jumps and links --------------------------------------------------------------
+
+/** An internal link's destination on a page whose size is not read yet. */
+let landing: { index: number; fraction: number } | null = null
 
 /** An internal link or a named action: its page and the destination's top, the zoom kept, and
  *  focus on the target page. */
@@ -365,6 +379,9 @@ function onNavigate(target: PdfDestination) {
   }
   const index = Math.min(column.count, Math.max(1, target.page)) - 1
   el.scrollTop = destinationOffset(column, index, target.fraction)
+  // A page still at its guessed size is landed on again once its own size is read, or a
+  // destination part-way down it would be off by the difference.
+  landing = column.measured[index] || target.fraction === null ? null : { index, fraction: target.fraction }
   pages.focusSection(index)
 }
 
@@ -376,6 +393,7 @@ function onJump(page: number, by: 'enter' | 'leave') {
   if (!column || !el) {
     return
   }
+  landing = null
   el.scrollTop = jumpOffset(column, page - 1)
   if (by === 'enter') {
     pages.focusSection(page - 1)
@@ -407,6 +425,8 @@ function applyZoom(next: ZoomState, anchor: { x: number; y: number }) {
   }
   const spacing = props.phone ? PHONE_SPACING : DESKTOP_SPACING
   if (next.scale === before.scale && spacing === before.spacing) {
+    // A pinch that ends at a limit changes nothing, but the frames it held back are still owed.
+    schedule()
     return
   }
   const after = scaleLayout(before, next.scale, spacing)

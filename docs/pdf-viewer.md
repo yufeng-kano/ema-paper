@@ -187,22 +187,22 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
   - `loadingTask.onProgress` drives nothing visible: its `percent` is `NaN` without a total, and with range requests the first pages show before most of the file has come.
 - **Each page is a white placeholder** before it is drawn. A page not drawn after 0.4 s shows a spinner: `UiSpinner` at 24px, in the content layer's light colours, with no `role="status"`.
 - The pane carries `aria-busy="true"` until page 1 is drawn.
-- **Opening and its end are announced** in the viewer's live region: *Opening {name}* (*正在開啟 {name}*), then *Open, {total} pages* (*已開啟，共 {total} 頁*).
+- **Opening and its end are announced** in the viewer's live region: *Opening {name}* (*正在開啟 {name}*), then *Opened, {total} pages* (*已開啟，共 {total} 頁*).
 
 ### Password
 
 - **A PDF that needs a password asks for it in the page**, centred: a lock glyph, the heading *This PDF needs a password* (*這份 PDF 需要密碼*), the body, the field and *Open* (*開啟*). The browser's dialog is never used.
-- The body says what holds: *The password opens the file in this browser only. It is not sent to the server or saved.* (*密碼只在這個瀏覽器裡用來開啟檔案，不會傳到伺服器，也不會儲存。*)
+- The body says what holds: *The password is used only in this browser, to open the file. It isn’t sent to the server or saved.* (*密碼只在這個瀏覽器裡用來開啟檔案，不會傳到伺服器，也不會儲存。*)
 - **The password goes to pdf.js only**, through `loadingTask.onPassword(updateCallback, reason)` (`PasswordResponses.NEED_PASSWORD` 1, `INCORRECT_PASSWORD` 2). It is never sent to the server, stored, logged or put in a URL. Reopening the file asks again.
 - The field is a password field, and it takes focus when the prompt appears.
-- **A wrong password** keeps focus in the field and selects its text. Under the field *That password is wrong. Try again.* (*密碼不對，再試一次。*) appears with `role="alert"`, the field is `aria-invalid` and its `aria-describedby` points at that line. The first prompt shows no error.
+- **A wrong password** keeps focus in the field and selects its text. Under the field *That password isn’t right. Try again.* (*密碼不對，再試一次。*) appears with `role="alert"`, the field is `aria-invalid` and its `aria-describedby` points at that line. The first prompt shows no error.
 - While the prompt shows, zoom is disabled, and *Download* and *More* work.
 
 ### Errors
 
 - **A document that cannot be opened shows a centred state**: a glyph, an `<h3>` title and the reason, with actions by cause. No English error code and no blank view is ever shown.
 - **Corrupt**: `InvalidPDFException`, any other parse failure, and any failure not named below.
-  - *This PDF can't be shown* (*無法顯示這份 PDF*) over *The file's contents can't be read; it may have been damaged when it was uploaded. Download the original and try another app.* (*檔案的內容讀不出來，可能在上傳時就已經損壞。你可以下載原檔，用其他程式打開看看。*)
+  - *This PDF can’t be shown* (*無法顯示這份 PDF*) over *The file’s contents can’t be read. It may have been damaged when it was uploaded. You can download the original and open it in another app.* (*檔案的內容讀不出來，可能在上傳時就已經損壞。你可以下載原檔，用其他程式打開看看。*)
   - Its actions are *Download ({size})* (*下載（{size}）*; plain *Download* when the size is not known), the primary one, and *Open in new tab* (*在新分頁開啟*), a link.
 - **Network**: the fetch rejects, or the server answers 5xx. *Could not reach the server.* (*無法連線到伺服器。*, `errors.network`) with *Retry*, which opens the document again.
 - **Signed out**: a `ResponseException` with `status` 401. *Your session has ended. Sign in again to continue.* (*登入階段已結束，請重新登入。*, `errors.signedOut`), handled as an ended session is everywhere else in the app ([web.md](./web.md) § Rules).
@@ -212,8 +212,8 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
   - Focus on a header control stays there.
 - **A page that fails to draw keeps its place** and its known size: its own, or page 1's while it has none. The other pages draw as usual.
 - A page failure caused by a 401, a 404 or the network takes the wording of the matching document state, never a claim that the page is broken.
-- **Any other `getPage` or `render` rejection** shows, centred on the page, *Page {page} can't be shown* (*無法顯示第 {page} 頁*, an `<h3>`), *This page wasn't drawn. The other pages are fine.* (*這一頁沒有畫出來，其他頁不受影響。*) and *Retry*.
-  - The `<section>` is then named *Page {page}, can't be shown* (*第 {page} 頁，無法顯示*), and the button *Retry page {page}* (*重試第 {page} 頁*).
+- **Any other `getPage` or `render` rejection** shows, centred on the page, *Page {page} can’t be shown* (*無法顯示第 {page} 頁*, an `<h3>`), *This page wasn’t drawn. The other pages aren’t affected.* (*這一頁沒有畫出來，其他頁不受影響。*) and *Retry*.
+  - The `<section>` is then named *Page {page}, can’t be shown* (*第 {page} 頁，無法顯示*), and the button *Retry page {page}* (*重試第 {page} 頁*).
 - **A page failure never moves focus.** It is announced once per failure, and only while the page is in view.
 - **While a retry runs**, its button stays where it is, `aria-disabled` and busy, so it keeps focus. A retry that works moves focus to the page's `<section>`. A retry that fails keeps focus on the button and announces again.
 - A cancelled render (`RenderingCancelledException`) and the abort that closing the viewer causes are not errors and show nothing.
@@ -234,7 +234,7 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
 ### Phone
 
 - **The header** is the compact one of the result viewer's phone layout: *Close* at the left, the filename centred at 14px semibold with no tracking, and at the right a capsule of *Download* and *More* only ([web.md](./web.md) § Result viewer, *On a phone and a tablet*).
-- **More** has the same facts and views as on desktop, then a zoom group named *Zoom* (*縮放*): *Fit width* (*符合寬度*), *Zoom to 2×*, *Zoom to 3×* and *Zoom to 5×* (*放大 2 倍*, *放大 3 倍*, *放大 5 倍*), multiples of fit width with the current one checked, then *Open in new tab*. So zoom works without a gesture, under VoiceOver or Switch Control. It has no *Find* on the Original view.
+- **More** has the same facts and views as on desktop, then a zoom group, set off by a rule: *Fit width* (*符合寬度*), *Zoom to 2×*, *Zoom to 3×* and *Zoom to 5×* (*放大 2 倍*, *放大 3 倍*, *放大 5 倍*), multiples of fit width with the current one checked, then *Open in new tab*. So zoom works without a gesture, under VoiceOver or Switch Control. It has no *Find* on the Original view.
 - **Pinch** zooms about the fingers, from fit width up to 5 × fit width.
 - **A double tap** toggles between fit width and 2 × fit width, about the point tapped.
 - The pane takes pinch and double tap with `touch-action: pan-x pan-y` and its own handlers. The viewport meta keeps page zoom: no `user-scalable=no` and no `maximum-scale`.
@@ -329,7 +329,7 @@ The stage 1 viewer is checked by hand with this list on the owner's Mac and iPho
 15. Click an internal link, such as a citation. The view scrolls to that page and the zoom does not change. Click a web link: it opens in a new tab.
 16. Turn on dark mode. The header and surround are dark, the page is still white with its colours not inverted, and the pill is opaque and readable.
 17. Open a PDF that needs a password. The cursor is in the field. A wrong password shows the red line and keeps the text selected, and VoiceOver reads it out.
-18. Open a damaged PDF. *This PDF can't be shown* shows with *Download ({size})* and *Open in new tab*, which opens the browser's viewer in a new tab.
+18. Open a damaged PDF. *This PDF can’t be shown* shows with *Download ({size})* and *Open in new tab*, which opens the browser's viewer in a new tab.
 19. Open a PDF with portrait and landscape pages mixed, and scroll fast past pages not yet sized. What you are reading does not jump.
 20. Press ⌘F on Original. Safari's own find opens and finds text only on nearby pages.
 21. With VoiceOver, Tab runs Close, the zoom controls, Download, More, the pill, then the pages. Each page reads as *Page N of M* followed by its text.

@@ -174,7 +174,7 @@ defineExpose({ reveal })
       :aria-describedby="hintId"
       @click="openField"
     >
-      {{ page }} / {{ total }}
+      {{ t('viewer.pdf.pageOf', { page, total }) }}
     </button>
     <span :id="hintId" class="sr-only">{{ t('viewer.pdf.indicatorHint') }}</span>
   </div>
