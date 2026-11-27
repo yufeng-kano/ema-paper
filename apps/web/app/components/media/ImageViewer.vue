@@ -38,7 +38,7 @@ import {
   type Placement,
 } from '~/lib/media/image-zoom'
 import { attachPinch, type GesturePoint } from '~/lib/pdf/gestures'
-import type { ScrollPoint, Size } from '~/lib/pdf/layout'
+import type { Size } from '~/lib/pdf/layout'
 import { percentOf } from '~/lib/pdf/zoom'
 import { zoomKey } from '~/lib/shortcuts'
 
@@ -77,8 +77,6 @@ const natural = shallowRef<Size | null>(null)
 /** The pane's client box, which every zoom is measured in. */
 const paneSize = shallowRef<Size>({ width: 0, height: 0 })
 const zoom = shallowRef<ImageZoomState>({ mode: 'fit', scale: 1 })
-/** The pane's scroll as last read, for the state's centre. */
-const scroll = shallowRef<ScrollPoint>({ left: 0, top: 0 })
 /** During a pinch, the transform the stage shows until the zoom commits. */
 const pinch = shallowRef<{ scale: number; originX: number; originY: number } | null>(null)
 const dragging = ref(false)
@@ -90,8 +88,10 @@ const lifetime = new AbortController()
 /** The current load and its probe: a retry, a new address and unmounting abort it. */
 let loading = new AbortController()
 let observer: ResizeObserver | null = null
-let frame = 0
-let lastPointerType = ''
+/** When `doubleTap` last zoomed, so the `dblclick` the same tap fires is not a second zoom. */
+let doubleTapAt = -Infinity
+/** How long after a double tap its own `dblclick` can still arrive. */
+const DOUBLE_TAP_CLICK_MS = 500
 let drag: { pointer: number; x: number; y: number; left: number; top: number } | null = null
 
 const busy = computed(() => status.value === 'loading' || status.value === 'probing')
@@ -118,7 +118,6 @@ const pannable = computed(() => {
 
 const viewerState = computed<ImageViewerState>(() => {
   const measured = context()
-  const placed = placement.value
   return {
     ready: measured !== null,
     failed: status.value === 'failed',
@@ -127,7 +126,6 @@ const viewerState = computed<ImageViewerState>(() => {
     canZoomIn: measured ? canStepImageZoom(zoom.value, 'in', measured) : false,
     canZoomOut: measured ? canStepImageZoom(zoom.value, 'out', measured) : false,
     size: measured ? measured.image : null,
-    centre: placed ? pointAt(placed, scroll.value, paneCentre()) : null,
   }
 })
 
@@ -226,7 +224,6 @@ async function onLoad(event: Event) {
   if (props.initial && el && placed) {
     el.scrollTo(scrollForPoint(props.initial.centre, paneCentre(), placed, paneSize.value))
   }
-  readScroll()
   announce(t('viewer.media.opened'))
 }
 
@@ -279,20 +276,6 @@ async function retry() {
 
 // --- the pane ---------------------------------------------------------------------
 
-function readScroll() {
-  const el = pane.value
-  if (el) {
-    scroll.value = { left: el.scrollLeft, top: el.scrollTop }
-  }
-}
-
-function onScroll() {
-  frame ||= requestAnimationFrame(() => {
-    frame = 0
-    readScroll()
-  })
-}
-
 function paneCentre() {
   return { x: paneSize.value.width / 2, y: paneSize.value.height / 2 }
 }
@@ -319,7 +302,6 @@ function applyZoom(next: ImageZoomState, anchor: { x: number; y: number }, point
     const placed = placement.value
     if (el && placed) {
       el.scrollTo(scrollForPoint(point, anchor, placed, paneSize.value))
-      readScroll()
     }
   })
 }
@@ -413,21 +395,21 @@ const gestures = {
     if (measured) {
       const next = props.phone ? doubleTapImageZoom(zoom.value, measured) : doubleClickZoom(zoom.value, measured)
       applyZoom(next, paneAnchor(point))
+      doubleTapAt = performance.now()
     }
   },
 }
 
-/** A touch double tap fires `dblclick` too, and `doubleTap` has taken it already. */
+/** A double tap by a finger or a pen fires `dblclick` too, and `doubleTap` has taken it already. */
 function onDoubleClick(event: MouseEvent) {
   const measured = context()
-  if (lastPointerType !== 'touch' && measured) {
+  if (performance.now() - doubleTapAt > DOUBLE_TAP_CLICK_MS && measured) {
     applyZoom(doubleClickZoom(zoom.value, measured), paneAnchor(event))
   }
 }
 
 /** A mouse or a pen drags a box larger than the pane; a finger scrolls the pane itself. */
 function onPointerDown(event: PointerEvent) {
-  lastPointerType = event.pointerType
   const el = pane.value
   if (!el || event.pointerType === 'touch' || event.button !== 0 || !pannable.value) {
     return
@@ -516,7 +498,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   lifetime.abort()
   loading.abort()
-  cancelAnimationFrame(frame)
   observer?.disconnect()
 })
 
@@ -524,6 +505,8 @@ defineExpose({
   zoomIn: () => zoomStep('in'),
   zoomOut: () => zoomStep('out'),
   zoomTo,
+  /** The image point at the pane's centre, for the way back from Markdown; null until shown. */
+  centre: () => (context() ? pointUnder(paneCentre()) : null),
 })
 </script>
 
@@ -537,7 +520,6 @@ defineExpose({
       :tabindex="status === 'failed' ? undefined : 0"
       :aria-label="name"
       :aria-busy="busy ? 'true' : undefined"
-      @scroll.passive="onScroll"
     >
       <ViewerStateSheet
         v-if="status === 'failed' && failure"

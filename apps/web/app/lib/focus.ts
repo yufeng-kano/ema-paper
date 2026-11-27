@@ -41,6 +41,11 @@ export function wrapTab(event: KeyboardEvent, container: HTMLElement, items: HTM
     event.preventDefault()
     last.focus()
   } else if (!event.shiftKey && (active === last || outside)) {
+    // Focus inside a media element's native controls reads as the element itself: Tab walks
+    // them, and once a press has left the last one the next is pulled back in as `outside`.
+    if (active === last && last.matches('video[controls], audio[controls]')) {
+      return
+    }
     event.preventDefault()
     first.focus()
   }

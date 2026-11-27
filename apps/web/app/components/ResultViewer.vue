@@ -100,6 +100,7 @@ import {
 } from '~/lib/markdown'
 import {
   isImageZoomChecked,
+  type ImagePoint,
   type ImageReturn,
   type ImageViewerState,
   type ImageZoomTarget,
@@ -3978,7 +3979,12 @@ const pdfShown = computed(() => tab.value === 'original' && props.original?.kind
 /** The image view (docs/media-viewer.md § The image view), driven from the header as the PDF
  *  viewer is: what the zoom controls ask of it, and what it last said of itself — null until
  *  it first does, and again once the Original view has gone. */
-const image = ref<{ zoomIn(): void; zoomOut(): void; zoomTo(target: ImageZoomTarget): void } | null>(null)
+const image = ref<{
+  zoomIn(): void
+  zoomOut(): void
+  zoomTo(target: ImageZoomTarget): void
+  centre(): ImagePoint | null
+} | null>(null)
 const imageState = ref<ImageViewerState | null>(null)
 /** Where the reader was in the image when they left for Markdown: the zoom and the image
  *  point at the pane's centre, for the view to open on again. */
@@ -4143,8 +4149,9 @@ watch(tab, async (view) => {
   // The image view goes the same way, and may read the file again on the way back: it is
   // served `no-store`.
   const leftImage = imageState.value
-  if (leftImage?.ready && leftImage.centre) {
-    imageReturn.value = { zoom: leftImage.zoom, centre: leftImage.centre }
+  const centre = image.value?.centre()
+  if (leftImage?.ready && centre) {
+    imageReturn.value = { zoom: leftImage.zoom, centre }
   }
   imageState.value = null
   zoomMenu.value = null

@@ -1198,9 +1198,12 @@ async function showOpenInFiles(ready?: Promise<boolean>): Promise<boolean> {
   if (!open || (ready && !(await ready))) {
     return false
   }
-  if (openDocument.value?.id === open.id) {
-    openDocument.value = null
+  // The saves took a while and the reader has opened another file meanwhile: the list is not
+  // changed behind that viewer.
+  if (openDocument.value && openDocument.value.id !== open.id) {
+    return false
   }
+  openDocument.value = null
   showView('files')
   openFolder(open.folder_id)
   await nextTick()
@@ -1226,7 +1229,8 @@ async function duplicateOpen(ready?: Promise<boolean>) {
 
 async function trashOpen(ready?: Promise<boolean>) {
   const entry = viewerEntry()
-  if (!entry || (ready && !(await ready))) {
+  // `trashItems` does nothing while another operation runs, so the viewer stays open then.
+  if (!entry || (ready && !(await ready)) || busy.value) {
     return
   }
   // Closed before the trash is sent, so nothing can be typed into a document on its way to the

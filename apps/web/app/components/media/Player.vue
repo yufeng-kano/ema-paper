@@ -93,7 +93,9 @@ const shown = computed(() => revealed.value && status.value !== 'failed')
 const failed = computed(() => status.value === 'failed' && failure.value !== null)
 
 const box = computed(() => {
-  const size = dimensions.value ?? (status.value === 'unsized' ? FALLBACK_ASPECT : null)
+  // The fallback box stays while the element shows without a size: after the wait ran out,
+  // and while an error met there is being classified.
+  const size = dimensions.value ?? (revealed.value ? FALLBACK_ASPECT : null)
   const gutter = props.phone ? PHONE_SPACING.gutter : DESKTOP_SPACING.gutter
   return size ? videoBox(size, paneSize.value, gutter) : null
 })

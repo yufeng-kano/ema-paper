@@ -64,8 +64,6 @@ export interface ImageViewerState {
   canZoomOut: boolean
   /** The natural size, for More's *Dimensions*; null until ready. */
   size: Size | null
-  /** The image point at the pane's centre; null until ready. */
-  centre: ImagePoint | null
 }
 
 /** The scrolling stage, and the image box on it. */
