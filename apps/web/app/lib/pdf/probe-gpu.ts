@@ -5,40 +5,63 @@
  * on the device it runs on, the questions the page renderer's design rests on:
  *
  * - is there WebGPU at all, and how long do an adapter and a device take;
+ * - does the GPU draw what it is told, read back from the GPU itself;
  * - can several canvases draw from one device at once (one canvas per visible page);
- * - can a worker draw into an `OffscreenCanvas`;
- * - after the device is lost, does a new one draw again without a reload.
+ * - can a canvas be read through a 2D canvas, and what is left of it afterwards;
+ * - what a worker can do: draw, hand a frame over, draw a canvas of the page;
+ * - after a device is lost, does a new one draw again without a reload.
+ *
+ * What a canvas shows on the screen no check can read. So each way of drawing has canvases of
+ * its own (`PROBE_SURFACES`), no way touches another's, and a screenshot says the rest.
  *
  * Nothing here can run in node, so nothing here is unit tested; what can be is in `probe.ts`.
  */
 import {
   PROBE_CHECKS,
   PROBE_COLORS,
+  PROBE_SURFACES,
   errorText,
   pickLimits,
   pixelMatches,
+  readVerdict,
+  rgbaText,
   skipped,
   type ProbeCheck,
   type ProbeCheckId,
   type ProbeNote,
   type ProbeReport,
+  type ProbeSurface,
 } from './probe'
-import { PROBE_CANVAS_SIZE, clearTo, type ProbeWorkerReply, type ProbeWorkerRequest } from './probe-draw'
-
-/** How long the worker and the lost-device promise may take before the check gives up. */
-const STEP_TIMEOUT_MS = 8000
+import {
+  PROBE_CANVAS_SIZE,
+  clearTo,
+  configure,
+  drawAndRead,
+  plainTexture,
+  within,
+  type ProbeWorkerReply,
+  type ProbeWorkerRequest,
+} from './probe-draw'
 
 /** How long to wait for a frame to be shown: a hidden tab runs no frames at all. */
 const PRESENT_TIMEOUT_MS = 1000
 
+/** The page's canvases: the five drawn once, and one for each other way of drawing. */
+export type ProbeCanvases = { once: readonly HTMLCanvasElement[] } & Record<ProbeSurface, HTMLCanvasElement>
+
 export interface ProbeRun {
   report: ProbeReport
-  /** Releases the device the run left drawing the canvases. */
+  /** Stops the canvas that is redrawn every frame, ends the worker and releases the devices. */
   dispose: () => void
 }
 
+/** The color a one-canvas surface is drawn in: `PROBE_COLORS` at its place in `PROBE_SURFACES`. */
+function surfaceColor(surface: ProbeSurface): readonly number[] {
+  return PROBE_COLORS[PROBE_SURFACES.indexOf(surface)]!
+}
+
 /** The pixel at the middle of a canvas or a bitmap, read through a 2D canvas. */
-function centerPixel(source: HTMLCanvasElement | ImageBitmap): Uint8ClampedArray {
+function centerPixel(source: HTMLCanvasElement | ImageBitmap): number[] {
   const scratch = document.createElement('canvas')
   scratch.width = PROBE_CANVAS_SIZE
   scratch.height = PROBE_CANVAS_SIZE
@@ -47,7 +70,7 @@ function centerPixel(source: HTMLCanvasElement | ImageBitmap): Uint8ClampedArray
     throw new Error('no 2d context')
   }
   context.drawImage(source, 0, 0)
-  return context.getImageData(PROBE_CANVAS_SIZE / 2, PROBE_CANVAS_SIZE / 2, 1, 1).data
+  return Array.from(context.getImageData(PROBE_CANVAS_SIZE / 2, PROBE_CANVAS_SIZE / 2, 1, 1).data)
 }
 
 /**
@@ -67,165 +90,220 @@ function presented(): Promise<void> {
   })
 }
 
-interface Drawing {
-  drawn: number
-  /** At least one canvas read as drawn only once its frame had been shown. */
-  afterPresent: boolean
-  /** At least one canvas gave no WebGPU context. */
-  noContext: boolean
-  error?: string
+/** A new adapter and a device from it: an adapter gives one device only. */
+async function newDevice(gpu: GPU): Promise<GPUDevice | null> {
+  const adapter = await gpu.requestAdapter()
+  return adapter ? adapter.requestDevice() : null
 }
 
 /**
- * Draws one color per canvas from `device`, starting at `offset` in the palette, and counts
- * the canvases whose middle pixel reads back as drawn.
- *
- * The read is made twice when it has to be: in the task that drew, where the canvas still
- * holds its current texture, and after the frame is presented. A browser may answer either.
+ * Five canvases drawn once from one device, all in one task as a viewer draws its visible
+ * pages, each read back from the GPU. No 2D canvas ever reads them.
  */
-async function drawCanvases(
-  device: GPUDevice,
-  format: GPUTextureFormat,
-  canvases: readonly HTMLCanvasElement[],
-  offset: number,
-): Promise<Drawing> {
-  const colors = canvases.map((_, index) => PROBE_COLORS[(index + offset) % PROBE_COLORS.length]!)
-  const matched = canvases.map(() => false)
-  let noContext = false
-  let error: string | undefined
-  for (const [index, canvas] of canvases.entries()) {
-    try {
-      canvas.width = PROBE_CANVAS_SIZE
-      canvas.height = PROBE_CANVAS_SIZE
-      const context = canvas.getContext('webgpu')
-      if (!context) {
-        noContext = true
-        continue
-      }
-      context.configure({ device, format, alphaMode: 'opaque' })
-      clearTo(device, context, colors[index]!)
-      matched[index] = pixelMatches(centerPixel(canvas), colors[index]!)
-    } catch (caught) {
-      error ??= errorText(caught)
-    }
+async function canvasesCheck(device: GPUDevice, format: GPUTextureFormat, canvases: readonly HTMLCanvasElement[]): Promise<ProbeCheck> {
+  const reads = await Promise.all(
+    canvases.map(async (canvas, index) => {
+      const context = configure(canvas, device, format)
+      return context
+        ? readVerdict(await drawAndRead(device, context.getCurrentTexture(), PROBE_COLORS[index]!), PROBE_COLORS[index]!)
+        : readVerdict({ note: 'noContext' }, PROBE_COLORS[index]!)
+    }),
+  )
+  const failed = reads.find((read) => read.status === 'fail')
+  const drawn = reads.length - reads.filter((read) => read.status === 'fail').length
+  return {
+    id: 'canvases',
+    // No canvas to draw on is a failed check, not five of five.
+    status: reads.length > 0 && !failed ? 'pass' : 'fail',
+    notes: [{ code: 'drawn', params: { count: drawn, total: reads.length } }, ...(failed?.notes ?? [])],
+    detail: failed?.detail,
   }
-  let afterPresent = false
-  if (matched.includes(false)) {
-    await presented()
-    for (const [index, canvas] of canvases.entries()) {
-      if (matched[index]) {
-        continue
-      }
-      try {
-        if (pixelMatches(centerPixel(canvas), colors[index]!)) {
-          matched[index] = true
-          afterPresent = true
-        }
-      } catch (caught) {
-        error ??= errorText(caught)
-      }
-    }
-  }
-  return { drawn: matched.filter(Boolean).length, afterPresent, noContext, error }
-}
-
-/** A drawing as a check: passed when every canvas drew, and there was a canvas to draw on. */
-function drawingCheck(id: ProbeCheckId, drawing: Drawing, total: number, lead: ProbeNote[] = [], ms?: number): ProbeCheck {
-  const notes: ProbeNote[] = [...lead, { code: 'drawn', params: { count: drawing.drawn, total } }]
-  if (drawing.afterPresent) {
-    notes.push({ code: 'afterPresent' })
-  }
-  if (drawing.noContext) {
-    notes.push({ code: 'noContext' })
-  }
-  return { id, status: total > 0 && drawing.drawn === total ? 'pass' : 'fail', ms, notes, detail: drawing.error }
 }
 
 /**
- * Whether a worker can draw with WebGPU into an `OffscreenCanvas` and hand the frame back.
- * The time is the worker's own, from asking for an adapter to the frame drawn.
+ * One canvas drawn once and read through a 2D canvas (`drawImage`), as a thumbnail or a print
+ * would read a page: in the task that drew it, and again once the frame has been shown. Both
+ * pixels are noted. It passes when the first read is the color drawn: a browser gives the
+ * canvas a new, empty texture after showing a frame, so the second read is not held to it.
  */
-function workerCheck(): Promise<ProbeCheck> {
-  return new Promise((resolve) => {
-    const fail = (rest: Pick<ProbeCheck, 'notes' | 'detail'>): ProbeCheck => ({ id: 'worker', status: 'fail', ...rest })
-    let worker: Worker
+async function snapshotCheck(device: GPUDevice, format: GPUTextureFormat, canvas: HTMLCanvasElement): Promise<ProbeCheck> {
+  const color = surfaceColor('snapshot')
+  const context = configure(canvas, device, format)
+  if (!context) {
+    return { id: 'snapshot', status: 'fail', notes: [{ code: 'noContext' }] }
+  }
+  clearTo(device, context.getCurrentTexture(), color)
+  const now = centerPixel(canvas)
+  await presented()
+  const later = centerPixel(canvas)
+  return {
+    id: 'snapshot',
+    status: pixelMatches(now, color) ? 'pass' : 'fail',
+    notes: [
+      { code: 'readNow', params: { got: rgbaText(now) } },
+      { code: 'readLater', params: { got: rgbaText(later) } },
+    ],
+  }
+}
+
+/** Redraws `canvas` on every frame until the returned function is called. Nothing reads it: the screen is the answer. */
+function drawLive(device: GPUDevice, format: GPUTextureFormat, canvas: HTMLCanvasElement): () => void {
+  const context = configure(canvas, device, format)
+  let frame = 0
+  const draw = () => {
     try {
-      worker = new Worker(new URL('./probe.worker.ts', import.meta.url), { type: 'module' })
+      clearTo(device, context!.getCurrentTexture(), surfaceColor('live'))
+      frame = requestAnimationFrame(draw)
+    } catch {
+      // No context, or a device that is gone: the canvas stays as it is, which the screenshot shows.
+    }
+  }
+  draw()
+  return () => cancelAnimationFrame(frame)
+}
+
+/** The three checks a worker's one answer makes, and the worker, which keeps the page's canvas drawn while it lives. */
+async function workerChecks(canvas: HTMLCanvasElement): Promise<{ checks: ProbeCheck[]; worker: Worker | null }> {
+  const failed = (rest: Pick<ProbeCheck, 'notes' | 'detail'>): ProbeCheck[] => [{ id: 'worker', status: 'fail', ...rest }]
+  let worker: Worker
+  try {
+    worker = new Worker(new URL('./probe.worker.ts', import.meta.url), { type: 'module' })
+  } catch (error) {
+    return { checks: failed({ detail: errorText(error) }), worker: null }
+  }
+  const request: ProbeWorkerRequest = { color: PROBE_COLORS[0]!, canvasColor: surfaceColor('worker') }
+  let transferError: string | undefined
+  if ('transferControlToOffscreen' in canvas) {
+    try {
+      request.canvas = canvas.transferControlToOffscreen()
     } catch (error) {
-      resolve(fail({ detail: errorText(error) }))
-      return
+      transferError = errorText(error)
     }
-    const finish = (check: ProbeCheck) => {
-      clearTimeout(timer)
-      worker.terminate()
-      resolve(check)
+  }
+  let reply: ProbeWorkerReply
+  try {
+    reply = await within(
+      new Promise<ProbeWorkerReply>((resolve, reject) => {
+        worker.onmessage = (event: MessageEvent<ProbeWorkerReply>) => resolve(event.data)
+        worker.onerror = (event) => reject(new Error(event.message || 'worker failed to start'))
+        worker.postMessage(request, request.canvas ? [request.canvas] : [])
+      }),
+    )
+  } catch (error) {
+    worker.terminate()
+    const timedOut = errorText(error) === 'timed out'
+    return { checks: failed(timedOut ? { notes: [{ code: 'timedOut' }] } : { detail: errorText(error) }), worker: null }
+  }
+  if (!reply.texture) {
+    worker.terminate()
+    return { checks: failed({ notes: reply.note ? [{ code: reply.note }] : undefined, detail: reply.error }), worker: null }
+  }
+
+  const checks: ProbeCheck[] = [{ id: 'worker', ms: reply.ms, ...readVerdict(reply.texture, request.color) }]
+
+  // What the page reads from each bitmap, through a 2D canvas as it would draw one.
+  const notes: ProbeNote[] = []
+  let transferred: number[] | undefined
+  let detail = reply.bitmapError
+  for (const code of ['bitmapTransfer', 'bitmapCopy', 'bitmapAfterWork'] as const) {
+    const bitmap = reply[code]
+    if (!bitmap) {
+      continue
     }
-    const timer = setTimeout(() => finish(fail({ notes: [{ code: 'timedOut' }] })), STEP_TIMEOUT_MS)
-    worker.onerror = (event) => finish(fail({ notes: [{ code: 'noFrame' }], detail: event.message || undefined }))
-    worker.onmessage = (event: MessageEvent<ProbeWorkerReply>) => {
-      const { bitmap, ms, note, error } = event.data
-      if (!bitmap) {
-        finish(fail({ notes: [{ code: note ?? 'noFrame' }], detail: error }))
-        return
+    try {
+      const pixel = centerPixel(bitmap)
+      notes.push({ code, params: { got: rgbaText(pixel) } })
+      if (code === 'bitmapTransfer') {
+        transferred = pixel
       }
-      try {
-        finish(
-          pixelMatches(centerPixel(bitmap), PROBE_COLORS[0]!)
-            ? { id: 'worker', status: 'pass', ms }
-            : fail({ notes: [{ code: 'wrongColor' }] }),
-        )
-      } catch (caught) {
-        finish(fail({ detail: errorText(caught) }))
-      } finally {
-        bitmap.close()
-      }
+    } catch (error) {
+      detail ??= errorText(error)
+    } finally {
+      bitmap.close()
     }
-    const request: ProbeWorkerRequest = { color: PROBE_COLORS[0]! }
-    worker.postMessage(request)
+  }
+  if (reply.bitmapNote) {
+    notes.push({ code: reply.bitmapNote })
+  }
+  checks.push({
+    id: 'workerBitmap',
+    status: transferred && pixelMatches(transferred, request.color) ? 'pass' : 'fail',
+    notes,
+    detail,
   })
+
+  checks.push(
+    reply.canvas
+      ? { id: 'workerCanvas', ...readVerdict(reply.canvas, request.canvasColor) }
+      : { id: 'workerCanvas', status: 'fail', notes: transferError ? undefined : [{ code: 'noTransfer' }], detail: transferError },
+  )
+  return { checks, worker }
 }
 
 /**
- * Destroys `device`, waits for the browser to report it lost, then asks for a new adapter and
- * device and redraws every canvas in the next color of the palette. The time is the recovery
- * alone: from the loss to the last canvas drawn.
+ * A device of its own draws `canvas` and is destroyed; once the browser reports it lost, a new
+ * adapter and device draw the canvas again in another color. The time is the recovery alone:
+ * from the loss to the canvas drawn and read back.
  *
  * A destroyed device is the one loss a page can cause itself. A loss the GPU process causes
- * takes the same path from `device.lost` on, which is the part being checked.
+ * takes the same path from `device.lost` on, which is the part being checked. The device the
+ * other canvases are drawn from is never the one destroyed.
  */
 async function deviceLossCheck(
   gpu: GPU,
-  device: GPUDevice,
   format: GPUTextureFormat,
-  canvases: readonly HTMLCanvasElement[],
+  canvas: HTMLCanvasElement,
 ): Promise<{ check: ProbeCheck; device: GPUDevice | null }> {
-  device.destroy()
-  const reason = await Promise.race([
-    device.lost.then((info) => info.reason ?? 'unknown'),
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), STEP_TIMEOUT_MS)),
-  ])
-  if (reason === null) {
-    return { check: { id: 'deviceLoss', status: 'fail', notes: [{ code: 'lostUnreported' }] }, device: null }
+  const fail = (notes: ProbeNote[], detail?: string) => ({ check: { id: 'deviceLoss' as const, status: 'fail' as const, notes, detail }, device: null })
+  const first = await newDevice(gpu)
+  if (!first) {
+    return fail([{ code: 'noAdapter' }])
+  }
+  const before = configure(canvas, first, format)
+  if (!before) {
+    first.destroy()
+    return fail([{ code: 'noContext' }])
+  }
+  const drawn = readVerdict(await drawAndRead(first, before.getCurrentTexture(), PROBE_COLORS[4]!), PROBE_COLORS[4]!)
+  first.destroy()
+  let reason: string
+  try {
+    reason = (await within(first.lost)).reason ?? 'unknown'
+  } catch {
+    return fail([{ code: 'lostUnreported' }])
   }
   const lost: ProbeNote = { code: 'lost', params: { reason } }
-  const started = performance.now()
-  const adapter = await gpu.requestAdapter()
-  if (!adapter) {
-    return { check: { id: 'deviceLoss', status: 'fail', notes: [lost, { code: 'noAdapter' }] }, device: null }
+  if (drawn.status === 'fail') {
+    return fail([lost, ...(drawn.notes ?? [])], drawn.detail)
   }
-  const next = await adapter.requestDevice()
-  const drawing = await drawCanvases(next, format, canvases, 1)
+  const started = performance.now()
+  const next = await newDevice(gpu)
+  if (!next) {
+    return fail([lost, { code: 'noAdapter' }])
+  }
+  const after = configure(canvas, next, format)
+  if (!after) {
+    next.destroy()
+    return fail([lost, { code: 'noContext' }])
+  }
+  const redrawn = readVerdict(await drawAndRead(next, after.getCurrentTexture(), surfaceColor('loss')), surfaceColor('loss'))
   return {
-    check: drawingCheck('deviceLoss', drawing, canvases.length, [lost], performance.now() - started),
+    check: {
+      id: 'deviceLoss',
+      status: redrawn.status,
+      ms: performance.now() - started,
+      notes: [lost, ...(redrawn.notes ?? [])],
+      detail: redrawn.detail,
+    },
     device: next,
   }
 }
 
 /**
- * Runs every check on `canvases`, which the page shows so the colors can be seen as well as
- * read. One check at a time, so that no step's time includes another's work.
+ * Runs every check on the page's canvases. One check at a time, so that no step's time
+ * includes another's work.
  */
-export async function runProbe(canvases: readonly HTMLCanvasElement[]): Promise<ProbeRun> {
+export async function runProbe(canvases: ProbeCanvases): Promise<ProbeRun> {
   const done = new Map<ProbeCheckId, ProbeCheck>()
   const record = (check: ProbeCheck) => done.set(check.id, check)
   const report: ProbeReport = {
@@ -237,10 +315,19 @@ export async function runProbe(canvases: readonly HTMLCanvasElement[]): Promise<
     limits: {},
     checks: [],
   }
-  let live: GPUDevice | null = null
+  // What the run leaves working, for the page to release when it goes or runs again.
+  const release: (() => void)[] = []
   const finish = (): ProbeRun => {
     report.checks = PROBE_CHECKS.map((id) => done.get(id) ?? skipped(id))
-    return { report, dispose: () => live?.destroy() }
+    return { report, dispose: () => release.forEach((step) => step()) }
+  }
+  // The worker asks for an adapter of its own, so it is checked whatever the page's answers.
+  const checkWorker = async () => {
+    const { checks, worker } = await workerChecks(canvases.worker)
+    checks.forEach(record)
+    if (worker) {
+      release.push(() => worker.terminate())
+    }
   }
 
   record({ id: 'float16', status: 'Float16Array' in globalThis ? 'pass' : 'fail' })
@@ -266,8 +353,7 @@ export async function runProbe(canvases: readonly HTMLCanvasElement[]): Promise<
   }
   if (!adapter) {
     record({ id: 'adapter', status: 'fail', notes: failure ? undefined : [{ code: 'noAdapter' }], detail: failure })
-    // The worker asks for an adapter of its own, so it is checked whatever the page's answer.
-    record(await workerCheck())
+    await checkWorker()
     return finish()
   }
   record({ id: 'adapter', status: 'pass', ms: performance.now() - started })
@@ -290,21 +376,33 @@ export async function runProbe(canvases: readonly HTMLCanvasElement[]): Promise<
     device = await adapter.requestDevice()
   } catch (error) {
     record({ id: 'device', status: 'fail', detail: errorText(error) })
-    record(await workerCheck())
+    await checkWorker()
     return finish()
   }
-  live = device
+  release.push(() => device.destroy())
   record({ id: 'device', status: 'pass', ms: performance.now() - started })
 
-  record(drawingCheck('canvases', await drawCanvases(device, format, canvases, 0), canvases.length))
-  record(await workerCheck())
+  const texture = plainTexture(device)
+  record({ id: 'readback', ...readVerdict(await drawAndRead(device, texture, PROBE_COLORS[0]!), PROBE_COLORS[0]!) })
+  texture.destroy()
+
+  record(await canvasesCheck(device, format, canvases.once))
+  try {
+    record(await snapshotCheck(device, format, canvases.snapshot))
+  } catch (error) {
+    record({ id: 'snapshot', status: 'fail', detail: errorText(error) })
+  }
+  release.push(drawLive(device, format, canvases.live))
+  await checkWorker()
 
   try {
-    const recovery = await deviceLossCheck(gpu, device, format, canvases)
-    live = recovery.device
+    const recovery = await deviceLossCheck(gpu, format, canvases.loss)
     record(recovery.check)
+    if (recovery.device) {
+      const kept = recovery.device
+      release.push(() => kept.destroy())
+    }
   } catch (error) {
-    live = null
     record({ id: 'deviceLoss', status: 'fail', detail: errorText(error) })
   }
   return finish()

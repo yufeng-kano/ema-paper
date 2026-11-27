@@ -4,10 +4,13 @@ import {
   PROBE_CHECKS,
   PROBE_COLORS,
   PROBE_NOTES,
+  PROBE_SURFACES,
   errorText,
   pickLimits,
   pixelMatches,
+  readVerdict,
   reportText,
+  rgbaText,
   skipped,
   type ProbeReport,
 } from './probe'
@@ -66,7 +69,10 @@ describe('reportText', () => {
       {
         id: 'canvases',
         status: 'fail',
-        notes: [{ code: 'drawn', params: { count: 3, total: 5 } }, { code: 'afterPresent' }],
+        notes: [
+          { code: 'drawn', params: { count: 3, total: 5 } },
+          { code: 'wrongColor', params: { got: '0 0 0 255', want: '255 59 48 255' } },
+        ],
         detail: 'Device is lost',
       },
       skipped('worker'),
@@ -82,7 +88,7 @@ describe('reportText', () => {
     expect(reportText(report).split('\n')).toEqual([
       'gpu: pass',
       'adapter: pass, 12 ms',
-      'canvases: fail, drawn(count=3, total=5), afterPresent, Device is lost',
+      'canvases: fail, drawn(count=3, total=5), wrongColor(got=0 0 0 255, want=255 59 48 255), Device is lost',
       'worker: skipped',
       'userAgent: TestAgent/1.0',
       'secureContext: true',
@@ -115,6 +121,43 @@ describe('reportText', () => {
   })
 })
 
+describe('readVerdict', () => {
+  const red = PROBE_COLORS[0]!
+
+  it('passes a read of the color drawn, with nothing to add', () => {
+    expect(readVerdict({ pixel: [255, 59, 48, 255] }, red)).toEqual({ status: 'pass' })
+  })
+
+  it('fails another color and says both, so a swap of red and blue reads as one', () => {
+    expect(readVerdict({ pixel: [48, 59, 255, 255] }, red)).toEqual({
+      status: 'fail',
+      notes: [{ code: 'wrongColor', params: { got: '48 59 255 255', want: '255 59 48 255' } }],
+    })
+  })
+
+  it('fails a read that has no pixel with its note or the browser’s message', () => {
+    expect(readVerdict({ note: 'noContext' }, red)).toEqual({ status: 'fail', notes: [{ code: 'noContext' }], detail: undefined })
+    expect(readVerdict({ error: 'usage is not allowed' }, red)).toEqual({
+      status: 'fail',
+      notes: undefined,
+      detail: 'usage is not allowed',
+    })
+  })
+})
+
+describe('rgbaText', () => {
+  it('prints a pixel’s four bytes, from an array or a typed array', () => {
+    expect(rgbaText([0, 122, 255, 255])).toBe('0 122 255 255')
+    expect(rgbaText(new Uint8ClampedArray([255, 204, 0, 255]))).toBe('255 204 0 255')
+  })
+})
+
+describe('PROBE_SURFACES', () => {
+  it('each has a color of its own to be drawn in, and one more is left for the device that is lost', () => {
+    expect(PROBE_SURFACES.length).toBeLessThan(PROBE_COLORS.length)
+  })
+})
+
 describe('errorText', () => {
   it("is an error's message, and anything else as a string", () => {
     expect(errorText(new TypeError('Device is lost'))).toBe('Device is lost')
@@ -130,6 +173,17 @@ describe('the page’s words', () => {
     expect(en.pdfProbe.notes.drawn).toContain('{count}')
     expect(en.pdfProbe.notes.drawn).toContain('{total}')
     expect(en.pdfProbe.notes.lost).toContain('{reason}')
+    for (const code of ['wrongColor', 'readNow', 'readLater', 'bitmapTransfer', 'bitmapCopy', 'bitmapAfterWork'] as const) {
+      expect(en.pdfProbe.notes[code]).toContain('{got}')
+    }
+    expect(en.pdfProbe.notes.wrongColor).toContain('{want}')
+  })
+
+  it('name every way a canvas is drawn', () => {
+    expect(en.pdfProbe.surfaces.once).toBeTruthy()
+    for (const surface of PROBE_SURFACES) {
+      expect(en.pdfProbe.surfaces[surface]).toBeTruthy()
+    }
   })
 
   it('name every check and every status', () => {
