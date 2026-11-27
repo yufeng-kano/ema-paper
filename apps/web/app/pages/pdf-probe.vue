@@ -72,7 +72,9 @@ async function start() {
     const fives = [...(once.value ?? [])].sort((a, b) => Number(a.dataset.index) - Number(b.dataset.index))
     const singles = single.value ?? []
     if (fives.length !== PROBE_COLORS.length || singles.length !== PROBE_SURFACES.length) {
-      throw new Error('the canvases are not on the page')
+      // The canvases are not on the page: nothing to run on, and no words of the browser's to show.
+      state.value = 'failed'
+      return
     }
     // Its own chunk: no other page asks for a GPU device.
     const { runProbe } = await import('~/lib/pdf/probe-gpu')

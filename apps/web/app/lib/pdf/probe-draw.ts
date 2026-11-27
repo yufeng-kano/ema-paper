@@ -16,6 +16,13 @@ const BYTES_PER_ROW = PROBE_CANVAS_SIZE * 4
 /** How long a step that waits on the GPU may take before the check gives up on it. */
 export const STEP_TIMEOUT_MS = 8000
 
+/**
+ * How long the page waits for the worker's next message. Longer than any one stage of the
+ * worker: the first waits on the GPU three times, for a device, for the drawing to be accepted
+ * and for the read.
+ */
+export const WORKER_IDLE_TIMEOUT_MS = STEP_TIMEOUT_MS * 3.5
+
 /** What the page asks its worker to do: draw in `color`, and `canvas` — one of the page's, handed over — in `canvasColor`. */
 export interface ProbeWorkerRequest {
   color: readonly number[]
@@ -23,33 +30,49 @@ export interface ProbeWorkerRequest {
   canvasColor: readonly number[]
 }
 
-/** The worker's answer. Without `texture` nothing ran, and `note` or `error` says why. */
-export interface ProbeWorkerReply {
+/** The ways the worker makes a bitmap of an `OffscreenCanvas` frame, each on a canvas of its own. */
+export const BITMAP_WAYS = ['bitmapTransfer', 'bitmapCopy', 'bitmapAfterWork'] as const
+
+export type BitmapWay = (typeof BITMAP_WAYS)[number]
+
+/**
+ * The worker's answer. It comes in parts, one message for each stage as the stage ends, so a
+ * stage that never answers takes no other stage's answer with it; `done` is on the last.
+ */
+export interface ProbeWorkerReply extends Partial<Record<BitmapWay, ImageBitmap>> {
+  done?: boolean
+  /** Why nothing ran: no WebGPU or no adapter in the worker, or what the browser threw. */
   note?: ProbeNoteCode
   error?: string
   /** A texture drawn and read back in the worker, and how long from asking for an adapter to that read. */
   texture?: ProbeRead
   ms?: number
   /**
-   * An `OffscreenCanvas` frame as `transferToImageBitmap()` gives it and as `createImageBitmap()`
-   * copies it, both in the task that drew it, and as `transferToImageBitmap()` gives it once
-   * `onSubmittedWorkDone()` has resolved.
+   * An `OffscreenCanvas` frame (the `BitmapWay` fields) as `transferToImageBitmap()` gives it
+   * and as `createImageBitmap()` copies it, both in the task that drew it, and as
+   * `transferToImageBitmap()` gives it once `onSubmittedWorkDone()` has resolved.
    */
-  bitmapTransfer?: ImageBitmap
-  bitmapCopy?: ImageBitmap
-  bitmapAfterWork?: ImageBitmap
   bitmapNote?: ProbeNoteCode
-  bitmapError?: string
+  /** What the browser threw in place of a bitmap, by way. */
+  bitmapErrors?: Partial<Record<BitmapWay, string>>
   /** The page's canvas, drawn by the worker and read back from the GPU there. */
   canvas?: ProbeRead
 }
 
-/** `promise`, or a rejection once `ms` have passed: a lost device answers nothing at all. */
+/** What `within` rejects with when the time is up. */
+export class TimedOut extends Error {}
+
+/** `promise`, or a `TimedOut` rejection once `ms` have passed: a lost device answers nothing at all. */
 export function within<T>(promise: Promise<T>, ms = STEP_TIMEOUT_MS): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('timed out')), ms)
+    const timer = setTimeout(() => reject(new TimedOut()), ms)
     promise.then(resolve, reject).finally(() => clearTimeout(timer))
   })
+}
+
+/** A step that failed, as a read: out of time is a note, anything else the browser's own message. */
+export function failedRead(error: unknown): ProbeRead {
+  return error instanceof TimedOut ? { note: 'timedOut' } : { error: errorText(error) }
 }
 
 /**
@@ -110,8 +133,10 @@ export function clearTo(device: GPUDevice, texture: GPUTexture, color: readonly 
  */
 export async function drawAndRead(device: GPUDevice, texture: GPUTexture, color: readonly number[]): Promise<ProbeRead> {
   let buffer: GPUBuffer | undefined
+  let scoped = false
   try {
     device.pushErrorScope('validation')
+    scoped = true
     clearTo(device, texture, color)
     buffer = device.createBuffer({
       size: BYTES_PER_ROW * PROBE_CANVAS_SIZE,
@@ -125,6 +150,7 @@ export async function drawAndRead(device: GPUDevice, texture: GPUTexture, color:
     )
     device.queue.submit([encoder.finish()])
     const bgra = texture.format.startsWith('bgra')
+    scoped = false
     const refused = await within(device.popErrorScope())
     if (refused) {
       return { error: refused.message }
@@ -134,7 +160,11 @@ export async function drawAndRead(device: GPUDevice, texture: GPUTexture, color:
     const [first, green, third, alpha] = new Uint8Array(buffer.getMappedRange(middle, 4))
     return { pixel: bgra ? [third!, green!, first!, alpha!] : [first!, green!, third!, alpha!] }
   } catch (error) {
-    return { error: errorText(error) }
+    if (scoped) {
+      // A step threw before the scope was taken off: left on, it would swallow every later error.
+      void device.popErrorScope().catch(() => undefined)
+    }
+    return failedRead(error)
   } finally {
     buffer?.destroy()
   }

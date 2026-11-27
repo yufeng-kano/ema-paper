@@ -795,7 +795,7 @@ export default {
       bitmapCopy: 'Copied first: {got}',
       bitmapAfterWork: 'Handed over once the GPU had finished: {got}',
       timedOut: 'No answer in time',
-      noFrame: 'No frame came back',
+      workerFailed: 'The worker did not start',
       noGpu: 'This browser has no navigator.gpu',
       insecureContext: 'This page is not on HTTPS, where browsers hide WebGPU',
       noAdapter: 'The browser gave no adapter',

@@ -76,7 +76,7 @@ The fallback is a whole page at a time: a page is never drawn half by each rende
 
 ## Safari
 
-Safari 27.2 is WebKit 625.2.8. These rules come from that source and from WebKit's bug tracker, and the device check asks each of them of a real device (§ The device check).
+Safari 27.2 is WebKit 625.2.8. These rules come from that source and from WebKit's bug tracker. The device check asks the first three of a real device (§ The device check); no check exercises the rest.
 
 - **A canvas the reader sees is never read through a 2D canvas or made into a bitmap.** In Safari 27.2 `drawImage`, `toDataURL`, `toBlob` and `createImageBitmap` of a WebGPU canvas leave it showing a buffer nothing was drawn to, which is black, until the canvas is drawn again. Chromium reads an empty frame from a canvas whose frame has been shown. A thumbnail or a print is drawn into a texture the renderer owns.
 - **Pixels are read from the GPU**, with `copyTextureToBuffer` and `mapAsync`.
@@ -134,7 +134,7 @@ The checks, in the order they are listed:
 | Five canvases from one device | Whether one device draws five canvases in one task — one canvas per visible page |
 | A canvas read through a 2D canvas | What `drawImage` reads from a WebGPU canvas, as a thumbnail or a print would: in the task that drew it, and once the frame has been shown |
 | WebGPU in a background worker | Whether a worker gets a device and draws a texture that reads back right, and in how long by the worker's own clock |
-| A worker's frame handed over as a bitmap | What the page reads from a worker's `OffscreenCanvas` frame: from `transferToImageBitmap()` and from `createImageBitmap()` in the task that drew it, and from `transferToImageBitmap()` once `onSubmittedWorkDone()` has resolved |
+| A worker's frame handed over as a bitmap | What the page reads from a worker's `OffscreenCanvas` frame: from `transferToImageBitmap()` and from `createImageBitmap()` in the task that drew it, and from `transferToImageBitmap()` once `onSubmittedWorkDone()` has resolved, each on a canvas of its own |
 | A worker drawing a canvas of the page | Whether a worker draws a canvas the page handed it with `transferControlToOffscreen()` |
 | Recovery after the device is lost | Whether, after a device is destroyed, a new adapter and device draw the same canvas again without a reload, and in how long |
 
@@ -159,7 +159,9 @@ The checks, in the order they are listed:
 
 **What the page shows.**
 
-- **The checks run one at a time**, so no check's time includes another's work.
+- **The checks run one at a time**, so no check's time includes another's work. The canvas drawn on every frame starts after the last check.
+- **A step the browser throws on fails its own check only**, with the browser's message. The other checks still run.
+- **The worker answers stage by stage.** A stage that never answers is noted as out of time, and the stages that did answer still count.
 - **A check that could not run is shown as skipped**, with the earlier failure above it.
 - **What a check adds to its status is a note**, said in the page's language: how many canvases drew, the pixel read, why the device was lost, that the browser gave no adapter. An error's message is the browser's own words and is printed as it is.
 - **A page that is not on HTTPS has no WebGPU**, on any device. The check says so in place of *no WebGPU*, and the report carries whether the page was a secure context.

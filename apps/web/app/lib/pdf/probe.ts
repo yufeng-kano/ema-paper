@@ -39,7 +39,7 @@ export const PROBE_NOTES = [
   'bitmapCopy',
   'bitmapAfterWork',
   'timedOut',
-  'noFrame',
+  'workerFailed',
   'noGpu',
   'insecureContext',
   'noAdapter',

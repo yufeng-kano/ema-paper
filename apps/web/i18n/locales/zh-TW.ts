@@ -778,7 +778,7 @@ export default {
       bitmapCopy: '先複製再交回的圖讀到 {got}',
       bitmapAfterWork: '等 GPU 畫完才交回的圖讀到 {got}',
       timedOut: '逾時沒有回應',
-      noFrame: '沒有收到畫面',
+      workerFailed: '背景執行緒沒有啟動',
       noGpu: '這個瀏覽器沒有 navigator.gpu',
       insecureContext: '這一頁不是 HTTPS，瀏覽器不會提供 WebGPU',
       noAdapter: '瀏覽器沒有給顯示卡',
