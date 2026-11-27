@@ -7,7 +7,19 @@
  */
 
 /** The checks, in the order they run and are listed. */
-export const PROBE_CHECKS = ['gpu', 'adapter', 'device', 'float16', 'canvases', 'worker', 'deviceLoss'] as const
+export const PROBE_CHECKS = [
+  'gpu',
+  'adapter',
+  'device',
+  'float16',
+  'readback',
+  'canvases',
+  'snapshot',
+  'worker',
+  'workerBitmap',
+  'workerCanvas',
+  'deviceLoss',
+] as const
 
 export type ProbeCheckId = (typeof PROBE_CHECKS)[number]
 
@@ -20,15 +32,21 @@ export type ProbeStatus = 'pass' | 'fail' | 'skipped'
  */
 export const PROBE_NOTES = [
   'drawn',
-  'afterPresent',
-  'timedOut',
   'wrongColor',
-  'noFrame',
+  'readNow',
+  'readLater',
+  'bitmapTransfer',
+  'bitmapCopy',
+  'bitmapAfterWork',
+  'timedOut',
+  'workerFailed',
   'noGpu',
   'insecureContext',
   'noAdapter',
   'noContext',
+  'no2dContext',
   'noOffscreenCanvas',
+  'noTransfer',
   'lost',
   'lostUnreported',
 ] as const
@@ -37,8 +55,22 @@ export type ProbeNoteCode = (typeof PROBE_NOTES)[number]
 
 export interface ProbeNote {
   code: ProbeNoteCode
-  /** The note's numbers and names: `drawn` has `count` and `total`, `lost` the browser's `reason`. */
+  /**
+   * The note's numbers and names: `drawn` has `count` and `total`, `wrongColor` the pixel it
+   * `got` and the one it should `want`, a read the pixel it `got`, `lost` the browser's `reason`,
+   * `timedOut` the `way` of making a bitmap that gave none.
+   */
   params?: Record<string, string | number>
+}
+
+/**
+ * One pixel read back from what a check drew: the pixel as RGBA bytes, or why there is none —
+ * a note where the browser lacks something, the browser's own message where it refused a step.
+ */
+export interface ProbeRead {
+  pixel?: number[]
+  note?: ProbeNoteCode
+  error?: string
 }
 
 export interface ProbeCheck {
@@ -103,7 +135,23 @@ export function pickLimits(limits: object): Record<string, number> {
   return picked
 }
 
-/** The five clear colors the canvases check draws, as RGBA bytes: all different, none black. */
+/**
+ * The canvases the page shows, each drawn one way. What ends up on the screen no check can
+ * read, so each way has canvases of its own and a screenshot tells them apart:
+ *
+ * - `once`: five canvases drawn once from one device and never read through a 2D canvas;
+ * - `snapshot`: drawn once, then read through a 2D canvas (`drawImage`);
+ * - `live`: redrawn on every frame;
+ * - `worker`: handed to a worker, which draws it once;
+ * - `loss`: drawn by a device that is then destroyed, and again by the device that replaces it.
+ *
+ * Each of the last four is one canvas, in the color of `PROBE_COLORS` at its index here.
+ */
+export const PROBE_SURFACES = ['snapshot', 'live', 'worker', 'loss'] as const
+
+export type ProbeSurface = (typeof PROBE_SURFACES)[number]
+
+/** The five clear colors the checks draw, as RGBA bytes: all different, none black. */
 export const PROBE_COLORS: readonly (readonly [number, number, number, number])[] = [
   [255, 59, 48, 255],
   [52, 199, 89, 255],
@@ -123,6 +171,22 @@ export function pixelMatches(actual: ArrayLike<number>, expected: ArrayLike<numb
     }
   }
   return true
+}
+
+/** A pixel as the report prints it: its four bytes, `255 59 48 255`. */
+export function rgbaText(pixel: ArrayLike<number>): string {
+  return Array.from(pixel).join(' ')
+}
+
+/** What a read says of a drawing in `color`: passed, or failed with what was read in its place. */
+export function readVerdict(read: ProbeRead, color: ArrayLike<number>): Pick<ProbeCheck, 'status' | 'notes' | 'detail'> {
+  if (!read.pixel) {
+    return { status: 'fail', notes: read.note ? [{ code: read.note }] : undefined, detail: read.error }
+  }
+  if (pixelMatches(read.pixel, color)) {
+    return { status: 'pass' }
+  }
+  return { status: 'fail', notes: [{ code: 'wrongColor', params: { got: rgbaText(read.pixel), want: rgbaText(color) } }] }
 }
 
 /** A thrown value's message; the browser's own words go into the report as they are. */

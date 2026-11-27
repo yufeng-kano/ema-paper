@@ -238,7 +238,7 @@
 - Domain tests (`lib/admin.test.ts` and the like) check that the words their lists need exist in English; the parity check carries that to zh-TW.
 - No browser-automation UI verification: correctness is judged by reading code and types.
 - The PDF viewer (`app/lib/pdf/`, [pdf-viewer.md](./pdf-viewer.md) § Testing):
-  - what runs without a browser is unit tested like any other module — for the device check, `probe.test.ts`: the limits kept, the pixel comparison, the copied report's exact lines, and a label for every check and every note;
+  - what runs without a browser is unit tested like any other module — for the device check, `probe.test.ts`: the limits kept, the pixel comparison, what a read says of a drawing, the copied report's exact lines, and a label for every check, every note and every way a canvas is drawn;
   - what needs a GPU cannot run in vitest. It is checked by hand on real devices, Safari on a Mac and on an iPhone first, through the device check at `/pdf-probe`.
 
 ## Lint/format
