@@ -245,6 +245,12 @@
   - the catalog check above covers the `viewer.pdf` keys with no test of their own;
   - what the stage 1 viewer does in a browser is checked by hand on the owner's Mac and iPhone with [pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *The device test list*. The rule above, no browser automation, stands;
   - what needs a GPU cannot run in vitest. It is checked by hand on real devices, Safari on a Mac and on an iPhone first, through the device check at `/pdf-probe`.
+- The media viewer (`app/lib/media/`, [media-viewer.md](./media-viewer.md) § Testing):
+  - its pure modules, each with its test beside it: `image-zoom.test.ts` (fit to window from a pane and an image, never above 100%; the range on desktop and on a phone; a menu choice and a phone multiple; the ladder from a fit between rungs; a pinch clamped to the range; a double click and a double tap; a resize at fit and at a custom zoom; which choice is checked; the image box, its place on the stage and the scroll that keeps a point under the anchor), `player.test.ts` (the video box in a landscape and a portrait pane, with and without a gutter, and a seek kept inside the video), `tracks.test.ts` (an MP4 or QuickTime box tree built in the test: a video track found or not, a movie header at the end asking for the next read, a header too large, a WebM refused) and `failure.test.ts` (a failure classed by the one-byte read's status, its rejection, the browser being offline, the `MediaError` code and whether the metadata had come);
+  - the helpers it adds have their tests where their modules' are: `mediaKey` in `shortcuts.test.ts`, `formatDuration` in `format.test.ts`, `probeFileStatus` and `readFileBytes` with a stubbed `fetch` in `api.test.ts`, the Tab trap's selector naming `video[controls]` and `audio[controls]` in `focus.test.ts` (the suite has no DOM, so the selector is what it can test), and an SVG's kind in `library.test.ts`;
+  - no test loads an image or a video, or reaches the network;
+  - the catalog check above covers the `viewer.image`, `viewer.video`, `viewer.audio` and `viewer.media` keys;
+  - what the image view and the player do in a browser is checked by hand on the owner's Mac and iPhone with [media-viewer.md](./media-viewer.md) § The device test list. The rule above, no browser automation, stands.
 
 ## Lint/format
 

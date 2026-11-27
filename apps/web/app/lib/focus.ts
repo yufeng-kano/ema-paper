@@ -5,8 +5,11 @@
  * and its check that it is the topmost surface.
  */
 
-const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+/** What Tab can reach. A `<video controls>` and an `<audio controls>` are named: Tab reaches
+ *  their native controls though they carry no `tabindex` (and WebKit reports `tabIndex` -1 for
+ *  them), while a bare `<video>` or `<audio>` is no Tab stop. */
+export const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), video[controls], audio[controls], [tabindex]:not([tabindex="-1"])'
 
 /** The controls inside `container` that Tab can reach, in document order. A hidden one
  *  (no `offsetParent`) and one inside an inert region — a pane of the phone's reader that

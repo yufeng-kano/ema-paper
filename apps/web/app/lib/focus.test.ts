@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { wrapTab } from './focus'
+import { FOCUSABLE, wrapTab } from './focus'
 
 /** Structural stand-ins: the wrap reads `document.activeElement`, `contains` and `focus`. */
 function control(name: string) {
@@ -64,5 +64,19 @@ describe('wrapTab', () => {
 
     wrapTab(press(true), container, items)
     expect(last.focus).toHaveBeenCalledOnce()
+  })
+})
+
+describe('FOCUSABLE', () => {
+  const clauses = FOCUSABLE.split(',').map((clause) => clause.trim())
+
+  it('counts a video’s and an audio file’s native controls, which carry no tabindex', () => {
+    expect(clauses).toContain('video[controls]')
+    expect(clauses).toContain('audio[controls]')
+  })
+
+  it('never counts a video or an audio element without its controls', () => {
+    expect(clauses).not.toContain('video')
+    expect(clauses).not.toContain('audio')
   })
 })

@@ -478,7 +478,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - Every color is declared once, as `light-dark(<light>, <dark>)`, and nothing outside the token block names a color.
   - The light values are Apple's: white paper, `#1d1d1f` ink, `#6e6e73` secondary text, `#e5e5ea` separators, `#0071e3` blue.
   - The dark values are Apple's dark appearance, not an inversion: `#1c1c1e` paper, `#f5f5f7` ink, `#0a84ff` blue.
-  - A PDF page is the one surface that keeps its light value in both appearances: white paper on `--desk`, its content layer carrying `color-scheme: light`, so its colours are never inverted ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Colours*).
+  - A PDF page is one of the surfaces that keep their light value in both appearances: white paper on `--desk`, its content layer carrying `color-scheme: light`, so its colours are never inverted ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Colours*). The others are the image view's checkerboard (`--checker-base`, `--checker-square`) and the video's black box (`--media-matte`), each one value in both ([media-viewer.md](./media-viewer.md) § Colours).
   - Text tokens clear WCAG AA (4.5:1) on `--paper` in both.
   - One surface token belongs to the result viewer alone: `--block-selected`, the wash a block selection draws (§ Editing, *Keyboard block selection*), between `--rail` and `--rail-active` in both appearances. It is neutral rather than the accent because selecting blocks commits nothing, and an accent wash already means a place the viewer led the reader to (`--accent-wash`, `--find`); a selection drawn in the same hue would read as one more of those.
 - **Theme.** Light and dark are both first-class, and the reader chooses.
@@ -554,7 +554,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - `PageHeader`: the large title and what is beside it.
   - `Panel`: a scrolling body under an optional header, no border or shadow.
   - `Capsule`: a glass capsule of a toolbar's icon buttons — the screens' toolbars, the reader's header. A toggle that is on is in the accent tint; a button whose menu is open is filled.
-    - It holds one labelled button beside its icons where a toolbar needs a reading: the PDF viewer's zoom level, `--space-14` wide at least, in tabular figures.
+    - It holds one labelled button beside its icons where a toolbar needs a reading: the zoom level of the PDF viewer and of the image view, `--space-14` wide at least, in tabular figures.
   - `Segmented`: the system's segmented control. Inline: a `--fill` track with the chosen segment raised on `--segment`. Inline it is *Theme*, *Body margins*, *Open on*, the Agent section's tabs and the grant and code dialogs' kind. Or `glass`: the toolbar's 44px capsule — *Files · Trash*, the console's filters and ranges, the reader's pane switch.
   - `DataTable`: the only table markup, drawn as Finder's list.
     - Sentence-case 12px column headers in `--muted` over a hairline; `--row-height` rows with `--radius-md` ends and no stripes.
@@ -562,7 +562,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
     - `min-width` + nowrap so it scrolls in place, a sticky header, per-column alignment.
     - Its **detail row**: a `detail` slot the caller fills for the rows it says are open, drawn as one full-width row under its row on `--paper-sunken`, the row's `aria-expanded` set — the audit log's before and after.
   - `Modal`: `--radius-xl`, opaque. Its header is a 17px title, an optional `subtitle` — one muted `--text-xs` line under the title, wrapping anywhere (an address, a long label) — and a round close button. It can host a grid-bodied dialog as well as a form.
-    - `size="full"` fills the viewport, which only the result viewer asks for.
+    - `size="full"` fills the viewport, which only the result viewer and the file viewer ask for.
     - `back` draws the close as a round back button at the header's left.
     - `persistent` draws no close and ignores Escape and the scrim, so the footer's button is the only way out — for what a stray key must not lose, the console's codes shown once.
   - `Button`: capsules — accent / secondary on `--fill` / ghost / danger, `icon-only` round, four sizes, `lg` being the toolbar's 44px.
@@ -631,7 +631,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - A label naming a key the reader's keyboard does not have teaches the wrong habit, and two hand-written spellings drift apart in the first release that adds a third.
 - **Icons** are Lucide paths on a 24 grid at stroke 1.75, inlined in `Icon.vue` — never a package, never a remote sprite, never inline SVG at a call site — and named in `IconName` (`app/lib/icons.ts`).
   - Icon-only controls carry `label` (= aria-label + tooltip).
-  - The PDF viewer's glyphs: `minus` beside `plus` (zoom out and in), `external-link` (*Open in new tab*), and on its states `lock` (a password), `file-x` (a document that cannot be shown) and `file-exclamation-point` (a page that cannot be drawn).
+  - The PDF viewer's glyphs: `minus` beside `plus` (zoom out and in), `external-link` (*Open in new tab*), and on its states `lock` (a password), `file-x` (a document that cannot be shown) and `file-exclamation-point` (a page that cannot be drawn). The image view and the player take the same `minus`, `plus`, `external-link` and `file-x`; the audio layout's glyph is `music` ([media-viewer.md](./media-viewer.md)).
   - A destructive action either keeps its visible word or, when icon-only, is backed by a `ConfirmDialog` whose title and message carry it.
   - **One action, one glyph**: an action on the document has the same glyph on every surface it appears on — a block's menu, the selection toolbar, the slash menu, an outline row — and no two of those actions share one, so a reader who has learned one surface reads the others.
 - **Motion**: 120–240ms, on color, background, opacity and a few pixels of scale or slide — the context menu's scale-in, the find bar's and the outline panel's 4px slide, the drawer's slide, the reader's document re-centring when a card opens or closes — none under `prefers-reduced-motion`.
@@ -881,15 +881,14 @@ A file manager over everything the reader keeps — parse results, markdown docu
 ### Opening a file
 
 - **A PDF or an image opens in the result viewer; every other file in the file viewer.**
-  - A PDF or an image kept as it is opens in the result viewer on its *Original* view (§ Result viewer, *Original and Markdown*) — the one screen it has, converted or not. Its More menu holds the file's facts (*Kind*, *Size*, *Date added*, *Location*) over the two views, and *Markdown* there is what converts it (below).
-    - On the Original view the header's capsule always holds **Download**, and on a PDF More adds *Open in new tab* after the two views (§ Result viewer, *The header*).
-  - Every other file opens in the file viewer: the result viewer's shell with the document's panes left out.
-    - At the left, in the capsule: the way back and the name, with its kind and size.
-    - At the right: **Download** and the *More* button, whose menu opens on the file's facts over *Rename*, *Duplicate*, *Show in Files* and *Move to Trash*.
+  - A PDF or an image kept as it is opens in the result viewer on its *Original* view (§ Result viewer, *Original and Markdown*) — the one screen it has, converted or not. An SVG is an image. *Markdown* in its More menu is what converts it (below).
+    - On the Original view the header's capsule always holds **Download** and **More**, and on desktop the zoom controls before them (§ Result viewer, *The header*).
+  - Every other file opens in the file viewer, on the same shell: the round back button, the filename alone in the middle, and a capsule of **Download** and **More** at the right.
   - The file viewer shows what a browser shows safely on its own, from `…/file` ([api.md](./api.md)):
-    - a video or audio file with the browser's controls;
+    - a video or audio file in the browser's own player;
     - plain text in a monospace pane;
-    - for anything else, a sheet with the file's glyph, its name, kind and size, *There is no preview for this kind of file*, that the agent can still read it in any conversation, and **Download** with the size on it.
+    - for anything else, a sheet with the file's glyph, *There is no preview for this kind of file*, that the agent can still read it in any conversation, and **Download** with the size on it.
+  - Both viewers' header, panes, states and More menu are [media-viewer.md](./media-viewer.md)'s: § The shell, § The More menu, § The image view, § The player: video and audio, and § Text and files with no preview. More holds the file's facts, the two views on a PDF and an image, and *Rename*, *Duplicate*, *Show in Files* and *Move to Trash* on every file.
   - `?doc=<id>` names it in the URL as it names a document's viewer.
 - **A file's menu** is a document's without the document's items: **Open** (⌘↓), **Download**, **Rename** (↩, or F2) · **Convert to document…** (a PDF or an image only) · **Copy** (⌘C), **Duplicate** (⌘D) · **Move to Trash** (⌘⌫). Everything that acts on the selection — move, copy, paste, drag, the Trash, undo — treats a file as any row.
 - **Convert to document…** opens a dialog over the list: the file's name, kind and size; one paragraph — it becomes a document the reader can read, mark and talk to, it stays where it is under its name, the parse agent's model converts it and each page costs the plan's credits, as an upload converted on arrival does; *Cancel* and **Convert**.
@@ -913,7 +912,7 @@ A file manager over everything the reader keeps — parse results, markdown docu
   - Opening it — a double click, ⌘↓, the menu's *Open original*, a link to it — opens the result viewer on its **original**, the file it was made from (§ Result viewer, *Original and Markdown*):
     - A note under the header says the conversion did not finish and how many pages failed (*The conversion did not finish: 3 pages failed.* — *轉換沒有完成：3 頁失敗。*; *The conversion did not finish.* when no page is missing), that the original can still be read and downloaded, and that Markdown and the Agent come once a retry succeeds.
     - The note carries **Retry N pages…** (*Retry…* when no page is missing), which opens the retry dialog over the viewer.
-    - The header's capsule holds **Download original** (`…/original?download=1`) beside More; it takes the place of the Original view's own *Download*, after a PDF's zoom controls. More's menu has the row's facts as a file kept as it is has them (*Kind*, *Size*, *Date added*, *Location*) over the two views, *Markdown* disabled with *Once a retry succeeds* (*重試成功後才有*) beside it.
+    - The header's capsule holds **Download original** (`…/original?download=1`) beside More; it takes the place of the Original view's own *Download*, after the zoom controls of a PDF or an image. More's menu has the row's facts as a file kept as it is has them (*Kind*, an image's *Dimensions*, *Size*, *Date added*, *Location*) over the two views, *Markdown* disabled with *Once a retry succeeds* (*重試成功後才有*) beside it.
     - Find, Notes and Agent are not there: there is no document to read or talk about yet.
   - A failed parse whose original was not kept (`original: false` — a workspace at its quota when the parse ended, [workspace.md](./workspace.md) § Layout) has nothing to show, and opening it opens the **retry dialog** at once.
   - Its menu carries *Retry failed pages…* either way (*Retry…* when no page is missing, and the dialog's title is then *Retry*), which opens the dialog without the viewer.
@@ -1084,16 +1083,18 @@ The result viewer opens from a document on `/files` (`GET /api/library/documents
   - the filename, centred;
   - at the right, one glass capsule of icon toggles — **Find**, **Notes**, **Agent** — and a **More** button (`ellipsis`);
   - between Find and Notes, an **Outline** button (`list-tree`), standing while the outline's ticks have no room beside the text (*Outline, collapse and the way back*, below).
-  - On the Original view the capsule holds instead **Zoom out** (`minus`), the zoom level, **Zoom in** (`plus`), a rule, **Download** and More on a PDF, and **Download** and More on an image. On a phone the capsule is **Download** and More alone. What the zoom controls do is [pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Zoom*.
+  - On the Original view the capsule holds instead **Zoom out** (`minus`), the zoom level, **Zoom in** (`plus`), a rule, **Download** and More, on a PDF and on an image alike. On a phone the capsule is **Download** and More alone. What the zoom controls do is [pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Zoom*, on a PDF, and [media-viewer.md](./media-viewer.md) § The image view, *Zoom*, on an image.
 - Each of these is named by its label (the tooltip and the accessible name). A toggle that is on takes the accent tint (§ Design system).
 - **More is disabled until the result has loaded**, since everything in its menu is the result, and a menu that grew under the pointer when the facts arrived would no longer fit where it was placed. A PDF or an image not yet converted, or a failed parse, has its facts from its row, so its More is enabled at once.
-- **More opens `UiContextMenu` under the button**:
+- **More opens `UiContextMenu` under the button.** On a PDF and an image its groups and their order are [media-viewer.md](./media-viewer.md) § The More menu, the same menu the file viewer opens:
   - first the facts as label/value rows (the menu's `facts`, below the design system's note):
     - for a parse: model, pages, bbox format, and the figure check once the result's figures went through one — how many passed it, or how many of them are unverified;
-    - for a file while it is not converted or its parse failed: its *Kind*, *Size*, *Date Added* and *Location*;
+    - for a file while it is not converted or its parse failed: its *Kind*, on an image its *Dimensions* once they are known, then *Size*, *Date Added* and *Location*;
   - then **Original** and **Markdown** as a pair of `checked` choices (*Original and Markdown*, below);
-  - on a PDF's Original view, on a phone, then the zoom group ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Phone*);
-  - on a PDF's Original view, last, **Open in new tab** (`external-link`, `…/file` or `…/original`), the file in the browser's own viewer, which finds and prints in the whole file.
+  - on the Original view, on a phone, then the zoom group ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Phone*; [media-viewer.md](./media-viewer.md) § The image view, *Phone*);
+  - then **Rename**, **Duplicate**, **Show in Files** and, after a rule, **Move to Trash**, the Files page's own operations on the open row, on both views of a converted document; each first writes back an open block and waits for the saves ([media-viewer.md](./media-viewer.md) § The More menu);
+  - on the Original view, last, **Open in new tab** (`external-link`, `…/file` or `…/original`), the file in the browser's own viewer (on a PDF, one that finds and prints in the whole file). An SVG has none, nor an image whose view has failed.
+  - It is built when it opens and does not grow while it is open.
 - **There is no JSON view.** The result's JSON is the API's contract (`…/result`), not something a reader switches to.
 - A partial result still shows its progress note under the header (*A partial result is read page by page*, below): that is live state, not a fact.
 - On a phone the header is the filename over a switch between the document, the notes and the agent instead (*On a phone and a tablet*, below).
@@ -1250,7 +1251,7 @@ The result viewer opens from a document on `/files` (`GET /api/library/documents
   - It has no figure route: a `sightread://` placeholder pasted in reads as the dashed placeholder.
   - **Pages it never had are not added.** `app/lib/markdown.ts` reads text before the first `<!-- page: N -->` marker as an unmarked first page and writes it back unmarked, so a document with no markers saves with none: an edit never puts `<!-- page: 1 -->` at the top of a reader's own file. A marker the reader types is a page like any parsed one.
 - **Original and Markdown.** A PDF or an image has two views, chosen from the header's More menu.
-  - **Original** is the file itself — a PDF in the app's own viewer ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, which holds everything the view does); an image as a picture. It is read from `…/file` while the row is a file kept as it is, and from `…/original` once it is a parsed document ([api.md](./api.md)).
+  - **Original** is the file itself — a PDF in the app's own viewer ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, which holds everything the view does); an image in the image view ([media-viewer.md](./media-viewer.md) § The image view). It is read from `…/file` while the row is a file kept as it is, and from `…/original` once it is a parsed document ([api.md](./api.md)).
   - **Markdown** is the document.
   - Find, Notes and Agent are hidden while the original shows, and so is everything the Markdown view adds. The same menu's *Markdown* goes back to where the reader was in the document, and *Original* back to where the reader was in the PDF ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Layout and scrolling*).
   - **A PDF or an image not yet converted** opens on Original and has nothing else to show. Choosing *Markdown* there opens the *Convert to document* dialog over the viewer (§ Files), and the document opens on Markdown by itself when the parse succeeds.
@@ -2279,7 +2280,7 @@ A passage asked for this way is markdown — a block's source or the selection's
   - Otherwise what was asked joins what is there and everything waits for Send, where the reader can see it; a draft is never sent for the reader.
 - **An ask that sends waits for the save.** Before it posts, the viewer writes an open editor back and flushes the pending saves of the document and the notes, and it sends once both have answered.
   - The turn context then names the revision the reader sees, and the passage the agent is sent is in the file it reads. Otherwise a paragraph typed and run through the slash menu's `/translate` at once would anchor the translator on words not yet saved, and the reader's save, landing after the agent's write, would meet a 409.
-  - A save that fails or meets a 409 leaves the ask in the composer unsent, under the save's own banner.
+  - A save that had failed is sent once more first: the send is the reader asking for it. A save that fails or meets a 409 leaves the ask in the composer unsent, under the save's own banner.
   - A message the server refuses leaves it there too, under the composer's error.
   - Either way it waits there like any ask that does not go, with focus (*Where focus goes*).
   - An ask that does not send writes an open editor back first too, so a section's text is read from what the reader sees — an outline row's ask finds its heading again where the written-back draft leaves it.
@@ -2426,7 +2427,7 @@ Under 900px the document's column is the whole pane, whatever *Body margins* say
 - The filename stays in the header (§ Result viewer); a press on it opens the outline (below).
 - The control is a `tablist` named *Reading panes* (*閱讀區塊*): each segment a `tab` controlling its pane (`aria-controls`), ← and → moving between them, and the track's full 44px height its hit area.
 - Notes and Agent are drawn from the first paint wherever the document can become editable, disabled until it is, so the header does not change shape under the reader's thumb. A viewer whose document can never be edited draws the filename alone.
-- The control is not drawn on the Original view, which is the file alone. There the header is one line: the back button (*Close*), the filename centred, and at the right a capsule of **Download** and More ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Phone*).
+- The control is not drawn on the Original view, which is the file alone. There the header is one line: the back button (*Close*), the filename centred, and at the right a capsule of **Download** and More ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Phone*). The file viewer draws the same one-line header on a phone ([media-viewer.md](./media-viewer.md) § The shell).
 - Find, the *Outline* button and the Notes and Agent toggles leave the header: on the Markdown view **More's first item is *Find*** (*搜尋*), above the facts, and the outline is the filename's.
 - A save that failed says *Not saved* after the filename, in the danger colour, as it does beside the title on the desktop.
 

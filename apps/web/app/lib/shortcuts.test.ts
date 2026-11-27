@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { ariaShortcut, hasMod, isApplePlatform, matchesShortcut, shortcutLabel, ZOOM_SHORTCUTS, zoomKey } from './shortcuts'
+import {
+  ariaShortcut,
+  hasMod,
+  isApplePlatform,
+  matchesShortcut,
+  MEDIA_KEYSHORTCUTS,
+  mediaKey,
+  shortcutLabel,
+  ZOOM_SHORTCUTS,
+  zoomKey,
+  type MediaKeyEvent,
+} from './shortcuts'
 
 function key(key: string, mods: Partial<{ meta: boolean; ctrl: boolean; shift: boolean; alt: boolean }> = {}, code?: string) {
   return { key, code, metaKey: !!mods.meta, ctrlKey: !!mods.ctrl, shiftKey: !!mods.shift, altKey: !!mods.alt }
@@ -123,5 +134,75 @@ describe('the PDF viewer’s zoom keys', () => {
     expect(zoomKey(key('ß', { ctrl: true }, 'Minus'), false)).toBeNull()
     expect(zoomKey(key('´', { ctrl: true }, 'Equal'), false)).toBeNull()
     expect(zoomKey(key(')', { ctrl: true }, 'Minus'), false)).toBeNull()
+  })
+})
+
+describe('the player’s keys', () => {
+  function press(key: string, code?: string, more: Partial<MediaKeyEvent> = {}): MediaKeyEvent {
+    return { key, code, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, repeat: false, ...more }
+  }
+
+  it('plays, seeks, goes full screen and mutes', () => {
+    expect(mediaKey(press(' ', 'Space'))).toBe('toggle')
+    expect(mediaKey(press('ArrowLeft', 'ArrowLeft'))).toBe('back')
+    expect(mediaKey(press('ArrowRight', 'ArrowRight'))).toBe('forward')
+    expect(mediaKey(press('f', 'KeyF'))).toBe('fullscreen')
+    expect(mediaKey(press('F', 'KeyF'))).toBe('fullscreen')
+    expect(mediaKey(press('m', 'KeyM'))).toBe('mute')
+  })
+
+  it('reads F and M by the key they sit on, under any input source', () => {
+    expect(mediaKey(press('ㄑ', 'KeyF'))).toBe('fullscreen')
+    expect(mediaKey(press('ㄩ', 'KeyM'))).toBe('mute')
+  })
+
+  it('leaves every key with a modifier to the browser, Shift included', () => {
+    for (const modifier of ['metaKey', 'ctrlKey', 'altKey', 'shiftKey'] as const) {
+      expect(mediaKey(press(' ', 'Space', { [modifier]: true }))).toBeNull()
+      expect(mediaKey(press('ArrowRight', 'ArrowRight', { [modifier]: true }))).toBeNull()
+      expect(mediaKey(press('f', 'KeyF', { [modifier]: true }))).toBeNull()
+    }
+  })
+
+  it('takes a held Space, F or M without repeating it, and lets a held arrow repeat', () => {
+    expect(mediaKey(press(' ', 'Space', { repeat: true }))).toBe('held')
+    expect(mediaKey(press('f', 'KeyF', { repeat: true }))).toBe('held')
+    expect(mediaKey(press('m', 'KeyM', { repeat: true }))).toBe('held')
+    expect(mediaKey(press('ArrowRight', 'ArrowRight', { repeat: true }))).toBe('forward')
+    expect(mediaKey(press('ArrowLeft', 'ArrowLeft', { repeat: true }))).toBe('back')
+  })
+
+  it('leaves F to the page on an audio file, held or not', () => {
+    expect(mediaKey(press('f', 'KeyF'), 'audio')).toBeNull()
+    expect(mediaKey(press('ㄑ', 'KeyF'), 'audio')).toBeNull()
+    expect(mediaKey(press('f', 'KeyF', { repeat: true }), 'audio')).toBeNull()
+    expect(mediaKey(press('m', 'KeyM'), 'audio')).toBe('mute')
+    expect(mediaKey(press(' ', 'Space', { repeat: true }), 'audio')).toBe('held')
+  })
+
+  it('leaves a composing input method, Tab, Escape and other keys alone', () => {
+    expect(mediaKey(press(' ', 'Space', { isComposing: true }))).toBeNull()
+    expect(mediaKey(press('Process', 'KeyF'))).toBeNull()
+    expect(mediaKey(press('Tab', 'Tab'))).toBeNull()
+    expect(mediaKey(press('Escape', 'Escape'))).toBeNull()
+    expect(mediaKey(press('k', 'KeyK'))).toBeNull()
+    expect(mediaKey(press('ArrowUp', 'ArrowUp'))).toBeNull()
+  })
+
+  it('announces exactly the keys it reads, audio without F', () => {
+    const events: Record<string, MediaKeyEvent> = {
+      Space: press(' ', 'Space'),
+      ArrowLeft: press('ArrowLeft', 'ArrowLeft'),
+      ArrowRight: press('ArrowRight', 'ArrowRight'),
+      F: press('f', 'KeyF'),
+      M: press('m', 'KeyM'),
+    }
+    for (const [layout, names] of Object.entries(MEDIA_KEYSHORTCUTS) as [keyof typeof MEDIA_KEYSHORTCUTS, string][]) {
+      for (const name of Object.keys(events)) {
+        expect(mediaKey(events[name]!, layout) !== null).toBe(names.split(' ').includes(name))
+      }
+    }
+    expect(MEDIA_KEYSHORTCUTS.video.split(' ')).toEqual(Object.keys(events))
+    expect(MEDIA_KEYSHORTCUTS.audio.split(' ')).toEqual(Object.keys(events).filter((name) => name !== 'F'))
   })
 })

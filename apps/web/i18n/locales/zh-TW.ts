@@ -546,7 +546,10 @@ export default {
       size: '大小',
       added: '加入時間',
       location: '位置',
-      noPreview: '這種檔案沒有預覽。',
+      dimensions: '尺寸',
+      dimensionsValue: '{width} × {height}',
+      duration: '長度',
+      noPreview: '這種檔案沒有預覽',
       agentReads: '在任何對話中，Agent 仍然可以讀取它。',
       textCut: '只顯示檔案開頭的 {size}。',
     },
@@ -603,6 +606,29 @@ export default {
         page: '第 {page} 頁',
         external: '{host}（另開分頁）',
       },
+    },
+    image: {
+      fit: '符合視窗',
+      zoomLevelFit: '縮放比例 {percent}，符合視窗',
+      error: {
+        title: '無法顯示這張圖片',
+        unsupported: '這個瀏覽器不支援這種圖片格式，或是檔案已經損壞。你可以下載原檔，用其他程式打開看看。',
+      },
+    },
+    video: {
+      error: {
+        title: '無法播放這部影片',
+        unsupported: '這個瀏覽器不支援這部影片的格式。你可以下載原檔，用其他播放程式打開。',
+      },
+    },
+    audio: {
+      error: {
+        title: '無法播放這個聲音檔',
+        unsupported: '這個瀏覽器不支援這個聲音檔的格式。你可以下載原檔，用其他播放程式打開。',
+      },
+    },
+    media: {
+      opened: '已開啟',
     },
     findPlaceholder: '在文件中尋找…',
     findCount: '第 {index} / {total} 筆',

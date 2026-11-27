@@ -131,9 +131,36 @@ describe('autosave', () => {
     expect(error.value).toBe('failed: offline')
     expect(onFailure).toHaveBeenCalledOnce()
     expect(onConflict).not.toHaveBeenCalled()
-    expect(await saves.settle()).toBe(false)
     void saves.save()
     expect(error.value).toBeNull()
+  })
+
+  it('gives a failed save one more try when settled, and settles false if it fails again', async () => {
+    const { saves, state, file, puts } = harness()
+    file.text = 'two'
+    void saves.save()
+    puts[0]!.reject(new Error('offline'))
+    await settled()
+    expect(state.value).toBe('failed')
+    const settling = saves.settle()
+    expect(puts.map((put) => put.text)).toEqual(['two', 'two'])
+    puts[1]!.reject(new Error('offline'))
+    expect(await settling).toBe(false)
+    expect(state.value).toBe('failed')
+    expect(puts).toHaveLength(2)
+  })
+
+  it('settles true once the retried save lands, so the reader can choose the action again', async () => {
+    const { saves, state, revision, file, puts } = harness()
+    file.text = 'two'
+    void saves.save()
+    puts[0]!.reject(new Error('offline'))
+    await settled()
+    const settling = saves.settle()
+    puts[1]!.resolve('r1')
+    expect(await settling).toBe(true)
+    expect(state.value).toBe('saved')
+    expect(revision.value).toBe('r1')
   })
 
   it('makes a reload deferred behind the save once it settles', async () => {

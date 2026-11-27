@@ -376,7 +376,7 @@ export function documentGlyph(document: { kind: string; name: string; media_type
 }
 
 /** What a row's original is, as the result viewer's Original view shows it: a PDF in the
- *  browser's own viewer, an image as a picture (docs/web.md § Result viewer, *Original and
+ *  app's PDF viewer, an image in the image view (docs/web.md § Result viewer, *Original and
  *  Markdown*) — a parsed document by what it was converted from, a file kept as it is by its
  *  type; null for a markdown document and for any other file, which the file viewer shows. */
 export function originalKind(document: { kind: string; media_type?: string | null }): 'pdf' | 'image' | null {
@@ -419,17 +419,15 @@ export function initialView(
   return document.view ?? defaultView
 }
 
-/** What a browser renders of a file safely on its own, as the file route serves it inline
- *  (docs/api.md § `GET /api/library/documents/{id}/file`); an SVG is served as a download, so
- *  it has none. The file viewer shows 'video', 'audio' and 'text'; 'pdf' and 'image' send the
- *  file to the result viewer's Original view (`originalKind`). */
+/** What a browser renders of a file safely on its own (docs/media-viewer.md § Which viewer
+ *  shows what). An SVG is an image: the file route serves it as a download under a sandbox,
+ *  and an `<img>` still draws it, running no script. The file viewer shows 'video', 'audio'
+ *  and 'text'; 'pdf' and 'image' send the file to the result viewer's Original view
+ *  (`originalKind`). */
 type FilePreview = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'none'
 
 export function filePreview(mediaType: string | null | undefined): FilePreview {
   const type = (mediaType ?? '').toLowerCase()
-  if (type === 'image/svg+xml') {
-    return 'none'
-  }
   for (const media of ['image', 'video', 'audio'] as const) {
     if (type.startsWith(`${media}/`)) {
       return media

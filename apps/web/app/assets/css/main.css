@@ -123,6 +123,14 @@
   --tint-indigo: light-dark(#5856d6, #5e5ce6);
   --tint-teal: light-dark(#30b0c7, #40cbe0);
 
+  /* --- Color: media ---------------------------------------------------------
+     A file's own surroundings, one value in both themes, since they belong to the file and
+     not to the interface (docs/media-viewer.md § Colours): the light checkerboard behind a
+     transparent image's pixels, and the black box a video plays in. */
+  --checker-base: light-dark(#ffffff, #ffffff);
+  --checker-square: light-dark(#e5e5ea, #e5e5ea);
+  --media-matte: light-dark(#000000, #000000);
+
   /* --- Color: interaction -------------------------------------------------- */
   /* The chosen segment of a segmented control, raised off its track: white in light, a
      lighter gray in dark, as the system draws it. */
@@ -177,6 +185,11 @@
   --space-11: 44px;
   --space-12: 48px;
   --space-14: 56px;
+
+  /* The media viewer's two sizes: a checkerboard square behind a transparent image, and the
+     audio player's width (docs/media-viewer.md § Colours). */
+  --checker-size: 16px;
+  --audio-width: 360px;
 
   /* --- Radius -------------------------------------------------------------
      Continuous rounded corners, concentric where one shape holds another: the smaller the
@@ -348,6 +361,27 @@ a {
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* A viewer's pane — the PDF's, an image's, the player's, a text file's — takes focus to
+   scroll and zoom, and its ring is the keyboard's: `useKeyboardFocus` sets `.keyboard-focus`
+   while Tab moves focus, rather than `:focus-visible`, which a key pressed after a click turns
+   on (docs/web.md § Files). The ring is the pane's `.keyboard-frame`'s, the positioned box around
+   it that does not scroll: an outline on the scrolling pane itself is painted under the image,
+   the pages or the video it positions, so the frame draws it over them, inside its edge
+   (docs/media-viewer.md § Accessibility). Above the content, under the loading bar. */
+.keyboard-pane:focus {
+  outline: none;
+}
+
+.keyboard-frame:has(> .keyboard-pane.keyboard-focus:focus)::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  pointer-events: none;
 }
 
 /* Scrollbars: thin and quiet, as the system's overlay bars are. */

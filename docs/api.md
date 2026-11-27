@@ -874,11 +874,14 @@ A `.md` or `.markdown` file, or one sent as `text/markdown`, other than an `AGEN
 - The one copy, read from the tree, with its `media_type`, its length and a `Content-Disposition`.
 - `inline` for what a browser shows safely on its own: an image, a video or audio file, a PDF, plain text.
 - `attachment` for everything else, HTML, SVG and XML included, since a page served from this origin would run with the session. `?download=1` forces `attachment`.
+  - An `<img>` still draws an SVG served so, and runs no script in it: the image view shows it that way ([media-viewer.md](./media-viewer.md) § Which viewer shows what). Opened in a tab, it downloads.
 - Always under a policy of its own, which the Caddyfile leaves to this route ([deployment.md](./deployment.md) § Security headers):
   - `Content-Security-Policy: sandbox` with `X-Frame-Options: DENY`;
   - except a PDF served inline, which a browser's viewer will not open in a sandbox, for the result viewer's *Open in new tab*: that answer carries `frame-ancestors 'self'` and `SAMEORIGIN`, so no other origin may frame it;
   - plus `X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`.
 - One `Range` answers 206 (**416** past the end; several ranges are answered whole), for the video and audio a browser seeks in and for the PDF viewer, which reads a large PDF a range at a time ([pdf-viewer.md](./pdf-viewer.md)).
+  - The image view and the player read `bytes=0-0` after the browser fails to show a file, and class the failure by the status (401, 404, 5xx, or anything else); an empty file answers 416 and reads as one the browser cannot show ([media-viewer.md](./media-viewer.md) § The image view, *Failure*).
+  - The player reads an MP4's or a QuickTime file's movie header a range at a time when the browser reports a video with no picture, to tell sound alone from a picture it cannot decode: at most four reads, none past 16 MiB ([media-viewer.md](./media-viewer.md) § The player: video and audio, *A video with no picture*). Nothing changes here: these are ordinary single ranges.
 - 404 for a parse or a markdown document, which have no file of this kind: a parse's original is `…/original` whole and `…/pages/{n}/image` one page at a time, and their text `…/content`.
 
 **`GET /api/library/documents/{id}/original`**

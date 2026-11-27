@@ -50,6 +50,7 @@ import {
   documentFileUrl,
   documentImagesBase,
   documentOriginalUrl,
+  downloadFile,
   putDocumentView,
   type CreditsRefusal,
   type DocumentView,
@@ -1105,7 +1106,10 @@ async function recordView(document: LibraryDocument, view: DocumentView) {
 /** The open row's original for the viewer's Original view: a file kept as it is from
  *  `…/file`, a parsed document from `…/original` where it was kept; null otherwise. Shown
  *  inline and saved as an attachment, with the upload's size for a PDF that cannot be shown
- *  to offer *Download (size)* (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Errors*). */
+ *  to offer *Download (size)* (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Errors*).
+ *  An SVG has no *Open in new tab*: the file route serves it as an attachment, so a tab would
+ *  download it (docs/media-viewer.md § The More menu). A parse's `media_type` is never an
+ *  SVG's, since the parse agent does not take one. */
 const openOriginal = computed(() => {
   const open = openDocument.value
   const kind = open ? originalKind(open) : null
@@ -1118,6 +1122,7 @@ const openOriginal = computed(() => {
     download: file ? documentFileUrl(open.id, true) : documentOriginalUrl(open.id, true),
     downloadSize: open.size_bytes === null ? null : formatBytes(open.size_bytes, locale.value),
     kind,
+    newTab: kind === 'pdf' || open.media_type !== 'image/svg+xml',
   }
 })
 
@@ -1172,56 +1177,64 @@ const openLocation = computed(() => {
   return [t('files.root'), ...folderPath(folders.value, open.folder_id).map((folder) => folder.name)].join(' › ')
 })
 
-/** The file's bytes, saved: the browser takes `?download=1` to the disk (docs/api.md). */
-function downloadEntry(url: string) {
-  const anchor = window.document.createElement('a')
-  anchor.href = url
-  anchor.download = ''
-  anchor.click()
-}
-
 /** The open file as an entry of the list, for the viewer's menu to act on. */
 function viewerEntry(): Entry | null {
   const open = openDocument.value
   return open ? { kind: 'file', id: open.id, key: `file-${open.id}`, name: open.name } : null
 }
 
-/** Show in Files: the viewer closes on the file's row, selected and in view. */
-async function showOpenInFiles() {
+/*
+ * More's file operations on the open file (docs/media-viewer.md § The More menu). The result
+ * viewer hands each over the moment it is chosen, with `ready`: its saves settling, true once
+ * what the reader wrote has landed. The operation acts on the file open when it was chosen,
+ * once `ready` allows it, even if the viewer was closed meanwhile; a save that failed stops it.
+ * The file viewer has nothing to save, and hands over none.
+ */
+
+/** Show in Files: the viewer closes on the file's row, selected and in view. False when it did
+ *  not run. */
+async function showOpenInFiles(ready?: Promise<boolean>): Promise<boolean> {
   const open = openDocument.value
-  if (!open) {
-    return
+  if (!open || (ready && !(await ready))) {
+    return false
   }
-  openDocument.value = null
+  if (openDocument.value?.id === open.id) {
+    openDocument.value = null
+  }
   showView('files')
   openFolder(open.folder_id)
   await nextTick()
   selectOnly(`file-${open.id}`)
   scrollToRow(`file-${open.id}`)
+  return true
 }
 
-async function renameOpen() {
+async function renameOpen(ready?: Promise<boolean>) {
   const entry = viewerEntry()
-  if (!entry) {
-    return
+  if (entry && (await showOpenInFiles(ready))) {
+    startRename(entry.key)
   }
-  await showOpenInFiles()
-  startRename(entry.key)
 }
 
-function duplicateOpen() {
+async function duplicateOpen(ready?: Promise<boolean>) {
   const entry = viewerEntry()
   const into = openDocument.value?.folder_id ?? null
-  if (entry) {
+  if (entry && (!ready || (await ready))) {
     void copyInto([entry], into)
   }
 }
 
-function trashOpen() {
+async function trashOpen(ready?: Promise<boolean>) {
   const entry = viewerEntry()
-  if (entry) {
-    void trashItems([entry])
+  if (!entry || (ready && !(await ready))) {
+    return
   }
+  // Closed before the trash is sent, so nothing can be typed into a document on its way to the
+  // Trash, and its viewer's close has nothing left to save.
+  if (openDocument.value?.id === entry.id) {
+    openDocument.value = null
+  }
+  void trashItems([entry])
 }
 
 // --- file operations -------------------------------------------------------
@@ -2314,9 +2327,9 @@ function runMenu(action: string) {
     case 'rename':
       return items[0] && startRename(items[0].key)
     case 'download':
-      return items[0] && downloadEntry(documentFileUrl(items[0].id, true))
+      return items[0] && downloadFile(documentFileUrl(items[0].id, true))
     case 'downloadOriginal':
-      return items[0] && downloadEntry(documentOriginalUrl(items[0].id, true))
+      return items[0] && downloadFile(documentOriginalUrl(items[0].id, true))
     case 'convert': {
       const document = selectedDocument.value
       if (document) {
@@ -3190,7 +3203,7 @@ useBuildHold(
       v-if="openDocument && openDocument.kind === 'file' && !originalKind(openDocument)"
       :key="openDocument.id"
       :document="openDocument"
-      :location="openLocation"
+      :facts="openFileFacts"
       @close="openDocument = null"
       @rename="renameOpen"
       @duplicate="duplicateOpen"
@@ -3219,6 +3232,10 @@ useBuildHold(
       @convert="convertOpen"
       @retry="retrying = openDocument"
       @filed="refresh()"
+      @rename="renameOpen"
+      @duplicate="duplicateOpen"
+      @show="showOpenInFiles"
+      @trash="trashOpen"
       @close="openDocument = null"
     />
   </div>

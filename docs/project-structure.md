@@ -138,6 +138,10 @@ ema-paper/
           zoom.ts, layout.ts, budget.ts, page-input.ts, errors.ts, links.ts, support.ts  # pure, with vitest tests beside them
           pdfjs.ts, page-view.ts, text-selection.ts, gestures.ts  # browser side: pdf.js, a page's layers, selection, pinch
         components/pdf/           # Viewer.vue (PdfViewer) mounts the viewer, PageIndicator.vue the page pill
+        lib/media/                # the image view's and the player's pure rules (docs/media-viewer.md)
+          image-zoom.ts, player.ts, tracks.ts, failure.ts  # zoom and geometry, the video box and seeks, an MP4's video track, a failure's cause; vitest tests beside them
+        components/media/         # ImageViewer.vue (MediaImageViewer) the image view, Player.vue (MediaPlayer) video and audio
+        components/viewer/        # what every original's viewer shares: StateSheet.vue, Loading.vue
         middleware/               # route guards: authed.ts, admin.ts
         plugins/                  # client start-up: the session, the theme, the build update
         types/                    # page-meta.d.ts: the `adminArea` page meta
@@ -189,6 +193,7 @@ ema-paper/
 - `parsing/poppler.py` is the only module that spawns Poppler; everything else consumes its typed results.
 - The API and the worker import no PDF library, because PyMuPDF is AGPL and their only PDF engine is Poppler as a separate program ([parsing.md](./parsing.md)).
 - The web app's PDF viewer is `apps/web/app/lib/pdf/` and nothing outside it draws a PDF ([pdf-viewer.md](./pdf-viewer.md)). `components/pdf/` only mounts it.
+- The image view and the player are `components/media/` over the pure `lib/media/` ([media-viewer.md](./media-viewer.md)). `lib/media/` may import what is not about PDFs from `lib/pdf/` (the gestures, the zoom ladder, the spacing, the failure kinds); nothing in `lib/pdf/` imports `lib/media/`. `components/viewer/` holds the state sheet and the loading bar both share, and imports neither.
 - The tests' fixture PDFs are built with `reportlab`, a dev dependency (BSD) the application never imports ([testing.md](./testing.md) § The suite).
 - `upstream/` is the only package that calls the model upstream, Kano Proxy on the operator's key: `client.py` for vision calls and the catalog, `anthropic.py` for every Messages API call.
 - `kano_connection` in `upstream/client.py` is the only code that reads the value of `KANO_PROXY_API_KEY`; its callers hold the `Connection` it returns and hand it back to `upstream/`.
