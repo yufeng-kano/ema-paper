@@ -369,9 +369,10 @@ describe('documentGlyph and filePreview', () => {
     expect(documentGlyph(document(1, 'a.mov', null, { kind: 'file', media_type: 'video/quicktime' }))).toBe('film')
   })
 
-  it('previews only what a browser shows safely, and never an SVG', () => {
+  it('previews only what a browser shows safely, an SVG as an image', () => {
     expect(filePreview('image/png')).toBe('image')
-    expect(filePreview('image/svg+xml')).toBe('none')
+    expect(filePreview('image/svg+xml')).toBe('image')
+    expect(filePreview('image/heic')).toBe('image')
     expect(filePreview('video/mp4')).toBe('video')
     expect(filePreview('audio/mpeg')).toBe('audio')
     expect(filePreview('application/pdf')).toBe('pdf')
@@ -387,8 +388,8 @@ describe('originalKind and initialView', () => {
     expect(originalKind(document(1, 'a.png', null, { kind: 'image' }))).toBe('image')
     expect(originalKind(document(1, 'a.pdf', null, { kind: 'file', media_type: 'application/pdf' }))).toBe('pdf')
     expect(originalKind(document(1, 'a.jpg', null, { kind: 'file', media_type: 'image/jpeg' }))).toBe('image')
-    // An SVG is served as a download, so there is nothing to show of it.
-    expect(originalKind(document(1, 'a.svg', null, { kind: 'file', media_type: 'image/svg+xml' }))).toBeNull()
+    // An SVG is served as a download, and an `<img>` still draws it.
+    expect(originalKind(document(1, 'a.svg', null, { kind: 'file', media_type: 'image/svg+xml' }))).toBe('image')
     expect(originalKind(document(1, 'a.mov', null, { kind: 'file', media_type: 'video/quicktime' }))).toBeNull()
     expect(originalKind(document(1, 'a.md', null, { kind: 'markdown' }))).toBeNull()
   })

@@ -1,19 +1,17 @@
 <script setup lang="ts">
 /**
- * The file viewer (docs/web.md § Files): the result viewer's shell with the document's
- * panes left out, for every file that is neither a PDF nor an image — those open in the
- * result viewer on their original. The way back and the name, with its kind and size, at
- * the left; at the right Download and More, whose menu opens on the file's facts over
- * Rename, Duplicate, Show in Files and Move to Trash. The body is what a browser shows
- * safely on its own, from `…/file` (docs/api.md): a video or audio file with the browser's
- * controls, plain text in a monospace pane; for anything else a sheet with the file's
- * glyph, name, kind and size, that there is no preview, that the agent can still read it,
- * and Download.
+ * The file viewer (docs/media-viewer.md § The shell): the result viewer's shell for every file
+ * that is neither a PDF nor an image — those open in the result viewer on their original. The
+ * way back at the left, the filename alone in the middle, and at the right one capsule of
+ * Download and More, whose menu opens on the file's facts over Rename, Duplicate, Show in Files
+ * and Move to Trash. The pane is what a browser shows safely on its own, from `…/file`
+ * (docs/api.md): a video or an audio file in the player (`MediaPlayer`), plain text in a
+ * monospace pane, and for anything else the state sheet with Download.
  */
-import type { ComponentPublicInstance } from 'vue'
-import { documentFileUrl, readDocumentFileHead, type LibraryDocument } from '~/lib/api'
-import { formatBytes, formatShortDateTime } from '~/lib/format'
+import { documentFileUrl, downloadFile, readDocumentFileHead, type LibraryDocument } from '~/lib/api'
+import { formatBytes, formatDuration } from '~/lib/format'
 import { documentGlyph, filePreview } from '~/lib/library'
+import type { MediaPlayerState } from '~/lib/media/player'
 import type { MenuFact, MenuItem, Point } from '~/lib/menu'
 
 /** How much of a text file the pane reads: the head of a log is what a reader opens it for. */
@@ -21,8 +19,8 @@ const TEXT_PREVIEW_MAX = 262_144
 
 const props = defineProps<{
   document: LibraryDocument
-  /** Where the file is, Home first, as the facts say it. */
-  location: string
+  /** The file's facts as Files words them: Kind, Size, Date added, Location. */
+  facts: MenuFact[]
 }>()
 
 const emit = defineEmits<{
@@ -35,20 +33,25 @@ const emit = defineEmits<{
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
-const kindLabel = useKindLabel()
+/** The compact header on a phone, following a resize and a change of pointer. */
+const layout = useWindowLayout()
+const phone = computed(() => layout.value === 'phone')
+/** The text pane's ring follows the keyboard, not `:focus-visible` (docs/web.md § Rules). */
+const keyboardFocus = useKeyboardFocus()
 
-const kind = computed(() => kindLabel(props.document))
 const size = computed(() =>
   props.document.size_bytes === null ? null : formatBytes(props.document.size_bytes, locale.value),
 )
-const facts = computed(() => (size.value ? `${kind.value} · ${size.value}` : kind.value))
 const preview = computed(() => filePreview(props.document.media_type))
 const url = computed(() => documentFileUrl(props.document.id))
 const downloadUrl = computed(() => documentFileUrl(props.document.id, true))
-const glyph = computed(() => documentGlyph(props.document))
+
+/** What the player last reported: More's Dimensions and Duration once the browser knows them. */
+const playerState = shallowRef<MediaPlayerState | null>(null)
 
 // --- plain text, read once ------------------------------------------------------------
 
+const textPane = ref<HTMLElement | null>(null)
 const text = ref<string | null>(null)
 const textCut = ref(false)
 const textError = ref<string | null>(null)
@@ -65,21 +68,45 @@ async function readText() {
 
 onMounted(() => {
   if (preview.value === 'text') {
+    // The pane takes focus on open, so the keys scroll it; the player focuses its own pane.
+    textPane.value?.focus({ preventScroll: true })
     void readText()
   }
 })
 
 // --- More -----------------------------------------------------------------------------
 
-const moreButton = ref<ComponentPublicInstance | null>(null)
 const moreMenu = ref<Point | null>(null)
+const moreFromKey = ref(false)
+/** The facts as they stood when the menu opened: it does not grow while it is open. */
+const moreFacts = shallowRef<MenuFact[]>([])
+/** When the menu last closed, and the press that closed it. A press on More while the menu is
+ *  open closes it (a press outside the menu) and is followed by that button's click, which must
+ *  not open it again; a close by any other cause leaves More free at once. */
+let moreClosedAt = 0
+let moreClosedBy: EventTarget | null = null
 
-const moreFacts = computed<MenuFact[]>(() => [
-  { label: t('viewer.file.kind'), value: kind.value },
-  ...(size.value ? [{ label: t('viewer.file.size'), value: size.value }] : []),
-  { label: t('viewer.file.added'), value: formatShortDateTime(props.document.created_at, locale.value) },
-  { label: t('viewer.file.location'), value: props.location },
-])
+/** Files' facts with what the player has learnt since: Dimensions after Kind, then Duration,
+ *  both before Size. */
+const currentFacts = computed<MenuFact[]>(() => {
+  const facts = [...props.facts]
+  const state = playerState.value
+  let at = 1
+  if (state?.dimensions) {
+    // Strings, so the numbers are never grouped (docs/media-viewer.md § The More menu).
+    const value = t('viewer.file.dimensionsValue', {
+      width: String(state.dimensions.width),
+      height: String(state.dimensions.height),
+    })
+    facts.splice(at, 0, { label: t('viewer.file.dimensions'), value })
+    at += 1
+  }
+  const duration = state && state.duration !== null ? formatDuration(state.duration) : null
+  if (duration) {
+    facts.splice(at, 0, { label: t('viewer.file.duration'), value: duration })
+  }
+  return facts
+})
 
 const moreItems = computed<MenuItem[]>(() => [
   { key: 'rename', label: t('files.rename'), icon: 'edit', separated: true },
@@ -88,15 +115,26 @@ const moreItems = computed<MenuItem[]>(() => [
   { key: 'trash', label: t('files.moveToTrash'), icon: 'trash', danger: true, separated: true },
 ])
 
-/** The menu under the button's right edge; flipped by the menu itself where it does not fit. */
-function toggleMore() {
-  if (moreMenu.value) {
+/** Anchored under the button's right edge: More sits at the dialog's right, so the menu
+ *  opens leftwards under it (`placeMenu` flips it). */
+function toggleMore(event: MouseEvent) {
+  const button = event.currentTarget as HTMLElement
+  const closedByThis = moreClosedBy instanceof Node && button.contains(moreClosedBy)
+  if (moreMenu.value || (closedByThis && performance.now() - moreClosedAt < 200)) {
     moreMenu.value = null
     return
   }
-  const element = moreButton.value?.$el as HTMLElement | undefined
-  const rect = element?.getBoundingClientRect()
-  moreMenu.value = rect ? { x: rect.right, y: rect.bottom + 4 } : { x: 0, y: 0 }
+  const box = button.getBoundingClientRect()
+  // A click the keyboard made carries no pointer detail.
+  moreFromKey.value = event.detail === 0
+  moreFacts.value = currentFacts.value
+  moreMenu.value = { x: box.right, y: box.bottom + 4 }
+}
+
+function closeMore(cause?: Event) {
+  moreMenu.value = null
+  moreClosedAt = performance.now()
+  moreClosedBy = cause?.target ?? null
 }
 
 function onMoreSelect(key: string) {
@@ -115,21 +153,19 @@ function onMoreSelect(key: string) {
 </script>
 
 <template>
-  <UiModal :title="document.name" size="full" tall flush back @close="emit('close')">
+  <UiModal :title="document.name" size="full" tall flush back :compact="phone" @close="emit('close')">
     <template #title>
-      <div class="doc-head">
-        <h2 class="doc-title" :title="document.name">{{ document.name }}</h2>
-        <span class="doc-facts">{{ facts }}</span>
-      </div>
+      <h2 class="doc-title" :class="{ 'phone-title': phone }" :title="document.name">{{ document.name }}</h2>
     </template>
 
     <template #actions>
       <UiCapsule :label="t('viewer.file.tools')">
-        <UiButton variant="ghost" icon-only :label="t('viewer.file.download')" :href="downloadUrl">
+        <!-- A button, never a link: the dialog focuses its first field that is not a button on
+             open, and Enter on a link there would start a download. -->
+        <UiButton variant="ghost" icon-only :label="t('viewer.file.download')" @click="downloadFile(downloadUrl)">
           <template #icon><UiIcon name="download" /></template>
         </UiButton>
         <UiButton
-          ref="moreButton"
           variant="ghost"
           icon-only
           :label="t('viewer.more')"
@@ -147,53 +183,59 @@ function onMoreSelect(key: string) {
         :label="t('viewer.more')"
         :header="t('viewer.file.details')"
         :facts="moreFacts"
+        :focus-first="moreFromKey"
         @select="onMoreSelect"
-        @close="moreMenu = null"
+        @close="closeMore"
       />
     </template>
 
-    <div class="file" :class="preview">
-      <video v-if="preview === 'video'" class="media" :src="url" controls preload="metadata" />
-      <div v-else-if="preview === 'audio'" class="sheet">
-        <UiIcon :name="glyph" class="sheet-glyph" />
-        <p class="sheet-name">{{ document.name }}</p>
-        <p class="sheet-facts">{{ facts }}</p>
-        <audio class="audio" :src="url" controls preload="metadata" />
-      </div>
-      <template v-else-if="preview === 'text'">
-        <UiBanner v-if="textError" tone="error">{{ textError }}</UiBanner>
-        <UiSkeleton v-else-if="text === null" class="text-wait" :rows="8" />
-        <div v-else class="text-pane">
-          <pre class="text mono">{{ text }}</pre>
-          <p v-if="textCut" class="text-cut">
-            {{ t('viewer.file.textCut', { size: formatBytes(TEXT_PREVIEW_MAX, locale, { limit: true }) }) }}
-          </p>
+    <MediaPlayer
+      v-if="preview === 'video' || preview === 'audio'"
+      :url="url"
+      :name="document.name"
+      :kind="preview"
+      :download="downloadUrl"
+      :download-size="size"
+      :phone="phone"
+      @state="playerState = $event"
+      @close="emit('close')"
+    />
+    <!-- The head of a text file, in a column centred on the desk; its skeleton is the wait, so
+         there is no loading bar. -->
+    <div v-else-if="preview === 'text'" class="text-frame keyboard-frame">
+      <main
+        ref="textPane"
+        class="pane text-pane keyboard-pane"
+        :class="{ 'keyboard-focus': keyboardFocus }"
+        tabindex="0"
+        :aria-label="document.name"
+      >
+        <div class="text-column">
+          <UiBanner v-if="textError" tone="error">{{ textError }}</UiBanner>
+          <UiSkeleton v-else-if="text === null" :rows="8" />
+          <template v-else>
+            <pre class="text mono">{{ text }}</pre>
+            <p v-if="textCut" class="text-cut">
+              {{ t('viewer.file.textCut', { size: formatBytes(TEXT_PREVIEW_MAX, locale, { limit: true }) }) }}
+            </p>
+          </template>
         </div>
-      </template>
-      <div v-else class="sheet">
-        <UiIcon :name="glyph" class="sheet-glyph" />
-        <p class="sheet-name">{{ document.name }}</p>
-        <p class="sheet-facts">{{ facts }}</p>
-        <p class="sheet-note">{{ t('viewer.file.noPreview') }}</p>
-        <p class="sheet-note">{{ t('viewer.file.agentReads') }}</p>
-        <UiButton variant="primary" :href="downloadUrl">
+      </main>
+    </div>
+    <!-- Nothing to scroll or play, so not a Tab stop. -->
+    <main v-else class="pane centred" :aria-label="document.name">
+      <ViewerStateSheet :glyph="documentGlyph(document)" :title="t('viewer.file.noPreview')" :body="t('viewer.file.agentReads')">
+        <UiButton variant="primary" @click="downloadFile(downloadUrl)">
           {{ size ? t('viewer.file.downloadSize', { size }) : t('viewer.file.download') }}
         </UiButton>
-      </div>
-    </div>
+      </ViewerStateSheet>
+    </main>
   </UiModal>
 </template>
 
 <style scoped>
-/* The header as the result viewer draws it: the name, and the file's facts after it. */
-.doc-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: center;
-  gap: var(--space-3);
-  min-width: 0;
-}
-
+/* The filename alone, centred between the back button and the capsule, as the result viewer
+   draws it; a phone's compact header sets it smaller, with no tracking. */
 .doc-title {
   min-width: 0;
   overflow: hidden;
@@ -204,43 +246,43 @@ function onMoreSelect(key: string) {
   letter-spacing: -0.01em;
 }
 
-.doc-facts {
-  flex-shrink: 0;
-  color: var(--faint);
-  font-size: var(--text-xs);
-  white-space: nowrap;
+.doc-title.phone-title {
+  font-size: var(--text-sm);
+  letter-spacing: normal;
 }
 
-@media (max-width: 720px) {
-  .doc-facts {
-    display: none;
-  }
-}
-
-/* The body: the preview centred in the window, scrolling where it is taller. */
-.file {
-  display: grid;
-  place-items: center;
+/* The desk under the header. Its own scrolling only, so a scroll that reaches an edge never
+   chains into Safari's back or forward swipe. */
+.pane {
+  position: relative;
   height: 100%;
   min-height: 0;
-  padding: var(--space-4);
   overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--desk);
 }
 
-.file.text {
-  place-items: start center;
+.pane.centred {
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
 }
 
-.media {
-  max-width: 100%;
-  max-height: 100%;
-  border-radius: var(--radius-card);
-  object-fit: contain;
+/* The text pane's positioned box, which draws its keyboard ring (main.css `.keyboard-frame`). */
+.text-frame {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
-.text-pane,
-.text-wait {
+.text-pane {
+  padding: var(--space-4);
+}
+
+.text-column {
   width: min(100%, 84ch);
+  margin: 0 auto;
 }
 
 .text {
@@ -256,53 +298,5 @@ function onMoreSelect(key: string) {
   margin: var(--space-4) 0 0;
   color: var(--faint);
   font-size: var(--text-xs);
-}
-
-/* No preview: the file's glyph, its name and facts, and the way to its bytes. */
-.sheet {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  max-width: 440px;
-  text-align: center;
-}
-
-.sheet-glyph {
-  width: 48px;
-  height: 48px;
-  margin-bottom: var(--space-2);
-  color: var(--faint);
-}
-
-.sheet-name {
-  max-width: 100%;
-  margin: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
-}
-
-.sheet-facts {
-  margin: 0;
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-
-.sheet-note {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-sm);
-}
-
-.sheet-note + .sheet-note {
-  margin-bottom: var(--space-3);
-}
-
-.audio {
-  width: min(100%, 360px);
-  margin-top: var(--space-3);
 }
 </style>

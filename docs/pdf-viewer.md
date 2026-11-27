@@ -200,7 +200,7 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
 
 ### Errors
 
-- **A document that cannot be opened shows a centred state**: a glyph, an `<h3>` title and the reason, with actions by cause. No English error code and no blank view is ever shown.
+- **A document that cannot be opened shows a centred state**: a glyph, an `<h3>` title and the reason, with actions by cause. No English error code and no blank view is ever shown. It is the state sheet every original's viewer shares ([media-viewer.md](./media-viewer.md) § The shell).
 - **Corrupt**: `InvalidPDFException`, any other parse failure, and any failure not named below.
   - *This PDF can’t be shown* (*無法顯示這份 PDF*) over *The file’s contents can’t be read. It may have been damaged when it was uploaded. You can download the original and open it in another app.* (*檔案的內容讀不出來，可能在上傳時就已經損壞。你可以下載原檔，用其他程式打開看看。*)
   - Its actions are *Download ({size})* (*下載（{size}）*; plain *Download* when the size is not known), the primary one, and *Open in new tab* (*在新分頁開啟*), a link.
@@ -234,7 +234,7 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
 ### Phone
 
 - **The header** is the compact one of the result viewer's phone layout: *Close* at the left, the filename centred at 14px semibold with no tracking, and at the right a capsule of *Download* and *More* only ([web.md](./web.md) § Result viewer, *On a phone and a tablet*).
-- **More** has the same facts and views as on desktop, then a zoom group, set off by a rule: *Fit width* (*符合寬度*), *Zoom to 2×*, *Zoom to 3×* and *Zoom to 5×* (*放大 2 倍*, *放大 3 倍*, *放大 5 倍*), multiples of fit width with the current one checked, then *Open in new tab*. So zoom works without a gesture, under VoiceOver or Switch Control. It has no *Find* on the Original view.
+- **More** has the same facts and views as on desktop, then a zoom group, set off by a rule: *Fit width* (*符合寬度*), *Zoom to 2×*, *Zoom to 3×* and *Zoom to 5×* (*放大 2 倍*, *放大 3 倍*, *放大 5 倍*), multiples of fit width with the current one checked, then the file operations and *Open in new tab*, in the order of [media-viewer.md](./media-viewer.md) § The More menu. So zoom works without a gesture, under VoiceOver or Switch Control. It has no *Find* on the Original view.
 - **Pinch** zooms about the fingers, from fit width up to 5 × fit width.
 - **A double tap** toggles between fit width and 2 × fit width, about the point tapped.
 - The pane takes pinch and double tap with `touch-action: pan-x pan-y` and its own handlers. The viewport meta keeps page zoom: no `user-scalable=no` and no `maximum-scale`.
@@ -266,7 +266,7 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
 
 - **No find in the original.** Ctrl/⌘F is left to the browser on the Original view, and finds only in the text layers mounted at the time. *Open in new tab* is the way to search the whole file.
 - **No print.** Ctrl/⌘P is left to the browser. *Open in new tab* is the way to print.
-- No thumbnail sidebar, no jump from a figure to its box (stage 2), and no new preview for other kinds of file, which are handled apart.
+- No thumbnail sidebar and no jump from a figure to its box (stage 2). Images, video, audio and other files have their own views ([media-viewer.md](./media-viewer.md)).
 - No go-to-page key and no fit-width key.
 - No form fields, no annotation editing, no PDF JavaScript, no ICC colour management (qcms is WebAssembly) and no XFA.
 
@@ -304,6 +304,8 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
   - `text-selection.ts`: the selection fix and the plain-text copy, ported from pdf.js's `TextLayerBuilder`;
   - `gestures.ts`: pinch from `wheel` with `ctrlKey`, WebKit's gesture events and two-finger touch, and the double tap.
 - `app/components/pdf/Viewer.vue` (`PdfViewer`) mounts it in the pane and owns the zoom keys and the live region; `PageIndicator.vue` (`PdfPageIndicator`) is the pill and the page field. The result viewer owns the header around them ([web.md](./web.md) § Result viewer).
+- `app/components/pdf/DocumentError.vue` (`PdfDocumentError`) draws its states through `ViewerStateSheet`, and the viewer's loading bar is `ViewerLoading`, both in `app/components/viewer/`; the pane's keyboard ring is `useKeyboardFocus` (`app/composables/`) with the `.keyboard-pane` and `.keyboard-frame` rules in `app/assets/css/main.css`, which every original's pane shares: the viewer's root is the frame that draws the ring over the pages. The image view and the player share them ([media-viewer.md](./media-viewer.md) § The code).
+- The image view imports `gestures.ts`, and parts of `zoom.ts`, `layout.ts` and `errors.ts`, as they are. Nothing in `app/lib/pdf/` imports `app/lib/media/`, and a change to one of those four files is checked against both viewers.
 - `app/assets/css/pdf-layers.css` holds the text and link layers' rules taken from pdf.js.
 
 ### The device test list

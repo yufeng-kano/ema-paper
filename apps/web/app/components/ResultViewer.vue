@@ -8,6 +8,7 @@ import type { DragCardControls } from '~/components/DragCard.vue'
 import type { ToolbarRect, ToolbarSkill } from '~/components/ViewerToolbar.vue'
 import {
   ApiRequestError,
+  downloadFile,
   getDocumentContent,
   listSkills,
   putDocumentContent,
@@ -97,6 +98,13 @@ import {
   type PlacedBlock,
   type ResultBlock,
 } from '~/lib/markdown'
+import {
+  isImageZoomChecked,
+  type ImagePoint,
+  type ImageReturn,
+  type ImageViewerState,
+  type ImageZoomTarget,
+} from '~/lib/media/image-zoom'
 import type { MenuFact, MenuItem, Point } from '~/lib/menu'
 import {
   PHONE_MULTIPLES,
@@ -255,10 +263,18 @@ const props = defineProps<{
    *  what the row remembers, or the reader's default — Files decides (`initialView`). */
   initialView: DocumentView
   /** The original, for the Original view: where its bytes are read from, where it downloads
-   *  from and how large it is (null when not known), and what it is — a PDF drawn by the
-   *  app's own viewer, an image as a picture. Null where none is kept: *Original* in the
-   *  menu is then disabled, with the reason under it. */
-  original: { url: string; download: string; downloadSize: string | null; kind: 'pdf' | 'image' } | null
+   *  from and how large it is (null when not known), what it is — a PDF drawn by the app's
+   *  own viewer, an image in the image view — and whether More offers it in a new tab, which
+   *  an SVG served as an attachment would only download (docs/media-viewer.md § The More
+   *  menu). Null where none is kept: *Original* in the menu is then disabled, with the
+   *  reason under it. */
+  original: {
+    url: string
+    download: string
+    downloadSize: string | null
+    kind: 'pdf' | 'image'
+    newTab: boolean
+  } | null
   /** The row's facts for the More menu while the file is not converted: kind, size, date
    *  added, location. */
   facts: MenuFact[]
@@ -284,6 +300,13 @@ const emit = defineEmits<{
   filed: []
   /** *Retry* on a failed parse: the retry dialog, over the viewer. */
   retry: []
+  /** More's file operations on the open row, the Files page's own (docs/media-viewer.md
+   *  § The More menu): emitted when chosen, with `ready`, true once what is open has been
+   *  written back and saved, and false when a save failed, which stops the operation. */
+  rename: [ready: Promise<boolean>]
+  duplicate: [ready: Promise<boolean>]
+  show: [ready: Promise<boolean>]
+  trash: [ready: Promise<boolean>]
 }>()
 
 const { t, locale } = useI18n()
@@ -3951,81 +3974,153 @@ const pdfReturn = shallowRef<{ page: number; zoom: ZoomState } | null>(null)
 /** Whether the Original view of a PDF shows: the viewer's zoom controls are the header's. */
 const pdfShown = computed(() => tab.value === 'original' && props.original?.kind === 'pdf')
 
+// --- the Original view's image -------------------------------------------------
+
+/** The image view (docs/media-viewer.md § The image view), driven from the header as the PDF
+ *  viewer is: what the zoom controls ask of it, and what it last said of itself — null until
+ *  it first does, and again once the Original view has gone. */
+const image = ref<{
+  zoomIn(): void
+  zoomOut(): void
+  zoomTo(target: ImageZoomTarget): void
+  centre(): ImagePoint | null
+} | null>(null)
+const imageState = ref<ImageViewerState | null>(null)
+/** Where the reader was in the image when they left for Markdown: the zoom and the image
+ *  point at the pane's centre, for the view to open on again. */
+const imageReturn = shallowRef<ImageReturn | null>(null)
+
+const imageShown = computed(() => tab.value === 'original' && props.original?.kind === 'image')
+/** Either original with a zoom: the header's zoom controls, and More's phone zoom group. */
+const originalShown = computed(() => pdfShown.value || imageShown.value)
+
+/** The shown original's zoom, as the header reads it: null until it has one to give (a PDF
+ *  until page 1's size is known or behind a password or an error, an image until it has
+ *  loaded or once it failed). `fit` is an image at fit to window, which the level names. */
+const zoomReading = computed(() => {
+  if (pdfShown.value) {
+    const state = pdfState.value
+    return state?.ready ? { scale: state.zoom.scale, fit: false, canIn: state.canZoomIn, canOut: state.canZoomOut } : null
+  }
+  if (imageShown.value) {
+    const state = imageState.value
+    return state?.ready
+      ? { scale: state.zoom.scale, fit: state.zoom.mode === 'fit', canIn: state.canZoomIn, canOut: state.canZoomOut }
+      : null
+  }
+  return null
+})
+
 /** The zoom level as a percentage in the page's locale: the button's text, and part of its
- *  name, as the visible text must be (WCAG 2.5.3). Null until page 1's size is known, when
- *  the button reads a dash and is named *Zoom* alone. */
+ *  name, as the visible text must be (WCAG 2.5.3). Null while there is no zoom, when the
+ *  button reads a dash and is named *Zoom* alone. */
 const zoomPercent = computed(() =>
-  pdfState.value?.ready
-    ? new Intl.NumberFormat(locale.value, { style: 'percent' }).format(percentOf(pdfState.value.zoom.scale) / 100)
+  zoomReading.value
+    ? new Intl.NumberFormat(locale.value, { style: 'percent' }).format(percentOf(zoomReading.value.scale) / 100)
     : null,
 )
 
 /** A zoom choice in a menu, and what choosing it asks the viewer for: checked against the
- *  viewer's zoom, and disabled while it has none (a password prompt or an error showing). */
-function zoomChoice(item: MenuItem, target: ZoomTarget): { item: MenuItem; target: ZoomTarget } {
-  const state = pdfState.value
-  return {
-    item: { ...item, checked: state ? isZoomChecked(state.zoom, target, state.fitWidth) : false, disabled: !state?.ready },
-    target,
-  }
+ *  viewer's zoom, and disabled while it has none. */
+function zoomChoice(item: MenuItem, apply: () => void, checked: boolean): { item: MenuItem; apply: () => void } {
+  return { item: { ...item, checked, disabled: !zoomReading.value }, apply }
 }
 
-/** The zoom level's menu (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Zoom*): the
- *  two fits, then the presets, 100% with its key. */
+function pdfZoomChoice(item: MenuItem, target: ZoomTarget) {
+  const state = pdfState.value
+  return zoomChoice(
+    item,
+    () => pdf.value?.zoomTo(target),
+    state ? isZoomChecked(state.zoom, target, state.fitWidth) : false,
+  )
+}
+
+function imageZoomChoice(item: MenuItem, target: ImageZoomTarget) {
+  const state = imageState.value
+  return zoomChoice(
+    item,
+    () => image.value?.zoomTo(target),
+    state ? isImageZoomChecked(state.zoom, target, state.fit) : false,
+  )
+}
+
+/** The zoom level's menu (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Zoom*, and
+ *  docs/media-viewer.md § The image view, *Zoom*): a PDF's two fits or an image's fit to
+ *  window, then the presets, 100% with its key. */
 const zoomChoices = computed(() => {
   const percent = new Intl.NumberFormat(locale.value, { style: 'percent' })
+  const presets = ZOOM_PRESETS.map((scale, index) => ({
+    item: {
+      key: `zoom-${scale}`,
+      label: percent.format(percentOf(scale) / 100),
+      separated: index === 0,
+      shortcut: scale === 1 ? keyLabel(ZOOM_SHORTCUTS.reset) : undefined,
+    },
+    scale,
+  }))
+  if (imageShown.value) {
+    return [
+      imageZoomChoice({ key: 'zoom-fit', label: t('viewer.image.fit') }, { mode: 'fit' }),
+      ...presets.map(({ item, scale }) => imageZoomChoice(item, { mode: 'custom', scale })),
+    ]
+  }
   return [
-    zoomChoice({ key: 'fit-width', label: t('viewer.pdf.fitWidth') }, { mode: 'fit-width' }),
-    zoomChoice({ key: 'fit-page', label: t('viewer.pdf.fitPage') }, { mode: 'fit-page' }),
-    ...ZOOM_PRESETS.map((scale, index) =>
-      zoomChoice(
-        {
-          key: `zoom-${scale}`,
-          label: percent.format(percentOf(scale) / 100),
-          separated: index === 0,
-          shortcut: scale === 1 ? keyLabel(ZOOM_SHORTCUTS.reset) : undefined,
-        },
-        { mode: 'custom', scale },
-      ),
-    ),
+    pdfZoomChoice({ key: 'fit-width', label: t('viewer.pdf.fitWidth') }, { mode: 'fit-width' }),
+    pdfZoomChoice({ key: 'fit-page', label: t('viewer.pdf.fitPage') }, { mode: 'fit-page' }),
+    ...presets.map(({ item, scale }) => pdfZoomChoice(item, { mode: 'custom', scale })),
   ]
 })
 
-/** A phone's zoom group in More, in multiples of fit width: what a pinch does, for a reader
- *  who cannot pinch (VoiceOver, Switch Control). */
-const phoneZoomChoices = computed(() => [
-  zoomChoice({ key: 'zoom-fit', label: t('viewer.pdf.fitWidth'), separated: true }, { mode: 'fit-width' }),
-  ...PHONE_MULTIPLES.map((times) =>
-    zoomChoice({ key: `zoom-x${times}`, label: t('viewer.pdf.magnify', { n: times }) }, { mode: 'multiple', times }),
-  ),
-])
+/** A phone's zoom group in More, in multiples of the fit — fit width on a PDF, fit to window
+ *  on an image: what a pinch does, for a reader who cannot pinch (VoiceOver, Switch
+ *  Control). */
+const phoneZoomChoices = computed(() =>
+  imageShown.value
+    ? [
+        imageZoomChoice({ key: 'zoom-fit', label: t('viewer.image.fit'), separated: true }, { mode: 'fit' }),
+        ...PHONE_MULTIPLES.map((times) =>
+          imageZoomChoice(
+            { key: `zoom-x${times}`, label: t('viewer.pdf.magnify', { n: times }) },
+            { mode: 'multiple', times },
+          ),
+        ),
+      ]
+    : [
+        pdfZoomChoice({ key: 'zoom-fit', label: t('viewer.pdf.fitWidth'), separated: true }, { mode: 'fit-width' }),
+        ...PHONE_MULTIPLES.map((times) =>
+          pdfZoomChoice({ key: `zoom-x${times}`, label: t('viewer.pdf.magnify', { n: times }) }, { mode: 'multiple', times }),
+        ),
+      ],
+)
 
 const zoomMenu = ref<Point | null>(null)
 const zoomFromKey = ref(false)
+/** When the menu last closed, and the press that closed it: as More's (`moreClosedBy`). */
 let zoomClosedAt = 0
+let zoomClosedBy: EventTarget | null = null
 
 /** Anchored as More's menu is, under the button's right edge, so it opens leftwards under
  *  the level and clear of More. */
 function toggleZoom(event: MouseEvent) {
-  if (zoomMenu.value || performance.now() - zoomClosedAt < 200) {
+  const button = event.currentTarget as HTMLElement
+  const closedByThis = zoomClosedBy instanceof Node && button.contains(zoomClosedBy)
+  if (zoomMenu.value || (closedByThis && performance.now() - zoomClosedAt < 200)) {
     zoomMenu.value = null
     return
   }
-  const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  const box = button.getBoundingClientRect()
   zoomFromKey.value = event.detail === 0
   zoomMenu.value = { x: box.right, y: box.bottom + 4 }
 }
 
-function closeZoom() {
+function closeZoom(cause?: Event) {
   zoomMenu.value = null
   zoomClosedAt = performance.now()
+  zoomClosedBy = cause?.target ?? null
 }
 
 function onZoomSelect(key: string) {
-  const choice = zoomChoices.value.find((entry) => entry.item.key === key)
-  if (choice) {
-    pdf.value?.zoomTo(choice.target)
-  }
+  zoomChoices.value.find((entry) => entry.item.key === key)?.apply()
 }
 
 /** The find bar belongs to the document, so leaving the document for the original closes
@@ -4051,6 +4146,14 @@ watch(tab, async (view) => {
     pdfReturn.value = { page: left.page, zoom: left.zoom }
   }
   pdfState.value = null
+  // The image view goes the same way, and may read the file again on the way back: it is
+  // served `no-store`.
+  const leftImage = imageState.value
+  const centre = image.value?.centre()
+  if (leftImage?.ready && centre) {
+    imageReturn.value = { zoom: leftImage.zoom, centre }
+  }
+  imageState.value = null
   zoomMenu.value = null
   await nextTick()
   if (scroller.value) {
@@ -4075,26 +4178,38 @@ function closeOverBlocks() {
 
 const moreMenu = ref<Point | null>(null)
 const moreFromKey = ref(false)
-/** When the menu last closed itself. The press on More that closes it (a press outside the
- *  menu) is followed by that button's click, which must not open it again. */
+/** When the menu last closed, and the press that closed it. A press on More while the menu is
+ *  open closes it (a press outside the menu) and is followed by that button's click, which must
+ *  not open it again; a close by any other cause leaves More free at once. */
 let moreClosedAt = 0
+let moreClosedBy: EventTarget | null = null
+/** What the open menu is made of, taken when it opens: it does not grow while open, so a fact
+ *  the browser learns meanwhile (an image's dimensions) is in it the next time
+ *  (docs/media-viewer.md § The More menu). */
+const moreSnapshot = shallowRef<{ items: MenuItem[]; facts: MenuFact[] } | null>(null)
 
 /** Anchored under the button's right edge: More sits at the dialog's right, so the menu
  *  opens leftwards under it (`placeMenu` flips it). */
 function toggleMore(event: MouseEvent) {
-  if (moreMenu.value || performance.now() - moreClosedAt < 200) {
+  const button = event.currentTarget as HTMLElement
+  const closedByThis = moreClosedBy instanceof Node && button.contains(moreClosedBy)
+  if (moreMenu.value || (closedByThis && performance.now() - moreClosedAt < 200)) {
     moreMenu.value = null
+    moreSnapshot.value = null
     return
   }
-  const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  const box = button.getBoundingClientRect()
   // A click the keyboard made carries no pointer detail.
   moreFromKey.value = event.detail === 0
+  moreSnapshot.value = { items: moreItems.value, facts: moreFacts.value }
   moreMenu.value = { x: box.right, y: box.bottom + 4 }
 }
 
-function closeMore() {
+function closeMore(cause?: Event) {
   moreMenu.value = null
+  moreSnapshot.value = null
   moreClosedAt = performance.now()
+  moreClosedBy = cause?.target ?? null
 }
 
 /** What the parse was: read once, not every time the document is open. */
@@ -4123,8 +4238,25 @@ const parseFacts = computed<MenuFact[]>(() => {
   return facts
 })
 
-/** The facts over the views: the parse's, or the row's while the file is not converted. */
-const moreFacts = computed<MenuFact[]>(() => (converted.value ? parseFacts.value : props.facts))
+/** The facts over the views: the parse's, or the row's while the file is not converted —
+ *  with an image's dimensions after its kind once the image view has them. */
+const moreFacts = computed<MenuFact[]>(() => {
+  if (converted.value) {
+    return parseFacts.value
+  }
+  const size = imageShown.value ? imageState.value?.size : null
+  if (!size) {
+    return props.facts
+  }
+  return [
+    ...props.facts.slice(0, 1),
+    {
+      label: t('viewer.file.dimensions'),
+      value: t('viewer.file.dimensionsValue', { width: String(size.width), height: String(size.height) }),
+    },
+    ...props.facts.slice(1),
+  ]
+})
 
 /** More holds Find on a phone's Markdown view, above the facts. */
 const moreFind = computed(() => phone.value && tab.value === 'markdown')
@@ -4138,9 +4270,11 @@ const moreReady = computed(() => (props.markdownDocument ? moreFind.value : conv
 
 /** The two views, as a pair of choices (docs/web.md § Result viewer, *Original and
  *  Markdown*): Original is disabled where no original was kept, with the reason under it;
- *  Markdown, on a file not yet converted, is the conversion. Over a PDF's original, a phone's
- *  zoom group follows, then *Open in new tab*: the browser's own viewer, which finds and
- *  prints in the whole file. */
+ *  Markdown, on a file not yet converted, is the conversion. Over a PDF's or an image's
+ *  original, a phone's zoom group follows. Then, on anything but a markdown document, the
+ *  Files page's file operations on the row, and over the original *Open in new tab*: the
+ *  browser's own viewer, which finds and prints in the whole file (docs/media-viewer.md
+ *  § The More menu). */
 const moreItems = computed<MenuItem[]>(() => [
   // On a phone Find leaves the header for More, first (docs/web.md § Result viewer, *On a
   // phone and a tablet*).
@@ -4165,8 +4299,17 @@ const moreItems = computed<MenuItem[]>(() => [
         ? undefined
         : t(props.failure ? 'viewer.failed.noMarkdown' : 'viewer.notConvertible'),
   },
-  ...(pdfShown.value && phone.value ? phoneZoomChoices.value.map((choice) => choice.item) : []),
-  ...(pdfShown.value && props.original
+  ...(originalShown.value && phone.value ? phoneZoomChoices.value.map((choice) => choice.item) : []),
+  ...(!props.markdownDocument
+    ? [
+        { key: 'rename', label: t('files.rename'), icon: 'edit' as const, separated: true },
+        { key: 'duplicate', label: t('files.duplicate'), icon: 'copy-plus' as const },
+        { key: 'show', label: t('viewer.file.showInFiles'), icon: 'folder-open' as const },
+        { key: 'trash', label: t('files.moveToTrash'), icon: 'trash' as const, danger: true, separated: true },
+      ]
+    : []),
+  // An image the view could not show has none: its sheet's *Download* is the way to the file.
+  ...(originalShown.value && props.original?.newTab && !(imageShown.value && imageState.value?.failed)
     ? [
         {
           key: 'open-tab',
@@ -4185,13 +4328,52 @@ const moreItems = computed<MenuItem[]>(() => [
  *  start a download. */
 function downloadOriginal() {
   const href = props.failure?.download ?? props.original?.download
-  if (!href) {
+  if (href) {
+    downloadFile(href)
+  }
+}
+
+/** Set while a file operation waits for the saves: a second choice of one meanwhile is
+ *  dropped rather than run twice. */
+let operating = false
+
+/**
+ * One of More's file operations, handed to the Files page the moment it is chosen
+ * (docs/media-viewer.md § The More menu), so a viewer closed while the saves settle does not
+ * drop it. A converted document first writes back what is open — the open block, the images
+ * waiting on it — and `ready` waits for both files' saves, as a sending ask does: a copy then
+ * holds the last edit. A save that fails or meets a 409 makes it false, and the Files page
+ * does not run the operation; the header's *Not saved* or the reload note says why. A file
+ * not converted, or a failed parse, has nothing to save.
+ */
+function fileOperation(operation: 'rename' | 'duplicate' | 'show' | 'trash') {
+  if (operating) {
     return
   }
-  const anchor = document.createElement('a')
-  anchor.href = href
-  anchor.download = ''
-  anchor.click()
+  operating = true
+  let ready = Promise.resolve(true)
+  if (props.documentId !== null) {
+    commitEdit()
+    landWaitingImages()
+    ready = flushSaves()
+  }
+  void ready.finally(() => {
+    operating = false
+  })
+  switch (operation) {
+    case 'rename':
+      emit('rename', ready)
+      break
+    case 'duplicate':
+      emit('duplicate', ready)
+      break
+    case 'show':
+      emit('show', ready)
+      break
+    case 'trash':
+      emit('trash', ready)
+      break
+  }
 }
 
 function onMoreSelect(key: string) {
@@ -4203,9 +4385,13 @@ function onMoreSelect(key: string) {
   if (key === 'open-tab') {
     return
   }
+  if (key === 'rename' || key === 'duplicate' || key === 'show' || key === 'trash') {
+    fileOperation(key)
+    return
+  }
   const zoom = phoneZoomChoices.value.find((choice) => choice.item.key === key)
   if (zoom) {
-    pdf.value?.zoomTo(zoom.target)
+    zoom.apply()
     return
   }
   if (key === 'markdown' && !converted.value) {
@@ -4766,7 +4952,8 @@ watch(
     <template #actions>
       <!-- The switches for the markdown view, then More: one glass capsule, each button
            named by its label (docs/web.md § Result viewer). None of the switches means
-           anything over the original, which has a PDF's zoom and Download instead. -->
+           anything over the original, which has a PDF's or an image's zoom and Download
+           instead. -->
       <UiCapsule :label="t('viewer.tools')">
         <template v-if="tab === 'markdown' && !phone">
           <UiButton
@@ -4815,25 +5002,30 @@ watch(
           <span class="capsule-rule" aria-hidden="true" />
         </template>
 
-        <!-- A PDF's zoom, on desktop: the viewer does the zooming, the header holds its
-             controls (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Zoom*). Natively
-             disabled until page 1's size is known, and at either end of the range. A phone
-             has its zoom group in More instead. -->
-        <template v-if="pdfShown && !phone">
+        <!-- A PDF's or an image's zoom, on desktop: the viewer does the zooming, the header
+             holds its controls (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Zoom*;
+             docs/media-viewer.md § The image view, *Zoom*). Natively disabled until the
+             viewer has a zoom, and at either end of the range. A phone has its zoom group in
+             More instead. -->
+        <template v-if="originalShown && !phone">
           <UiButton
             variant="ghost"
             icon-only
             :label="t('viewer.pdf.zoomOut')"
-            :disabled="!pdfState?.ready || !pdfState.canZoomOut"
-            @click="pdf?.zoomOut()"
+            :disabled="!zoomReading?.canOut"
+            @click="pdfShown ? pdf?.zoomOut() : image?.zoomOut()"
           >
             <template #icon><UiIcon name="minus" /></template>
           </UiButton>
           <!-- A dash where there is no level yet: not a word, so not the catalog's. -->
           <UiButton
             variant="ghost"
-            :label="zoomPercent ? t('viewer.pdf.zoomLevel', { percent: zoomPercent }) : t('viewer.pdf.zoom')"
-            :disabled="!pdfState?.ready"
+            :label="
+              zoomPercent
+                ? t(zoomReading?.fit ? 'viewer.image.zoomLevelFit' : 'viewer.pdf.zoomLevel', { percent: zoomPercent })
+                : t('viewer.pdf.zoom')
+            "
+            :disabled="!zoomReading"
             aria-haspopup="menu"
             :aria-expanded="zoomMenu ? 'true' : 'false'"
             @click="toggleZoom"
@@ -4844,8 +5036,8 @@ watch(
             variant="ghost"
             icon-only
             :label="t('viewer.pdf.zoomIn')"
-            :disabled="!pdfState?.ready || !pdfState.canZoomIn"
-            @click="pdf?.zoomIn()"
+            :disabled="!zoomReading?.canIn"
+            @click="pdfShown ? pdf?.zoomIn() : image?.zoomIn()"
           >
             <template #icon><UiIcon name="plus" /></template>
           </UiButton>
@@ -4880,12 +5072,12 @@ watch(
         </UiButton>
       </UiCapsule>
       <UiContextMenu
-        v-if="moreMenu"
+        v-if="moreMenu && moreSnapshot"
         :at="moreMenu"
-        :items="moreItems"
+        :items="moreSnapshot.items"
         :label="t('viewer.more')"
-        :header="moreFacts.length ? t(converted ? 'viewer.details' : 'viewer.file.details') : undefined"
-        :facts="moreFacts"
+        :header="moreSnapshot.facts.length ? t(converted ? 'viewer.details' : 'viewer.file.details') : undefined"
+        :facts="moreSnapshot.facts"
         :lead="moreFind ? 1 : 0"
         :focus-first="moreFromKey"
         @select="onMoreSelect"
@@ -4904,8 +5096,8 @@ watch(
 
     <div class="body" :class="layout">
       <!-- The original: the file itself, whatever the parse made of it — a PDF drawn by the
-           app's own viewer, an image as a picture (docs/web.md § Result viewer, *Original
-           and Markdown*). -->
+           app's own viewer, an image in the image view (docs/web.md § Result viewer,
+           *Original and Markdown*; docs/media-viewer.md § The image view). -->
       <div v-if="tab === 'original' && original" class="original-view">
         <!-- A failed parse: that the conversion did not finish, what the reader still has,
              and the retry (docs/web.md § Files, *A failed parse opens on its original*).
@@ -4940,9 +5132,18 @@ watch(
           @state="pdfState = $event"
           @close="emit('close')"
         />
-        <div v-else class="original">
-          <img class="original-image" :src="original.url" :alt="title">
-        </div>
+        <MediaImageViewer
+          v-else
+          ref="image"
+          :url="original.url"
+          :name="title"
+          :download="original.download"
+          :download-size="original.downloadSize"
+          :phone="phone"
+          :initial="imageReturn"
+          @state="imageState = $event"
+          @close="emit('close')"
+        />
       </div>
 
       <UiBanner v-else-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
@@ -6011,32 +6212,15 @@ watch(
 /* --- Original view -------------------------------------------------------- */
 
 /* The original fills what the notes over it leave: a failed parse's failure, nothing
-   otherwise. The column is held to the body's width, so a PDF zoomed wider than the window
-   scrolls sideways in its own pane rather than widening the grid. */
+   otherwise. The column is held to the body's width, so a PDF or an image zoomed wider than
+   the window scrolls sideways in its own pane rather than widening the grid: the PDF's or the
+   image's pane is the row. */
 .original-view {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   grid-template-columns: minmax(0, 1fr);
   height: 100%;
   min-height: 0;
-}
-
-/* A picture, centred, scrolling where it is taller than the window. A PDF's viewer is this
-   row itself, its pane scrolling on the desk. */
-.original {
-  display: grid;
-  place-items: center;
-  height: 100%;
-  min-height: 0;
-  padding: var(--space-4);
-  overflow: auto;
-}
-
-.original-image {
-  max-width: 100%;
-  max-height: 100%;
-  border-radius: var(--radius-card);
-  object-fit: contain;
 }
 
 /* --- Phone and tablet (docs/web.md § Result viewer, *On a phone and a tablet*) --------------- */
@@ -6185,6 +6369,9 @@ watch(
   white-space: nowrap;
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
+  /* No tracking, as the file viewer's compact title (docs/media-viewer.md § The shell): an h2
+     otherwise takes the headings' tight tracking. */
+  letter-spacing: normal;
 }
 
 /* The segments keep the track's whole height as what a finger presses. */

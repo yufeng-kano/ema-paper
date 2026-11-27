@@ -86,7 +86,7 @@ const current = ref(0)
 /** During a pinch, the transform the column shows until the zoom commits. */
 const pinch = shallowRef<{ scale: number; originX: number; originY: number } | null>(null)
 /** The pane's ring follows the keyboard, not `:focus-visible` (docs/web.md § Rules). */
-const keyboardFocus = ref(false)
+const keyboardFocus = useKeyboardFocus()
 
 let frame = 0
 let settled = true
@@ -559,19 +559,6 @@ watch(
   () => void start(),
 )
 
-// --- focus ------------------------------------------------------------------------
-
-/** Tab, ⇧Tab and Safari's ⌥Tab move focus; with ⌘ or Ctrl held, Tab switches apps or tabs. */
-function onTabPress(event: KeyboardEvent) {
-  if (event.key === 'Tab' && !event.metaKey && !event.ctrlKey) {
-    keyboardFocus.value = true
-  }
-}
-
-function onPointerPress() {
-  keyboardFocus.value = false
-}
-
 onMounted(() => {
   const el = pane.value!
   // The pane is the dialog's first field, so the dialog focuses it on open; on a switch back
@@ -585,9 +572,6 @@ onMounted(() => {
   observer.observe(el)
   detachPinch = attachPinch(el, gestures)
   document.addEventListener('keydown', onDocumentKey, true)
-  window.addEventListener('keydown', onTabPress, true)
-  window.addEventListener('keyup', onTabPress, true)
-  window.addEventListener('pointerdown', onPointerPress, true)
   void start()
 })
 
@@ -598,9 +582,6 @@ onBeforeUnmount(() => {
   observer?.disconnect()
   detachPinch?.()
   document.removeEventListener('keydown', onDocumentKey, true)
-  window.removeEventListener('keydown', onTabPress, true)
-  window.removeEventListener('keyup', onTabPress, true)
-  window.removeEventListener('pointerdown', onPointerPress, true)
 })
 
 defineExpose({
@@ -611,10 +592,8 @@ defineExpose({
 </script>
 
 <template>
-  <div ref="root" class="viewer">
-    <div v-if="busy" class="progress" role="progressbar" :aria-label="t('viewer.pdf.opening')">
-      <span class="progress-bar" />
-    </div>
+  <div ref="root" class="viewer keyboard-frame">
+    <ViewerLoading :busy="busy" />
     <!-- After the header and before the pages, so it is the next Tab stop after More. -->
     <PdfPageIndicator
       v-if="ready && layout"
@@ -626,7 +605,7 @@ defineExpose({
     />
     <main
       ref="pane"
-      class="pane"
+      class="pane keyboard-pane"
       :class="{ 'keyboard-focus': keyboardFocus, centred: showsState }"
       :tabindex="showsState ? undefined : 0"
       :aria-label="name"
@@ -701,18 +680,6 @@ defineExpose({
   background: var(--desk);
 }
 
-/* Its ring is the keyboard's, set by `keyboardFocus` rather than `:focus-visible`, which a key
-   pressed after a click turns on (docs/web.md § Files), and drawn inside its edge, which the
-   result viewer clips. */
-.pane:focus {
-  outline: none;
-}
-
-.pane.keyboard-focus:focus {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
 /* The password prompt and a document error, centred on the desk. */
 .pane.centred {
   display: grid;
@@ -757,42 +724,5 @@ defineExpose({
   z-index: 2;
   margin: -12px 0 0 -12px;
   color: var(--muted);
-}
-
-/* An indeterminate bar under the header while the document opens; static under reduced
-   motion. */
-.progress {
-  position: absolute;
-  top: 0;
-  right: 0;
-  left: 0;
-  z-index: 3;
-  height: 2px;
-  overflow: hidden;
-  pointer-events: none;
-}
-
-.progress-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 28%;
-  height: 2px;
-  border-radius: 2px;
-  background: var(--accent);
-  animation: sweep 1.2s var(--ease) infinite alternate;
-}
-
-@keyframes sweep {
-  to {
-    transform: translateX(257%);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .progress-bar {
-    left: 34%;
-    animation: none;
-  }
 }
 </style>

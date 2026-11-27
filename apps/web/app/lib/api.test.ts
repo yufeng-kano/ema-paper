@@ -15,9 +15,11 @@ import {
   listAdminAudit,
   listAdminCodes,
   loginUrl,
+  probeFileStatus,
   putAgentSettings,
   putDocumentContent,
   readDocumentFileHead,
+  readFileBytes,
   removeAdminGroupMember,
   revertRevision,
   sendMessage,
@@ -211,10 +213,107 @@ describe('a file preview', () => {
     expect(headersOf(fetchMock).Range).toBe('bytes=0-2')
   })
 
-  it('throws on a failed answer', async () => {
-    stubFetch(new Response('', { status: 404 }))
+  it('throws the API’s own error on a failed answer, so the pane words it', async () => {
+    stubFetch(
+      new Response(JSON.stringify({ error: { type: 'invalid_request', message: 'Document not found' } }), { status: 404 }),
+    )
 
-    await expect(readDocumentFileHead(7, 3)).rejects.toThrow('HTTP 404')
+    const error = await readDocumentFileHead(7, 3).catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(ApiRequestError)
+    expect(error).toMatchObject({ status: 404, type: 'invalid_request', message: 'Document not found' })
+  })
+
+  it('throws a 401 as one, so the session ends as everywhere else', async () => {
+    stubFetch(new Response(JSON.stringify({ error: { type: 'auth', message: 'Not signed in' } }), { status: 401 }))
+
+    const error = await readDocumentFileHead(7, 3).catch((caught: unknown) => caught)
+    expect((error as ApiRequestError).isUnauthorized).toBe(true)
+  })
+
+  it('throws a read that never got an answer as offline', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockRejectedValue(new TypeError('Failed to fetch')))
+
+    const error = await readDocumentFileHead(7, 3).catch((caught: unknown) => caught)
+    expect((error as ApiRequestError).isOffline).toBe(true)
+  })
+
+  it('reads an empty file, which answers 416, as empty text', async () => {
+    stubFetch(new Response('', { status: 416, headers: { 'Content-Range': 'bytes */0' } }))
+
+    await expect(readDocumentFileHead(7, 3)).resolves.toEqual({ text: '', partial: false })
+  })
+})
+
+/** A body that records being cancelled, so a test can tell the rest of a file was not read. */
+function cancellableBody() {
+  const cancel = vi.fn()
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(new Uint8Array(1024))
+    },
+    cancel,
+  })
+  return { body, cancel }
+}
+
+describe('a media file’s reads', () => {
+  it('probes the first byte past the cache and answers the status, the body left unread', async () => {
+    const { body, cancel } = cancellableBody()
+    const fetchMock = stubFetch(new Response(body, { status: 206 }))
+    const controller = new AbortController()
+
+    await expect(probeFileStatus('/api/library/documents/7/file', controller.signal)).resolves.toBe(206)
+    expect(fetchMock).toHaveBeenCalledWith('/api/library/documents/7/file', expect.anything())
+    expect(headersOf(fetchMock).Range).toBe('bytes=0-0')
+    expect(lastInit(fetchMock).cache).toBe('no-store')
+    expect(lastInit(fetchMock).credentials).toBe('same-origin')
+    expect(lastInit(fetchMock).signal).toBe(controller.signal)
+    expect(cancel).toHaveBeenCalledOnce()
+  })
+
+  it('answers a server’s refusal as its status, and lets a failed fetch reject', async () => {
+    stubFetch(new Response(null, { status: 401 }))
+    await expect(probeFileStatus('/f')).resolves.toBe(401)
+
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockRejectedValue(new TypeError('Failed to fetch')))
+    await expect(probeFileStatus('/f')).rejects.toThrow('Failed to fetch')
+  })
+
+  it('reads a range and the file’s length from Content-Range', async () => {
+    const fetchMock = stubFetch(
+      new Response(new Uint8Array([1, 2, 3, 4]), { status: 206, headers: { 'Content-Range': 'bytes 100-103/5000' } }),
+    )
+
+    const read = await readFileBytes('/f', 100, 4)
+    expect(headersOf(fetchMock).Range).toBe('bytes=100-103')
+    expect(lastInit(fetchMock).cache).toBe('no-store')
+    expect([...read.bytes]).toEqual([1, 2, 3, 4])
+    expect(read.total).toBe(5000)
+  })
+
+  it('never hands back more than was asked for', async () => {
+    stubFetch(new Response(new Uint8Array([1, 2, 3, 4, 5, 6]), { status: 206, headers: { 'Content-Range': 'bytes 0-5/6' } }))
+
+    expect((await readFileBytes('/f', 0, 4)).bytes).toHaveLength(4)
+  })
+
+  it('has no length when the answer does not give one', async () => {
+    stubFetch(
+      new Response(new Uint8Array([1]), { status: 206, headers: { 'Content-Range': 'bytes 0-0/*' } }),
+      new Response(new Uint8Array([1]), { status: 206 }),
+    )
+
+    expect((await readFileBytes('/f', 0, 1)).total).toBeNull()
+    expect((await readFileBytes('/f', 0, 1)).total).toBeNull()
+  })
+
+  it('refuses a whole file and any failed answer without reading it', async () => {
+    const whole = cancellableBody()
+    stubFetch(new Response(whole.body, { status: 200 }), new Response(null, { status: 416 }))
+
+    await expect(readFileBytes('/f', 0, 65_536)).rejects.toThrow('HTTP 200')
+    expect(whole.cancel).toHaveBeenCalledOnce()
+    await expect(readFileBytes('/f', 10_000, 65_536)).rejects.toThrow('HTTP 416')
   })
 })
 

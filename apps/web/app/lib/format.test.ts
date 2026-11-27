@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatBytes, formatDate, formatMinorAmount, formatTime, packValidity } from './format'
+import { formatBytes, formatDate, formatDuration, formatMinorAmount, formatTime, packValidity } from './format'
 
 describe('formatBytes', () => {
   it('steps by 1000, as the unit names Intl prints do', () => {
@@ -55,5 +55,26 @@ describe('packValidity', () => {
     expect(packValidity(90)).toEqual({ unit: 'months', n: 3 })
     expect(packValidity(45)).toEqual({ unit: 'days', n: 45 })
     expect(packValidity(7)).toEqual({ unit: 'days', n: 7 })
+  })
+})
+
+describe('formatDuration', () => {
+  it('reads minutes and seconds under an hour, cut to the second', () => {
+    expect(formatDuration(0)).toBe('0:00')
+    expect(formatDuration(59.9)).toBe('0:59')
+    expect(formatDuration(768)).toBe('12:48')
+    expect(formatDuration(3599.99)).toBe('59:59')
+  })
+
+  it('reads hours from one, with the minutes padded', () => {
+    expect(formatDuration(3600)).toBe('1:00:00')
+    expect(formatDuration(3723)).toBe('1:02:03')
+    expect(formatDuration(36_000)).toBe('10:00:00')
+  })
+
+  it('has nothing for a length that is infinite, unknown or negative', () => {
+    expect(formatDuration(Infinity)).toBeNull()
+    expect(formatDuration(NaN)).toBeNull()
+    expect(formatDuration(-1)).toBeNull()
   })
 })

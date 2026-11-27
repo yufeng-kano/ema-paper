@@ -86,16 +86,22 @@ export class Autosave {
   }
 
   /** Waits for the saves to settle: true once what the reader sees is saved and no save met
-   *  a 409 meanwhile. */
+   *  a 409 meanwhile. A failed save left its text with no timer, and whoever waits on the
+   *  saves is the reader asking for them — an ask that sends, a file operation — so it gets one
+   *  more try, as closing gives it; a second failure is false. */
   async settle(): Promise<boolean> {
     const { state } = this.options
     const conflicts = this.conflicts
+    let retried = false
     for (let round = 0; round < 5; round += 1) {
       if (state.value === 'saved' && !this.inFlight) {
         return this.conflicts === conflicts
       }
       if (state.value === 'failed') {
-        return false
+        if (retried) {
+          return false
+        }
+        retried = true
       }
       await this.save()
     }

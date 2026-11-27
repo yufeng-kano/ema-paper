@@ -86,3 +86,19 @@ export function formatBytes(bytes: number, locale: string, options: { limit?: bo
     roundingMode: options.limit ? 'floor' : 'halfExpand',
   }).format(value)
 }
+
+/**
+ * A video's or an audio file's length, cut to the second: `12:48` under an hour, `1:02:03` from
+ * one (docs/media-viewer.md § The More menu, *The facts' values*). Null for a length the
+ * browser reports as infinite or unknown, which More leaves out.
+ */
+export function formatDuration(seconds: number): string | null {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return null
+  }
+  const whole = Math.floor(seconds)
+  const hours = Math.floor(whole / 3600)
+  const minutes = Math.floor((whole % 3600) / 60)
+  const rest = String(whole % 60).padStart(2, '0')
+  return hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${rest}` : `${minutes}:${rest}`
+}

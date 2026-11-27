@@ -561,7 +561,10 @@ export default {
       size: 'Size',
       added: 'Date added',
       location: 'Location',
-      noPreview: 'There is no preview for this kind of file.',
+      dimensions: 'Dimensions',
+      dimensionsValue: '{width} × {height}',
+      duration: 'Duration',
+      noPreview: 'There is no preview for this kind of file',
       agentReads: 'The Agent can still read it in any conversation.',
       textCut: 'The first {size} of the file.',
     },
@@ -618,6 +621,32 @@ export default {
         page: 'Page {page}',
         external: '{host} (opens in a new tab)',
       },
+    },
+    image: {
+      fit: 'Fit to window',
+      zoomLevelFit: 'Zoom {percent}, fit to window',
+      error: {
+        title: 'This image can’t be shown',
+        unsupported:
+          'This browser doesn’t support this image format, or the file is damaged. You can download the original and open it in another app.',
+      },
+    },
+    video: {
+      error: {
+        title: 'This video can’t be played',
+        unsupported:
+          'This browser doesn’t support this video’s format. You can download the original and open it in another player.',
+      },
+    },
+    audio: {
+      error: {
+        title: 'This audio file can’t be played',
+        unsupported:
+          'This browser doesn’t support this audio file’s format. You can download the original and open it in another player.',
+      },
+    },
+    media: {
+      opened: 'Opened',
     },
     findPlaceholder: 'Find in document…',
     findCount: '{index} / {total}',

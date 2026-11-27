@@ -1340,16 +1340,77 @@ export function documentFileUrl(id: number, download = false): string {
 }
 
 /** The head of a file as text, for its plain-text preview: a Range read of its first
- *  `bytes`, `partial` when the answer is a 206. A failed answer throws. */
+ *  `bytes`, `partial` when the answer is a 206. An empty file has no first byte and answers
+ *  416, which is its empty text (docs/media-viewer.md § Edge cases). Any other failed answer
+ *  throws the API's error, as `request` does, so the pane words it and a 401 ends the session;
+ *  a read that never got an answer throws as offline. */
 export async function readDocumentFileHead(id: number, bytes: number): Promise<{ text: string; partial: boolean }> {
-  const response = await fetch(documentFileUrl(id), {
-    headers: { Range: `bytes=0-${bytes - 1}` },
-    credentials: 'same-origin',
-  })
+  let response: Response
+  try {
+    response = await fetch(documentFileUrl(id), {
+      headers: { Range: `bytes=0-${bytes - 1}` },
+      credentials: 'same-origin',
+    })
+  } catch (cause) {
+    throw new ApiRequestError(0, 'internal', cause instanceof Error ? cause.message : 'Network error')
+  }
+  if (response.status === 416) {
+    return { text: '', partial: false }
+  }
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`)
+    const payload: unknown = await response.json().catch(() => null)
+    throw toApiError(response.status, response.statusText, payload)
   }
   return { text: await response.text(), partial: response.status === 206 }
+}
+
+/** The status of a file's address, from a read of its first byte: why an `<img>`, a `<video>`
+ *  or an `<audio>` failed, since none of them says (docs/media-viewer.md § The image view,
+ *  *Failure*). A GET, as the file routes have no HEAD, and not `request`'s, so a 401 is the
+ *  viewer's to hand to the session handling. A read that never got an answer rejects. */
+export async function probeFileStatus(url: string, signal?: AbortSignal): Promise<number> {
+  const response = await fetch(url, {
+    headers: { Range: 'bytes=0-0' },
+    credentials: 'same-origin',
+    cache: 'no-store',
+    signal,
+  })
+  void response.body?.cancel()
+  return response.status
+}
+
+/** `length` bytes of a file from `start`, for the player's read of a video's track list
+ *  (docs/media-viewer.md § The player, *A video with no picture*), and the file's whole length
+ *  from `Content-Range`, null when the answer does not give it. Only a 206 is read: a 200 would
+ *  be the whole file in memory. Any other answer throws. */
+export async function readFileBytes(
+  url: string,
+  start: number,
+  length: number,
+  signal?: AbortSignal,
+): Promise<{ bytes: Uint8Array; total: number | null }> {
+  const response = await fetch(url, {
+    headers: { Range: `bytes=${start}-${start + length - 1}` },
+    credentials: 'same-origin',
+    cache: 'no-store',
+    signal,
+  })
+  if (response.status !== 206) {
+    void response.body?.cancel()
+    throw new Error(`HTTP ${response.status}`)
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer()).subarray(0, length)
+  const total = /\/(\d+)$/.exec(response.headers.get('Content-Range') ?? '')
+  return { bytes, total: total ? Number(total[1]) : null }
+}
+
+/** Saves an address as a download, from a button: a link in a dialog would take its focus on
+ *  open, and Enter there would start the download (docs/media-viewer.md § The shell). */
+export function downloadFile(url: string): void {
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = ''
+  anchor.click()
 }
 
 /** A parsed document's original, inline, for the Original view — as a save with

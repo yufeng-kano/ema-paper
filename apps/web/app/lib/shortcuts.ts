@@ -167,3 +167,54 @@ export function zoomKey(event: KeyEventLike, apple: boolean): 'in' | 'out' | 're
   }
   return matchesShortcut(event, 'mod+0', apple) ? 'reset' : null
 }
+
+/** What a player key does (docs/media-viewer.md § The player, *Video*): `held` is a key the
+ *  player owns held down, whose repeats it takes and drops so they never reach the browser's
+ *  own controls. */
+export type MediaKeyAction = 'toggle' | 'back' | 'forward' | 'fullscreen' | 'mute' | 'held'
+
+export interface MediaKeyEvent extends KeyEventLike {
+  repeat: boolean
+  isComposing?: boolean
+}
+
+/** The player's keys for `aria-keyshortcuts`: audio's are video's without F. */
+export const MEDIA_KEYSHORTCUTS = {
+  video: 'Space ArrowLeft ArrowRight F M',
+  audio: 'Space ArrowLeft ArrowRight M',
+} as const
+
+/**
+ * Which player key an event is, if any. Never with a modifier, Shift included, so Shift+Space
+ * and Shift+arrows stay the browser's, and never while an input method composes. F and M are
+ * read by the key they sit on too, so they work under any input source. A held Space, F or M
+ * is `held`; a held arrow repeats. An audio file has no F, so there it is not a player key at
+ * all, held or not, and stays the page's.
+ */
+export function mediaKey(event: MediaKeyEvent, layout: keyof typeof MEDIA_KEYSHORTCUTS = 'video'): MediaKeyAction | null {
+  if (event.isComposing || event.key === 'Process') {
+    return null
+  }
+  if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) {
+    return null
+  }
+  if (event.key === ' ' || event.code === 'Space') {
+    return event.repeat ? 'held' : 'toggle'
+  }
+  if (event.key === 'ArrowLeft') {
+    return 'back'
+  }
+  if (event.key === 'ArrowRight') {
+    return 'forward'
+  }
+  if (event.key === 'f' || event.key === 'F' || event.code === 'KeyF') {
+    if (layout === 'audio') {
+      return null
+    }
+    return event.repeat ? 'held' : 'fullscreen'
+  }
+  if (event.key === 'm' || event.key === 'M' || event.code === 'KeyM') {
+    return event.repeat ? 'held' : 'mute'
+  }
+  return null
+}

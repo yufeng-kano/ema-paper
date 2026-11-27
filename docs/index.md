@@ -68,10 +68,13 @@ In the order a newcomer should meet them. Each entry says what the doc is the ho
 
 - **[web.md](./web.md)** — the Nuxt app: its stack, pages, settings dialog, design system, the Files library, the result viewer with its editor, notes and agent panel, phones and tablets, and search engines.
   - Read: any screen, component, interaction or piece of copy.
-  - Not here: the console's pages (admin.md); the contract the Usage section renders (billing.md); how a PDF's pages are drawn (pdf-viewer.md).
+  - Not here: the console's pages (admin.md); the contract the Usage section renders (billing.md); how a PDF's pages are drawn (pdf-viewer.md); the image view, the player, the file viewer's panes and the More menu of an original (media-viewer.md).
 - **[pdf-viewer.md](./pdf-viewer.md)** — the web app's own PDF viewer: what reads the file and what draws it, the stages it is built in and the one the code is at, the stage 1 Canvas 2D viewer (layout, zoom, the render budget, the page indicator, text and links, loading, the password and errors, the files served beside the build and the device test list), what it takes from other engines and under which licences with `THIRD_PARTY_NOTICES` and the licence check, the fallback, what Safari's WebGPU asks of the renderer, the room kept for editing, and the device check at `/pdf-probe` with the devices it has been run on.
-  - Read: anything that draws a PDF in the browser, the Original view's behaviour, a library added for it, or the device check.
-  - Not here: where the Original view sits in the result viewer (web.md); the server's PDF work (parsing.md).
+  - Read: anything that draws a PDF in the browser, the Original view's behaviour on a PDF, a library added for it, or the device check.
+  - Not here: where the Original view sits in the result viewer (web.md); an image's Original view, the shared state sheet and loading bar, and the More menu (media-viewer.md); the server's PDF work (parsing.md).
+- **[media-viewer.md](./media-viewer.md)** — how the web app shows a kept file that is not a PDF's pages: which viewer shows what, the shell the result viewer and the file viewer share, the one More menu of every original, the image view (layout, zoom, loading, failure, phone), the player for video and audio (its keys, a video with no picture told apart by reading the file's tracks, a device that does not preload, failure by cause and by the media error), text and files with no preview, its colour and size tokens, accessibility, the code, what it does not do, its edge cases, and the device test list for a Mac and an iPhone.
+  - Read: anything about an image, a video, an audio file, a text file or another file opened from Files, the viewers' header and More menu, or `app/lib/media/`, `app/components/media/` and `app/components/viewer/`.
+  - Not here: where a file opens from and its menu in the list (web.md § Files); how a PDF's pages are drawn (pdf-viewer.md); the routes that serve the bytes (api.md).
 - **[admin.md](./admin.md)** — the operator console: permissions and groups, signing in, the audit log, what an operator sees, the settings the database may override, and the console's routes and pages.
   - Read: anything under `/api/admin` or `/admin`, a new permission, or a setting the console may change.
   - Not here: the rules of the grants and codes it makes (billing.md).
