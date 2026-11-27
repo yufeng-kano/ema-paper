@@ -478,6 +478,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - Every color is declared once, as `light-dark(<light>, <dark>)`, and nothing outside the token block names a color.
   - The light values are Apple's: white paper, `#1d1d1f` ink, `#6e6e73` secondary text, `#e5e5ea` separators, `#0071e3` blue.
   - The dark values are Apple's dark appearance, not an inversion: `#1c1c1e` paper, `#f5f5f7` ink, `#0a84ff` blue.
+  - A PDF page is the one surface that keeps its light value in both appearances: white paper on `--desk`, its content layer carrying `color-scheme: light`, so its colours are never inverted ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Colours*).
   - Text tokens clear WCAG AA (4.5:1) on `--paper` in both.
   - One surface token belongs to the result viewer alone: `--block-selected`, the wash a block selection draws (§ Editing, *Keyboard block selection*), between `--rail` and `--rail-active` in both appearances. It is neutral rather than the accent because selecting blocks commits nothing, and an accent wash already means a place the viewer led the reader to (`--accent-wash`, `--find`); a selection drawn in the same hue would read as one more of those.
 - **Theme.** Light and dark are both first-class, and the reader chooses.
@@ -553,6 +554,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - `PageHeader`: the large title and what is beside it.
   - `Panel`: a scrolling body under an optional header, no border or shadow.
   - `Capsule`: a glass capsule of a toolbar's icon buttons — the screens' toolbars, the reader's header. A toggle that is on is in the accent tint; a button whose menu is open is filled.
+    - It holds one labelled button beside its icons where a toolbar needs a reading: the PDF viewer's zoom level, `--space-14` wide at least, in tabular figures.
   - `Segmented`: the system's segmented control. Inline: a `--fill` track with the chosen segment raised on `--segment`. Inline it is *Theme*, *Body margins*, *Open on*, the Agent section's tabs and the grant and code dialogs' kind. Or `glass`: the toolbar's 44px capsule — *Files · Trash*, the console's filters and ranges, the reader's pane switch.
   - `DataTable`: the only table markup, drawn as Finder's list.
     - Sentence-case 12px column headers in `--muted` over a hairline; `--row-height` rows with `--radius-md` ends and no stripes.
@@ -564,7 +566,8 @@ Apple's own look, held back: solid white content, the system font, continuous ro
     - `back` draws the close as a round back button at the header's left.
     - `persistent` draws no close and ignores Escape and the scrim, so the footer's button is the only way out — for what a stray key must not lose, the console's codes shown once.
   - `Button`: capsules — accent / secondary on `--fill` / ghost / danger, `icon-only` round, four sizes, `lg` being the toolbar's 44px.
-  - `TextInput`: `text`, `email`, and — for the console's create dialog — `date` with `min`, and `inputmode="numeric"` for a whole number. A whole number is still a text field, with the numeric keypad, because a browser's `number` field hands over an empty string for what it cannot parse — `-`, `1e`, `abc` — and the field could then not say what is wrong.
+    - With `href` it is a link, and `target="_blank"` opens it in a new tab with `rel="noopener noreferrer"`: the PDF viewer's *Open in new tab*.
+  - `TextInput`: `text`, `email`, `password` for a PDF's password (`autocomplete="off"` kept), and — for the console's create dialog — `date` with `min`, and `inputmode="numeric"` for a whole number. A whole number is still a text field, with the numeric keypad, because a browser's `number` field hands over an empty string for what it cannot parse — `-`, `1e`, `abc` — and the field could then not say what is wrong.
   - `Select`.
   - `Field`: with `labelHidden` its `<label>` stays in the DOM, visually hidden (`sr-only`), for a control the design draws bare.
   - `CopyButton`: with `labelled`, its word is `label` when one is given — *Copy all* on the console's created codes — and *Copy* otherwise.
@@ -576,7 +579,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
     - It is arrow-key navigable, and dismissed by Escape, a click outside, or a scroll outside it.
     - It is never taller than the viewport: a menu that would be scrolls inside its own edge, so its last items stay reachable.
     - **Nothing is highlighted when it opens**: focus lands on the menu itself, not on its first item, because the highlight is the pointer's — a menu that opens with a row lit is claiming the pointer is on that row, and the lit row stays lit for as long as the menu is up. `focusFirst` is the exception, set when the menu was opened from the keyboard, where the highlight is the cursor.
-    - An item is a button, or a real link when it carries `to`. One of a set of choices carries `checked`. An optional `header` names what the menu is about.
+    - An item is a button, or a real link when it carries `to`. An item with `href` and `newTab` is a plain `<a target="_blank" rel="noopener noreferrer">` to a destination outside the app's routes, such as a file the browser shows itself (*Open in new tab*, § Result viewer). One of a set of choices carries `checked`. An optional `header` names what the menu is about.
     - Its callers: the library's right-click, the sidebar's account row (§ The account menu), a conversation's **⋯** in the agent panel's list (§ The agent panel — the list itself is a popover, since its rows carry a second button), the result viewer's More button (§ Result viewer), the result viewer's block menu (§ Editing), the file viewer's More button (§ Files), the notes' block menu (§ Notes), and in the agent panel an answer block's menu, the composer's *Add context* menu and the model pill (§ The agent panel).
     - `facts`: besides `header`, a menu about one thing can carry label/value rows under the header, values in `.mono` where they are identifiers, wrapping rather than ellipsized — for the facts a single header line cannot hold. Like the header, they take no focus and do nothing. They are the menu's `aria-describedby`, so a screen reader reads them when the menu opens rather than skipping them on the way to the items.
     - `shortcut`: text drawn right-aligned in `--faint`, in the mono face (`shortcutMono`) when it is markdown or a command rather than a key. A key is not drawn at all on a coarse pointer, which has no keyboard to press it on.
@@ -619,6 +622,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - A 120ms scale-in from whichever corner the pointer opened it at — restarted by hand when a second right-click reuses the same element, and off under `prefers-reduced-motion`.
   - The highlighted row is filled with the accent: it is the action about to be committed, which is what the accent is for. A destructive row fills with `--danger` instead.
   - The result viewer's other floating pieces are built from the same tokens, for the same reason — each floats over the document rather than being part of it: the slash menu, the outline's panel, the hint bar, the status note and the return pill (§ Result viewer, § Editing).
+  - The PDF viewer's page indicator takes the menu's surface and its `--menu-edge` but no shadow: it rests on the pages while the reader scrolls, and only what opens over content casts one ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Page indicator*).
   - The find bar and the selection toolbar are glass capsules (above). The agent panel's reply toolbar, over the agent's glass card, is the menu's surface in the capsule's shape.
   - A switch (`role="switch"`) is the system's: a capsule track, `--fill-strong` off and the accent on, its white knob sliding across.
 - **Shortcuts are labelled for the platform.**
@@ -627,6 +631,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - A label naming a key the reader's keyboard does not have teaches the wrong habit, and two hand-written spellings drift apart in the first release that adds a third.
 - **Icons** are Lucide paths on a 24 grid at stroke 1.75, inlined in `Icon.vue` — never a package, never a remote sprite, never inline SVG at a call site — and named in `IconName` (`app/lib/icons.ts`).
   - Icon-only controls carry `label` (= aria-label + tooltip).
+  - The PDF viewer's glyphs: `minus` beside `plus` (zoom out and in), `external-link` (*Open in new tab*), and on its states `lock` (a password), `file-x` (a document that cannot be shown) and `file-exclamation-point` (a page that cannot be drawn).
   - A destructive action either keeps its visible word or, when icon-only, is backed by a `ConfirmDialog` whose title and message carry it.
   - **One action, one glyph**: an action on the document has the same glyph on every surface it appears on — a block's menu, the selection toolbar, the slash menu, an outline row — and no two of those actions share one, so a reader who has learned one surface reads the others.
 - **Motion**: 120–240ms, on color, background, opacity and a few pixels of scale or slide — the context menu's scale-in, the find bar's and the outline panel's 4px slide, the drawer's slide, the reader's document re-centring when a card opens or closes — none under `prefers-reduced-motion`.
@@ -877,6 +882,7 @@ A file manager over everything the reader keeps — parse results, markdown docu
 
 - **A PDF or an image opens in the result viewer; every other file in the file viewer.**
   - A PDF or an image kept as it is opens in the result viewer on its *Original* view (§ Result viewer, *Original and Markdown*) — the one screen it has, converted or not. Its More menu holds the file's facts (*Kind*, *Size*, *Date added*, *Location*) over the two views, and *Markdown* there is what converts it (below).
+    - On the Original view the header's capsule always holds **Download**, and on a PDF More adds *Open in new tab* after the two views (§ Result viewer, *The header*).
   - Every other file opens in the file viewer: the result viewer's shell with the document's panes left out.
     - At the left, in the capsule: the way back and the name, with its kind and size.
     - At the right: **Download** and the *More* button, whose menu opens on the file's facts over *Rename*, *Duplicate*, *Show in Files* and *Move to Trash*.
@@ -907,7 +913,7 @@ A file manager over everything the reader keeps — parse results, markdown docu
   - Opening it — a double click, ⌘↓, the menu's *Open original*, a link to it — opens the result viewer on its **original**, the file it was made from (§ Result viewer, *Original and Markdown*):
     - A note under the header says the conversion did not finish and how many pages failed (*The conversion did not finish: 3 pages failed.* — *轉換沒有完成：3 頁失敗。*; *The conversion did not finish.* when no page is missing), that the original can still be read and downloaded, and that Markdown and the Agent come once a retry succeeds.
     - The note carries **Retry N pages…** (*Retry…* when no page is missing), which opens the retry dialog over the viewer.
-    - The header's capsule holds **Download original** (`…/original?download=1`) beside More. More's menu has the row's facts as a file kept as it is has them (*Kind*, *Size*, *Date added*, *Location*) over the two views, *Markdown* disabled with *Once a retry succeeds* (*重試成功後才有*) beside it.
+    - The header's capsule holds **Download original** (`…/original?download=1`) beside More; it takes the place of the Original view's own *Download*, after a PDF's zoom controls. More's menu has the row's facts as a file kept as it is has them (*Kind*, *Size*, *Date added*, *Location*) over the two views, *Markdown* disabled with *Once a retry succeeds* (*重試成功後才有*) beside it.
     - Find, Notes and Agent are not there: there is no document to read or talk about yet.
   - A failed parse whose original was not kept (`original: false` — a workspace at its quota when the parse ended, [workspace.md](./workspace.md) § Layout) has nothing to show, and opening it opens the **retry dialog** at once.
   - Its menu carries *Retry failed pages…* either way (*Retry…* when no page is missing, and the dialog's title is then *Retry*), which opens the dialog without the viewer.
@@ -1078,13 +1084,16 @@ The result viewer opens from a document on `/files` (`GET /api/library/documents
   - the filename, centred;
   - at the right, one glass capsule of icon toggles — **Find**, **Notes**, **Agent** — and a **More** button (`ellipsis`);
   - between Find and Notes, an **Outline** button (`list-tree`), standing while the outline's ticks have no room beside the text (*Outline, collapse and the way back*, below).
+  - On the Original view the capsule holds instead **Zoom out** (`minus`), the zoom level, **Zoom in** (`plus`), a rule, **Download** and More on a PDF, and **Download** and More on an image. On a phone the capsule is **Download** and More alone. What the zoom controls do is [pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Zoom*.
 - Each of these is named by its label (the tooltip and the accessible name). A toggle that is on takes the accent tint (§ Design system).
 - **More is disabled until the result has loaded**, since everything in its menu is the result, and a menu that grew under the pointer when the facts arrived would no longer fit where it was placed. A PDF or an image not yet converted, or a failed parse, has its facts from its row, so its More is enabled at once.
 - **More opens `UiContextMenu` under the button**:
   - first the facts as label/value rows (the menu's `facts`, below the design system's note):
     - for a parse: model, pages, bbox format, and the figure check once the result's figures went through one — how many passed it, or how many of them are unverified;
     - for a file while it is not converted or its parse failed: its *Kind*, *Size*, *Date Added* and *Location*;
-  - then **Original** and **Markdown** as a pair of `checked` choices (*Original and Markdown*, below).
+  - then **Original** and **Markdown** as a pair of `checked` choices (*Original and Markdown*, below);
+  - on a PDF's Original view, on a phone, then the zoom group ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Phone*);
+  - on a PDF's Original view, last, **Open in new tab** (`external-link`, `…/file` or `…/original`), the file in the browser's own viewer, which finds and prints in the whole file.
 - **There is no JSON view.** The result's JSON is the API's contract (`…/result`), not something a reader switches to.
 - A partial result still shows its progress note under the header (*A partial result is read page by page*, below): that is live state, not a fact.
 - On a phone the header is the filename over a switch between the document, the notes and the agent instead (*On a phone and a tablet*, below).
@@ -1095,7 +1104,7 @@ The result viewer opens from a document on `/files` (`GET /api/library/documents
 - **The column is 70% of the pane, centered**, until the reader chooses other margins (§ Body margins). On a very wide display that is wider than a typographer would set prose, and it is the width the reader asked for.
 - **Markdown** is the default tab: one continuous scroll of the whole document.
 - **The document itself never carries page labels**: a reader checking a transcription reads it as a document, not as a stack of pages.
-- **The viewer offers no page navigation either.**
+- **The Markdown view offers no page navigation either.** The Original view of a PDF is the file's pages, and has its page indicator ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Page indicator*).
   - The page grouping is real — a figure's crop is addressed by the page it came from, and a page marker still splits the document's blocks — but it is the pipeline's fact, not something the reader steers by.
   - A reader finds a passage with Find and a section with the outline (*Outline, collapse and the way back*, below).
   - The agent says where it changed something by the section heading or the words it changed, never by a page number the reader has no way to see ([chat.md](./chat.md) § System prompt).
@@ -1201,7 +1210,7 @@ The result viewer opens from a document on `/files` (`GET /api/library/documents
   - A match may span elements — a phrase running through a bold word is one hit — because the search runs over the document's text with an offset map back into its nodes, not node by node.
 - **Three things find deliberately does not search:**
   - KaTeX subtrees: a typeset formula is a tree of per-glyph spans plus a hidden MathML twin, and searching it yields fragments and doubled hits.
-  - The Original view: a PDF's own viewer has its own find, and Ctrl+F is left alone there.
+  - The Original view: Ctrl/Cmd+F is left to the browser there, which finds only in the PDF's text layers mounted at the time. Find in the whole original is stage 2 of the PDF viewer ([pdf-viewer.md](./pdf-viewer.md) § Stages).
   - The viewer's own controls drawn among the blocks — handles, collapse chevrons, fold notes, backlink markers, the drop line (§ Editing, § Notes).
 - **The viewer's controls are `data-chrome`.** They are Vue-rendered siblings of a block's rendering, never written into it, and each carries `data-chrome`, which every walk over the rendered text skips: find's, copy's serializer, the selection the agent reads, `selectionEdge`, locate's and a block link's first words. They are not the document, and *4 blocks collapsed* must never be a hit, a copied line or a passage's text. Find's `MutationObserver` ignores a mutation that only adds, removes or changes `data-chrome` elements, so a handle drawn and taken away under a moving pointer does not rescan the document.
 - **Ctrl+C copies markdown.** A `copy` listener on the document pane serializes the selection back to markdown (`app/lib/copy.ts`):
@@ -1241,9 +1250,9 @@ The result viewer opens from a document on `/files` (`GET /api/library/documents
   - It has no figure route: a `sightread://` placeholder pasted in reads as the dashed placeholder.
   - **Pages it never had are not added.** `app/lib/markdown.ts` reads text before the first `<!-- page: N -->` marker as an unmarked first page and writes it back unmarked, so a document with no markers saves with none: an edit never puts `<!-- page: 1 -->` at the top of a reader's own file. A marker the reader types is a page like any parsed one.
 - **Original and Markdown.** A PDF or an image has two views, chosen from the header's More menu.
-  - **Original** is the file itself — a PDF in the browser's own viewer, in a frame; an image as a picture. It is read from `…/file` while the row is a file kept as it is, and from `…/original` once it is a parsed document ([api.md](./api.md)).
+  - **Original** is the file itself — a PDF in the app's own viewer ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, which holds everything the view does); an image as a picture. It is read from `…/file` while the row is a file kept as it is, and from `…/original` once it is a parsed document ([api.md](./api.md)).
   - **Markdown** is the document.
-  - Find, Notes and Agent are hidden while the original shows, and so is everything the Markdown view adds. The same menu's *Markdown* goes back to where the reader was in the document.
+  - Find, Notes and Agent are hidden while the original shows, and so is everything the Markdown view adds. The same menu's *Markdown* goes back to where the reader was in the document, and *Original* back to where the reader was in the PDF ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Layout and scrolling*).
   - **A PDF or an image not yet converted** opens on Original and has nothing else to show. Choosing *Markdown* there opens the *Convert to document* dialog over the viewer (§ Files), and the document opens on Markdown by itself when the parse succeeds.
   - **A failed parse** opens on Original too, whatever was remembered and whatever a block link names, with *Markdown* disabled and *Once a retry succeeds* beside it: there is no document until a retry succeeds (§ Files, *A failed parse opens on its original*).
   - **A converted document** opens on the view it was last read in: the row's `view`, written by `PUT …/view` each time the reader switches, never by the opening itself. Until it has been switched once, it opens on the reader's default from Settings › Preferences (`default_view` in `GET /api/me`, Markdown unless changed).
@@ -2417,8 +2426,8 @@ Under 900px the document's column is the whole pane, whatever *Body margins* say
 - The filename stays in the header (§ Result viewer); a press on it opens the outline (below).
 - The control is a `tablist` named *Reading panes* (*閱讀區塊*): each segment a `tab` controlling its pane (`aria-controls`), ← and → moving between them, and the track's full 44px height its hit area.
 - Notes and Agent are drawn from the first paint wherever the document can become editable, disabled until it is, so the header does not change shape under the reader's thumb. A viewer whose document can never be edited draws the filename alone.
-- The control is not drawn on the Original view, which is the file alone.
-- Find, the *Outline* button and the Notes and Agent toggles leave the header: **More's first item is *Find*** (*搜尋*), above the facts, and the outline is the filename's.
+- The control is not drawn on the Original view, which is the file alone. There the header is one line: the back button (*Close*), the filename centred, and at the right a capsule of **Download** and More ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Phone*).
+- Find, the *Outline* button and the Notes and Agent toggles leave the header: on the Markdown view **More's first item is *Find*** (*搜尋*), above the facts, and the outline is the filename's.
 - A save that failed says *Not saved* after the filename, in the danger colour, as it does beside the title on the desktop.
 
 **One pane at a time, none unmounted.** The document, the notes and the agent stand in one grid cell under the header, full width, on the paper (no card surface, no radius, no shadow — a pane is the page, not something floating over it).
@@ -2468,14 +2477,14 @@ Under 900px the document's column is the whole pane, whatever *Body margins* say
 
 **Touch sizes.** Under a coarse pointer:
 
-- Every text field the viewer focuses is at least 16px — the block editor and the notes, the formula field, the find field, the composer, the editor of a sent message, a conversation's name — since Safari on iOS zooms the page into a smaller one and leaves it zoomed.
+- Every text field the viewer focuses is at least 16px — the block editor and the notes, the formula field, the find field, the composer, the editor of a sent message, a conversation's name, the PDF's page field — since Safari on iOS zooms the page into a smaller one and leaves it zoomed.
 - The pill and the status note's text buttons are 44px tall.
 - An outline row's actions are always drawn, without hover.
 - On a phone the notes, a full pane, are set at the document's reading sizes rather than the card's.
 
 **The on-screen keyboard.** Safari on iOS — 26 and 27 alike — lays the keyboard over the page: the layout viewport, `100dvh`, `innerHeight` and a fixed box keep their size, only the visual viewport (`window.visualViewport`) shrinks, and a field focused near the foot pans the visual viewport, which carries the header off the top. No shipped Safari has `interactive-widget` or the VirtualKeyboard API. Chrome on Android since 108 and Firefox on Android since 132 do the same by default (`interactive-widget=resizes-visual`), and the page does not opt out of it, so what follows holds there too.
 
-So while a text field inside the viewer has focus — the block editor, the notes, the composer, the find field — the viewer's box follows the visual viewport:
+So while a text field inside the viewer has focus — the block editor, the notes, the composer, the find field, the PDF's page field — the viewer's box follows the visual viewport:
 
 - **The box.** When the visual viewport is at least 100px shorter than the viewer's box (a keyboard, not the shortcut bar an iPad shows over a hardware keyboard), the box stands at the visual viewport's top (`offsetTop`) at its height. So the header stays on screen and the pane — the agent's composer at its foot — ends where the keyboard begins.
 - **The overlay.** Meanwhile the overlay behind the box is drawn in the paper's colour rather than the scrim, so the strip a keyboard still sliding up leaves uncovered is not the library under it.
@@ -2493,7 +2502,7 @@ So while a text field inside the viewer has focus — the block editor, the note
 
 **Safari's bottom bar.** The viewer's box is its overlay's — `position: fixed; inset: 0` — rather than `100dvh`: since Safari 26, WebKit ends a fixed box at the top edge of the floating tab bar, so the foot of a pane is never under the bar, and nothing pads for it.
 
-**No `viewport-fit=cover`.** The page does not opt into `viewport-fit=cover`. In a portrait Safari tab the safe-area insets are 0 either way, and a page that opts in has to pad all four edges on every screen — the app's shell and the public pages too — so a phone held sideways keeps Safari's margins beside the notch. A PDF's Original view is the browser's frame, which iOS does not page well.
+**No `viewport-fit=cover`.** The page does not opt into `viewport-fit=cover`. In a portrait Safari tab the safe-area insets are 0 either way, and a page that opts in has to pad all four edges on every screen — the app's shell and the public pages too — so a phone held sideways keeps Safari's margins beside the notch.
 
 ## Rules
 
@@ -2514,7 +2523,7 @@ So while a text field inside the viewer has focus — the block editor, the note
 - `curl` and connector instructions live in the settings dialog's *API keys* and *MCP Connector* sections (`?settings=keys`, `?settings=mcp`) — the library is for reading a document, not for learning the API.
 - **Every control has a visible focus ring:** a 2px accent outline at 2px offset, never removed, never replaced per component.
   - A region is not a control. One focused only to hold or move focus, a dialog's panel or the layout's `main` (the skip link's target), draws no ring.
-  - The Files list, a region that is also a tab stop, draws its ring inside its edge and only while the keyboard moves focus (§ Files, *A menu is not mouse-only*).
+  - The Files list and the PDF viewer's pane, regions that are also tab stops, draw their ring inside their edge and only while the keyboard moves focus (§ Files, *A menu is not mouse-only*; [pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Accessibility*).
 - **A tab left open across a deploy moves to the new build by itself.** The authed pages are client-rendered and long-lived — `/files` is a tab people keep for days — so without this a release changes nothing for them until they happen to reload, and a fix to the viewer looks like it never shipped. Code: `app/lib/build-update.ts`, `app/plugins/build-update.client.ts`.
   - **Detecting a new build.** The app compares its own build id with `/_nuxt/builds/latest.json` (Nuxt's app manifest; nothing new is served) whenever the tab becomes visible. It also listens to Nuxt's own periodic check. A failed check is silence, never an error — the next one will do.
   - **When it reloads.** Once a newer build exists the page reloads at the first moment that costs nothing: immediately if the page is idle, or when the page's last *hold* is released.

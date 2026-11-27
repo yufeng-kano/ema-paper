@@ -98,8 +98,18 @@ import {
   type ResultBlock,
 } from '~/lib/markdown'
 import type { MenuFact, MenuItem, Point } from '~/lib/menu'
+import {
+  PHONE_MULTIPLES,
+  ZOOM_PRESETS,
+  isZoomChecked,
+  percentOf,
+  type PdfViewerState,
+  type ZoomState,
+  type ZoomTarget,
+} from '~/lib/pdf/zoom'
 import type { Caret, LeaveReason, RichOptions, SectionLinkState, SectionLinkTarget, TextPoint } from '~/lib/rich-extensions'
 import { TURN_KINDS, blockIndexAt, blockKindName, captionLine, convertBlock, type BlockKindName } from '~/lib/richdoc'
+import { ZOOM_SHORTCUTS } from '~/lib/shortcuts'
 import { SLASH_CONVERSIONS, skillIcon, type SlashSkill } from '~/lib/slash'
 
 /** The document pane never gets narrower than this to make room for a dragged column. */
@@ -244,10 +254,11 @@ const props = defineProps<{
   /** The view the viewer opens on (docs/web.md § Result viewer, *Original and Markdown*):
    *  what the row remembers, or the reader's default — Files decides (`initialView`). */
   initialView: DocumentView
-  /** The original, for the Original view: where its bytes are read from and what it is —
-   *  a PDF in a frame, an image as a picture. Null where none is kept: *Original* in the
+  /** The original, for the Original view: where its bytes are read from, where it downloads
+   *  from and how large it is (null when not known), and what it is — a PDF drawn by the
+   *  app's own viewer, an image as a picture. Null where none is kept: *Original* in the
    *  menu is then disabled, with the reason under it. */
-  original: { url: string; kind: 'pdf' | 'image' } | null
+  original: { url: string; download: string; downloadSize: string | null; kind: 'pdf' | 'image' } | null
   /** The row's facts for the More menu while the file is not converted: kind, size, date
    *  added, location. */
   facts: MenuFact[]
@@ -3891,7 +3902,9 @@ async function openFind() {
  * Ctrl/Cmd+F, taken from the browser while this dialog is open. The document is a scroll
  * region inside an overlay, and the native find bar cannot usefully reach into it — it
  * matches text the reader cannot see and scrolls the page behind the dialog. Only on the
- * Markdown view: the original is the browser's own viewer, which brings its own find.
+ * Markdown view: the Original view has no find of its own yet, so the browser's searches the
+ * PDF's text layers drawn at the time (docs/web.md § Find and copy), and the PDF viewer reads
+ * its zoom keys itself.
  *
  * And ⌘[ (Ctrl+[ elsewhere), the way back — taken for as long as the Markdown view shows, pill
  * or not: on Apple platforms it is the browser's Back, and a reader who has learned the key
@@ -3923,6 +3936,98 @@ function onDocumentKey(event: KeyboardEvent) {
  *  way back and would otherwise open at the top. */
 let documentScroll = 0
 
+// --- the Original view's PDF ---------------------------------------------------
+
+/** The PDF viewer (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer): what the header's
+ *  zoom controls ask of it, and what it last said of itself — null until it first does, and
+ *  again once the Original view has gone. */
+const pdf = ref<{ zoomIn(): void; zoomOut(): void; zoomTo(target: ZoomTarget): void } | null>(null)
+const pdfState = ref<PdfViewerState | null>(null)
+/** Where the reader was in the PDF when they left for Markdown. The viewer goes with the
+ *  Original view and reads the file again on the way back, so it is handed this to open on
+ *  the same page at the same zoom. */
+const pdfReturn = shallowRef<{ page: number; zoom: ZoomState } | null>(null)
+
+/** Whether the Original view of a PDF shows: the viewer's zoom controls are the header's. */
+const pdfShown = computed(() => tab.value === 'original' && props.original?.kind === 'pdf')
+
+/** The zoom level as a percentage in the page's locale: the button's text, and part of its
+ *  name, as the visible text must be (WCAG 2.5.3). Null until page 1's size is known, when
+ *  the button reads a dash and is named *Zoom* alone. */
+const zoomPercent = computed(() =>
+  pdfState.value?.ready
+    ? new Intl.NumberFormat(locale.value, { style: 'percent' }).format(percentOf(pdfState.value.zoom.scale) / 100)
+    : null,
+)
+
+/** A zoom choice in a menu, and what choosing it asks the viewer for: checked against the
+ *  viewer's zoom, and disabled while it has none (a password prompt or an error showing). */
+function zoomChoice(item: MenuItem, target: ZoomTarget): { item: MenuItem; target: ZoomTarget } {
+  const state = pdfState.value
+  return {
+    item: { ...item, checked: state ? isZoomChecked(state.zoom, target, state.fitWidth) : false, disabled: !state?.ready },
+    target,
+  }
+}
+
+/** The zoom level's menu (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Zoom*): the
+ *  two fits, then the presets, 100% with its key. */
+const zoomChoices = computed(() => {
+  const percent = new Intl.NumberFormat(locale.value, { style: 'percent' })
+  return [
+    zoomChoice({ key: 'fit-width', label: t('viewer.pdf.fitWidth') }, { mode: 'fit-width' }),
+    zoomChoice({ key: 'fit-page', label: t('viewer.pdf.fitPage') }, { mode: 'fit-page' }),
+    ...ZOOM_PRESETS.map((scale, index) =>
+      zoomChoice(
+        {
+          key: `zoom-${scale}`,
+          label: percent.format(percentOf(scale) / 100),
+          separated: index === 0,
+          shortcut: scale === 1 ? keyLabel(ZOOM_SHORTCUTS.reset) : undefined,
+        },
+        { mode: 'custom', scale },
+      ),
+    ),
+  ]
+})
+
+/** A phone's zoom group in More, in multiples of fit width: what a pinch does, for a reader
+ *  who cannot pinch (VoiceOver, Switch Control). */
+const phoneZoomChoices = computed(() => [
+  zoomChoice({ key: 'zoom-fit', label: t('viewer.pdf.fitWidth'), separated: true }, { mode: 'fit-width' }),
+  ...PHONE_MULTIPLES.map((times) =>
+    zoomChoice({ key: `zoom-x${times}`, label: t('viewer.pdf.magnify', { n: times }) }, { mode: 'multiple', times }),
+  ),
+])
+
+const zoomMenu = ref<Point | null>(null)
+const zoomFromKey = ref(false)
+let zoomClosedAt = 0
+
+/** Anchored as More's menu is, under the button's right edge, so it opens leftwards under
+ *  the level and clear of More. */
+function toggleZoom(event: MouseEvent) {
+  if (zoomMenu.value || performance.now() - zoomClosedAt < 200) {
+    zoomMenu.value = null
+    return
+  }
+  const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  zoomFromKey.value = event.detail === 0
+  zoomMenu.value = { x: box.right, y: box.bottom + 4 }
+}
+
+function closeZoom() {
+  zoomMenu.value = null
+  zoomClosedAt = performance.now()
+}
+
+function onZoomSelect(key: string) {
+  const choice = zoomChoices.value.find((entry) => entry.item.key === key)
+  if (choice) {
+    pdf.value?.zoomTo(choice.target)
+  }
+}
+
 /** The find bar belongs to the document, so leaving the document for the original closes
  *  it rather than leaving it hanging over the original; an open block is written back
  *  first, and everything the Markdown view adds goes with it. The watcher runs before the
@@ -3939,6 +4044,14 @@ watch(tab, async (view) => {
     closeOverBlocks()
     return
   }
+  // The PDF viewer goes with the Original view: where it stood is kept for the way back,
+  // unless it never got that far (a password prompt or an error).
+  const left = pdfState.value
+  if (left?.ready && left.page > 0) {
+    pdfReturn.value = { page: left.page, zoom: left.zoom }
+  }
+  pdfState.value = null
+  zoomMenu.value = null
   await nextTick()
   if (scroller.value) {
     scroller.value.scrollTop = documentScroll
@@ -4025,7 +4138,9 @@ const moreReady = computed(() => (props.markdownDocument ? moreFind.value : conv
 
 /** The two views, as a pair of choices (docs/web.md § Result viewer, *Original and
  *  Markdown*): Original is disabled where no original was kept, with the reason under it;
- *  Markdown, on a file not yet converted, is the conversion. */
+ *  Markdown, on a file not yet converted, is the conversion. Over a PDF's original, a phone's
+ *  zoom group follows, then *Open in new tab*: the browser's own viewer, which finds and
+ *  prints in the whole file. */
 const moreItems = computed<MenuItem[]>(() => [
   // On a phone Find leaves the header for More, first (docs/web.md § Result viewer, *On a
   // phone and a tablet*).
@@ -4050,16 +4165,31 @@ const moreItems = computed<MenuItem[]>(() => [
         ? undefined
         : t(props.failure ? 'viewer.failed.noMarkdown' : 'viewer.notConvertible'),
   },
+  ...(pdfShown.value && phone.value ? phoneZoomChoices.value.map((choice) => choice.item) : []),
+  ...(pdfShown.value && props.original
+    ? [
+        {
+          key: 'open-tab',
+          label: t('viewer.pdf.openInNewTab'),
+          icon: 'external-link' as const,
+          href: props.original.url,
+          newTab: true,
+          separated: true,
+        },
+      ]
+    : []),
 ])
 
-/** A failed parse's original, saved. A button rather than a link: the dialog gives its first
- *  link the focus on open, and Enter must not start a download. */
+/** The original, saved: a failed parse's, or the one the Original view shows. A button
+ *  rather than a link: the dialog gives its first link the focus on open, and Enter must not
+ *  start a download. */
 function downloadOriginal() {
-  if (!props.failure) {
+  const href = props.failure?.download ?? props.original?.download
+  if (!href) {
     return
   }
   const anchor = document.createElement('a')
-  anchor.href = props.failure.download
+  anchor.href = href
   anchor.download = ''
   anchor.click()
 }
@@ -4067,6 +4197,15 @@ function downloadOriginal() {
 function onMoreSelect(key: string) {
   if (key === 'find') {
     void openFind()
+    return
+  }
+  // *Open in new tab* is a link, and has opened the tab itself.
+  if (key === 'open-tab') {
+    return
+  }
+  const zoom = phoneZoomChoices.value.find((choice) => choice.item.key === key)
+  if (zoom) {
+    pdf.value?.zoomTo(zoom.target)
     return
   }
   if (key === 'markdown' && !converted.value) {
@@ -4627,7 +4766,7 @@ watch(
     <template #actions>
       <!-- The switches for the markdown view, then More: one glass capsule, each button
            named by its label (docs/web.md § Result viewer). None of the switches means
-           anything over the original. -->
+           anything over the original, which has a PDF's zoom and Download instead. -->
       <UiCapsule :label="t('viewer.tools')">
         <template v-if="tab === 'markdown' && !phone">
           <UiButton
@@ -4676,13 +4815,51 @@ watch(
           <span class="capsule-rule" aria-hidden="true" />
         </template>
 
-        <!-- A failed parse's original, saved: the file the reader still has (docs/web.md
-             § Files, *A failed parse opens on its original*). -->
+        <!-- A PDF's zoom, on desktop: the viewer does the zooming, the header holds its
+             controls (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Zoom*). Natively
+             disabled until page 1's size is known, and at either end of the range. A phone
+             has its zoom group in More instead. -->
+        <template v-if="pdfShown && !phone">
+          <UiButton
+            variant="ghost"
+            icon-only
+            :label="t('viewer.pdf.zoomOut')"
+            :disabled="!pdfState?.ready || !pdfState.canZoomOut"
+            @click="pdf?.zoomOut()"
+          >
+            <template #icon><UiIcon name="minus" /></template>
+          </UiButton>
+          <!-- A dash where there is no level yet: not a word, so not the catalog's. -->
+          <UiButton
+            variant="ghost"
+            :label="zoomPercent ? t('viewer.pdf.zoomLevel', { percent: zoomPercent }) : t('viewer.pdf.zoom')"
+            :disabled="!pdfState?.ready"
+            aria-haspopup="menu"
+            :aria-expanded="zoomMenu ? 'true' : 'false'"
+            @click="toggleZoom"
+          >
+            {{ zoomPercent ?? '–' }}
+          </UiButton>
+          <UiButton
+            variant="ghost"
+            icon-only
+            :label="t('viewer.pdf.zoomIn')"
+            :disabled="!pdfState?.ready || !pdfState.canZoomIn"
+            @click="pdf?.zoomIn()"
+          >
+            <template #icon><UiIcon name="plus" /></template>
+          </UiButton>
+          <span class="capsule-rule" aria-hidden="true" />
+        </template>
+
+        <!-- The original, saved, wherever it shows. A failed parse's is *Download original*,
+             the file the reader still has (docs/web.md § Files, *A failed parse opens on its
+             original*). -->
         <UiButton
-          v-if="failure"
+          v-if="failure || (tab === 'original' && original)"
           variant="ghost"
           icon-only
-          :label="t('viewer.failed.download')"
+          :label="t(failure ? 'viewer.failed.download' : 'viewer.file.download')"
           @click="downloadOriginal"
         >
           <template #icon><UiIcon name="download" /></template>
@@ -4714,12 +4891,21 @@ watch(
         @select="onMoreSelect"
         @close="closeMore"
       />
+      <UiContextMenu
+        v-if="zoomMenu"
+        :at="zoomMenu"
+        :items="zoomChoices.map((choice) => choice.item)"
+        :label="t('viewer.pdf.zoom')"
+        :focus-first="zoomFromKey"
+        @select="onZoomSelect"
+        @close="closeZoom"
+      />
     </template>
 
     <div class="body" :class="layout">
-      <!-- The original: the file itself, whatever the parse made of it — a PDF in the
-           browser's own viewer, an image as a picture (docs/web.md § Result viewer,
-           *Original and Markdown*). -->
+      <!-- The original: the file itself, whatever the parse made of it — a PDF drawn by the
+           app's own viewer, an image as a picture (docs/web.md § Result viewer, *Original
+           and Markdown*). -->
       <div v-if="tab === 'original' && original" class="original-view">
         <!-- A failed parse: that the conversion did not finish, what the reader still has,
              and the retry (docs/web.md § Files, *A failed parse opens on its original*).
@@ -4740,9 +4926,22 @@ watch(
             </template>
           </UiBanner>
         </div>
-        <div class="original" :class="original.kind">
-          <iframe v-if="original.kind === 'pdf'" class="original-frame" :src="original.url" :title="title" />
-          <img v-else class="original-image" :src="original.url" :alt="title">
+        <!-- Its pane fills the row under the notes; its *Back to Files*, on a file that is
+             no longer there, closes the viewer as the back button does. -->
+        <PdfViewer
+          v-if="original.kind === 'pdf'"
+          ref="pdf"
+          :url="original.url"
+          :name="title"
+          :download="original.download"
+          :download-size="original.downloadSize"
+          :phone="phone"
+          :initial="pdfReturn"
+          @state="pdfState = $event"
+          @close="emit('close')"
+        />
+        <div v-else class="original">
+          <img class="original-image" :src="original.url" :alt="title">
         </div>
       </div>
 
@@ -5812,16 +6011,18 @@ watch(
 /* --- Original view -------------------------------------------------------- */
 
 /* The original fills what the notes over it leave: a failed parse's failure, nothing
-   otherwise. */
+   otherwise. The column is held to the body's width, so a PDF zoomed wider than the window
+   scrolls sideways in its own pane rather than widening the grid. */
 .original-view {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   height: 100%;
   min-height: 0;
 }
 
-/* The file itself: a PDF's frame fills the body, since the browser's viewer brings its own
-   chrome; a picture is centred, scrolling where it is taller than the window. */
+/* A picture, centred, scrolling where it is taller than the window. A PDF's viewer is this
+   row itself, its pane scrolling on the desk. */
 .original {
   display: grid;
   place-items: center;
@@ -5829,19 +6030,6 @@ watch(
   min-height: 0;
   padding: var(--space-4);
   overflow: auto;
-}
-
-.original.pdf {
-  display: block;
-  padding: 0;
-  overflow: hidden;
-}
-
-.original-frame {
-  display: block;
-  width: 100%;
-  height: 100%;
-  border: 0;
 }
 
 .original-image {

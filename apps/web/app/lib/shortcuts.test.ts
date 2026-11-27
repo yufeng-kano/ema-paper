@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ariaShortcut, hasMod, isApplePlatform, matchesShortcut, shortcutLabel } from './shortcuts'
+import { ariaShortcut, hasMod, isApplePlatform, matchesShortcut, shortcutLabel, ZOOM_SHORTCUTS, zoomKey } from './shortcuts'
 
 function key(key: string, mods: Partial<{ meta: boolean; ctrl: boolean; shift: boolean; alt: boolean }> = {}, code?: string) {
   return { key, code, metaKey: !!mods.meta, ctrlKey: !!mods.ctrl, shiftKey: !!mods.shift, altKey: !!mods.alt }
@@ -74,5 +74,54 @@ describe('reading a shortcut off a key event', () => {
     expect(matchesShortcut(key('Delete', { ctrl: true }), 'delete', false)).toBe(false)
     expect(matchesShortcut(key('F2'), 'f2', true)).toBe(true)
     expect(matchesShortcut(key('End'), 'end', false)).toBe(true)
+  })
+})
+
+describe('the PDF viewer’s zoom keys', () => {
+  it('labels them as Safari and Chrome do, Ctrl in place of ⌘ elsewhere', () => {
+    expect(shortcutLabel(ZOOM_SHORTCUTS.in, true)).toBe('⌘+')
+    expect(shortcutLabel(ZOOM_SHORTCUTS.out, true)).toBe('⌘−')
+    expect(shortcutLabel(ZOOM_SHORTCUTS.reset, true)).toBe('⌘0')
+    expect(shortcutLabel(ZOOM_SHORTCUTS.in, false)).toBe('Ctrl++')
+    expect(shortcutLabel(ZOOM_SHORTCUTS.out, false)).toBe('Ctrl+−')
+    expect(shortcutLabel(ZOOM_SHORTCUTS.reset, false)).toBe('Ctrl+0')
+    expect(ariaShortcut(ZOOM_SHORTCUTS.in, true)).toBe('Meta+Plus')
+    expect(ariaShortcut(ZOOM_SHORTCUTS.out, false)).toBe('Control+-')
+  })
+
+  it('zooms in on ⌘=, ⌘⇧= and any key that types +', () => {
+    expect(zoomKey(key('=', { meta: true }, 'Equal'), true)).toBe('in')
+    expect(zoomKey(key('+', { meta: true, shift: true }, 'Equal'), true)).toBe('in')
+    expect(zoomKey(key('+', { ctrl: true }, 'BracketRight'), false)).toBe('in')
+    expect(zoomKey(key('+', { ctrl: true }, 'NumpadAdd'), false)).toBe('in')
+  })
+
+  it('zooms out on − and resets on 0, by the key typed or the key it sits on', () => {
+    expect(zoomKey(key('-', { meta: true }, 'Minus'), true)).toBe('out')
+    expect(zoomKey(key('-', { ctrl: true }, 'NumpadSubtract'), false)).toBe('out')
+    expect(zoomKey(key('0', { meta: true }, 'Digit0'), true)).toBe('reset')
+    expect(zoomKey(key('0', { ctrl: true }, 'Numpad0'), false)).toBe('reset')
+    expect(zoomKey(key('à', { ctrl: true }, 'Digit0'), false)).toBe('reset')
+  })
+
+  it('needs the platform’s command key alone, and never Alt', () => {
+    expect(zoomKey(key('='), true)).toBeNull()
+    expect(zoomKey(key('=', { ctrl: true }), false)).toBe('in')
+    expect(zoomKey(key('=', { meta: true }), false)).toBeNull()
+    expect(zoomKey(key('=', { meta: true, ctrl: true }), true)).toBeNull()
+    expect(zoomKey(key('≠', { meta: true, alt: true }, 'Equal'), true)).toBeNull()
+    expect(zoomKey(key('0', { ctrl: true, alt: true }, 'Digit0'), false)).toBeNull()
+  })
+
+  it('leaves every other key with the command key alone', () => {
+    expect(zoomKey(key(')', { meta: true, shift: true }, 'Digit0'), true)).toBeNull()
+    expect(zoomKey(key('9', { meta: true }, 'Digit9'), true)).toBeNull()
+    expect(zoomKey(key('f', { meta: true }, 'KeyF'), true)).toBeNull()
+  })
+
+  it('goes by the character for in and out, not the US key it sits on', () => {
+    expect(zoomKey(key('ß', { ctrl: true }, 'Minus'), false)).toBeNull()
+    expect(zoomKey(key('´', { ctrl: true }, 'Equal'), false)).toBeNull()
+    expect(zoomKey(key(')', { ctrl: true }, 'Minus'), false)).toBeNull()
   })
 })

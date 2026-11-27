@@ -32,6 +32,8 @@ const APPLE: Record<string, string> = {
   home: 'Home',
   end: 'End',
   f2: 'F2',
+  plus: '+',
+  minus: '−',
 }
 
 const OTHER: Record<string, string> = {
@@ -48,12 +50,15 @@ const OTHER: Record<string, string> = {
   home: 'Home',
   end: 'End',
   f2: 'F2',
+  plus: '+',
+  minus: '−',
 }
 
 const MODIFIERS = new Set(['mod', 'shift', 'alt'])
 
 function parts(spec: string): string[] {
-  // `mod++` would be the plus key; nothing here uses it, so a plain split is enough.
+  // `mod++` would be the plus key, which is written `mod+plus` instead, so a plain split is
+  // enough.
   return spec.split('+').filter(Boolean)
 }
 
@@ -80,12 +85,15 @@ const KEY_NAMES: Record<string, string> = {
   home: 'Home',
   end: 'End',
   f2: 'F2',
+  plus: '+',
+  minus: '-',
 }
 
-/** The same shortcut for `aria-keyshortcuts`, in `KeyboardEvent.key` names. */
+/** The same shortcut for `aria-keyshortcuts`, in `KeyboardEvent.key` names; the plus key is
+ *  `Plus` there, since `+` joins the keys. */
 export function ariaShortcut(spec: string, apple: boolean): string {
   return parts(spec)
-    .map((key) => (key === 'mod' ? (apple ? 'Meta' : 'Control') : key === 'shift' ? 'Shift' : key === 'alt' ? 'Alt' : (KEY_NAMES[key] ?? key)))
+    .map((key) => (key === 'mod' ? (apple ? 'Meta' : 'Control') : key === 'shift' ? 'Shift' : key === 'alt' ? 'Alt' : key === 'plus' ? 'Plus' : (KEY_NAMES[key] ?? key)))
     .join('+')
 }
 
@@ -106,7 +114,7 @@ export function hasMod(event: KeyEventLike, apple: boolean): boolean {
 }
 
 /** The `KeyboardEvent.code` a character key sits on, so a shortcut is read on any layout. */
-const CODES: Record<string, string> = { '/': 'Slash', '[': 'BracketLeft' }
+const CODES: Record<string, string> = { '/': 'Slash', '[': 'BracketLeft', '0': 'Digit0' }
 
 /** Whether a key event is the shortcut: its modifiers exactly, and its key by name or by the
  *  physical key — `⌘⇧C` arrives as `C`, and `⌘/` as `?` where Shift is part of the slash. */
@@ -133,4 +141,29 @@ export function matchesShortcut(event: KeyEventLike, spec: string, apple: boolea
   // Punctuation is the character typed, whatever it took to type it — `/` is Shift+7 on a
   // German keyboard — or, failing that, the key it sits on in the US layout.
   return event.key === key || (shift && CODES[key] !== undefined && event.code === CODES[key])
+}
+
+/** The PDF viewer's zoom keys, written for `shortcutLabel` and `ariaShortcut`: `⌘+`, `⌘−` and
+ *  `⌘0` on Apple platforms, `Ctrl++`, `Ctrl+−` and `Ctrl+0` elsewhere. */
+export const ZOOM_SHORTCUTS = { in: 'mod+plus', out: 'mod+minus', reset: 'mod+0' } as const
+
+/**
+ * Which zoom key an event is, if any: in for the command key with a key that types `=` or `+`
+ * (Shift or not, a German keyboard's own `+`, the keypad's); out with one that types `-`; reset
+ * with `0`. In and out go by the character alone, since another layout has other characters
+ * on the US keyboard's minus and equals keys. Never with Alt, which types other characters on
+ * these keys. The caller cancels the event's default, which is the browser zooming the whole
+ * page.
+ */
+export function zoomKey(event: KeyEventLike, apple: boolean): 'in' | 'out' | 'reset' | null {
+  if (!hasMod(event, apple) || event.altKey) {
+    return null
+  }
+  if (event.key === '+' || event.key === '=') {
+    return 'in'
+  }
+  if (event.key === '-') {
+    return 'out'
+  }
+  return matchesShortcut(event, 'mod+0', apple) ? 'reset' : null
 }

@@ -5,7 +5,8 @@
  *
  * The buttons inside are plain `UiButton`s, `ghost` and `icon-only`: the capsule is the one
  * glass surface, and nothing glass sits on it. A button that is a toggle carries
- * `aria-pressed`, and the pressed one takes the accent tint.
+ * `aria-pressed`, and the pressed one takes the accent tint. One button may carry a label
+ * rather than a glyph, a readout that opens a menu: the PDF viewer's zoom level (`100%`).
  */
 defineProps<{
   /** What the group of controls is, for assistive tech. */
@@ -44,6 +45,15 @@ defineProps<{
 .capsule :deep(.btn) {
   width: 40px;
   color: var(--ink);
+}
+
+/* A labelled button, the zoom level: as wide as its text and never narrower than a short
+   one, in figures of one width so the capsule does not shift as the percentage changes. */
+.capsule :deep(.btn:not(.btn-icon)) {
+  width: auto;
+  min-width: var(--space-14);
+  padding: 0 var(--space-2);
+  font-variant-numeric: tabular-nums;
 }
 
 /* A button whose menu is open stays filled while the menu is up. */

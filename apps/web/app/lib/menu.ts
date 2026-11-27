@@ -32,6 +32,13 @@ export interface MenuItem {
   /** A destination rather than an action: the item is drawn as a real link — the account
    *  menu's Admin row. */
   to?: string
+  /** An address outside the app's routes, drawn as a plain `<a href>`: a file the browser shows
+   *  itself, such as the result viewer's *Open in new tab* to the original. Disabled, it keeps
+   *  no `href`, so there is nothing to follow. */
+  href?: string
+  /** With `href`: opened in a new tab (`target="_blank"`, `rel="noopener noreferrer"`), so the
+   *  page that opened it can neither be reached from it nor named to it as the referrer. */
+  newTab?: boolean
   /**
    * Present when the item is one of a set of choices, and `true` on the chosen one — drawn
    * with a check and announced as a radio rather than a plain item.

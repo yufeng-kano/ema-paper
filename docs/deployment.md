@@ -143,6 +143,7 @@ Proxying:
 
 - `/healthz` is in the `@api` matcher so an external monitor hits the API rather than the Nuxt 404 page.
 - Uploads and SSE go straight through Caddy to FastAPI — never through the Nuxt/Node server.
+- `/pdfjs/<version>/*`, the PDF viewer's data files, falls to the web app, which sends their year-long `Cache-Control` itself (§ Security headers). Caddy sets no cache header of its own.
 - The API proxy disables response buffering (`flush_interval -1`), for SSE and MCP streams.
 - Long-lived connections need generous idle timeouts: the API proxy sets 30-minute read/write timeouts.
 
@@ -184,18 +185,30 @@ connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame
   - `blob:` is the composer's preview of a pasted or attached image (an object URL).
   - `data:` is inline images.
   - A remote image in a document is not rendered (it stays text), so no other host is listed.
-- `connect-src 'self'`: the app calls only its own origin — `/api/*`, `/v1/*` and their SSE streams.
-- `worker-src 'self'`: the PDF viewer's workers are chunks of the build, served from this origin ([pdf-viewer.md](./pdf-viewer.md)). No worker starts from a `blob:` or `data:` URL. It is named, not left to fall back to `script-src`, so the rule for workers is read in one place.
-- No `'wasm-unsafe-eval'` in `script-src`: nothing in the app compiles WebAssembly, the PDF viewer included ([pdf-viewer.md](./pdf-viewer.md) § Who does what).
+- `connect-src 'self'`: the app calls only its own origin — `/api/*`, `/v1/*` and their SSE streams. The PDF viewer's fetches are on it too: pdf.js's range requests to `…/file` and `…/original`, and its worker's fetches of the CMaps and standard fonts under `/pdfjs/<version>/`.
+- `worker-src 'self'`: the PDF viewer's one worker is pdf.js's `pdf.worker.min.mjs`, an asset of the build under `/_nuxt/`, served from this origin ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Files served beside the build*). It imports the two no-WebAssembly image decoders from `/pdfjs/<version>/wasm/`, under `script-src 'self'`. pdf.js's renderer worker is not used. No worker starts from a `blob:` or `data:` URL: pdf.js makes one only for a worker on another origin. It is named, not left to fall back to `script-src`, so the rule for workers is read in one place.
+- No `'wasm-unsafe-eval'` in `script-src`: nothing in the app compiles WebAssembly, the PDF viewer included. pdf.js is opened with `useWasm: false`, its JBIG2 and JPEG 2000 decoders run from their JavaScript fallbacks, and no ICC profile is read, since its colour management is WebAssembly ([pdf-viewer.md](./pdf-viewer.md) § Who does what).
 - No `form-action`: the consent screen's form posts to `/oauth/authorize`, which redirects to the connector's `redirect_uri` — another origin, or `http://localhost` for a CLI client — and browsers hold that redirect to `form-action` too. Checkout and the portal are full-page navigations to Kano Pay, which no directive restricts.
 - No `Cross-Origin-Opener-Policy` or `Cross-Origin-Resource-Policy`: a connector opens the consent screen in a popup and keeps its handle, and a connector's page loads this site's icon from its own origin.
 
 Two routes keep a policy of their own: `GET /api/library/documents/{id}/file` and `GET /api/library/documents/{id}/original`, which serve the reader's files and a parsed document's original inline ([api.md](./api.md)).
 
 - They answer with `Content-Security-Policy: sandbox` and `X-Frame-Options: DENY`, so that whatever a file is, it runs nothing with the session. An HTML or SVG file is sent as an attachment, but the headers stand on every answer.
-- A PDF served inline is the one exception, since a browser's PDF viewer refuses a sandboxed frame: that answer carries `frame-ancestors 'self'` and `SAMEORIGIN`, so the result viewer's Original frame on this origin may show it and no other page may.
+- A PDF served inline is the one exception, since a browser's PDF viewer refuses a sandboxed document, and the result viewer's *Open in new tab* opens the file in the browser's own viewer. That answer carries `frame-ancestors 'self'` and `SAMEORIGIN` instead, so no other origin may frame it. The app's own viewer fetches the bytes, which neither header governs; `'self'` stays so that a frame on this origin remains possible as a fallback.
 - The site's policy allows inline scripts and its frame header forbids every frame, and both would replace the routes', so the Caddyfile sends those two from a block with a matcher that leaves both paths out (`header @notfile`, `@notfile not path /api/library/documents/*/file /api/library/documents/*/original`).
 - The other headers stay on every answer, the file routes' included.
+
+The PDF viewer's data files under `/pdfjs/<version>/` ([pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *Files served beside the build*) are the web app's own answers, with the site's headers:
+
+| Path | Content type | Read by |
+|------|--------------|---------|
+| `/pdfjs/<version>/cmaps/*.bcmap` | `text/plain; charset=utf-8`, nitro's type for an extension it does not know | the worker's `fetch`, as bytes, so the type does not matter |
+| `/pdfjs/<version>/standard_fonts/*.pfb` | `application/x-font-type1` | the worker's `fetch`, as bytes |
+| `/pdfjs/<version>/wasm/*_nowasm_fallback.js` | `text/javascript` | the worker's `import()`, which `nosniff` holds to a JavaScript type |
+| the `LICENSE*` files beside them | `text/plain; charset=utf-8` | a reader of the notices |
+
+- Nitro sends each with `Cache-Control: public, max-age=31536000, immutable`, which the version in the path makes safe.
+- A path under `/pdfjs/` that is not one of these files is a 404 from the web app.
 
 `deploy/caddy/Caddyfile.local` sends the same headers except HSTS, which a browser ignores over plain HTTP, so a policy violation shows up in a local integration run before production. Change both together.
 

@@ -96,9 +96,26 @@ const SUBMENU_OPEN_MS = 150
 const SUBMENU_TAKEOVER_MS = 300
 let restTimer: ReturnType<typeof setTimeout> | undefined
 
-/** Items are buttons, or links where the item is a destination — both are options here. */
+/** Items are buttons, or links where the item is a destination — both are options here, but
+ *  for a disabled one, which the arrow keys pass over as a native menu does. */
 function options(surface: HTMLElement | null): HTMLElement[] {
-  return [...(surface?.querySelectorAll<HTMLElement>('button:not([disabled]), a') ?? [])]
+  return [...(surface?.querySelectorAll<HTMLElement>('button:not([disabled]), a:not([aria-disabled="true"])') ?? [])]
+}
+
+/** What an item's element carries: a route is a `NuxtLink`, an outside address a plain link —
+ *  with no `href` while disabled, so neither a click nor Enter can follow it — and an action
+ *  a button. */
+function itemAttrs(item: MenuItem): Record<string, unknown> {
+  if (item.to) {
+    return { to: item.to }
+  }
+  if (item.href) {
+    if (item.disabled) {
+      return { 'aria-disabled': 'true' }
+    }
+    return item.newTab ? { href: item.href, target: '_blank', rel: 'noopener noreferrer' } : { href: item.href }
+  }
+  return { type: 'button', disabled: item.disabled }
 }
 
 function focusAt(surface: HTMLElement | null, index: number) {
@@ -150,6 +167,11 @@ function onKeydown(event: KeyboardEvent) {
   } else if (event.key === 'Tab') {
     // Tabbing away is leaving, and the browser's own focus move is the right one.
     emit('close', event)
+  } else if (event.key === ' ' && row instanceof HTMLAnchorElement) {
+    // A link answers Enter only, and a menu item answers Space too: the click is made by hand,
+    // inside the key's own event, so a new tab it opens is still the reader's doing.
+    event.preventDefault()
+    row.click()
   } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
     closeSub()
     moveKeys(event, menu.value)
@@ -396,9 +418,9 @@ function choose(item: MenuItem, event?: MouseEvent) {
           </dl>
         </template>
         <component
-          :is="item.to ? NuxtLinkComponent : 'button'"
+          :is="item.to ? NuxtLinkComponent : item.href ? 'a' : 'button'"
           v-else
-          v-bind="item.to ? { to: item.to } : { type: 'button', disabled: item.disabled }"
+          v-bind="itemAttrs(item)"
           :role="item.checked === undefined ? 'menuitem' : 'menuitemradio'"
           :aria-checked="item.checked"
           :aria-haspopup="item.children ? 'menu' : undefined"
@@ -596,7 +618,8 @@ function choose(item: MenuItem, event?: MouseEvent) {
   color: currentcolor;
 }
 
-.item:disabled {
+.item:disabled,
+.item[aria-disabled='true'] {
   color: var(--faint);
   background: none;
 }
@@ -674,7 +697,9 @@ function choose(item: MenuItem, event?: MouseEvent) {
 }
 
 .item:disabled .description,
-.item:disabled .shortcut {
+.item:disabled .shortcut,
+.item[aria-disabled='true'] .description,
+.item[aria-disabled='true'] .shortcut {
   color: var(--faint);
 }
 

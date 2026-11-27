@@ -1,0 +1,193 @@
+/*
+ * The Original view's page layers (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Text*,
+ * *Links*): the canvases, pdf.js's text layer and the app's own link layer, inside each page's
+ * content layer (`.pdf-page-content`, drawn by `PdfViewer`; `app/lib/pdf/page-view.ts` fills it).
+ *
+ * The `.textLayer` rules are pdf.js's own, from pdfjs-dist 6.5.438 web/pdf_viewer.css:648-796
+ * (Copyright 2024 Mozilla Foundation, Apache-2.0; THIRD_PARTY_NOTICES § 1), without the find
+ * highlights, the image and editor rules, and flattened from its CSS nesting to match the rest
+ * of the app's CSS. The link rules follow its `.annotationLayer` ones (:872-983) for our own
+ * `<a>` elements, and the rotation rules its global `[data-main-rotation]` ones (:6305-6313),
+ * scoped here to these layers because the attribute is generic.
+ *
+ * The page carries `--total-scale-factor` and `--scale-round-x/y`, which `setLayerDimensions`
+ * and the text sizes read, and the pane `--scale-factor`, so a zoom is a change of custom
+ * properties and never rebuilds a layer.
+ */
+
+/*
+ * A size container, so a quarter-turned layer can take the content layer's height as its width
+ * (`cqh`); its size comes from the page box around it, never from what it holds.
+ */
+.pdf-page-content {
+  container-type: size;
+}
+
+/* A canvas fills the content layer, stretched by CSS; a capped page's detail canvas has its own
+ * place and size inline, in percentages of the page. */
+.pdf-page-content .pdf-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+.pdf-page-content .textLayer {
+  color-scheme: only light;
+  position: absolute;
+  text-align: initial;
+  inset: 0;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  -webkit-text-size-adjust: none;
+  -moz-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 0;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+/*
+ * The text and link layers fill the content layer whatever size `setLayerDimensions` wrote
+ * inline: the page box is the layout model's whole pixels less its border, and the layers have
+ * to match it, not pdf.js's own rounding of the unbordered page. A layer turned a quarter is
+ * laid out unturned, so it takes the box's sides the other way round.
+ */
+.pdf-page-content :is(.textLayer, .pdf-link-layer) {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.pdf-page-content :is(.textLayer, .pdf-link-layer):is([data-main-rotation='90'], [data-main-rotation='270']) {
+  width: 100cqh !important;
+  height: 100cqw !important;
+}
+
+.pdf-page-content :is(.textLayer, .pdf-link-layer)[data-main-rotation='90'] {
+  transform: rotate(90deg) translateY(-100%);
+}
+
+.pdf-page-content :is(.textLayer, .pdf-link-layer)[data-main-rotation='180'] {
+  transform: rotate(180deg) translate(-100%, -100%);
+}
+
+.pdf-page-content :is(.textLayer, .pdf-link-layer)[data-main-rotation='270'] {
+  transform: rotate(270deg) translateX(-100%);
+}
+
+.pdf-page-content .textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  user-select: text;
+}
+
+.pdf-page-content .textLayer > :not(.markedContent),
+.pdf-page-content .textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.pdf-page-content .textLayer .markedContent {
+  display: contents;
+}
+
+.pdf-page-content .textLayer ::-moz-selection {
+  background: rgba(0 0 255 / 0.25);
+  background: color-mix(in srgb, AccentColor, transparent 50%);
+  color: transparent;
+}
+
+.pdf-page-content .textLayer ::selection {
+  background: rgba(0 0 255 / 0.25);
+  background: color-mix(in srgb, AccentColor, transparent 50%);
+  color: transparent;
+}
+
+.pdf-page-content .textLayer br::-moz-selection {
+  background: transparent;
+}
+
+.pdf-page-content .textLayer br::selection {
+  background: transparent;
+}
+
+.pdf-page-content .textLayer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  user-select: none;
+}
+
+.pdf-page-content .textLayer.selecting .endOfContent {
+  top: 0;
+}
+
+/* The link layer lets everything but its links through to the text under it. */
+.pdf-page-content .pdf-link-layer {
+  color-scheme: only light;
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  transform-origin: 0 0;
+}
+
+.pdf-page-content .pdf-link-layer > a {
+  position: absolute;
+  box-sizing: border-box;
+  pointer-events: auto;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  user-select: none;
+}
+
+/* A selection being dragged runs on over the links rather than stopping at them. */
+.pdf-page-content .textLayer.selecting ~ .pdf-link-layer > a {
+  pointer-events: none;
+}
+
+/*
+ * pdf.js's hover tint, yellow at a fifth: written as the colour's own alpha rather than its
+ * `opacity: 0.2` on the link, which would fade the focus ring with it.
+ */
+.pdf-page-content .pdf-link-layer > a:hover {
+  background-color: rgb(255 255 0 / 0.2);
+}
+
+.pdf-page-content .pdf-link-layer > a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media screen and (forced-colors: active) {
+  .pdf-page-content .pdf-link-layer > a {
+    outline: 1.5px solid LinkText;
+  }
+
+  .pdf-page-content .pdf-link-layer > a:hover {
+    background: none;
+  }
+}
