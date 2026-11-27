@@ -76,14 +76,15 @@ The fallback is a whole page at a time: a page is never drawn half by each rende
 
 ## Safari
 
-Safari 27.2 is WebKit 625.2.8. These rules come from that source and from WebKit's bug tracker. The device check asks the first three of a real device (§ The device check); no check exercises the rest.
+Safari 27.2 is WebKit 625.2.8. These rules come from that source and from WebKit's bug tracker. The device check asks the first three of a real device (§ The device check), and § Recorded devices holds its answers; no check exercises the rest.
 
-- **A canvas the reader sees is never read through a 2D canvas or made into a bitmap.** In Safari 27.2 `drawImage`, `toDataURL`, `toBlob` and `createImageBitmap` of a WebGPU canvas leave it showing a buffer nothing was drawn to, which is black, until the canvas is drawn again. Chromium reads an empty frame from a canvas whose frame has been shown. A thumbnail or a print is drawn into a texture the renderer owns.
+- **A canvas the reader sees is never read through a 2D canvas or made into a bitmap.** In Safari 27.2 `drawImage`, `toDataURL`, `toBlob` and `createImageBitmap` of a WebGPU canvas leave it showing a buffer nothing was drawn to, which is black, until the canvas is drawn again. A Mac and an iPhone on Safari 27.2 both show it: the canvas the check reads this way is black afterwards, and a second read gives opaque black. Chromium reads an empty frame from a canvas whose frame has been shown. A thumbnail or a print is drawn into a texture the renderer owns.
 - **Pixels are read from the GPU**, with `copyTextureToBuffer` and `mapAsync`.
   - A canvas read this way is configured with `COPY_SRC`.
   - Its current texture is copied in the task that drew it. A copy made later reads nothing and raises no error.
   - `bgra8unorm` bytes come blue first.
-- **A worker shows a page on a canvas the page handed it** with `transferControlToOffscreen()`. `transferToImageBitmap()` on a WebGPU `OffscreenCanvas` is not used: in Safari 27.2 it can hand back the frame from before the drawing.
+- **A worker shows a page on a canvas the page handed it** with `transferControlToOffscreen()`. Both recorded devices draw it right.
+- **A worker's `transferToImageBitmap()` frame is not what a page is shown from.** WebKit 625 copies the surface without waiting for the drawing to be scheduled. Both recorded devices hand back the frame drawn, in each of the three ways the check tries, yet the same Mac has read a wrong color from one.
 - **No multisampling.** Safari 27.2 loses the device with it, transient attachments or not (WebKit bug 329089).
 - **A lost device may leave the page with no adapter** until it is reloaded (WebKit bug 331190). That is the second case of § The fallback.
 - **A texture view lives for the pass that uses it.** On iOS 27.2 a view that is kept makes the GPU process's memory grow without bound (WebKit bug 329399).
@@ -176,6 +177,13 @@ What the check answered on the devices the renderer is designed for. A row is ad
 
 | Device | Browser | Checks passed | Largest texture | Notes |
 |--------|---------|---------------|-----------------|-------|
-| Mac, Apple GPU, 8 cores, a 2× screen | Safari 27.2 | Not yet run in the form above | 16384 | Canvas format `bgra8unorm`. Adapter and device in under 1 ms, recovery from a lost device in 260 ms. `float16-renderable`, `shader-f16`, `bgra8unorm-storage` and `timestamp-query` are among the features. The canvases turned black once read through a 2D canvas, and a worker's `transferToImageBitmap()` frame read a wrong color (§ Safari) |
+| Mac, Apple GPU, 8 cores, a 2× screen | Safari 27.2 | 11 of 11 | 16384 | Adapter and device in under 1 ms, the worker's device and first read in 3 ms, recovery from a lost device in 2 ms |
+| iPhone, Apple GPU, 4 cores reported, a 3× screen | Safari 27.2 | 11 of 11 | 16384 | Adapter in under 1 ms, device in 4 ms, the worker's device and first read in 1 ms, recovery from a lost device in 437 ms |
 
-The other limits of that Mac: 2048 texture array layers, 11 bind groups, 44 sampled textures per shader stage, 8 color attachments, a 2147483644-byte largest buffer and 12 vertex buffers.
+On both:
+
+- **The screen matches the dots** on every canvas but the one read through a 2D canvas. That one reads its color in the task that drew it, reads opaque black once the frame has been shown, and is black on the screen (§ Safari).
+- **A worker's frame comes back in the color drawn** from all three ways of making a bitmap, and the canvas a worker draws shows its color.
+- **The canvas format is `bgra8unorm`.**
+- **The limits**: 2048 texture array layers, 11 bind groups, 44 sampled textures per shader stage, 8 color attachments and 12 vertex buffers. The largest buffer, and the largest storage and uniform buffer bindings, are 2147483644 bytes on the Mac and 1073741824 on the iPhone.
+- **Among the features**: `float16-renderable`, `shader-f16`, `bgra8unorm-storage`, `texture-formats-tier1`, `texture-formats-tier2` and `timestamp-query`.
