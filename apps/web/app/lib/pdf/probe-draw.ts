@@ -53,7 +53,8 @@ export interface ProbeWorkerReply extends Partial<Record<BitmapWay, ImageBitmap>
    * `transferToImageBitmap()` gives it once `onSubmittedWorkDone()` has resolved.
    */
   bitmapNote?: ProbeNoteCode
-  /** What the browser threw in place of a bitmap, by way. */
+  /** The ways that gave no bitmap in time, and what the browser threw in place of one, by way. */
+  bitmapTimedOut?: BitmapWay[]
   bitmapErrors?: Partial<Record<BitmapWay, string>>
   /** The page's canvas, drawn by the worker and read back from the GPU there. */
   canvas?: ProbeRead

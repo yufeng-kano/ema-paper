@@ -144,7 +144,7 @@ async function snapshotCheck(device: GPUDevice, format: GPUTextureFormat, canvas
   await presented()
   const later = centerPixel(canvas)
   if (!now || !later) {
-    return { id: 'snapshot', status: 'fail', notes: [{ code: 'noContext' }] }
+    return { id: 'snapshot', status: 'fail', notes: [{ code: 'no2dContext' }] }
   }
   return {
     id: 'snapshot',
@@ -196,42 +196,52 @@ async function workerChecks(canvas: HTMLCanvasElement): Promise<{ checks: ProbeC
     }
   }
   const reply: ProbeWorkerReply = {}
-  /** Whether the worker stopped answering before its last part. */
+  /** How the wait ended short of the worker's last part: it went silent, or it raised an error. */
   let silent = false
-  try {
-    await new Promise<void>((resolve, reject) => {
-      let timer = 0
-      const wait = () => {
-        clearTimeout(timer)
-        timer = window.setTimeout(() => {
-          silent = true
-          resolve()
-        }, WORKER_IDLE_TIMEOUT_MS)
+  let broke = false
+  await new Promise<void>((resolve) => {
+    let timer = 0
+    const settle = () => {
+      clearTimeout(timer)
+      worker.onerror = null
+      // The worker lives on to keep the page's canvas drawn; a bitmap it still sends has no reader.
+      worker.onmessage = (event: MessageEvent<ProbeWorkerReply>) => BITMAP_WAYS.forEach((way) => event.data[way]?.close())
+      resolve()
+    }
+    const wait = () => {
+      clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        silent = true
+        settle()
+      }, WORKER_IDLE_TIMEOUT_MS)
+    }
+    worker.onmessage = (event: MessageEvent<ProbeWorkerReply>) => {
+      Object.assign(reply, event.data)
+      if (reply.done) {
+        settle()
+      } else {
+        wait()
       }
-      worker.onmessage = (event: MessageEvent<ProbeWorkerReply>) => {
-        Object.assign(reply, event.data)
-        if (reply.done) {
-          clearTimeout(timer)
-          resolve()
-        } else {
-          wait()
-        }
-      }
-      worker.onerror = (event) => {
-        clearTimeout(timer)
-        reject(new Error(event.message))
-      }
-      wait()
+    }
+    worker.onerror = (event) => {
+      broke = true
+      reply.error ??= event.message || undefined
+      settle()
+    }
+    try {
       worker.postMessage(request, request.canvas ? [request.canvas] : [])
-    })
-  } catch (error) {
-    worker.terminate()
-    return { checks: failed({ notes: [{ code: 'workerFailed' }], detail: errorText(error) || undefined }), worker: null }
-  }
-  const late: ProbeNote[] = silent ? [{ code: 'timedOut' }] : []
+      wait()
+    } catch (error) {
+      broke = true
+      reply.error = errorText(error)
+      settle()
+    }
+  })
+  // What a part that never came is noted as. The parts that did come still count.
+  const stopped: ProbeNote[] = broke ? [{ code: 'workerFailed' }] : silent ? [{ code: 'timedOut' }] : []
   if (!reply.texture) {
     worker.terminate()
-    return { checks: failed({ notes: reply.note ? [{ code: reply.note }] : late, detail: reply.error }), worker: null }
+    return { checks: failed({ notes: reply.note ? [{ code: reply.note }] : stopped, detail: reply.error }), worker: null }
   }
 
   const checks: ProbeCheck[] = [{ id: 'worker', ms: reply.ms, ...readVerdict(reply.texture, request.color) }]
@@ -239,6 +249,7 @@ async function workerChecks(canvas: HTMLCanvasElement): Promise<{ checks: ProbeC
   // What the page reads from each bitmap, through a 2D canvas as it would draw one.
   const notes: ProbeNote[] = []
   let transferred: number[] | null = null
+  let unread = false
   // What the browser threw in place of a pixel, by way: in the worker, or here on reading the bitmap.
   const refused: Record<string, string> = { ...reply.bitmapErrors }
   for (const way of BITMAP_WAYS) {
@@ -250,6 +261,8 @@ async function workerChecks(canvas: HTMLCanvasElement): Promise<{ checks: ProbeC
       const pixel = centerPixel(bitmap)
       if (pixel) {
         notes.push({ code: way, params: { got: rgbaText(pixel) } })
+      } else {
+        unread = true
       }
       if (way === 'bitmapTransfer') {
         transferred = pixel
@@ -260,16 +273,22 @@ async function workerChecks(canvas: HTMLCanvasElement): Promise<{ checks: ProbeC
       bitmap.close()
     }
   }
+  if (unread) {
+    notes.push({ code: 'no2dContext' })
+  }
   if (reply.bitmapNote) {
     notes.push({ code: reply.bitmapNote })
-  } else if (notes.length === 0 && Object.keys(refused).length === 0) {
-    notes.push(...late)
   }
+  for (const way of reply.bitmapTimedOut ?? []) {
+    notes.push({ code: 'timedOut', params: { way } })
+  }
+  // No bitmap, note or refusal: the worker stopped before this stage answered.
+  const unanswered = notes.length === 0 && Object.keys(refused).length === 0
   checks.push({
     id: 'workerBitmap',
     status: transferred && pixelMatches(transferred, request.color) ? 'pass' : 'fail',
-    notes,
-    detail: Object.entries(refused).map(([way, message]) => `${way}: ${message}`).join('; ') || undefined,
+    notes: unanswered ? stopped : notes,
+    detail: Object.entries(refused).map(([way, message]) => `${way}: ${message}`).join('; ') || (unanswered ? reply.error : undefined),
   })
 
   if (reply.canvas) {
@@ -277,7 +296,7 @@ async function workerChecks(canvas: HTMLCanvasElement): Promise<{ checks: ProbeC
   } else if (!request.canvas) {
     checks.push({ id: 'workerCanvas', status: 'fail', notes: transferError ? undefined : [{ code: 'noTransfer' }], detail: transferError })
   } else {
-    checks.push({ id: 'workerCanvas', status: 'fail', notes: late, detail: reply.error })
+    checks.push({ id: 'workerCanvas', status: 'fail', notes: stopped, detail: reply.error })
   }
   return { checks, worker }
 }

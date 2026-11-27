@@ -54,7 +54,14 @@ async function bitmaps(device: GPUDevice, format: GPUTextureFormat, color: reado
   const ways: Record<BitmapWay, (canvas: OffscreenCanvas) => ImageBitmap | Promise<ImageBitmap>> = {
     // In the task that drew: the frame is the canvas's only until the browser takes it.
     bitmapTransfer: (canvas) => canvas.transferToImageBitmap(),
-    bitmapCopy: (canvas) => within(createImageBitmap(canvas)),
+    bitmapCopy: (canvas) => {
+      const copy = createImageBitmap(canvas)
+      return within(copy).catch((error: unknown) => {
+        // A copy that comes after its time has no reader left.
+        void copy.then((bitmap) => bitmap.close()).catch(() => undefined)
+        throw error
+      })
+    },
     // The same hand-over, late: a frame that only this way gets right was taken before it was drawn.
     bitmapAfterWork: async (canvas) => {
       await within(device.queue.onSubmittedWorkDone())
@@ -71,7 +78,7 @@ async function bitmaps(device: GPUDevice, format: GPUTextureFormat, color: reado
       reply[way] = await ways[way](canvas)
     } catch (error) {
       if (error instanceof TimedOut) {
-        reply.bitmapNote = 'timedOut'
+        reply.bitmapTimedOut = [...(reply.bitmapTimedOut ?? []), way]
       } else {
         reply.bitmapErrors = { ...reply.bitmapErrors, [way]: errorText(error) }
       }

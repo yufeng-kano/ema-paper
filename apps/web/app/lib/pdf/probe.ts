@@ -44,6 +44,7 @@ export const PROBE_NOTES = [
   'insecureContext',
   'noAdapter',
   'noContext',
+  'no2dContext',
   'noOffscreenCanvas',
   'noTransfer',
   'lost',
@@ -56,7 +57,8 @@ export interface ProbeNote {
   code: ProbeNoteCode
   /**
    * The note's numbers and names: `drawn` has `count` and `total`, `wrongColor` the pixel it
-   * `got` and the one it should `want`, a read the pixel it `got`, `lost` the browser's `reason`.
+   * `got` and the one it should `want`, a read the pixel it `got`, `lost` the browser's `reason`,
+   * `timedOut` the `way` of making a bitmap that gave none.
    */
   params?: Record<string, string | number>
 }

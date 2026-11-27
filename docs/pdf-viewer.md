@@ -167,7 +167,7 @@ The checks, in the order they are listed:
 - **A page that is not on HTTPS has no WebGPU**, on any device. The check says so in place of *no WebGPU*, and the report carries whether the page was a secure context.
 - **The page lists**, under the checks, the browser's user agent, whether the page is a secure context, the device pixel ratio, the processor count, the preferred canvas format, the adapter's name, the adapter limits the renderer is sized by and the adapter's features.
 - ***Copy results*** copies all of it as plain text: one `name: value` line per fact and no name twice, the checks first. It is in English whatever the page's language, a note as its code and what it carries (`drawn(count=5, total=5)`), so that a pasted report reads the same from every device.
-- **A run that starts clears the last run's answers**, so nothing copied is older than the colors on the page. A run that cannot finish shows the error's message.
+- **A run that starts clears the last run's answers**, so nothing copied is older than the colors on the page. A run that cannot finish says so, with the error's message where the browser gave one.
 - **The code.** `app/pages/pdf-probe.vue` draws and lists. `app/lib/pdf/probe.ts` holds what a run records and the copied text, and is unit tested. `probe-gpu.ts` runs the checks, `probe.worker.ts` is the worker's half and `probe-draw.ts` what the two share: the drawing, the read-back and the worker's messages. The page loads `probe-gpu.ts` only when a check is started, so no other page asks for a GPU device.
 
 ### Recorded devices
