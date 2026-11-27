@@ -1103,14 +1103,22 @@ async function recordView(document: LibraryDocument, view: DocumentView) {
 }
 
 /** The open row's original for the viewer's Original view: a file kept as it is from
- *  `…/file`, a parsed document from `…/original` where it was kept; null otherwise. */
+ *  `…/file`, a parsed document from `…/original` where it was kept; null otherwise. Shown
+ *  inline and saved as an attachment, with the upload's size for a PDF that cannot be shown
+ *  to offer *Download (size)* (docs/pdf-viewer.md § Stage 1: the Canvas 2D viewer, *Errors*). */
 const openOriginal = computed(() => {
   const open = openDocument.value
   const kind = open ? originalKind(open) : null
   if (!open || !kind || (open.kind !== 'file' && open.original === false)) {
     return null
   }
-  return { url: open.kind === 'file' ? documentFileUrl(open.id) : documentOriginalUrl(open.id), kind }
+  const file = open.kind === 'file'
+  return {
+    url: file ? documentFileUrl(open.id) : documentOriginalUrl(open.id),
+    download: file ? documentFileUrl(open.id, true) : documentOriginalUrl(open.id, true),
+    downloadSize: open.size_bytes === null ? null : formatBytes(open.size_bytes, locale.value),
+    kind,
+  }
 })
 
 /** The open failed parse, for the viewer: what a retry sends and where its original

@@ -134,11 +134,15 @@ ema-paper/
         components/               # Vue components; admin/, agents/, chat/, settings/, ui/ by area
         composables/              # shared reactive state (useAuth, useAdminConsole, useConversationStream…)
         lib/                      # framework-free logic with vitest tests; api.ts the typed API client
-        lib/pdf/                  # the PDF viewer (docs/pdf-viewer.md); the device check's probe*.ts for now
+        lib/pdf/                  # the PDF viewer (docs/pdf-viewer.md): everything that touches pdf.js, and the device check's probe*.ts
+          zoom.ts, layout.ts, budget.ts, page-input.ts, errors.ts, links.ts, support.ts  # pure, with vitest tests beside them
+          pdfjs.ts, page-view.ts, text-selection.ts, gestures.ts  # browser side: pdf.js, a page's layers, selection, pinch
+        components/pdf/           # Viewer.vue (PdfViewer) mounts the viewer, PageIndicator.vue the page pill
         middleware/               # route guards: authed.ts, admin.ts
         plugins/                  # client start-up: the session, the theme, the build update
         types/                    # page-meta.d.ts: the `adminArea` page meta
-        assets/css/               # global styles
+        assets/css/               # global styles; pdf-layers.css the PDF text and link layers' rules, taken from pdf.js
+      modules/                    # pdfjs-assets.ts: serves pdf.js's CMaps, fonts and decoders at /pdfjs/<version>/
       i18n/locales/               # en.ts, zh-TW.ts: the UI catalog
       shared/                     # seo.ts: framework-free code nuxt.config.ts, the app and server/ all read
       server/routes/              # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)
@@ -158,6 +162,7 @@ ema-paper/
   .rule                           # the agent rules; AGENTS.md and CLAUDE.md link to it
   README.md, README.zh-TW.md
   LICENSE                         # MIT
+  THIRD_PARTY_NOTICES             # what the PDF viewer ships from others, with its licences (docs/pdf-viewer.md § Licences)
 ```
 
 ## Boundaries
@@ -183,7 +188,7 @@ ema-paper/
 
 - `parsing/poppler.py` is the only module that spawns Poppler; everything else consumes its typed results.
 - The API and the worker import no PDF library, because PyMuPDF is AGPL and their only PDF engine is Poppler as a separate program ([parsing.md](./parsing.md)).
-- The web app's PDF viewer is `apps/web/app/lib/pdf/` and nothing outside it draws a PDF ([pdf-viewer.md](./pdf-viewer.md)).
+- The web app's PDF viewer is `apps/web/app/lib/pdf/` and nothing outside it draws a PDF ([pdf-viewer.md](./pdf-viewer.md)). `components/pdf/` only mounts it.
 - The tests' fixture PDFs are built with `reportlab`, a dev dependency (BSD) the application never imports ([testing.md](./testing.md) § The suite).
 - `upstream/` is the only package that calls the model upstream, Kano Proxy on the operator's key: `client.py` for vision calls and the catalog, `anthropic.py` for every Messages API call.
 - `kano_connection` in `upstream/client.py` is the only code that reads the value of `KANO_PROXY_API_KEY`; its callers hold the `Connection` it returns and hand it back to `upstream/`.

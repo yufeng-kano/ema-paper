@@ -69,8 +69,8 @@ In the order a newcomer should meet them. Each entry says what the doc is the ho
 - **[web.md](./web.md)** — the Nuxt app: its stack, pages, settings dialog, design system, the Files library, the result viewer with its editor, notes and agent panel, phones and tablets, and search engines.
   - Read: any screen, component, interaction or piece of copy.
   - Not here: the console's pages (admin.md); the contract the Usage section renders (billing.md); how a PDF's pages are drawn (pdf-viewer.md).
-- **[pdf-viewer.md](./pdf-viewer.md)** — the web app's own PDF viewer: what reads the file and what draws it, the stages it is built in and the one the code is at, what it takes from other engines and under which licences, the fallback, what Safari's WebGPU asks of the renderer, the room kept for editing, and the device check at `/pdf-probe` with the devices it has been run on.
-  - Read: anything that draws a PDF in the browser, a library added for it, or the device check.
+- **[pdf-viewer.md](./pdf-viewer.md)** — the web app's own PDF viewer: what reads the file and what draws it, the stages it is built in and the one the code is at, the stage 1 Canvas 2D viewer (layout, zoom, the render budget, the page indicator, text and links, loading, the password and errors, the files served beside the build and the device test list), what it takes from other engines and under which licences with `THIRD_PARTY_NOTICES` and the licence check, the fallback, what Safari's WebGPU asks of the renderer, the room kept for editing, and the device check at `/pdf-probe` with the devices it has been run on.
+  - Read: anything that draws a PDF in the browser, the Original view's behaviour, a library added for it, or the device check.
   - Not here: where the Original view sits in the result viewer (web.md); the server's PDF work (parsing.md).
 - **[admin.md](./admin.md)** — the operator console: permissions and groups, signing in, the audit log, what an operator sees, the settings the database may override, and the console's routes and pages.
   - Read: anything under `/api/admin` or `/admin`, a new permission, or a setting the console may change.

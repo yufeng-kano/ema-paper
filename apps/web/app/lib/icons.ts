@@ -102,3 +102,8 @@ export type IconName =
   | 'ticket'
   | 'layout-grid'
   | 'list-checks'
+  | 'minus'
+  | 'lock'
+  | 'external-link'
+  | 'file-x'
+  | 'file-exclamation-point'

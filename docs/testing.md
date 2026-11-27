@@ -239,6 +239,11 @@
 - No browser-automation UI verification: correctness is judged by reading code and types.
 - The PDF viewer (`app/lib/pdf/`, [pdf-viewer.md](./pdf-viewer.md) § Testing):
   - what runs without a browser is unit tested like any other module — for the device check, `probe.test.ts`: the limits kept, the pixel comparison, what a read says of a drawing, the copied report's exact lines, and a label for every check, every note and every way a canvas is drawn;
+  - the stage 1 viewer's pure modules, each with its test beside it: `zoom.test.ts` (the clamp, the ladder, fit width and fit page from a page size, the opening zoom, a phone's multiples, the anchored scroll of a zoom commit, the checked preset), `layout.test.ts` (the page boxes, the current page and its tie, the render window, the correction for a size change above the viewport), `budget.test.ts` (the cap, the backing size, the detail canvas's part, what the total budget releases), `page-input.test.ts` (parsing, clamping, commit and cancel for Enter and for leaving), `errors.test.ts` (a failure classed by its exception and status), `links.test.ts` (the URL filter, a link's box, an explicit destination) and `support.test.ts` (the build probe);
+  - none of them imports `pdfjs-dist`, and no test reaches the network or fetches a real PDF;
+  - the licence check (`app/lib/`), which reads the installed tree of the viewer's libraries and fails on a licence [pdf-viewer.md](./pdf-viewer.md) § Licences does not allow;
+  - the catalog check above covers the `viewer.pdf` keys with no test of their own;
+  - what the stage 1 viewer does in a browser is checked by hand on the owner's Mac and iPhone with [pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *The device test list*. The rule above, no browser automation, stands;
   - what needs a GPU cannot run in vitest. It is checked by hand on real devices, Safari on a Mac and on an iPhone first, through the device check at `/pdf-probe`.
 
 ## Lint/format

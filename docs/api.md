@@ -876,15 +876,15 @@ A `.md` or `.markdown` file, or one sent as `text/markdown`, other than an `AGEN
 - `attachment` for everything else, HTML, SVG and XML included, since a page served from this origin would run with the session. `?download=1` forces `attachment`.
 - Always under a policy of its own, which the Caddyfile leaves to this route ([deployment.md](./deployment.md) § Security headers):
   - `Content-Security-Policy: sandbox` with `X-Frame-Options: DENY`;
-  - except a PDF served inline, which a browser's viewer will not open in a sandbox: that answer carries `frame-ancestors 'self'` and `SAMEORIGIN`, so the result viewer's Original frame on this origin may show it and no other page may;
+  - except a PDF served inline, which a browser's viewer will not open in a sandbox, for the result viewer's *Open in new tab*: that answer carries `frame-ancestors 'self'` and `SAMEORIGIN`, so no other origin may frame it;
   - plus `X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`.
-- One `Range` answers 206 (**416** past the end; several ranges are answered whole), for the video and audio a browser seeks in.
+- One `Range` answers 206 (**416** past the end; several ranges are answered whole), for the video and audio a browser seeks in and for the PDF viewer, which reads a large PDF a range at a time ([pdf-viewer.md](./pdf-viewer.md)).
 - 404 for a parse or a markdown document, which have no file of this kind: a parse's original is `…/original` whole and `…/pages/{n}/image` one page at a time, and their text `…/content`.
 
 **`GET /api/library/documents/{id}/original`**
 
 - The upload the parse was made from, kept beside the git directory, for the result viewer's *Original* view ([web.md](./web.md) § Result viewer, *Original and Markdown*).
-- Served as `…/file` serves a file: inline, its media type the parse's, its length, one `Range` answered 206, the same security headers (a PDF framed by this origin alone, an image sandboxed), `nosniff`, never cached.
+- Served as `…/file` serves a file: inline, its media type the parse's, its length, one `Range` answered 206, the same security headers (a PDF unsandboxed and framed by no other origin, an image sandboxed), `nosniff`, never cached.
 - `?download=1` forces `attachment`, for a failed parse's *Download original* ([web.md](./web.md) § Files).
 - Until a finished parse's original is filed ([jobs.md](./jobs.md) § Retention), the upload it is filed from answers in its place for the row it is filed for (`original` in the library read, above), so the moment after a parse ends never reads as an original lost.
 - 404 for a markdown document, for a file (its bytes are `…/file`), for a document in the Trash, and for a parse whose original was not kept (`original: false` in the library read).

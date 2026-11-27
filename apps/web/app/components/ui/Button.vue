@@ -4,7 +4,8 @@
  *
  * Renders as `<button>`, or as `<a>` / `<NuxtLink>` when given `href` / `to` — a link that
  * looks like a button is still a link, and must keep middle-click and "open in new tab".
- * `href` is a plain same-tab link, such as the file viewer's download.
+ * `href` is a plain link, such as the file viewer's download, in the same tab unless `target`
+ * says otherwise.
  *
  * `loading` shows a spinner *in place of* the icon and disables the control, so a pending
  * action can never be fired twice; the label stays put so the button does not resize
@@ -31,13 +32,17 @@ const props = withDefaults(
      */
     label?: string
     href?: string
+    /** With `href` only: `_blank` opens it in a new tab, the PDF viewer's *Open in new tab*. It
+     *  also carries `rel="noopener noreferrer"`, so the new page can neither reach this one nor
+     *  learn its address. */
+    target?: '_blank'
     to?: string
     type?: 'button' | 'submit'
   }>(),
-  // The three optional strings are spelled out as `undefined` because that is how
+  // The four optional strings are spelled out as `undefined` because that is how
   // `vue/require-default-prop` is satisfied for a type-only declaration: absent is the
   // default, and saying so keeps the lint output free of noise to read past.
-  { variant: 'secondary', size: 'md', type: 'button', label: undefined, href: undefined, to: undefined },
+  { variant: 'secondary', size: 'md', type: 'button', label: undefined, href: undefined, target: undefined, to: undefined },
 )
 
 // Resolved once at setup: `resolveComponent` is only valid here or in render, not inside a
@@ -56,7 +61,10 @@ const bindings = computed(() => {
     return isDisabled.value ? { role: 'link', 'aria-disabled': 'true' } : { to: props.to }
   }
   if (props.href) {
-    return isDisabled.value ? { role: 'link', 'aria-disabled': 'true' } : { href: props.href }
+    if (isDisabled.value) {
+      return { role: 'link', 'aria-disabled': 'true' }
+    }
+    return props.target ? { href: props.href, target: props.target, rel: 'noopener noreferrer' } : { href: props.href }
   }
   return { type: props.type, disabled: isDisabled.value }
 })

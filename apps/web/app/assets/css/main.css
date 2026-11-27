@@ -15,9 +15,15 @@
  * settings dialog (`data-theme` on <html>) — and nothing outside this block names a color.
  * The light values are Apple's light appearance, the dark values its dark one: the same
  * structure in both, not an inversion.
+ *
+ * A PDF page's content layer (`.pdf-page-content`) declares the block again for itself: it is
+ * white paper in both appearances and carries `color-scheme: light`, but the build turns
+ * `light-dark()` into values a custom property fixes where it is declared, so tokens
+ * inherited from `:root` would keep the dark side there.
  */
 
-:root {
+:root,
+.pdf-page-content {
   color-scheme: light dark;
 
   /* --- Color: surfaces ----------------------------------------------------
@@ -267,7 +273,8 @@
    keeps a button and the input beside it the same box there — growing them per component
    is how the two drift apart. */
 @media (pointer: coarse) {
-  :root {
+  :root,
+  .pdf-page-content {
     --control-height: 44px;
     --control-height-sm: 38px;
     --control-height-xs: 32px;

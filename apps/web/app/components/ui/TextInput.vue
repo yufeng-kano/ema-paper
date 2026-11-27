@@ -8,12 +8,15 @@
  * numeric keypad), not `type="number"`: a number field hands over an empty string for what
  * it cannot parse (`-`, `1e`, `abc`), and the caller could not tell it from an empty field
  * to say what is wrong. The caller reads the number out of the text.
+ *
+ * `password` is for a PDF's password, which opens one file in this browser and is never
+ * stored: `autocomplete="off"` stays, asking the browser neither to fill it nor to keep it.
  */
 withDefaults(
   defineProps<{
     modelValue: string
     id?: string
-    type?: 'text' | 'email' | 'date'
+    type?: 'text' | 'email' | 'date' | 'password'
     inputmode?: 'numeric'
     placeholder?: string
     describedBy?: string

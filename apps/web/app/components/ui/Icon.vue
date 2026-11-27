@@ -620,6 +620,40 @@ defineProps<{ name: IconName }>()
       <path d="m3 7 2 2 4-4" />
     </template>
 
+    <!-- minus: zoom out in the PDF viewer's capsule, beside plus. -->
+    <template v-else-if="name === 'minus'">
+      <path d="M5 12h14" />
+    </template>
+
+    <!-- lock: a PDF that needs a password before it opens. -->
+    <template v-else-if="name === 'lock'">
+      <rect width="18" height="11" x="3" y="11" rx="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </template>
+
+    <!-- external-link: open the original in a new browser tab. -->
+    <template v-else-if="name === 'external-link'">
+      <path d="M15 3h6v6" />
+      <path d="M10 14 21 3" />
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+    </template>
+
+    <!-- file-x: a PDF the viewer cannot open, damaged or gone. -->
+    <template v-else-if="name === 'file-x'">
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+      <path d="m9.5 12.5 5 5" />
+      <path d="m14.5 12.5-5 5" />
+    </template>
+
+    <!-- file-exclamation-point: one page of a PDF that did not draw. -->
+    <template v-else-if="name === 'file-exclamation-point'">
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+      <path d="M12 9v4" />
+      <path d="M12 17h.01" />
+    </template>
+
     <!-- check: the confirmation a copy swaps to. -->
     <template v-else>
       <path d="M20 6 9 17l-5-5" />
