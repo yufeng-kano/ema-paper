@@ -14,8 +14,9 @@ export default defineNuxtConfig({
   devtools: { enabled: false },
   css: ['~/assets/css/main.css', '~/assets/css/markdown.css', '~/assets/css/agents.css'],
   // This file reads WEB_URL from the build's environment, so its own type check needs Node's types.
+  // The developer scripts run under Node too (docs/pdf-viewer.md § The code), so they are checked here.
   typescript: {
-    nodeTsConfig: { compilerOptions: { types: ['node'] } },
+    nodeTsConfig: { compilerOptions: { types: ['node'] }, include: ['../scripts/**/*'] },
   },
 
   runtimeConfig: {

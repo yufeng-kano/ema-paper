@@ -10,7 +10,9 @@
     "postinstall": "nuxt prepare",
     "typecheck": "nuxt typecheck",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "fixtures:oplists": "node scripts/capture-oplists.ts",
+    "scene:check": "node scripts/check-scene.ts"
   },
   "dependencies": {
     "@tiptap/core": "3.32.0",
