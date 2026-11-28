@@ -24,8 +24,8 @@ In the order a newcomer should meet them. Each entry says what the doc is the ho
 
 ### The API and auth
 
-- **[api.md](./api.md)** — every HTTP route of both planes: the data plane `/v1/*` and the control plane `/api/*`, with their payloads, the one error shape, SSE and the request limits.
-  - Read: any change to a route, a payload, an error type or a limit.
+- **[api.md](./api.md)** — every HTTP route of both planes: the data plane `/v1/*` and the control plane `/api/*`, with their payloads, the one error shape, SSE, the request limits, and how long a request keeps a pooled database connection.
+  - Read: any change to a route, a payload, an error type or a limit, or to when a route reads its body or its database.
   - Not here: the console's routes (admin.md) and the billing routes' answers (billing.md); api.md lists them and points there.
 - **[auth.md](./auth.md)** — the credential kinds and how each is issued, stored and checked: Google sessions, API keys, the operator's upstream key, the OAuth 2.1 server for Claude Connectors and its scopes, upload and document tickets; and deleting the account.
   - Read: anything that signs a caller in, issues or checks a credential, or deletes an account.

@@ -141,15 +141,20 @@ async def trash(client: AsyncClient, kind: str, row_id: int) -> httpx.Response:
     return await client.post(f"/api/library/{kind}/{row_id}/trash", headers=CSRF_HEADERS)
 
 
-def fail_next_commit(monkeypatch: pytest.MonkeyPatch, *, landed: bool) -> dict[str, bool]:
-    """The next commit raises: after it went through (`landed`, the acknowledgement lost
-    with the connection) or instead of it (rolled back). Every later commit passes. The
-    flag it returns reads `{"on": False}` once the failure has fired."""
+def fail_next_commit(
+    monkeypatch: pytest.MonkeyPatch, *, landed: bool, after: int = 0
+) -> dict[str, bool]:
+    """`after` commits pass, then the next one raises: after it went through (`landed`, the
+    acknowledgement lost with the connection) or instead of it (rolled back). Every later
+    commit passes. The flag it returns reads `{"on": False}` once the failure has fired."""
     original = AsyncSession.commit
     failing = {"on": True}
+    passing = [after]
 
     async def commit(self):
-        if failing["on"]:
+        if failing["on"] and passing[0] > 0:
+            passing[0] -= 1
+        elif failing["on"]:
             failing["on"] = False
             if landed:
                 await original(self)

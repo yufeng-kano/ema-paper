@@ -62,6 +62,14 @@
 - `alembic downgrade base` leaves no table, sequence or type.
 - A migration that rewrites existing rows adds a test there. The test upgrades from the previous head with synthetic existing rows in place and checks what it left. It goes at the next squash.
 
+### Must-cover: database connections
+
+[api.md](./api.md) § Database connections.
+
+- A file whose reader stops halfway through its body: with a pool of one connection, the next request still answers.
+- No pooled connection checked out by the first byte of a body, on either plane, for a file, an original and a JSON answer.
+- No pooled connection checked out halfway through a request body, for the routes that read their own: the Files upload, an inserted image, a chat attachment, `POST /v1/parse` in both forms, the `doc.md` and `notes.md` saves and `POST /oauth/register`. Kano Pay's webhook is not among them.
+
 ### Must-cover: the chat agent and the workspace
 
 - The Messages stream parser: text, thinking, tool_use with partial JSON, usage with cache tokens, refusal.

@@ -19,7 +19,10 @@ from .oauth_as import resolve_access_token
 from .sessions import SESSION_COOKIE, resolve_session
 from .upload_tickets import TICKET_PREFIX
 
-DbSession = Annotated[AsyncSession, Depends(db_session)]
+# The session ends when the route returns, before the response is sent (docs/api.md
+# § Database connections). FastAPI's default scope ends it after the last byte of the body,
+# so a paused video or a slow download held a pooled connection for as long as it lasted.
+DbSession = Annotated[AsyncSession, Depends(db_session, scope="function")]
 
 
 async def get_settings_from_app(request: Request, db: DbSession) -> Settings:

@@ -26,6 +26,18 @@ The models are the deployment's ([billing.md](./billing.md) § Models and the op
 - It backs the compose healthchecks.
 - It is also routed to the API on the public origin, so an external monitor can reach it: Caddy's `@api` matcher includes it explicitly ([deployment.md](./deployment.md)).
 
+## Database connections
+
+A request's authentication, its settings read and its route share one database session. The API's connections come from one pool, and a transaction keeps its connection until it ends. So a request that waits on something else inside an open transaction leaves the pool one connection short for everyone.
+
+No pooled connection waits on a client, however slowly it sends or reads:
+
+- The session ends when the route returns, before the response is sent. No answer holds a connection while its body goes out: a video paused in a tab, a large download, a long result on a slow phone.
+- A route that reads its own request body ends the transaction its authentication and its first checks opened before it reads a byte: the Files upload, an inserted image, a chat attachment, `POST /v1/parse` and the data plane's `doc.md` and `notes.md` saves; and `POST /oauth/register` and Kano Pay's webhook, whose JSON they read themselves. Its later statements run in a transaction of their own once the body is in.
+- A JSON or form body a route declares arrives whole before its authentication runs, and holds nothing.
+
+The operator console's overview ends its session before it asks the two catalogs ([admin.md](./admin.md) § The overview). An SSE stream reads on short sessions of its own ([jobs.md](./jobs.md) § Progress, [chat.md](./chat.md) § The event stream).
+
 ## Errors
 
 All responses are JSON unless SSE is requested. Errors use one shape:
