@@ -139,6 +139,10 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
     declared_length = request.headers.get("content-length", "")
     if declared_length.isdigit() and int(declared_length) > settings.upload_max_bytes * 2:
         raise ApiError(413, "invalid_request", "The upload exceeds UPLOAD_MAX_BYTES")
+    # Authentication's transaction ends before the body: no pooled connection waits on the
+    # client while it arrives (docs/api.md § Database connections). A commit, not a
+    # rollback, so the caller's user and ticket stay loaded.
+    await db.commit()
 
     form: FormData | None = None
     try:
@@ -725,6 +729,8 @@ async def save_document_text(
     db: DbSession,
     settings: AppSettings,
 ):
+    # Authentication's transaction ends before the body (docs/api.md § Database connections).
+    await db.commit()
     text, base = await _edited_text(request, settings)
     row = await workspace_documents.live_text_document(db, user.id, document_id)
     revision = await workspace_documents.write_content(
@@ -741,6 +747,8 @@ async def save_document_notes(
     db: DbSession,
     settings: AppSettings,
 ):
+    # Authentication's transaction ends before the body (docs/api.md § Database connections).
+    await db.commit()
     text, base = await _edited_text(request, settings)
     row = await workspace_documents.live_text_document(db, user.id, document_id)
     revision = await workspace_documents.write_notes(

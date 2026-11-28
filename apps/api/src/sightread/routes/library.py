@@ -764,6 +764,10 @@ async def upload_document(
     await asyncio.to_thread(workspace_documents.sweep_staged_uploads, root)
     limit = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user_id))
     used = (await workspace_documents.measure_storage(db, settings, user_id, root)).total
+    # The reads before the body end here: the client sets the pace of up to FILE_MAX_BYTES,
+    # and no pooled connection waits on it (docs/api.md § Database connections). A commit,
+    # not a rollback, so `user` stays loaded.
+    await db.commit()
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(git.ensure_repo, root)
@@ -1518,6 +1522,9 @@ async def upload_image(request: Request, user: SessionUser, db: DbSession, setti
     if not is_multipart(request.headers.get("content-type", "")):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     cap = settings.document_image_max_bytes
+    # No pooled connection waits on the client while the body arrives (docs/api.md
+    # § Database connections).
+    await db.commit()
     # Bounded before the parser spools a byte, as an attachment's body is.
     form = await capped_form(request, cap, IMAGE_CAP_NAME)
     try:

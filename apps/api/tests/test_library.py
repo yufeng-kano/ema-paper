@@ -805,8 +805,9 @@ async def test_a_filing_whose_commit_landed_despite_the_error_is_answered_as_mad
     """The commit went through and the acknowledgement was lost: the row is read on a
     fresh connection and the filing is answered as made — reported as nothing filed, the
     browser's retry would file a suffixed twin (docs/workspace.md § Revisions)."""
-    # A markdown upload: no parse is queued first, so its one commit is the filing's.
-    failing = fail_next_commit(monkeypatch, landed=True)
+    # A markdown upload: no parse is queued first. Its first commit ends the reads before
+    # the body (docs/api.md § Database connections), and the next is the filing's.
+    failing = fail_next_commit(monkeypatch, landed=True, after=1)
     filed = await upload(library, "notes.md", b"# Notes\n", "text/markdown")
     assert failing["on"] is False
     assert filed.status_code == 201, filed.text
@@ -823,8 +824,9 @@ async def test_a_filing_whose_commit_rolled_back_leaves_no_file_behind(
     from sightread.workspace.layout import sources_dir
 
     root = library.root
-    # A markdown upload: its original is kept before its one commit, the filing's.
-    fail_next_commit(monkeypatch, landed=False)
+    # A markdown upload: its original is kept before the filing's commit, the one after
+    # the commit that ends the reads before the body (docs/api.md § Database connections).
+    fail_next_commit(monkeypatch, landed=False, after=1)
     refused = await upload(library, "notes.md", b"# Notes\n", "text/markdown")
     assert refused.status_code == 409 and "nothing was filed" in refused.json()["error"]["message"]
     # The original kept for the lost row is gone with it, and no entry stands.
