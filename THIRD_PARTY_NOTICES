@@ -3,9 +3,9 @@ THIRD-PARTY NOTICES
 Ema Paper is released under the MIT License (LICENSE). This file carries the
 notices and licences of the third-party code and data the web app's PDF viewer
 sends to the browser (docs/pdf-viewer.md § Licences). Every piece below is
-under Apache-2.0, BSD-2-Clause or BSD-3-Clause.
+under Apache-2.0, MIT, BSD-2-Clause or BSD-3-Clause.
 
-All of it comes from the npm package pdfjs-dist 6.5.438, as installed in
+Sections 1 to 7 come from the npm package pdfjs-dist 6.5.438, as installed in
 apps/web/node_modules/pdfjs-dist. Its data files are served by the web app
 under /pdfjs/<version>/, each folder with its licence files beside the files
 they cover (apps/web/modules/pdfjs-assets.ts, whitelist in
@@ -21,6 +21,9 @@ fetched from the same folder:
 
 The texts below are copied from those files and from pdfjs-dist/LICENSE.
 
+Sections 8 and 9 are source files ported from Vello and kurbo, which are
+licensed Apache-2.0 OR MIT and used here under MIT.
+
 ==============================================================================
 1. PDF.js (pdfjs-dist) - Apache-2.0
 ==============================================================================
@@ -31,10 +34,12 @@ What ships: the pdf.js library bundled into the web app's JavaScript, and
 its worker (build/pdf.worker.min.mjs or legacy/build/pdf.worker.min.mjs),
 emitted unchanged as a /_nuxt/ asset. The text-layer CSS, the selection
 handling, and the operator codes, the operator-list walk with its graphics
-and text state, glyph placement and affine helpers the web app ports from
-pdf.js (apps/web/app/lib/pdf/, apps/web/app/lib/pdf/scene/,
-apps/web/app/assets/css/pdf-layers.css) are covered by the same licence; each
-ported file names pdf.js and says what was changed.
+and text state, glyph placement and affine helpers, the image placement,
+smoothing and pre-halving, and the sharp canvas's redraw rule the web app
+ports from pdf.js (apps/web/app/lib/pdf/, apps/web/app/lib/pdf/scene/,
+apps/web/app/lib/pdf/raster/, apps/web/app/assets/css/pdf-layers.css) are
+covered by the same licence; each ported file names pdf.js and says what was
+changed.
 
 Licence: Apache License 2.0, the full text below, from
 apps/web/node_modules/pdfjs-dist/LICENSE.
@@ -465,6 +470,92 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+------------------------------------------------------------------------------
+
+==============================================================================
+8. Vello - Apache-2.0 OR MIT
+==============================================================================
+
+Copyright 2020 the Vello Authors
+
+What ships: the sparse-strip rasteriser of vello_common 0.4.0 and the strip
+instance layout and shader of vello_gpu and vello_gpu_shaders 0.4.0, git
+revision 570f0c4, ported to TypeScript and WGSL in
+apps/web/app/lib/pdf/raster/ (flatten.ts, tiles.ts, strips.ts, clip.ts,
+encode.ts) and apps/web/app/lib/pdf/gpu/shaders.ts. Each ported file names
+Vello and says what was changed.
+
+Licence: taken under the MIT License, the text below, from Vello's
+LICENSE-MIT.
+
+------------------------------------------------------------------------------
+Copyright 2020 the Vello Authors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+------------------------------------------------------------------------------
+
+==============================================================================
+9. kurbo - Apache-2.0 OR MIT
+==============================================================================
+
+Copyright (c) 2018 Raph Levien
+
+What ships: the stroker, offset curves, arcs and curve subdivision of kurbo
+at git revision 6bc7521 (unreleased, after 0.13.1), ported to TypeScript in
+apps/web/app/lib/pdf/raster/ (stroke.ts, offset.ts, and the subdivision in
+flatten.ts). Each ported file names kurbo and says what was changed.
+
+Licence: taken under the MIT License, the text below, from kurbo's
+LICENSE-MIT.
+
+------------------------------------------------------------------------------
+Copyright (c) 2018 Raph Levien
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ------------------------------------------------------------------------------
 
 ==============================================================================
