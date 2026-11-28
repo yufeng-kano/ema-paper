@@ -137,6 +137,8 @@ ema-paper/
         lib/pdf/                  # the PDF viewer (docs/pdf-viewer.md): everything that touches pdf.js, and the device check's probe*.ts
           zoom.ts, layout.ts, budget.ts, page-input.ts, errors.ts, links.ts, support.ts  # pure, with vitest tests beside them
           pdfjs.ts, page-view.ts, text-selection.ts, gestures.ts  # browser side: pdf.js, a page's layers, selection, pinch
+          scene/                  # the page scene and the adapter (docs/pdf-viewer.md § The WebGPU renderer): ops, matrix, scene, clips, state, text, adapter, slice, coverage, check, fixture; fixtures/*.oplist.json
+          scene-input.ts          # pdf.js to a page's input, typed structurally with no pdf.js import: the scripts' and, from stage 4, the viewer's
         components/pdf/           # Viewer.vue (PdfViewer) mounts the viewer, PageIndicator.vue the page pill
         lib/media/                # the image view's and the player's pure rules (docs/media-viewer.md)
           image-zoom.ts, player.ts, tracks.ts, failure.ts  # zoom and geometry, the video box and seeks, an MP4's video track, a failure's cause; vitest tests beside them
@@ -147,6 +149,7 @@ ema-paper/
         types/                    # page-meta.d.ts: the `adminArea` page meta
         assets/css/               # global styles; pdf-layers.css the PDF text and link layers' rules, taken from pdf.js
       modules/                    # pdfjs-assets.ts: serves pdf.js's CMaps, fonts and decoders at /pdfjs/<version>/
+      scripts/                    # developer tools, not tests: capture-oplists.ts (pnpm fixtures:oplists) with pdf-fixtures/, the hand-written PDFs it reads, check-scene.ts (pnpm scene:check), and pdfjs-node.ts, pdf.js in Node for both
       i18n/locales/               # en.ts, zh-TW.ts: the UI catalog
       shared/                     # seo.ts: framework-free code nuxt.config.ts, the app and server/ all read
       server/routes/              # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)
@@ -192,7 +195,8 @@ ema-paper/
 
 - `parsing/poppler.py` is the only module that spawns Poppler; everything else consumes its typed results.
 - The API and the worker import no PDF library, because PyMuPDF is AGPL and their only PDF engine is Poppler as a separate program ([parsing.md](./parsing.md)).
-- The web app's PDF viewer is `apps/web/app/lib/pdf/` and nothing outside it draws a PDF ([pdf-viewer.md](./pdf-viewer.md)). `components/pdf/` only mounts it.
+- The web app's PDF viewer is `apps/web/app/lib/pdf/` and nothing outside it draws a PDF in the app ([pdf-viewer.md](./pdf-viewer.md)). `components/pdf/` only mounts it. The developer scripts in `apps/web/scripts/` draw with pdf.js in Node, through `scripts/pdfjs-node.ts`.
+- `lib/pdf/scene/` imports nothing from pdf.js; `scene-input.ts` is the only app module that reads pdf.js's operator list. `scripts/pdfjs-node.ts` also reads the render list its recorded boxes index.
 - The image view and the player are `components/media/` over the pure `lib/media/` ([media-viewer.md](./media-viewer.md)). `lib/media/` may import what is not about PDFs from `lib/pdf/` (the gestures, the zoom ladder, the spacing, the failure kinds); nothing in `lib/pdf/` imports `lib/media/`. `components/viewer/` holds the state sheet and the loading bar both share, and imports neither.
 - The tests' fixture PDFs are built with `reportlab`, a dev dependency (BSD) the application never imports ([testing.md](./testing.md) § The suite).
 - `upstream/` is the only package that calls the model upstream, Kano Proxy on the operator's key: `client.py` for vision calls and the catalog, `anthropic.py` for every Messages API call.

@@ -1,6 +1,6 @@
 # The PDF viewer
 
-The web app draws a PDF's pages itself: with pdf.js's Canvas 2D renderer from stage 1, and with its own WebGPU renderer from stage 4, the default at stage 7. This doc is the home of that viewer: what reads the file, what draws it, the stages it is built in, what the stage 1 viewer does, what it takes from other engines, and the device check that tells what a browser's WebGPU can do.
+The web app draws a PDF's pages itself: with pdf.js's Canvas 2D renderer from stage 1, and with its own WebGPU renderer from stage 4, the default at stage 7 wherever the browser gives a WebGPU device. This doc is the home of that viewer: what reads the file, what draws it, the stages it is built in, what the stage 1 viewer does, the stage 3 scene check, the WebGPU renderer's design, what it takes from other engines, and the device check that tells what a browser's WebGPU can do.
 
 Where the Original view sits in the result viewer is [web.md](./web.md) § Result viewer, *Original and Markdown*. The server's PDF work is [parsing.md](./parsing.md).
 
@@ -10,7 +10,7 @@ Where the Original view sits in the result viewer is [web.md](./web.md) § Resul
 - **The viewer displays; it does not edit.** No stage below builds an editing feature.
 - **A solved problem is ported, not invented.** Where a mature engine already has the answer, the viewer takes that answer (§ What is taken from where).
 - **Permissive licences only** (§ Licences).
-- **Every reader sees the page.** A browser or a page the WebGPU renderer cannot serve is drawn another way (§ The fallback).
+- **Every reader sees the page.** A browser or a document the WebGPU renderer cannot serve is drawn by Canvas 2D, a whole document at a time (§ The fallback).
 
 ## Who does what
 
@@ -23,21 +23,21 @@ Where the Original view sits in the result viewer is [web.md](./web.md) § Resul
     - No `iccUrl` is passed: pdf.js's ICC colour management (qcms) is WebAssembly.
   - Its operator list changes shape between major versions. One adapter module reads it, and nothing else in the app knows those shapes.
 - **The adapter turns a page's operator list into a page scene**: a list of the page's objects, each with a stable id, its bounding box and its clip (§ Room for editing).
-- **The renderer draws a page scene with WebGPU**, one canvas per visible page.
+- **The renderer draws a page scene with WebGPU**: a base canvas for each page in the render window, and one sharp canvas over the visible part of a page whose base is below the device's resolution (§ The WebGPU renderer).
   - Antialiasing is coverage the renderer computes. It never asks for multisampling (§ Safari).
 - **pdf.js's own Canvas 2D renderer draws the pages in stage 1**, as the renderer rather than a fallback (§ Stage 1: the Canvas 2D viewer). From stage 4 it is the fallback (§ The fallback).
 - No Rust and no WebAssembly: the renderer is TypeScript and WGSL.
 
 ## Stages
 
-The viewer is built in stages, each delivered on its own. The code is at stage 1.
+The viewer is built in stages, each delivered on its own. The code is at stage 3.
 
 | Stage | What it delivers |
 |-------|------------------|
 | 0 | These rules and the device check (§ The device check) |
 | 1 | The in-app viewer on pdf.js's Canvas 2D renderer, with its own layout, zoom, page indicator, text layer and links, in place of the browser's own viewer in a frame |
 | 2 | Find in the original, and a jump from a figure to its box on the page |
-| 3 | The adapter and the page scene, built beside the Canvas 2D renderer and compared with it, drawing nothing |
+| 3 | The adapter and the page scene, compared in Node with pdf.js's Canvas 2D renderer, drawing nothing |
 | 4 | The WebGPU renderer's core: fills, strokes, clips and images |
 | 5 | Text from a glyph atlas |
 | 6 | Shadings, patterns, transparency groups and blend modes |
@@ -46,7 +46,9 @@ The viewer is built in stages, each delivered on its own. The code is at stage 1
 - The Original view of a PDF is the stage 1 viewer (§ Stage 1: the Canvas 2D viewer). The browser's own viewer is what *Open in new tab* shows.
 - Stage 1 adds `pdfjs-dist`, and with it `THIRD_PARTY_NOTICES` and a licence check (§ Licences).
 - Stage 2 gives the viewer and the figure boxes one page frame: the box `pdfinfo` sizes a page by and the box `pdftoppm` renders must be the same one ([parsing.md](./parsing.md)).
-- Stage 4 opens with a speed measurement on an iPhone. The WebGPU renderer goes on only if a page draws fast enough there; the Canvas 2D viewer of stage 1 stays the product otherwise.
+- Stages 3 to 7 are built in that order, one PR each, and stage 2 after them. No stage waits on a speed measurement.
+- Stage 3 changes nothing a reader's browser loads. Its comparison runs in Node (§ Stage 3: the scene check).
+- In stages 4 to 6 the WebGPU renderer draws only under a developer switch, for the whole document (§ The fallback).
 
 ## Stage 1: the Canvas 2D viewer
 
@@ -113,7 +115,7 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
   - It is drawn again once a scroll or a zoom has settled for 150 ms and the visible part has left the part it drew.
 - **All live canvases share one budget**: 3 × the cap on iOS, 4 × the cap elsewhere. The pages furthest from the viewport give theirs up first.
 - **Releasing a page** cancels its `RenderTask`, sets its canvases' `width` and `height` to 0, as pdf.js does, and calls `page.cleanup()`. A page that leaves the render window is released.
-- **Pages render on the main thread.** `disableWorkerRendering: true` is passed and `GlobalWorkerOptions.rendererSrc` is never set: a canvas handed to pdf.js 6's renderer worker could not be released as above. Stage 3 looks at it again.
+- **Pages render on the main thread.** `disableWorkerRendering: true` is passed and `GlobalWorkerOptions.rendererSrc` is never set: a canvas handed to pdf.js 6's renderer worker could not be released as above. Stage 3 keeps it: the WebGPU renderer also reads pdf.js on the main thread (§ The WebGPU renderer, *Threads*).
 - Pages are drawn with the `canvas` render parameter, not the legacy `canvasContext`, on the default white background, with `annotationMode` left at its default.
 
 ### Page indicator
@@ -153,8 +155,12 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
 - **A copy on the Original view copies the selection as plain text**, its whitespace normalised. The Markdown view's serializer ([web.md](./web.md) § Result viewer, *Find and copy*) does not run there.
 - **The text layer carries `lang` only when the document names its language** (`TextContent.lang`, the file's `/Lang`). Otherwise its `lang` is empty, so a screen reader does not read an English paper in the page's zh-Hant voice.
 - **Fonts.** `cMapUrl` (with `cMapPacked: true`) and `standardFontDataUrl` point at same-origin copies of pdfjs-dist's `cmaps/` and of the Foxit files of its `standard_fonts/` (§ Stage 1: the Canvas 2D viewer, *Files served beside the build*).
-  - A font that is neither embedded nor a Foxit one, such as Helvetica or Arial, is drawn with a system font (`useSystemFonts`, on by default).
+  - In a document Canvas 2D draws, a font that is neither embedded nor a Foxit one, such as Helvetica or Arial, is drawn with a system font (`useSystemFonts`, on by default).
   - Where the device has none, it takes the CSS generic family of its kind, such as `sans-serif`.
+  - For a document the WebGPU renderer draws, it is opened with `disableFontFace: true` and `useSystemFonts: false`.
+    - Glyph outlines then reach the display side as `commonObjs["<loadedName>_path_<fontChar>"]`.
+    - A base-14 font is drawn from the Foxit files.
+    - Only a font that is neither embedded nor base-14 has no outline. The renderer draws it with `fillText` in pdf.js's own CSS font string (§ The WebGPU renderer, *Text*).
 
 ### Links
 
@@ -298,7 +304,7 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
   - `errors.ts`: a failure read as corrupt, network, signed out, gone or cancelled, and a page's own failure;
   - `links.ts`: the external URL filter, a link's box on the page, an explicit destination's page and top, and a named action's step;
   - `support.ts`: the probe that picks the modern or the legacy build.
-- Browser-side modules in `app/lib/pdf/`, the only code that touches pdf.js:
+- Browser-side modules in `app/lib/pdf/`, which with `scene-input.ts` below are the only app code that touches pdf.js (the developer scripts reach it through `scripts/pdfjs-node.ts`):
   - `pdfjs.ts`: loads the chosen build and its worker once, and opens a document;
   - `page-view.ts`: one page's layers — base canvas, detail canvas, text layer and link layer — drawn, drawn again at a new scale, cancelled and released;
   - `text-selection.ts`: the selection fix and the plain-text copy, ported from pdf.js's `TextLayerBuilder`;
@@ -307,6 +313,21 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
 - `app/components/pdf/DocumentError.vue` (`PdfDocumentError`) draws its states through `ViewerStateSheet`, and the viewer's loading bar is `ViewerLoading`, both in `app/components/viewer/`; the pane's keyboard ring is `useKeyboardFocus` (`app/composables/`) with the `.keyboard-pane` and `.keyboard-frame` rules in `app/assets/css/main.css`, which every original's pane shares: the viewer's root is the frame that draws the ring over the pages. The image view and the player share them ([media-viewer.md](./media-viewer.md) § The code).
 - The image view imports `gestures.ts`, and parts of `zoom.ts`, `layout.ts` and `errors.ts`, as they are. Nothing in `app/lib/pdf/` imports `app/lib/media/`, and a change to one of those four files is checked against both viewers.
 - `app/assets/css/pdf-layers.css` holds the text and link layers' rules taken from pdf.js.
+- **Pure modules in `app/lib/pdf/scene/`** (stage 3), ported from pdf.js (`CanvasGraphics`, `util.js`) where they say so, each with its vitest test, none importing `pdfjs-dist`:
+  - `ops.ts`: pdf.js's op codes;
+  - `matrix.ts`: affine helpers;
+  - `scene.ts`: the page scene's typed layout and builder;
+  - `clips.ts`: clip-chain interning;
+  - `state.ts`: graphics and text state;
+  - `text.ts`: glyph placement;
+  - `adapter.ts`: the op-list walk;
+  - `slice.ts`: running it in slices of about 8 ms;
+  - `coverage.ts`: the op coverage table;
+  - `check.ts`: the stage 3 comparison and its report;
+  - `fixture.ts`: stored op-list fixtures, with `fixtures/`.
+- **`app/lib/pdf/scene-input.ts`** reads a page's operator list, fonts, images and text from pdf.js into the adapter's input. It types the few members of pdf.js it reads with its own interfaces and imports nothing from `pdfjs-dist`, so the scripts below use it as it is, and from stage 4 the viewer calls the same function with the browser build's page.
+- **Developer scripts in `scripts/`**, not tests: `capture-oplists.ts` (`pnpm fixtures:oplists`) with the hand-written PDFs of `pdf-fixtures/`, and `check-scene.ts` (`pnpm scene:check`, § Stage 3: the scene check). Both open and draw a document through `pdfjs-node.ts`.
+- The relative imports inside `scene/`, in `scene-input.ts` and in `scripts/` carry their `.ts` extension, unlike the rest of `app/lib/pdf/`, because Node runs the scripts by stripping types and resolves no extensionless path.
 
 ### The device test list
 
@@ -352,6 +373,26 @@ The stage 1 viewer is checked by hand with this list on the owner's Mac and iPho
 11. Tap a web link inside the PDF. It opens in a new tab.
 12. Turn on dark mode. The pages stay white and the pill is readable.
 
+## Stage 3: the scene check
+
+Stage 3 builds each page's scene and checks it against pdf.js's own Canvas 2D drawing of the same page, in Node. Nothing of it reaches a reader's browser.
+
+- **Where it runs.** The same comparison, `scene/check.ts`, runs in two places:
+  - the unit tests, on every page of the stored operator-list fixtures (§ Testing);
+  - `pnpm scene:check <file.pdf> [first-last]` in `apps/web`, on any PDF on disk.
+- **How the script reads a page.** It opens the file with pdf.js's legacy build in Node, with the app's font and asset options and the WebGPU renderer's two (`disableFontFace: true`, `useSystemFonts: false`).
+  - It draws each page at scale 1 into pdf.js's Node canvas (`@napi-rs/canvas`) with `recordOperations: true`, so pdf.js records each op's box.
+  - It reads the page's input through `scene-input.ts` and runs the adapter on it.
+- **What is compared.**
+  1. **Boxes.** pdf.js's recorded boxes and the boxes of the scene's drawn rows are each marked on a 256 × 256 grid over the page. Each grid is compared with the other one widened by a cell.
+     - pdf.js records a text run of an outline font as its whole clip box, since under `disableFontFace` it draws those glyphs as paths it does not measure, and so it records a run that adds to the clip. On a page of text that box is the page, so neither grid counts those runs; their glyphs are checked by the text comparison.
+     - pdf.js does not cut its boxes by a text clip, so a scene row under one is marked by the clip above it.
+  2. **Text.** The scene's glyphs, character by character with whitespace removed, against `getTextContent({ disableNormalization: true })`.
+  3. **Origins.** Each text item's origin against the origin of the glyph that carries its first character, within 1 pt.
+- **The report** is a few lines per page, in English: counts by kind, the features a later stage draws, content not drawn and why, the grid and text differences, and a verdict. The script's last line is `checked N pages, M mismatches`, and it exits with 1 when M is not 0.
+- **What counts as a mismatch.** A page mismatches when pdf.js drew where the scene has nothing, when the text differs, when an origin is off by more than 1 pt, or when an op shows up that pdf.js's operator list never emits. Scene cells pdf.js left empty are reported and are not a mismatch, since the scene's boxes are conservative (stroke miters, a missing font's em box).
+- **Nothing in it sends a page anywhere**: not to a server, and not to another renderer. It reads a local file and prints.
+
 ## What is taken from where
 
 | Problem | Taken from | How |
@@ -359,13 +400,17 @@ The stage 1 viewer is checked by hand with this list on the owner's Mac and iPho
 | Reading the file, fonts to outlines, the text layer, find | pdf.js | used as a library |
 | Selecting across a text layer, and the text and link layers' CSS | pdf.js's `web/` viewer (`TextLayerBuilder`, `pdf_viewer.css`) | ported |
 | A capped page canvas with a detail canvas, and a link's box on the page | pdf.js's `web/` viewer and display layer (`PDFPageView`, `AnnotationElement`) | the design, rewritten |
+| The operator state, glyph placement and the line-width floor | pdf.js's `CanvasGraphics` (`src/display/canvas.js`) | ported |
+| The op codes and the affine helpers | pdf.js's `src/shared/util.js` (`OPS`, `Util`) | ported |
+| Mesh shadings | pdf.js's `MESH_WGSL` | ported |
 | The object model and the interface a renderer draws through | PDFium, hayro | the design, rewritten |
 | Filling a path with antialiased coverage (sparse strips) | Vello (`vello_common`) | ported |
 | Strokes, joins, caps and dashes | kurbo | ported |
-| The glyph atlas and when a glyph is drawn as a path instead | hayro | ported |
+| Which glyphs the atlas holds, its key, and the 128 px cutoff to paths | hayro | ported |
+| The glyph atlas's packing, padding and eviction | glifo (Vello) | ported |
 | Gradient and blend-mode formulas | Skia | ported |
 
-- A ported file names its source, the source's licence and the revision it was ported from in its header.
+- A ported file names its source, the source's licence, the revision it was ported from and what was changed in its header.
 - `THIRD_PARTY_NOTICES` lists each of them, from the stage that adds the first.
 
 ## Licences
@@ -385,16 +430,75 @@ The stage 1 viewer is checked by hand with this list on the owner's Mac and iPho
   - OpenJPEG (BSD-2-Clause) and PDFium's JBIG2 decoder (BSD-3-Clause), with pdf.js's wrappers of the two (`LICENSE_PDFJS_OPENJPEG`, BSD-2-Clause; `LICENSE_PDFJS_JBIG2`, Apache-2.0).
 - **The licence check** is a vitest test in `apps/web` (`app/lib/`, node environment). It reads the installed tree of the viewer's libraries (§ Libraries) and fails on a licence outside the list.
   - A package that never reaches a browser is a named exception in the test, with its reason. `@napi-rs/canvas` is one: pdfjs-dist's optional canvas for Node, which pdf.js loads only under Node.
+  - It also reads each `scene/` file whose header says *Ported from*, and checks that the header names an allowed source, its licence, the revision, what was changed and its section of `THIRD_PARTY_NOTICES`.
+
+## The WebGPU renderer
+
+The design stages 4 to 7 build on the scene stage 3 makes. Nothing of it draws before stage 4. The developer switch arrives with stage 4: `?pdfRenderer=webgpu` on the page's URL, read once when a document opens. Until stage 7 the renderer draws only under it.
+
+### Threads
+
+From stage 4; the adapter's part from stage 3.
+
+- **The main thread owns everything that touches pdf.js's display API or the GPU**: the one `PDFDocumentProxy`, as in stage 1, the adapter, the page scenes, the `GPUDevice`, every canvas and upload, and the frame's one submit.
+- **pdf.js's own worker** parses the file and builds operator lists, as in stage 1.
+- **One raster worker** turns a scene and a region into sparse strips and returns them as transferred buffers. It holds copies of the scenes of the pages in the render window and nothing else.
+- **The adapter runs on the main thread, in slices of about 8 ms** that yield with a `MessageChannel` post, under pdf.js's own 15 ms render slice. A slice ends after the op that crosses 8 ms, and trimming the finished scene has a slice of its own when the walk used the whole of the last one. Sending the operator list to a worker would cost the main thread a structured clone of up to 16 ms for the largest list measured, in one task that cannot be cut; the walk can. Stage 3 measured the walk in Node with `pnpm scene:check`: up to about 30 ms a page of a paper, in slices of up to about 13 ms when one op runs long. Stage 4 measures it in the browser.
+- **The scene copies pdf.js's buffers and never holds them**, since pdf.js caches a path's buffer per op.
+- **Images** are pdf.js's `ImageBitmap` or `VideoFrame` objects in `page.objs`, which `page.cleanup()` closes. They are uploaded as soon as the scene is built. Their object ids change on every reading.
+
+### The page scene
+
+From stage 3.
+
+- **One structure-of-arrays table per page**, built once per reading from `getOperatorList({ intent: "display" })`.
+- **Its rows** are the page's objects in paint order, as a pre-order tree: `Path`, `Text` (a glyph run), `Image`, `ImageMask` and `Shading`, and the containers `Form`, `Group`, `SoftMask`, `Annotation` and `OptionalContent`. The `Type3Glyph` and `TilingCell` containers come after the page tree, outside it, and a glyph or a pattern refers to them by row.
+- **Its columns**: `kind`, `flags`, `parent`, `end`, `bbox`, `clip`, `xform`, `fill`, `stroke`, `style`, `comp`, `d0`, `d1` and `op`, the index of the op the row came from.
+- **Its pools**, interned where values repeat: `xforms`, `pathData` (pdf.js's path encoding, copied), `clips` with `clipRows`, `paints`, `styles` with `dashes`, `comps`, `transfers`, `glyphs`, `fonts`, `images`, `shadings`, `tilings`, `ocProps` and `strings`, with `notes` for content not drawn and `opCounts` for the ops the list had.
+- **Page space** is `page.getViewport({ scale: 1 })`'s: PDF points, y down, `/Rotate` applied. Boxes, hit testing and the stage 3 grid use it.
+- **A Type 3 glyph is adapted once**, out of the tree, and pdf.js runs its procedure in the state of each text that shows it. So what the procedure does not set comes from that `Text` row when it is drawn: its fill and stroke paints, the stroke fields it leaves alone (`styles.inherit`), and the base transform a pattern it sets is placed against.
+- **A stroked text run's line width is in em units**, as pdf.js strokes glyphs: the line width over the text matrix's scale and the font size.
+- **A text clip lists its runs** (`clipRows`): the runs shown in modes 4 to 7 between one `beginText` and its `endText`, and no run in another mode.
+- **Where pdf.js's Canvas 2D departs from the PDF, the scene follows the PDF.** One case is known: pdf.js keeps an even-odd fill's rule pending until a fill is drawn (`pendingEOFill`), so an `f*` it skips, outside the clip or in hidden optional content, makes the next `f`, `B` or `b` even-odd. The scene fills that one nonzero, and stage 4's pixel comparison expects the difference where such a path overlaps itself.
+- **Every kind, pool and flag stages 4 to 7 read is there from stage 3**, so the layout does not change as stages add drawing. The ids are § Room for editing's.
+
+### Canvases
+
+From stage 4.
+
+- **Every page in the render window has a base**: a 2D canvas of at most 2 MP on desktop and 1 MP on a phone.
+  - The GPU draws the whole page into a texture the renderer owns, reads it back with `copyTextureToBuffer` and `mapAsync` in the task that drew it, and writes it with `putImageData` (§ Safari).
+  - It is drawn once per reading, when the page enters the render window, and never again on a zoom: CSS stretches it.
+- **A visible page whose base is below the device's resolution also has one sharp canvas**, a WebGPU canvas at device resolution. It is stage 1's rule for a detail canvas.
+  - Its part of the page is the detail canvas's (`budget.ts`), bounded by pdf.js's cap at half its default area factor, and the cap is shared between the visible pages by their visible pixels.
+  - It is drawn again by pdf.js's detail-view rules once a scroll or a zoom has settled for 150 ms: the visible part has left the part it drew, the scale changed, or the margin has gone lopsided.
+  - Its sides are rounded up to steps of 256 device pixels, so most redraws keep its size. A redraw resizes, moves and draws it in one task.
+- **During a pinch** both are stretched with CSS, as in stage 1.
+
+### Text
+
+From stage 5.
+
+- **One glyph atlas**, an `r8unorm` texture. Which glyphs it holds, its key (font, character, the 2 × 2 device matrix, a quarter-pixel x step, y snapped) and the cutoff are hayro's: a glyph over 128 device pixels on a side is filled as a path. Its packing, 1px padding and eviction by age are glifo's.
+- **A glyph with an outline** is rasterised into the atlas by the same strip pipeline as a path.
+- **A glyph with no outline**, from a font neither embedded nor base-14, is drawn with `fillText` in pdf.js's own CSS font string at device size and copied into the atlas. It never becomes a path.
+  - The scene keeps that string without its size, the font's `remeasure` flag and each glyph's PDF width, and pdf.js's remeasuring is applied when the glyph is drawn.
+
+### The op coverage table
+
+From stage 3.
+
+- **`scene/coverage.ts` is the one list.** Each of pdf.js's op codes is handled, with the stage that draws it (4 to 6); ignored, as pdf.js's Canvas 2D ignores it; or never emitted by `getOperatorList()`, and counted as unexpected if it shows up.
+- **A feature the renderer does not draw yet is drawn as nothing** and counted in the developer report. No op sends a page to Canvas 2D.
 
 ## The fallback
 
-From stage 4, when the WebGPU renderer draws, pdf.js's Canvas 2D renderer draws the page when:
-
-- the browser has no WebGPU, or gives no adapter or device. Safari has WebGPU from macOS 26 and iOS 26 on;
-- the device is lost and a new one cannot be had;
-- the page uses a font pdf.js has no outlines for, one that is not embedded in the file.
-
-The fallback is a whole page at a time: a page is never drawn half by each renderer.
+- The renderer is chosen once, when a document opens, for the whole document. Until stage 7, a document opened without the developer switch is drawn by Canvas 2D.
+- From stage 4, Canvas 2D draws the whole document when:
+  - the browser has no WebGPU, or gives no adapter or device. Safari has WebGPU from macOS 26 and iOS 26 on;
+  - or the device is lost and a new one cannot be had.
+- A lost device that comes back redraws every page from a fresh reading.
+- A page is never drawn half by each renderer, and no font, op or size sends a page to Canvas 2D. A feature the renderer does not draw yet is drawn as nothing and counted in the developer report.
 
 ## Safari
 
@@ -418,7 +522,7 @@ Safari 27.2 is WebKit 625.2.8. These rules come from that source and from WebKit
 The page scene is what an editor would change, so it is kept and never thrown away after drawing.
 
 - **Objects are retained.** The renderer draws from the page scene, never straight from pdf.js's operator list.
-- **Each object has a stable id**, the same on every reading of the same file, so that a change can name its object.
+- **Each object has a stable id**, the same on every reading of the same file, so that a change can name its object. An object's id is its page and its row in the page scene, valid under the scene's stamp: the document's fingerprint, the pdf.js version, the annotation mode and the open options. An image's pdf.js object id changes on every reading and is never part of an id.
 - **Each object has its bounding box** in page coordinates, which hit testing and partial redraw read.
 - **Each object has an active flag.** An object switched off is skipped by the renderer and stays in the scene.
 - **Clips are shared chains**, named by id, so that changing one object does not disturb the clip of the next.
@@ -428,17 +532,22 @@ The page scene is what an editor would change, so it is kept and never thrown aw
 
 - `@webgpu/types` (BSD-3-Clause), a development dependency at one exact version: the WebGPU types TypeScript's own library lacks. Types only, nothing of it ships.
 - `pdfjs-dist` 6.5.438 (Apache-2.0) from stage 1, at that exact version.
-  - Its optional dependency `@napi-rs/canvas` (MIT) is a canvas for pdf.js under Node. The browser build never loads it, and nothing of it ships.
+  - Its optional dependency `@napi-rs/canvas` (MIT) is a canvas for pdf.js under Node. The browser build never loads it, and nothing of it ships. The developer scripts of § Stage 3: the scene check draw with it.
   - Besides the bundled code, its worker, its CMaps, its Foxit fonts and its two no-WebAssembly image decoders are served beside the build (§ Stage 1: the Canvas 2D viewer, *Files served beside the build*).
 
 ## Testing
 
 [testing.md](./testing.md) § Frontend holds the commands and the rule for what is unit tested.
 
-- The stage 1 viewer's pure parts are framework-free modules with vitest tests (§ Stage 1: the Canvas 2D viewer, *The code*). No test imports `pdfjs-dist` or fetches a PDF.
+- The stage 1 viewer's pure parts are framework-free modules with vitest tests (§ Stage 1: the Canvas 2D viewer, *The code*). No test imports `pdfjs-dist`, or fetches or reads a PDF.
 - What the stage 1 viewer does in a browser is checked by hand on the owner's Mac and iPhone, with § Stage 1: the Canvas 2D viewer, *The device test list*.
 - The licence check runs with the unit tests (§ Licences).
 - The adapter, the page scene and every pure part of the renderer are framework-free modules with vitest tests.
+- The adapter is tested on stored operator lists (`app/lib/pdf/scene/fixtures/*.oplist.json`).
+  - The script `scripts/capture-oplists.ts` (`pnpm fixtures:oplists`) captures them with pdf.js in Node 24 or later, from PDFs that `scripts/pdf-fixtures/` writes by hand. It refuses an older Node: pdf.js hands glyph outlines over as half floats where the runtime has them, as Node 24 and the browsers do, and the stored glyph boxes come from those values.
+  - Each stored list carries pdf.js's own Canvas 2D boxes and text content, so the tests compare the scene with pdf.js without importing it (§ Stage 3: the scene check).
+  - The script is a developer tool, not a test. Fixtures are captured again after a pdf.js upgrade.
+- `pnpm scene:check` runs the same comparison on any PDF on disk. It is a developer tool too, not a test.
 - The renderer's pictures are compared with stored hashes of its own earlier output, per test file. They are not compared pixel for pixel with Poppler's renders: two correct renderers differ at every antialiased edge.
 - What needs a GPU is checked by hand on real devices, Safari on a Mac and on an iPhone first.
 
@@ -459,7 +568,7 @@ The checks, in the order they are listed:
 | Graphics device created | Whether `requestDevice()` gives one, and in how long |
 | Half-float arrays | Whether `Float16Array` exists, which packs the renderer's half-float data |
 | A drawing read back from the GPU | Whether a texture that is no canvas's holds the color it was cleared to |
-| Five canvases from one device | Whether one device draws five canvases in one task — one canvas per visible page |
+| Five canvases from one device | Whether one device draws five canvases in one task — a sharp canvas for each visible page |
 | A canvas read through a 2D canvas | What `drawImage` reads from a WebGPU canvas, as a thumbnail or a print would: in the task that drew it, and once the frame has been shown |
 | WebGPU in a background worker | Whether a worker gets a device and draws a texture that reads back right, and in how long by the worker's own clock |
 | A worker's frame handed over as a bitmap | What the page reads from a worker's `OffscreenCanvas` frame: from `transferToImageBitmap()` and from `createImageBitmap()` in the task that drew it, and from `transferToImageBitmap()` once `onSubmittedWorkDone()` has resolved, each on a canvas of its own |

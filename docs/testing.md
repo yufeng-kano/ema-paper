@@ -240,8 +240,25 @@
 - The PDF viewer (`app/lib/pdf/`, [pdf-viewer.md](./pdf-viewer.md) § Testing):
   - what runs without a browser is unit tested like any other module — for the device check, `probe.test.ts`: the limits kept, the pixel comparison, what a read says of a drawing, the copied report's exact lines, and a label for every check, every note and every way a canvas is drawn;
   - the stage 1 viewer's pure modules, each with its test beside it: `zoom.test.ts` (the clamp, the ladder, fit width and fit page from a page size, the opening zoom, a phone's multiples, the anchored scroll of a zoom commit, the checked preset), `layout.test.ts` (the page boxes, the current page and its tie, the render window, the correction for a size change above the viewport), `budget.test.ts` (the cap, the backing size, the detail canvas's part, what the total budget releases), `page-input.test.ts` (parsing, clamping, commit and cancel for Enter and for leaving), `errors.test.ts` (a failure classed by its exception and status), `links.test.ts` (the URL filter, a link's box, an explicit destination) and `support.test.ts` (the build probe);
-  - none of them imports `pdfjs-dist`, and no test reaches the network or fetches a real PDF;
-  - the licence check (`app/lib/`), which reads the installed tree of the viewer's libraries and fails on a licence [pdf-viewer.md](./pdf-viewer.md) § Licences does not allow;
+  - the stage 3 scene's pure modules in `app/lib/pdf/scene/`, each with its test beside it:
+    - `ops.test.ts`: the codes against the stored fixtures and the installed version;
+    - `matrix.test.ts`;
+    - `clips.test.ts`: interning and boxes;
+    - `state.test.ts`;
+    - `text.test.ts`: glyph origins for each text-state operator;
+    - `scene.test.ts`: the layout, interning and the tree;
+    - `coverage.test.ts`: every op classed;
+    - `adapter.test.ts`: each fixture page well formed, deterministic and the same in slices;
+    - `slice.test.ts`;
+    - `check.test.ts`: the grid and text comparison, with pdf.js's own boxes and text in each fixture as the oracle, and a mutation that must fail;
+    - `fixture.test.ts`;
+  - stored operator-list fixtures (`app/lib/pdf/scene/fixtures/`):
+    - they are made by `pnpm fixtures:oplists`, a developer script that runs pdf.js in Node 24 or later (it refuses an older one, whose glyph outlines differ in precision) on PDFs written by `scripts/pdf-fixtures/`;
+    - no test runs pdf.js or reads a PDF;
+    - they are captured again after a `pdfjs-dist` upgrade, and `ops.test.ts` fails until they are;
+  - `pnpm scene:check <file.pdf>` runs the same comparison on any PDF on disk, with pdf.js in Node ([pdf-viewer.md](./pdf-viewer.md) § Stage 3: the scene check). It is a developer script, not a test;
+  - none of them imports `pdfjs-dist`, and no test reaches the network or fetches or reads a PDF;
+  - the licence check (`app/lib/`), which reads the installed tree of the viewer's libraries and fails on a licence [pdf-viewer.md](./pdf-viewer.md) § Licences does not allow. It also reads each `scene/` file whose header says *Ported from*, and checks that it names an allowed source, its licence, the revision, what changed and its section of `THIRD_PARTY_NOTICES`;
   - the catalog check above covers the `viewer.pdf` keys with no test of their own;
   - what the stage 1 viewer does in a browser is checked by hand on the owner's Mac and iPhone with [pdf-viewer.md](./pdf-viewer.md) § Stage 1: the Canvas 2D viewer, *The device test list*. The rule above, no browser automation, stands;
   - what needs a GPU cannot run in vitest. It is checked by hand on real devices, Safari on a Mac and on an iPhone first, through the device check at `/pdf-probe`.
