@@ -184,6 +184,13 @@ describe('placing glyphs', () => {
     expect(run.box).toEqual([-1, -2, 9, 8])
   })
 
+  it('widens a remeasured glyph’s box along the line by half its width, as far as pdf.js may move it to centre it', () => {
+    const font = record({ kind: 'missing', remeasure: true, bbox: [-100, -200, 900, 800] })
+    // 500 units at size 10: pdf.js moves the glyph by up to 500 / 2000 em, 2.5 pt.
+    const { run } = place([glyph('A')], state(), font, { ...INPUT, missingFile: true, remeasure: true }, () => null)
+    expect(run.box).toEqual([-1, -2, 11.5, 8])
+  })
+
   it('places Type 3 glyphs through the font matrix, its translation included', () => {
     const s = state()
     const font = record({ kind: 'type3', fontMatrix: [0.001, 0, 0, 0.001, 0.1, 0.2] })

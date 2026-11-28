@@ -326,6 +326,8 @@ The Original view of a PDF draws the file with pdf.js's display API and its Canv
   - `check.ts`: the stage 3 comparison and its report;
   - `fixture.ts`: stored op-list fixtures, with `fixtures/`.
 - **`app/lib/pdf/scene-input.ts`** reads a page's operator list, fonts, images and text from pdf.js into the adapter's input. It types the few members of pdf.js it reads with its own interfaces and imports nothing from `pdfjs-dist`, so the scripts below use it as it is, and from stage 4 the viewer calls the same function with the browser build's page.
+  - An image pdf.js could not decode resolves as nothing and is left out of the input, as pdf.js skips it. The adapter notes it as missing.
+  - An abort rejects the read even while it waits on an object, since `page.cleanup()` drops the callbacks of objects still pending.
 - **Developer scripts in `scripts/`**, not tests: `capture-oplists.ts` (`pnpm fixtures:oplists`) with the hand-written PDFs of `pdf-fixtures/`, and `check-scene.ts` (`pnpm scene:check`, § Stage 3: the scene check). Both open and draw a document through `pdfjs-node.ts`.
 - The relative imports inside `scene/`, in `scene-input.ts` and in `scripts/` carry their `.ts` extension, unlike the rest of `app/lib/pdf/`, because Node runs the scripts by stripping types and resolves no extensionless path.
 
@@ -384,13 +386,25 @@ Stage 3 builds each page's scene and checks it against pdf.js's own Canvas 2D dr
   - It draws each page at scale 1 into pdf.js's Node canvas (`@napi-rs/canvas`) with `recordOperations: true`, so pdf.js records each op's box.
   - It reads the page's input through `scene-input.ts` and runs the adapter on it.
 - **What is compared.**
-  1. **Boxes.** pdf.js's recorded boxes and the boxes of the scene's drawn rows are each marked on a 256 × 256 grid over the page. Each grid is compared with the other one widened by a cell.
-     - pdf.js records a text run of an outline font as its whole clip box, since under `disableFontFace` it draws those glyphs as paths it does not measure, and so it records a run that adds to the clip. On a page of text that box is the page, so neither grid counts those runs; their glyphs are checked by the text comparison.
-     - pdf.js does not cut its boxes by a text clip, so a scene row under one is marked by the clip above it.
-  2. **Text.** The scene's glyphs, character by character with whitespace removed, against `getTextContent({ disableNormalization: true })`.
+  1. **Boxes.** pdf.js's recorded boxes of its drawing ops and the boxes of the scene's drawn rows are each marked on a 256 × 256 grid over the page. Each grid is compared with the other one widened by a cell. Where pdf.js records a box the scene can follow, the grid follows it; where it records one that says nothing of where it drew, that content is left out of both grids and counted (the report's `not read: N ops, M rows`).
+     - **Left out of both grids.** These are a text run of an outline font, or a run that adds to the clip; a run of a Type 3 font whose glyphs paint a group; content inside a form drawn in hidden optional content; and content under a clip to a path with no points.
+       - pdf.js records an outline font's run as its whole clip box, since under `disableFontFace` it draws those glyphs as paths it does not measure. It records a run that adds to the clip the same way. On a page of text that box is the page. The text comparison checks those glyphs.
+       - pdf.js records what a Type 3 glyph's procedure paints as the run's box, and does not cut it by a group's bbox, which it clips the drawing to.
+       - In hidden optional content pdf.js still records a path's box, and both grids read it there. Inside a form drawn in hidden content it records it without the form's matrix and bbox.
+       - pdf.js takes a clip to a path with no points as the whole plane in its boxes, and draws nothing under it. The clip holds until the restore of the level it was set in.
+     - **Cut on pdf.js's side.** pdf.js clips its drawing to a group's bbox and an annotation's rect, but does not cut its boxes by either. Its grid is cut by them, as the scene's boxes are.
+     - **Marked from the clip above, on the scene's side.** pdf.js does not cut its boxes by a text clip. A scene row under one is marked by the box of the clip above the outermost text clip, or the page.
+     - **Marked on the edge, on the scene's side.** pdf.js records a box clamped into its clip box. It takes a `W` clip's box as the largest min and the smallest max of the clips on each axis, with no test for empty, so a clip off the page leaves a box on the edge cells beside it, even under a clip on the page. A scene row its clips cut away entirely is marked by that box, clamped onto the page, when it lies off the page on an axis. A form's bbox and a d1 box are taken the same way, though pdf.js records nothing under an empty one, so the scene may mark edge cells pdf.js lacks.
+     - **The pending clip.** A `W` pending when a `restore` runs, or when a form's bbox or an annotation's rect ends the path, clips nothing. One pending at a group's bbox clips the group's first path.
+  2. **Text.** The scene's glyphs, character by character with whitespace removed, against `getTextContent({ disableNormalization: true })`, with `getTextContent`'s own rules applied to the scene's side.
+     - A glyph that is a format mark (`\p{Cf}`) is dropped.
+     - A glyph whose origin lies off the page is dropped, unless it is a zero-width mark (`\p{Mn}`). pdf.js keeps a glyph that starts off the page by less than its advance, which the scene cannot know. So the first character of an item that starts off the page is left out too. Both are counted (`off the page: scene N, content M`).
+     - pdf.js reorders an item that holds a right-to-left character. Such an item is compared as a set of characters, and counted (`right-to-left items unordered: N`).
   3. **Origins.** Each text item's origin against the origin of the glyph that carries its first character, within 1 pt.
+     - Some items are not compared: one that starts with whitespace or off the page, and one whose first glyph pdf.js draws away from the pen. That is a vertical font's glyph, and a glyph of a Type 3 font whose font matrix translates.
 - **The report** is a few lines per page, in English: counts by kind, the features a later stage draws, content not drawn and why, the grid and text differences, and a verdict. The script's last line is `checked N pages, M mismatches`, and it exits with 1 when M is not 0.
 - **What counts as a mismatch.** A page mismatches when pdf.js drew where the scene has nothing, when the text differs, when an origin is off by more than 1 pt, or when an op shows up that pdf.js's operator list never emits. Scene cells pdf.js left empty are reported and are not a mismatch, since the scene's boxes are conservative (stroke miters, a missing font's em box).
+  - Where pdf.js departs from the PDF and the scene follows the PDF (§ The page scene), the check reports what pdf.js drew. One known case is a `cm` that a form in hidden optional content leaves unbalanced.
 - **Nothing in it sends a page anywhere**: not to a server, and not to another renderer. It reads a local file and prints.
 
 ## What is taken from where
@@ -458,8 +472,12 @@ From stage 3.
 - **Page space** is `page.getViewport({ scale: 1 })`'s: PDF points, y down, `/Rotate` applied. Boxes, hit testing and the stage 3 grid use it.
 - **A Type 3 glyph is adapted once**, out of the tree, and pdf.js runs its procedure in the state of each text that shows it. So what the procedure does not set comes from that `Text` row when it is drawn: its fill and stroke paints, the stroke fields it leaves alone (`styles.inherit`), and the base transform a pattern it sets is placed against.
 - **A stroked text run's line width is in em units**, as pdf.js strokes glyphs: the line width over the text matrix's scale and the font size.
+- **A remeasured run's box covers pdf.js's centring.** pdf.js draws a glyph of a font it remeasures (one with no outlines) moved along the line to centre it in its PDF width, when the system font draws it narrower: by up to half that width, depending on the width measured as it is drawn. So the box is widened by half the glyph's width along the line. A glyph the system font draws wider pdf.js squeezes into its width wherever text is antialiased, as in a browser.
 - **A text clip lists its runs** (`clipRows`): the runs shown in modes 4 to 7 between one `beginText` and its `endText`, and no run in another mode.
-- **Where pdf.js's Canvas 2D departs from the PDF, the scene follows the PDF.** One case is known: pdf.js keeps an even-odd fill's rule pending until a fill is drawn (`pendingEOFill`), so an `f*` it skips, outside the clip or in hidden optional content, makes the next `f`, `B` or `b` even-odd. The scene fills that one nonzero, and stage 4's pixel comparison expects the difference where such a path overlaps itself.
+- **A Type 3 glyph's box is where pdf.js paints it.** That is the hull of what its procedure draws: strokes at the line width it sets, forms through their matrix and cut by their bbox, a shading cut by the clip, and images pdf.js could decode. With `d1` it is the glyph box: pdf.js records that box for the glyph and clips the procedure to it. A shading under no clip makes the box unbounded.
+- **Where pdf.js's Canvas 2D departs from the PDF, the scene follows the PDF.** Two cases are known:
+  - pdf.js keeps an even-odd fill's rule pending until a fill is drawn (`pendingEOFill`), so an `f*` it skips, outside the clip or in hidden optional content, makes the next `f`, `B` or `b` even-odd. The scene fills that one nonzero, and stage 4's pixel comparison expects the difference where such a path overlaps itself.
+  - pdf.js skips a hidden form's `save` and `restore` but not the `cm` ops inside it, so a `cm` the form's content leaves unbalanced moves what follows the form. The scene keeps the form's own state, as the PDF does. The scene check reports such a page as a mismatch.
 - **Every kind, pool and flag stages 4 to 7 read is there from stage 3**, so the layout does not change as stages add drawing. The ids are § Room for editing's.
 
 ### Canvases
@@ -482,7 +500,7 @@ From stage 5.
 - **One glyph atlas**, an `r8unorm` texture. Which glyphs it holds, its key (font, character, the 2 × 2 device matrix, a quarter-pixel x step, y snapped) and the cutoff are hayro's: a glyph over 128 device pixels on a side is filled as a path. Its packing, 1px padding and eviction by age are glifo's.
 - **A glyph with an outline** is rasterised into the atlas by the same strip pipeline as a path.
 - **A glyph with no outline**, from a font neither embedded nor base-14, is drawn with `fillText` in pdf.js's own CSS font string at device size and copied into the atlas. It never becomes a path.
-  - The scene keeps that string without its size, the font's `remeasure` flag and each glyph's PDF width, and pdf.js's remeasuring is applied when the glyph is drawn.
+  - The scene keeps that string without its size, the font's `remeasure` flag and each glyph's PDF width, and pdf.js's remeasuring is applied when the glyph is drawn. The run's box already covers it (§ The page scene).
 
 ### The op coverage table
 

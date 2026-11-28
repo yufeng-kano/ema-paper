@@ -215,6 +215,26 @@ describe('containers', () => {
     expect(scene.comps.mask[comp[7]!]).toBe(-1)
   })
 
+  it('keep a pending clip for a group’s first path, which a form’s bbox drops, as pdf.js ends the path for one only', () => {
+    const group = { matrix: null, bbox: new Float32Array([0, 0, 200, 200]), smask: null, isolated: false, knockout: false,
+      needsIsolation: false }
+    const scene = adapt(page([
+      [OPS.clip, null],
+      [OPS.beginGroup, [group]],
+      rect(OPS.endPath, 0, 0, 10, 10),
+      rect(OPS.fill, 0, 0, 100, 100),
+      [OPS.endGroup, [group]],
+      [OPS.clip, null],
+      [OPS.paintFormXObjectBegin, [null, new Float32Array([0, 0, 200, 200])]],
+      rect(OPS.fill, 0, 0, 100, 100),
+      [OPS.paintFormXObjectEnd, []],
+    ]))
+    expect(Array.from(scene.obj.kind)).toEqual([Kind.Group, Kind.Path, Kind.Form, Kind.Path])
+    // In the group the `n` path took the clip; in the form the fill paints.
+    expect(box(scene, 1)).toEqual([0, 782, 10, 792])
+    expect(box(scene, 3)).toEqual([0, 692, 100, 792])
+  })
+
   it('map a group’s bbox through the group’s matrix', () => {
     const group = { matrix: [1, 0, 0, 1, 100, 0], bbox: new Float32Array([0, 0, 50, 50]), smask: null, isolated: false,
       knockout: false, needsIsolation: false }
@@ -433,6 +453,51 @@ describe('text', () => {
     expect(Array.from(scene.xforms.subarray(scene.paints.xform[paint]! * 6, scene.paints.xform[paint]! * 6 + 6)))
       .toEqual([1, 0, 0, 1, 5, 5])
   })
+
+  it('boxes a Type 3 glyph where pdf.js paints it: a gs line width, a form’s matrix and bbox, clipped shadings, d1', () => {
+    const proc = (...ops: [number, unknown][]) => ({ fnArray: [OPS.setCharWidth, ...ops.map(([fn]) => fn)],
+      argsArray: [[1000, 0], ...ops.map(([, args]) => args)] })
+    const procs = new Map([
+      ['width', proc([OPS.setGState, [[['LW', 100]]]],
+        [OPS.constructPath, [OPS.stroke, [new Float32Array([0, 200, 200, 1, 800, 800])], new Float32Array([200, 200, 800, 800])]])],
+      ['form', proc([OPS.paintFormXObjectBegin, [[1, 0, 0, 1, 300, 300], [0, 0, 400, 400]]], rect(OPS.fill, 0, 0, 500, 500),
+        [OPS.paintFormXObjectEnd, null])],
+      ['clipped', proc([OPS.save, null], [OPS.clip, null], rect(OPS.endPath, 300, 300, 700, 700), [OPS.shadingFill, ['pattern_p0_1']],
+        [OPS.restore, null], rect(OPS.fill, 0, 0, 100, 100))],
+      ['bounds', proc([OPS.setCharWidthAndBounds, [1000, 0, 100, 100, 900, 900]], rect(OPS.fill, 450, 450, 550, 2000))],
+      ['shading', proc([OPS.shadingFill, ['pattern_p0_1']])],
+    ])
+    const type3: FontInput = { ...OUTLINE, loadedName: 'T3', isType3Font: true, type3Procs: procs }
+    // At size 1000 a glyph unit is a point, and the run's origin is the page's bottom left: y is 792 - y.
+    const ops: [number, unknown][] = [[OPS.setFont, ['T3', 1000]]]
+    for (const id of procs.keys()) ops.push([OPS.beginText, null], [OPS.showText, [[glyph(id, 1000, { operatorListId: id })]]], [OPS.endText, null])
+    const scene = adapt(page([...ops, [OPS.save, null], [OPS.clip, null], rect(OPS.endPath, 10, 10, 20, 20), ...ops.slice(-3),
+      [OPS.restore, null]], { font: () => type3, shading: () => ['RadialAxial', 'axial', null, [[0, '#000000'], [1, '#ffffff']],
+      [0, 0], [1, 0], null, null] }))
+    expect(notes(scene)).toEqual([])
+    // A stroke 100 wide, padded by half its width times the miter limit of 10.
+    expect(box(scene, 0)).toEqual([-300, 792 - 1300, 1300, 792 + 300])
+    expect(box(scene, 1)).toEqual([300, 792 - 700, 700, 792 - 300])
+    expect(box(scene, 2)).toEqual([0, 792 - 700, 700, 792])
+    // The d1 bounds, which pdf.js records whatever the glyph paints inside them.
+    expect(box(scene, 3)).toEqual([100, 792 - 900, 900, 792 - 100])
+    // A shading with no clip in the glyph fills the clip of the text.
+    expect(box(scene, 4)).toEqual([-Infinity, -Infinity, Infinity, Infinity])
+    expect(box(scene, 5)).toEqual([10, 772, 20, 782])
+  })
+
+  it('boxes a Type 3 glyph without an image pdf.js could not decode, which paints nothing', () => {
+    const procs = new Map(['img_p0_1', 'img_p0_2'].map((id) => [id, { fnArray: [OPS.setCharWidth, OPS.save, OPS.transform,
+      OPS.paintImageXObject, OPS.restore, OPS.constructPath], argsArray: [[1000, 0], null, [1000, 0, 0, 1000, 0, 0], [id, 1, 1], null,
+      rect(OPS.fill, 0, 0, 100, 100)[1]] }]))
+    const type3: FontInput = { ...OUTLINE, loadedName: 'T3', isType3Font: true, type3Procs: procs }
+    const ops: [number, unknown][] = [[OPS.setFont, ['T3', 1000]]]
+    for (const id of procs.keys()) ops.push([OPS.beginText, null], [OPS.showText, [[glyph(id, 1000, { operatorListId: id })]]], [OPS.endText, null])
+    // img_p0_2 did not decode.
+    const scene = adapt(page(ops, { font: () => type3, image: (id) => (id === 'img_p0_1' ? { width: 4, height: 4 } : null) }))
+    expect(box(scene, 0)).toEqual([0, 792 - 1000, 1000, 792])
+    expect(box(scene, 1)).toEqual([0, 792 - 100, 100, 792])
+  })
 })
 
 describe('images', () => {
@@ -534,11 +599,11 @@ describe('a whole page', () => {
     // The glyph's own path is in glyph space, cut to its d1 bounds, and paints in its text's colour.
     expect(box(scene, glyphRow + 1)).toEqual([0, 0, 500, 600])
     expect(scene.obj.fill[glyphRow + 1]).toBe(-1)
-    // On the page the run starts where the F1 run ended (72 + 12) and each glyph is that box at 0.01 pt
-    // per unit, 5 pt apart.
+    // On the page the run starts where the F1 run ended (72 + 12) and each glyph is its d1 box, which
+    // pdf.js records whatever the glyph paints in it, at 0.01 pt per unit, 5 pt apart.
     const [x0, y0, x1, y1] = box(scene, 1)
     expect([x0, x1, y1]).toEqual([84, 94, 92])
-    expect(y0).toBeCloseTo(86, 4)
+    expect(y0).toBeCloseTo(85, 4)
 
     const cellRow = scene.treeEnd + 2
     expect(scene.tilings[0]!.cell).toBe(cellRow)

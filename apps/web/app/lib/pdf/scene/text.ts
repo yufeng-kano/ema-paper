@@ -8,7 +8,8 @@
  * Apache-2.0, Copyright 2024 Mozilla Foundation (THIRD_PARTY_NOTICES § 1). Changed: glyphs are
  * recorded instead of drawn, so what needs the browser's `measureText` (the `remeasure` squeeze or
  * centring, an `isRotated` glyph's centring) is left to the stage that draws, which keeps each glyph's
- * PDF width and flags for it. docs/pdf-viewer.md § What is taken from where.
+ * PDF width and flags for it; the box covers the centring's move. docs/pdf-viewer.md § What is taken
+ * from where.
  */
 
 import type { FontInput } from './adapter.ts'
@@ -72,7 +73,8 @@ export function placeGlyphs(items: readonly unknown[], state: GState, font: Font
     run.glyphCount++
   }
   const grow = (glyphToPage: Mat6, em: Readonly<Box4>): void => {
-    const box = boxThrough(glyphToPage, em)
+    // A Type 3 glyph that fills a shading with no clip covers the plane, which a matrix would turn into NaN.
+    const box: Box4 = em.every(Number.isFinite) ? boxThrough(glyphToPage, em) : [-Infinity, -Infinity, Infinity, Infinity]
     run.box = run.box === null ? box : union(run.box, box)
   }
 
@@ -173,6 +175,11 @@ export function placeGlyphs(items: readonly unknown[], state: GState, font: Font
     add(glyph.fontChar.codePointAt(0) ?? 0, ox, oy, glyph.isRotated ? glyph.width : width, glyph.unicode, flags)
     if (drawn) {
       const em = hasOutlines ? bounds(font.loadedName, glyph.fontChar) : missingEmBox(font, glyph.width * fm[0], glyph.isRotated === true)
+      // pdf.js centres a remeasured glyph the system font draws narrower in its width, moving it along the
+      // line by (its width - the measured width) / 2000 em, at most half its width (build/pdf.mjs
+      // 11370-11385). The measured width is known only where the glyph is drawn, so the box covers the whole
+      // move; a wider glyph pdf.js squeezes into its width where text is antialiased, as in a browser.
+      if (em !== null && font.kind === 'missing' && font.remeasure && !glyph.isRotated && width > 0) em[2] += width / 2000
       if (em !== null) grow([...run.xform.slice(0, 4), ox, oy] as Mat6, em)
       if (glyph.accent) {
         // The accent is its own glyph at `offset × size` from the base glyph (build/pdf.mjs 11399-11403).

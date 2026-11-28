@@ -88,6 +88,12 @@ export function documentStamp(fingerprint: string, pdfjsVersion: string, rendere
   return `${fingerprint}:${pdfjsVersion}:annot-enable:${renderer}`
 }
 
+/**
+ * Rejects with the signal's reason as soon as it aborts, even while it waits for an object: when the
+ * page is cleaned up, pdf.js drops a pending object's callbacks without calling either
+ * (`PDFPageProxy.cleanup` and `PDFObjects.clear`, build/pdf.mjs 16876-16897, 14618-14625), so a wait on
+ * the object alone might never end.
+ */
 export async function readPageInput(page: PdfPage, stamp: string, signal?: AbortSignal): Promise<PageReading> {
   const list = await page.getOperatorList({ intent: 'display' })
   signal?.throwIfAborted()
@@ -95,9 +101,19 @@ export async function readPageInput(page: PdfPage, stamp: string, signal?: Abort
   // `g_` ids are document-wide, in `commonObjs`; the rest are the page's own (build/pdf.mjs 10019-10026).
   const resolved = async (id: string): Promise<unknown> => {
     const objs = id.startsWith('g_') ? page.commonObjs : page.objs
-    const data = objs.has(id) ? objs.get(id) : await new Promise((resolve, reject) => objs.get(id, resolve, reject))
+    if (objs.has(id)) return objs.get(id)
     signal?.throwIfAborted()
-    return data
+    return new Promise((resolve, reject) => {
+      const abort = () => reject(signal!.reason)
+      signal?.addEventListener('abort', abort, { once: true })
+      objs.get(id, (value) => {
+        signal?.removeEventListener('abort', abort)
+        resolve(value)
+      }, (reason) => {
+        signal?.removeEventListener('abort', abort)
+        reject(reason)
+      })
+    })
   }
 
   const fonts = new Map<string, FontInput | string>()
@@ -142,8 +158,10 @@ export async function readPageInput(page: PdfPage, stamp: string, signal?: Abort
   }
   const readImage = async (id: string) => {
     if (images.has(id)) return
-    const { width, height, interpolate } = (await resolved(id)) as { width: number; height: number; interpolate?: boolean }
-    images.set(id, { width, height, interpolate: interpolate === true })
+    // An image pdf.js could not decode resolves as null, and its Canvas 2D skips it (build/pdf.mjs
+    // 12033-12037); left out, the adapter notes it ImageMissing.
+    const image = (await resolved(id)) as { width: number; height: number; interpolate?: boolean } | null
+    if (image !== null) images.set(id, { width: image.width, height: image.height, interpolate: image.interpolate === true })
   }
 
   for (let l = 0; l < lists.length; l++) {

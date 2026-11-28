@@ -258,8 +258,9 @@
     - `coverage.test.ts`: every op classed;
     - `adapter.test.ts`: each fixture page well formed, deterministic and the same in slices;
     - `slice.test.ts`;
-    - `check.test.ts`: the grid and text comparison, with pdf.js's own boxes and text in each fixture as the oracle, and a mutation that must fail;
+    - `check.test.ts`: the grid and text comparison, with pdf.js's own boxes and text in each fixture as the oracle, and a mutation that must fail. Each rule by which a side follows pdf.js, or leaves content out of both, is also tested on boxes and items built in the test;
     - `fixture.test.ts`;
+  - `scene-input.test.ts`, beside `scene-input.ts`, on a page and object store built in the test: an image that pdf.js resolves as nothing is left out, and an abort while an object is awaited rejects the read;
   - stored operator-list fixtures (`app/lib/pdf/scene/fixtures/`):
     - they are made by `pnpm fixtures:oplists`, a developer script that runs pdf.js in Node 24 or later (it refuses an older one, whose glyph outlines differ in precision) on PDFs written by `scripts/pdf-fixtures/`;
     - no test runs pdf.js or reads a PDF;

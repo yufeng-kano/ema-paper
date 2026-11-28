@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { adaptPage } from './adapter.ts'
 import { buildReport, diffGrids, diffText, dilate, GRID, gridFromRecorded, gridFromScene, ORIGIN_TOLERANCE, reportLines,
-  type GridDiff, type TextDiff } from './check.ts'
+  type Grid, type GridDiff, type TextDiff } from './check.ts'
 import { RENDERER_STAGE } from './coverage.ts'
 import { decodeFixture, fixtureInput } from './fixture.ts'
 import type { Box4, Mat6 } from './matrix.ts'
@@ -12,6 +12,8 @@ import { ClipKind, Flag, GlyphFlag, Kind, NoteReason, SceneBuilder, sceneBytes, 
 
 /** One grid cell per point. */
 const SQUARE = { width: GRID, height: GRID }
+/** `page.getViewport({ scale: 1 })`'s transform for SQUARE. */
+const SQUARE_VIEW: Mat6 = [1, 0, 0, -1, 0, GRID]
 const LETTER = { width: 612, height: 792 }
 /** `page.getViewport({ scale: 1 })`'s transform for an unrotated Letter page. */
 const LETTER_VIEW: Mat6 = [1, 0, 0, -1, 0, 792]
@@ -26,22 +28,31 @@ function recordedOps(...ops: [fn: number, args: unknown, box: number[]][]) {
 
 /** pdf.js's boxes for filled paths. */
 function recorded(...boxes: number[][]) {
-  return recordedOps(...boxes.map((box): [number, unknown, number[]] => [OPS.constructPath, [OPS.fill, [null], null], box]))
+  return recordedOps(...boxes.map(fill))
+}
+
+function fill(box: number[]): [number, unknown, number[]] {
+  return [OPS.constructPath, [OPS.fill, [null], null], box]
+}
+
+/** The cells pdf.js recorded, for a scene with no text or groups unless one is given. */
+function canvasGrid(boxes: ReturnType<typeof recordedOps>, scene: PageScene = NO_TEXT, ocVisible = ALL_VISIBLE): Grid {
+  return gridFromRecorded(boxes, scene, ocVisible, SQUARE_VIEW)
 }
 
 /** The covered cells as "x,y", in grid order. */
-function cells(grid: Uint8Array): string[] {
+function cells(grid: Grid | Uint8Array): string[] {
   const out: string[] = []
-  grid.forEach((v, i) => {
+  ;('cells' in grid ? grid.cells : grid).forEach((v, i) => {
     if (v) out.push(`${i % GRID},${Math.floor(i / GRID)}`)
   })
   return out
 }
 
-function grid(...covered: [number, number][]): Uint8Array {
+function grid(...covered: [number, number][]): Grid {
   const g = new Uint8Array(GRID * GRID)
   for (const [x, y] of covered) g[y * GRID + x] = 1
-  return g
+  return { cells: g, skipped: 0 }
 }
 
 function fontRecord(kind: FontRecord['kind']): FontRecord {
@@ -49,10 +60,16 @@ function fontRecord(kind: FontRecord['kind']): FontRecord {
     bbox: null, procs: {} }
 }
 
-function path(b: SceneBuilder, box: Box4, flags: number = Flag.Fill): number {
-  const row = b.leaf(Kind.Path, 0, { ...AT, flags, fill: b.solid(0) })
+function path(b: SceneBuilder, box: Box4, flags: number = Flag.Fill, clip = -1): number {
+  const row = b.leaf(Kind.Path, 0, { ...AT, flags, clip, fill: b.solid(0) })
   b.setBox(row, box)
   return row
+}
+
+/** A clip to a rectangle, its path in the scene's pool as the adapter puts it there. */
+function rectClip(b: SceneBuilder, parent: number, box: Box4): number {
+  const [d0, d1] = b.path([0, box[0], box[1], 1, box[2], box[1], 1, box[2], box[3], 1, box[0], box[3], 4])
+  return b.clips.intern(parent, ClipKind.Path, false, d0, d1, b.xform([1, 0, 0, 1, 0, 0]), `rect:${box.join(',')}`, box)
 }
 
 /** A `Text` row of one font, a glyph per entry: its Unicode (empty for none), origin and glyph flags. */
@@ -82,23 +99,24 @@ const NO_TEXT = finished(new SceneBuilder(0, 's', SQUARE))
 
 describe('the grid of pdf.js’s recorded boxes', () => {
   it('marks min to max, both included, as pdf.js reads a max c as (c + 1) / 256', () => {
-    const covered = cells(gridFromRecorded(recorded([10, 20, 12, 21]), NO_TEXT))
+    const covered = cells(canvasGrid(recorded([10, 20, 12, 21])))
     expect(covered).toEqual(['10,20', '11,20', '12,20', '10,21', '11,21', '12,21'])
   })
 
   it('skips EMPTY_BBOX, and covers nothing for a box pdf.js left with its min above its max', () => {
-    expect(cells(gridFromRecorded(recorded([255, 255, 0, 0], [30, 30, 29, 40], [30, 30, 40, 29]), NO_TEXT))).toEqual([])
+    expect(cells(canvasGrid(recorded([255, 255, 0, 0], [30, 30, 29, 40], [30, 30, 40, 29])))).toEqual([])
   })
 
   it('is the union of every op, in any order, up to the grid’s last cell', () => {
-    const ops = [[0, 0, 1, 1], [254, 255, 255, 255], [1, 1, 2, 1]]
-    const forward = gridFromRecorded(recorded(...ops), NO_TEXT)
-    expect(cells(forward)).toEqual(['0,0', '1,0', '0,1', '1,1', '2,1', '254,255', '255,255'])
-    expect(gridFromRecorded(recorded(...ops.reverse()), NO_TEXT)).toEqual(forward)
+    const ops = [[0, 0, 1, 1], [253, 254, 255, 255], [1, 1, 2, 1]]
+    const forward = canvasGrid(recorded(...ops))
+    expect(cells(forward)).toEqual(['0,0', '1,0', '0,1', '1,1', '2,1', '253,254', '254,254', '255,254', '253,255', '254,255',
+      '255,255'])
+    expect(canvasGrid(recorded(...ops.reverse()))).toEqual(forward)
   })
 
   it('covers nothing for a page with no ops', () => {
-    expect(cells(gridFromRecorded(recorded(), NO_TEXT))).toEqual([])
+    expect(canvasGrid(recorded())).toEqual({ cells: new Uint8Array(GRID * GRID), skipped: 0 })
   })
 
   it('reads the drawing ops’ own boxes, not the hulls of their dependents that state ops hold', () => {
@@ -107,7 +125,7 @@ describe('the grid of pdf.js’s recorded boxes', () => {
       [OPS.save, null, hull],
       [OPS.dependency, ['g_d0_f1'], hull],
       [OPS.setFillRGBColor, ['#000000'], hull],
-      [OPS.beginGroup, [{}], hull],
+      [OPS.beginGroup, [{ bbox: null, matrix: null }], hull],
       [OPS.constructPath, [OPS.stroke, [null], null], [10, 10, 10, 10]],
       [OPS.showText, [[]], [20, 20, 20, 20]],
       [OPS.paintImageXObject, ['img_p0_1', 4, 4], [30, 30, 30, 30]],
@@ -119,8 +137,10 @@ describe('the grid of pdf.js’s recorded boxes', () => {
       [OPS.restore, null, hull],
     )
     const b = new SceneBuilder(0, 's', SQUARE)
+    const group = b.open(Kind.Group, 0, AT)
     text(b, b.font(fontRecord('missing')), Flag.Fill, [['A', 20, 20]])
-    expect(cells(gridFromRecorded(boxes, finished(b)))).toEqual(['10,10', '20,20', '30,30', '40,40', '50,50', '60,60', '70,70'])
+    b.close(group)
+    expect(cells(canvasGrid(boxes, finished(b)))).toEqual(['10,10', '20,20', '30,30', '40,40', '50,50', '60,60', '70,70'])
   })
 
   it('reads no box of a showText whose run pdf.js records as its whole clip box, matching each to its Text row', () => {
@@ -134,24 +154,120 @@ describe('the grid of pdf.js’s recorded boxes', () => {
     const showText = (box: number[]): [number, unknown, number[]] => [OPS.showText, [[]], box]
     const boxes = recordedOps(showText([0, 0, 255, 255]), showText([20, 20, 20, 20]), showText([0, 0, 255, 255]),
       showText([0, 0, 255, 255]))
-    expect(cells(gridFromRecorded(boxes, scene))).toEqual(['20,20'])
+    expect(canvasGrid(boxes, scene)).toEqual({ cells: grid([20, 20]).cells, skipped: 3 })
     // A list with more or fewer showText ops than the scene has Text rows was not the scene's.
-    expect(() => gridFromRecorded(recordedOps(showText([20, 20, 20, 20])), scene)).toThrow()
-    expect(() => gridFromRecorded(boxes, NO_TEXT)).toThrow()
+    expect(() => canvasGrid(recordedOps(showText([20, 20, 20, 20])), scene)).toThrow()
+    expect(() => canvasGrid(boxes)).toThrow()
   })
 
   it('reads no box of a path that takes a pending clip or ends in n, neither of which draws', () => {
     const boxes = recordedOps(
       [OPS.clip, null, [0, 0, 100, 100]],
-      [OPS.constructPath, [OPS.fill, [null], null], [10, 10, 10, 10]],
+      fill([10, 10, 10, 10]),
       [OPS.constructPath, [OPS.endPath, [null], null], [20, 20, 20, 20]],
-      [OPS.constructPath, [OPS.fill, [null], null], [30, 30, 30, 30]],
+      fill([30, 30, 30, 30]),
     )
-    expect(cells(gridFromRecorded(boxes, NO_TEXT))).toEqual(['30,30'])
+    expect(cells(canvasGrid(boxes))).toEqual(['30,30'])
+  })
+
+  it('drops a pending clip at a restore, a form’s bbox and an annotation’s rect, and keeps it past a group’s', () => {
+    const page = (between: [number, unknown, number[]]) => cells(canvasGrid(recordedOps([OPS.clip, null, [0, 0, 0, 0]], between,
+      fill([30, 30, 30, 30]))))
+    expect(page([OPS.restore, null, [0, 0, 0, 0]])).toEqual(['30,30'])
+    expect(page([OPS.paintFormXObjectBegin, [null, [0, 0, 10, 10]], [0, 0, 0, 0]])).toEqual(['30,30'])
+    expect(page([OPS.paintFormXObjectBegin, [null, null], [0, 0, 0, 0]])).toEqual([])
+    const annotation = cells(canvasGrid(recordedOps([OPS.clip, null, [0, 0, 0, 0]],
+      [OPS.beginAnnotation, ['1R', [0, 0, 256, 256], [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 0], false], [0, 0, 0, 0]],
+      fill([30, 30, 30, 30]), [OPS.endAnnotation, null, [0, 0, 0, 0]])))
+    expect(annotation).toEqual(['30,30'])
+    const b = new SceneBuilder(0, 's', SQUARE)
+    b.close(b.open(Kind.Group, 0, AT))
+    const group = canvasGrid(recordedOps([OPS.clip, null, [0, 0, 0, 0]], [OPS.beginGroup, [{ bbox: null, matrix: null }], [0, 0, 0, 0]],
+      fill([30, 30, 30, 30]), [OPS.endGroup, null, [0, 0, 0, 0]]), finished(b))
+    expect(cells(group)).toEqual([])
+  })
+
+  it('cuts boxes by a group’s bbox and an annotation’s rect, which pdf.js clips its drawing to but not its boxes', () => {
+    const b = new SceneBuilder(0, 's', SQUARE)
+    // The group's CTM is the view's, moved 100 pt right; its matrix moves the bbox 10 pt more.
+    b.close(b.open(Kind.Group, 0, { ...AT, xform: b.xform([1, 0, 0, -1, 100, GRID]) }))
+    b.close(b.open(Kind.SoftMask, 0, AT))
+    const scene = finished(b)
+    const boxes = recordedOps(
+      [OPS.beginGroup, [{ bbox: [0, 0, 20, 20], matrix: [1, 0, 0, 1, 10, 0] }], [0, 0, 0, 0]],
+      fill([0, 200, 255, 255]),
+      [OPS.endGroup, null, [0, 0, 0, 0]],
+      [OPS.beginGroup, [{ bbox: null, matrix: null }], [0, 0, 0, 0]],
+      fill([5, 5, 5, 5]),
+      [OPS.endGroup, null, [0, 0, 0, 0]],
+      [OPS.beginAnnotation, ['1R', [50, 50, 52, 52], [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 0], false], [0, 0, 0, 0]],
+      fill([0, 0, 255, 255]),
+      [OPS.endAnnotation, null, [0, 0, 0, 0]],
+    )
+    const covered = cells(canvasGrid(boxes, scene))
+    // The group's bbox is x 110 to 130 and y 236 to 255 on the page; the annotation's rect y 204 to 206.
+    expect(covered.filter((c) => c.endsWith(',236'))).toEqual(Array.from({ length: 21 }, (_, i) => `${110 + i},236`))
+    expect(covered).toContain('5,5')
+    expect(covered.filter((c) => c.endsWith(',205'))).toEqual(['50,205', '51,205', '52,205'])
+    expect(covered).toHaveLength(21 * 20 + 1 + 9)
+    // A list with more or fewer groups than the scene has was not the scene's.
+    expect(() => canvasGrid(boxes)).toThrow()
+  })
+
+  it('reads a path in hidden optional content, and leaves out and counts what a form begun there draws', () => {
+    const none: number[] = [0, 0, 0, 0]
+    const boxes = recordedOps(
+      [OPS.beginMarkedContentProps, ['OC', { id: 'shown' }], none],
+      fill([10, 10, 10, 10]),
+      [OPS.beginMarkedContentProps, ['OC', { id: 'hidden' }], none],
+      [OPS.beginMarkedContent, ['Span'], none],
+      fill([20, 20, 20, 20]),
+      [OPS.endMarkedContent, null, none],
+      [OPS.paintFormXObjectBegin, [[1, 0, 0, 1, 50, 50], null], none],
+      fill([30, 30, 30, 30]),
+      [OPS.paintFormXObjectBegin, [null, null], none],
+      fill([31, 31, 31, 31]),
+      [OPS.paintFormXObjectEnd, null, none],
+      [OPS.paintFormXObjectEnd, null, none],
+      [OPS.endMarkedContent, null, none],
+      // A form begun shown applied its matrix, so a path hidden inside it is where pdf.js recorded it.
+      [OPS.paintFormXObjectBegin, [null, null], none],
+      [OPS.beginMarkedContentProps, ['OC', { id: 'hidden' }], none],
+      fill([40, 40, 40, 40]),
+      [OPS.endMarkedContent, null, none],
+      [OPS.paintFormXObjectEnd, null, none],
+      [OPS.endMarkedContent, null, none],
+    )
+    expect(canvasGrid(boxes, NO_TEXT, new Uint8Array([1, 0, 0]))).toEqual({ cells: grid([10, 10], [20, 20], [40, 40]).cells,
+      skipped: 2 })
+    expect(canvasGrid(boxes, NO_TEXT, ALL_VISIBLE)).toEqual({ cells: grid([10, 10], [20, 20], [30, 30], [31, 31], [40, 40]).cells,
+      skipped: 0 })
+  })
+
+  it('leaves out and counts what is drawn under a clip to a path with no points, until a restore of its level', () => {
+    const none: number[] = [0, 0, 0, 0]
+    const emptyClip = (): [number, unknown, number[]][] => [[OPS.clip, null, none],
+      [OPS.constructPath, [OPS.endPath, [new Float32Array([4])], null], none]]
+    const page = (...ops: [number, unknown, number[]][]) => canvasGrid(recordedOps(...ops))
+    expect(page([OPS.save, null, none], ...emptyClip(), fill([10, 10, 10, 10]), [OPS.save, null, none], fill([11, 11, 11, 11]),
+      [OPS.restore, null, none], fill([12, 12, 12, 12]), [OPS.restore, null, none], fill([20, 20, 20, 20])))
+      .toEqual({ cells: grid([20, 20]).cells, skipped: 3 })
+    // A form's end restores the level its begin saved; a clip set outside any save holds to the page's end.
+    expect(page([OPS.paintFormXObjectBegin, [null, null], none], ...emptyClip(), fill([10, 10, 10, 10]),
+      [OPS.paintFormXObjectEnd, null, none], fill([20, 20, 20, 20]), ...emptyClip(), fill([30, 30, 30, 30])))
+      .toEqual({ cells: grid([20, 20]).cells, skipped: 2 })
+    // A clip to a path with points is read as any clip: its path draws nothing, and what follows is read.
+    expect(page([OPS.clip, null, none], [OPS.constructPath, [OPS.endPath, [new Float32Array([0, 1, 1, 4])], null], none],
+      fill([10, 10, 10, 10]))).toEqual({ cells: grid([10, 10]).cells, skipped: 0 })
+  })
+
+  it('reads a box on the page’s edge cells as any other, content drawn in the last 1/256 of the page included', () => {
+    expect(canvasGrid(recorded([255, 0, 255, 0], [0, 30, 0, 40]))).toEqual({ cells: grid([255, 0], ...Array.from({ length: 11 },
+      (_, i): [number, number] => [0, 30 + i])).cells, skipped: 0 })
   })
 
   it('refuses boxes recorded for another list', () => {
-    expect(() => gridFromRecorded({ ...recorded([0, 0, 1, 1]), fnArray: [] }, NO_TEXT)).toThrow()
+    expect(() => canvasGrid({ ...recorded([0, 0, 1, 1]), fnArray: [] })).toThrow()
   })
 })
 
@@ -160,7 +276,7 @@ describe('the scene’s grid', () => {
     const b = new SceneBuilder(0, 's', { width: 512, height: 256 })
     // x in 2 pt cells: floor(10.5) = 10 and ceil(12) = 12; y: floor(20.5) = 20 and ceil(21.2) = 22.
     path(b, [21, 20.5, 24, 21.2])
-    expect(gridFromScene(finished(b), ALL_VISIBLE)).toEqual(gridFromRecorded(recorded([10, 20, 12, 22]), NO_TEXT))
+    expect(gridFromScene(finished(b), ALL_VISIBLE)).toEqual(canvasGrid(recorded([10, 20, 12, 22])))
   })
 
   it('clamps to the grid as pdf.js’s byte coordinates do', () => {
@@ -196,24 +312,34 @@ describe('the scene’s grid', () => {
     expect(cells(gridFromScene(scene, ALL_VISIBLE))).toEqual(['10,10', '11,10', '40,40', '41,40'])
     scene.obj.flags[alone]! &= ~Flag.Active
     scene.obj.flags[form]! &= ~Flag.Active
-    expect(cells(gridFromScene(scene, ALL_VISIBLE))).toEqual([])
+    expect(gridFromScene(scene, ALL_VISIBLE)).toEqual({ cells: new Uint8Array(GRID * GRID), skipped: 0 })
     scene.obj.flags[form]! |= Flag.Active
     expect(cells(gridFromScene(scene, ALL_VISIBLE))).toEqual(['40,40', '41,40'])
   })
 
-  it('marks only paths in hidden optional content, which pdf.js records before it checks visibility', () => {
+  it('marks only paths in hidden optional content, and leaves out and counts a path under a form there', () => {
     const b = new SceneBuilder(0, 's', SQUARE)
     const missing = b.font(fontRecord('missing'))
     const oc = b.open(Kind.OptionalContent, 0, { ...AT, d0: b.ocProps({ type: 'OCG', id: '1R' }), d1: 0 })
     path(b, [10, 10, 11, 10])
     b.setBox(b.leaf(Kind.Image, 0, { ...AT, d0: 0, d1: 0 }), [30, 30, 31, 30])
     text(b, missing, Flag.Fill, [['A', 50, 50]], [50, 50, 51, 50])
+    const form = b.open(Kind.Form, 0, AT)
+    path(b, [60, 60, 61, 60])
     b.setBox(b.leaf(Kind.Shading, 0, { ...AT, d0: 0, d1: 0 }), [70, 70, 71, 70])
+    b.close(form)
     b.close(oc)
+    // Hidden content inside a form begun shown is where the form put it.
+    const shownForm = b.open(Kind.Form, 0, AT)
+    const inner = b.open(Kind.OptionalContent, 0, { ...AT, d0: b.ocProps({ type: 'OCG', id: '1R' }), d1: 0 })
+    path(b, [90, 90, 91, 90])
+    b.close(inner)
+    b.close(shownForm)
     const scene = finished(b)
-    expect(cells(gridFromScene(scene, new Uint8Array([0])))).toEqual(['10,10', '11,10'])
-    const all = ['10,10', '11,10', '30,30', '31,30', '50,50', '51,50', '70,70', '71,70']
-    expect(cells(gridFromScene(scene, new Uint8Array([1])))).toEqual(all)
+    expect(gridFromScene(scene, new Uint8Array([0, 0]))).toEqual({ cells: grid([10, 10], [11, 10], [90, 90], [91, 90]).cells,
+      skipped: 1 })
+    const all = ['10,10', '11,10', '30,30', '31,30', '50,50', '51,50', '60,60', '61,60', '70,70', '71,70', '90,90', '91,90']
+    expect(cells(gridFromScene(scene, new Uint8Array([1, 1])))).toEqual(all)
     // Props the check was given no visibility for are drawn.
     expect(cells(gridFromScene(scene, ALL_VISIBLE))).toEqual(all)
   })
@@ -227,12 +353,12 @@ describe('the scene’s grid', () => {
     expect(cells(gridFromScene(finished(b), ALL_VISIBLE))).toEqual(['10,10', '11,10', '30,30', '31,30'])
   })
 
-  it('marks no run pdf.js records as its whole clip box: an outline font’s, or one that adds to the clip', () => {
+  it('leaves out and counts each run pdf.js records as its whole clip box: an outline font’s, or one that adds to the clip', () => {
     for (const [kind, flags] of [['outline', Flag.Fill], ['outline', Flag.Invisible], ['missing', Flag.Fill | Flag.AddToClip],
       ['missing', Flag.ClipOnly]] as const) {
       const b = new SceneBuilder(0, 's', SQUARE)
       text(b, b.font(fontRecord(kind)), flags, [['A', 10, 10]], [10, 10, 11, 10])
-      expect(cells(gridFromScene(finished(b), ALL_VISIBLE))).toEqual([])
+      expect(gridFromScene(finished(b), ALL_VISIBLE)).toEqual({ cells: new Uint8Array(GRID * GRID), skipped: 1 })
     }
   })
 
@@ -246,18 +372,75 @@ describe('the scene’s grid', () => {
     }
   })
 
-  it('marks a row under a text clip by the clip above it, which is all pdf.js cuts its box by', () => {
+  it('leaves out and counts a Type 3 run whose glyph procedures paint a group, which pdf.js records uncut by its bbox', () => {
     const b = new SceneBuilder(0, 's', SQUARE)
-    const rect = b.clips.intern(-1, ClipKind.Path, false, 0, 0, 0, 'rect', [100, 100, 200, 200])
+    const plain = b.font(fontRecord('type3'))
+    const grouped = b.font(fontRecord('type3'))
+    text(b, plain, Flag.Fill, [['A', 10, 10]], [10, 10, 11, 10])
+    text(b, grouped, Flag.Fill, [['B', 30, 30]], [30, 30, 31, 30])
+    b.markTreeEnd()
+    const glyph = b.open(Kind.Type3Glyph, 0, AT)
+    path(b, [0, 0, 1, 1])
+    b.close(glyph)
+    const groupGlyph = b.open(Kind.Type3Glyph, 0, AT)
+    b.close(b.open(Kind.Group, 0, AT))
+    b.close(groupGlyph)
+    const scene = b.finish()
+    scene.fonts[plain]!.procs = { g0: glyph }
+    scene.fonts[grouped]!.procs = { g0: glyph, g1: groupGlyph }
+    expect(gridFromScene(scene, ALL_VISIBLE)).toEqual({ cells: grid([10, 10], [11, 10]).cells, skipped: 1 })
+    const showText = (box: number[]): [number, unknown, number[]] => [OPS.showText, [[]], box]
+    expect(canvasGrid(recordedOps(showText([10, 10, 11, 10]), showText([0, 0, 255, 255])), scene))
+      .toEqual({ cells: grid([10, 10], [11, 10]).cells, skipped: 1 })
+  })
+
+  it('marks a row under a text clip by the clip above it, as pdf.js cuts its box by none', () => {
+    const b = new SceneBuilder(0, 's', SQUARE)
+    const rect = rectClip(b, -1, [100, 100, 200, 200])
     const textClip = b.clips.intern(rect, ClipKind.Text, false, 0, 1, -1, 'text', [110, 110, 120, 120])
-    const inner = b.clips.intern(textClip, ClipKind.Path, false, 0, 0, 0, 'inner', [0, 0, 255, 255])
-    b.setBox(b.leaf(Kind.Path, 0, { flags: Flag.Fill, clip: inner, xform: 0, fill: b.solid(0) }), [110, 110, 120, 120])
+    const inner = rectClip(b, textClip, [0, 0, 255, 255])
+    path(b, [110, 110, 120, 120], Flag.Fill, inner)
     const covered = cells(gridFromScene(finished(b), ALL_VISIBLE))
     expect([covered.length, covered[0], covered.at(-1)]).toEqual([101 * 101, '100,100', '200,200'])
-    const page = new SceneBuilder(0, 's', SQUARE)
-    const alone = page.clips.intern(-1, ClipKind.Text, false, 0, 1, -1, 'text', [10, 10, 20, 20])
-    page.setBox(page.leaf(Kind.Path, 0, { flags: Flag.Fill, clip: alone, xform: 0, fill: page.solid(0) }), [10, 10, 20, 20])
-    expect(cells(gridFromScene(finished(page), ALL_VISIBLE))).toHaveLength(GRID * GRID)
+    const alone = new SceneBuilder(0, 's', SQUARE)
+    path(alone, [10, 10, 20, 20], Flag.Fill, alone.clips.intern(-1, ClipKind.Text, false, 0, 1, -1, 'text', [10, 10, 20, 20]))
+    expect(cells(gridFromScene(finished(alone), ALL_VISIBLE))).toHaveLength(GRID * GRID)
+  })
+
+  it('leaves out and counts a row under a clip to a path with no points, and marks the rest of the page', () => {
+    const b = new SceneBuilder(0, 's', SQUARE)
+    // `h W n`: the path is a closePath alone.
+    const [d0, d1] = b.path([4])
+    const none = b.clips.intern(-1, ClipKind.Path, false, d0, d1, 0, 'none', [Infinity, Infinity, -Infinity, -Infinity])
+    path(b, [Infinity, Infinity, -Infinity, -Infinity], Flag.Fill, rectClip(b, none, [10, 10, 20, 20]))
+    path(b, [100, 100, 101, 100])
+    expect(gridFromScene(finished(b), ALL_VISIBLE)).toEqual({ cells: grid([100, 100], [101, 100]).cells, skipped: 1 })
+  })
+
+  it('marks a row its clip cuts away by the clip’s box clamped onto the page, when the clip lies wholly off the page', () => {
+    const b = new SceneBuilder(0, 's', SQUARE)
+    // Off the right edge and above the top: pdf.js's box clamps to the corner cell.
+    path(b, [Infinity, Infinity, -Infinity, -Infinity], Flag.Fill, rectClip(b, -1, [300, -20, 310, -10]))
+    // Off the left edge, across y 30 to 40.
+    path(b, [Infinity, Infinity, -Infinity, -Infinity], Flag.Fill, rectClip(b, -1, [-50, 30, -40, 40]))
+    // On the page and apart from the row, which pdf.js then records min above max.
+    path(b, [Infinity, Infinity, -Infinity, -Infinity], Flag.Fill, rectClip(b, -1, [100, 100, 110, 110]))
+    expect(cells(gridFromScene(finished(b), ALL_VISIBLE))).toEqual(['255,0',
+      ...Array.from({ length: 11 }, (_, i) => `0,${30 + i}`)])
+  })
+
+  it('marks the edge cells by the clips’ box with no test for empty, when an off-page clip meets one on the page', () => {
+    const b = new SceneBuilder(0, 's', SQUARE)
+    const page = rectClip(b, -1, [0, 0, 256, 256])
+    // The page, then off the right and above the top: x 300 to 256 and y 0 to -10 clamp to the corner cell.
+    path(b, [Infinity, Infinity, -Infinity, -Infinity], Flag.Fill, rectClip(b, page, [300, -20, 310, -10]))
+    // The page, then off the left: x 0 to -40 clamps to column 0, across y 30 to 40.
+    path(b, [Infinity, Infinity, -Infinity, -Infinity], Flag.Fill, rectClip(b, page, [-50, 30, -40, 40]))
+    // Off the right, the page, then a clip on the page: x 300 to 110, inside out across the page, marks nothing.
+    const right = rectClip(b, rectClip(b, rectClip(b, -1, [300, 100, 310, 110]), [0, 0, 256, 256]), [100, 100, 110, 110])
+    path(b, [Infinity, Infinity, -Infinity, -Infinity], Flag.Fill, right)
+    expect(cells(gridFromScene(finished(b), ALL_VISIBLE))).toEqual(['255,0',
+      ...Array.from({ length: 11 }, (_, i) => `0,${30 + i}`)])
   })
 
   it('marks nothing for a run with no glyphs', () => {
@@ -270,15 +453,16 @@ describe('the scene’s grid', () => {
 
 describe('dilate', () => {
   it('widens each cell to its eight neighbours, inside the grid', () => {
-    expect(cells(dilate(grid([5, 5])))).toEqual(['4,4', '5,4', '6,4', '4,5', '5,5', '6,5', '4,6', '5,6', '6,6'])
-    expect(cells(dilate(grid([0, 0], [255, 255])))).toEqual(['0,0', '1,0', '0,1', '1,1', '254,254', '255,254', '254,255', '255,255'])
+    expect(cells(dilate(grid([5, 5]).cells))).toEqual(['4,4', '5,4', '6,4', '4,5', '5,5', '6,5', '4,6', '5,6', '6,6'])
+    expect(cells(dilate(grid([0, 0], [255, 255]).cells))).toEqual(['0,0', '1,0', '0,1', '1,1', '254,254', '255,254', '254,255',
+      '255,255'])
   })
 })
 
 describe('the grid difference', () => {
-  it('counts each side’s cells against the other side widened by a cell', () => {
-    expect(diffGrids(grid([10, 10]), grid([11, 11]), SQUARE)).toEqual({ canvasCells: 1, sceneCells: 1, canvasOnly: 0, sceneOnly: 0,
-      canvasOnlyBoxes: [] })
+  it('counts each side’s cells against the other side widened by a cell, and carries what each left unread', () => {
+    expect(diffGrids({ ...grid([10, 10]), skipped: 2 }, { ...grid([11, 11]), skipped: 3 }, SQUARE)).toEqual({ canvasCells: 1,
+      sceneCells: 1, canvasOnly: 0, sceneOnly: 0, canvasOnlyBoxes: [], canvasSkipped: 2, sceneSkipped: 3 })
     const diff = diffGrids(grid([10, 10], [11, 10]), grid([12, 11]), SQUARE)
     expect([diff.canvasCells, diff.sceneCells, diff.canvasOnly, diff.sceneOnly]).toEqual([2, 1, 1, 0])
   })
@@ -310,7 +494,7 @@ describe('the text difference', () => {
       { str: 't\no', transform: [12, 0, 0, 12, 90, 700] },
     ], LETTER_VIEW)
     expect(diff).toEqual({ sceneChars: 4, contentChars: 4, firstMismatch: -1, context: null, originsCompared: 2,
-      originsOff: 0, maxOriginError: 0 })
+      originsOff: 0, maxOriginError: 0, offPage: { scene: 0, content: 0 }, unordered: 0 })
   })
 
   it('skips accents, annotations, inactive rows and rows out of the tree, and keeps a glyph’s characters together', () => {
@@ -333,6 +517,33 @@ describe('the text difference', () => {
       LETTER_VIEW)
     expect(diff.firstMismatch).toBe(-1)
     expect([diff.sceneChars, diff.originsCompared, diff.originsOff]).toEqual([4, 2, 0])
+  })
+
+  it('leaves out a glyph that is a format mark, and one off the page but for a zero-width mark, as getTextContent does', () => {
+    const b = new SceneBuilder(0, 's', LETTER)
+    const font = b.font(fontRecord('missing'))
+    text(b, font, Flag.Fill, [['x', 72, 92], ['­', 78, 92], ['y', 84, 92], ['o', 700, 92], ['u', 72, -1], ['́', 72, 800],
+      ['t', 612, 792]])
+    const diff = diffText(finished(b), [{ str: 'xýt', transform: [1, 0, 0, 1, 72, 700] }], LETTER_VIEW)
+    expect([diff.firstMismatch, diff.sceneChars, diff.offPage]).toEqual([-1, 4, { scene: 2, content: 0 }])
+  })
+
+  it('leaves out the first character of an item that starts off the page, which pdf.js kept for its advance', () => {
+    const b = new SceneBuilder(0, 's', LETTER)
+    // The scene leaves out the glyph at x -3; pdf.js keeps it, as its advance reaches the page.
+    text(b, b.font(fontRecord('missing')), Flag.Fill, [['a', -3, 92], ['b', 3, 92], ['c', 9, 92]])
+    const diff = diffText(finished(b), [{ str: 'abc', transform: [1, 0, 0, 1, -3, 700] }], LETTER_VIEW)
+    expect([diff.firstMismatch, diff.offPage, diff.originsCompared]).toEqual([-1, { scene: 1, content: 1 }, 0])
+  })
+
+  it('compares an item that holds a right-to-left character without its order, which pdf.js’s bidi changes', () => {
+    const b = new SceneBuilder(0, 's', LETTER)
+    text(b, b.font(fontRecord('missing')), Flag.Fill, line('אבאבxyz'))
+    const scene = finished(b)
+    const diff = diffText(scene, [{ str: 'xyzבאבא', transform: [1, 0, 0, 1, 72, 700] }], LETTER_VIEW)
+    expect([diff.firstMismatch, diff.unordered, diff.originsCompared, diff.originsOff]).toEqual([-1, 1, 1, 0])
+    // Another character in it is still a difference.
+    expect(diffText(scene, [{ str: 'xyzבאבב', transform: [1, 0, 0, 1, 72, 700] }], LETTER_VIEW).firstMismatch).toBe(0)
   })
 
   it('finds the first difference, with 20 characters on each side', () => {
@@ -381,6 +592,17 @@ describe('the text difference', () => {
     expect([diff.firstMismatch, diff.originsCompared, diff.originsOff]).toEqual([-1, 1, 0])
   })
 
+  it('compares no origin of a Type 3 font whose matrix translates, which pdf.js draws its glyphs away from the pen by', () => {
+    const b = new SceneBuilder(0, 's', LETTER)
+    const moved = b.font({ ...fontRecord('type3'), fontMatrix: [0.002, 0, 0, 0.001, 0.1, 0.2] })
+    // At 20 pt the glyph is drawn (2, 4) pt from the pen.
+    text(b, moved, Flag.Fill, [['a', 74, 88]])
+    text(b, b.font(fontRecord('type3')), Flag.Fill, [['b', 100, 92]])
+    const diff = diffText(finished(b), [{ str: 'a', transform: [20, 0, 0, 20, 72, 700] }, { str: 'b', transform: [20, 0, 0, 20, 100, 700] }],
+      LETTER_VIEW)
+    expect([diff.firstMismatch, diff.originsCompared, diff.originsOff]).toEqual([-1, 1, 0])
+  })
+
   it('compares no origin past the first difference, nor one of an item that starts with whitespace', () => {
     const b = new SceneBuilder(0, 's', LETTER)
     text(b, b.font(fontRecord('outline')), Flag.Fill, line('abcd'))
@@ -396,9 +618,10 @@ describe('the text difference', () => {
 
 describe('the report', () => {
   const stats = { slices: 1, totalMs: 3.14, longestMs: 3.14 }
-  const grid0: GridDiff = { canvasCells: 18311, sceneCells: 18904, canvasOnly: 0, sceneOnly: 593, canvasOnlyBoxes: [] }
+  const grid0: GridDiff = { canvasCells: 18311, sceneCells: 18904, canvasOnly: 0, sceneOnly: 593, canvasOnlyBoxes: [],
+    canvasSkipped: 120, sceneSkipped: 121 }
   const text0: TextDiff = { sceneChars: 28772, contentChars: 28772, firstMismatch: -1, context: null, originsCompared: 1410,
-    originsOff: 0, maxOriginError: 0.2149 }
+    originsOff: 0, maxOriginError: 0.2149, offPage: { scene: 0, content: 0 }, unordered: 0 }
 
   function page() {
     const b = new SceneBuilder(14, 'stamp', LETTER)
@@ -424,10 +647,17 @@ describe('the report', () => {
       'kinds: Path 2, Text 1, Image 1, Group 1',
       'pending (drawn from a later stage): glyph 3 (5), group 1 (6)',
       'not drawn: none',
-      'grid: canvas 18311 cells, scene 18904, canvas-only 0, scene-only 593',
+      'grid: canvas 18311 cells, scene 18904, canvas-only 0, scene-only 593; not read: 120 ops, 121 rows',
       'text: 28772 chars, equal; origins 1410 compared, 0 off (max 0.21 pt)',
       'verdict: match',
     ])
+  })
+
+  it('says how much text was left out off the page and how many items were compared without order', () => {
+    const report = buildReport({ scene: finished(page()), stats, renderMs: null, grid: grid0,
+      text: { ...text0, offPage: { scene: 7, content: 1 }, unordered: 2 }, rendererStage: 3 })
+    expect(reportLines(report)[5]).toBe('text: 28772 chars, equal; origins 1410 compared, 0 off (max 0.21 pt); off the page: scene 7, '
+      + 'content 1; right-to-left items unordered: 2')
   })
 
   it('counts every feature after the renderer’s stage as pending', () => {
@@ -463,7 +693,7 @@ describe('the report', () => {
     const lines = reportLines(report)
     expect(lines[0]).toContain('adapter 20.0 ms in 3 slices (longest 8.0 ms)')
     expect(lines.slice(4)).toEqual([
-      'grid: canvas 18311 cells, scene 18904, canvas-only 6, scene-only 593',
+      'grid: canvas 18311 cells, scene 18904, canvas-only 6, scene-only 593; not read: 120 ops, 121 rows',
       '  canvas-only boxes (pt): 20.0 20.0 26.0 24.0; 200.0 50.0 204.5 51.0',
       'text: scene 28772 chars, content 28771, first difference at 120; origins 1410 compared, 2 off (max 3.00 pt)',
       '  scene:   "ab\\"c"',
@@ -482,8 +712,8 @@ function stored(name: string) {
   const f = fixtures.get(name)!
   const { scene } = adaptPage(fixtureInput(f)).finish()
   // Every stored page's render list is its operator list (the capture checks), so its ops index the boxes.
-  const canvas = gridFromRecorded({ buffer: f.canvas.boxes, fnArray: f.fnArray, argsArray: f.argsArray }, scene)
   const ocVisible = Uint8Array.from(f.ocVisible, Number)
+  const canvas = gridFromRecorded({ buffer: f.canvas.boxes, fnArray: f.fnArray, argsArray: f.argsArray }, scene, ocVisible, f.view.transform)
   return {
     f,
     scene,

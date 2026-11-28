@@ -43,7 +43,7 @@ try {
     const adapted = await runSliced(adaptPage(input), messageChannelClock(), new AbortController().signal)
     const { scene, stats } = adapted!
     const ocVisible = await readOcVisibility(pdf, scene.ocProps)
-    const grid = diffGrids(gridFromRecorded(drawn, scene), gridFromScene(scene, ocVisible), scene.view)
+    const grid = diffGrids(gridFromRecorded(drawn, scene, ocVisible, input.view.transform), gridFromScene(scene, ocVisible), scene.view)
     const text = diffText(scene, items, input.view.transform)
     const report = buildReport({ scene, stats, renderMs: drawn.ms, grid, text, rendererStage: RENDERER_STAGE })
     for (const line of reportLines(report)) console.log(line)

@@ -8,18 +8,20 @@
  *   `getTextContent({ disableNormalization: true })`, and each text item's origin against its glyph's.
  *
  * pdf.js's recorded boxes say where it may have drawn, not what. A state op holds the hull of the ops
- * that depend on it, so only the drawing ops' own boxes are read (`gridFromRecorded`). Of those, a
- * path's box is recorded before its visibility is checked, a run of outline glyphs records its whole
- * clip box and is read on neither side, and a soft mask's content records as any other; the scene's
- * side follows those rules (`gridFromScene`), so that a cell pdf.js has and the scene lacks means
- * content the scene lost. Cells only the scene has are reported, never a mismatch.
+ * that depend on it, so only the drawing ops' own boxes are read (`gridFromRecorded`). Of those, some
+ * are recorded in ways the scene follows (`gridFromScene`), and some, such as a run of outline glyphs
+ * that records its whole clip box or content under a clip to no points, are read on neither side and
+ * counted, so that a cell pdf.js has and the scene lacks means content the scene lost. Cells only the
+ * scene has are reported, never a mismatch. `getTextContent`'s own rules are followed the same way
+ * (`diffText`).
  *
  * Pure: it runs in the tests and in `pnpm scene:check`, on plain data.
  */
 
+import { pathBounds } from './adapter.ts'
 import { Feature, FEATURE_STAGE, featureCounts } from './coverage.ts'
-import { apply, type Box4, type Mat6 } from './matrix.ts'
-import { OPS } from './ops.ts'
+import { apply, boxThrough, multiply, type Box4, type Mat6 } from './matrix.ts'
+import { DRAW_OPS, OPS } from './ops.ts'
 import { ClipKind, Flag, GlyphFlag, isContainer, Kind, kindName, NoteReason, sceneBytes, type PageScene } from './scene.ts'
 import type { SliceStats } from './slice.ts'
 
@@ -46,54 +48,190 @@ const DRAWING_OPS: ReadonlySet<number> = new Set([OPS.constructPath, OPS.showTex
   OPS.paintInlineImageXObjectGroup, OPS.paintImageXObjectRepeat, OPS.paintImageMaskXObjectRepeat])
 
 /**
- * A `Text` row whose op pdf.js records as its whole clip box, a box that says nothing of where the run
- * drew: an outline font's glyphs are paths drawn under `disableFontFace`, which pdf.js does not
- * measure, and a glyph added to the clip paints nothing (`recordCharacterBBox` with no measure,
- * build/pdf.mjs 8496-8516, from `paintChar`, 11166 and 11219). On a page of text that box is the page,
- * and it would cover every loss elsewhere, so neither grid reads these runs.
+ * A `Text` row whose op pdf.js records by a box that says nothing of where the run drew, so neither grid
+ * reads it:
+ * - an outline font's run, and one added to the clip, record the whole clip box: an outline font's
+ *   glyphs are paths drawn under `disableFontFace`, which pdf.js does not measure, and a glyph added to
+ *   the clip paints nothing (`recordCharacterBBox` with no measure, build/pdf.mjs 8496-8516, from
+ *   `paintChar`, 11166 and 11219). On a page of text that box is the page, and it would cover every
+ *   loss elsewhere;
+ * - a run of a Type 3 font whose glyph procedures paint a group records what the procedure paints on
+ *   the `showText` (`CanvasNestedDependencyTracker`, 8593-8700, 11447) without the group's bbox, which
+ *   pdf.js clips the drawing to (11622-11638) and the scene's box is cut by.
  */
-function recordsClipBox(scene: PageScene, row: number): boolean {
-  if (scene.obj.flags[row]! & (Flag.AddToClip | Flag.ClipOnly)) return true
-  return scene.obj.d1[row]! > 0 && scene.fonts[scene.glyphs.font[scene.obj.d0[row]!]!]?.kind === 'outline'
+function unreadRun(scene: PageScene, row: number): boolean {
+  const { kind, flags, end, d0, d1 } = scene.obj
+  if (flags[row]! & (Flag.AddToClip | Flag.ClipOnly)) return true
+  const font = d1[row]! > 0 ? scene.fonts[scene.glyphs.font[d0[row]!]!] : undefined
+  if (font?.kind === 'outline') return true
+  return font?.kind === 'type3'
+    && Object.values(font.procs).some((proc) => kind.subarray(proc + 1, end[proc]).some((k) => k === Kind.Group || k === Kind.SoftMask))
+}
+
+/** One side's grid: the covered cells, 1 each, and how many drawing ops or rows a rule left unread. */
+export interface Grid {
+  cells: Uint8Array
+  skipped: number
+}
+
+/** A page-space box as the cells pdf.js quantises it to (build/pdf.mjs 8276-8279), clamped as its bytes are. */
+function cellBox(box: ArrayLike<number>, view: { width: number; height: number }): Box4 {
+  return [
+    Math.min(GRID - 1, Math.max(0, Math.floor(box[0]! * GRID / view.width))),
+    Math.min(GRID - 1, Math.max(0, Math.floor(box[1]! * GRID / view.height))),
+    Math.min(GRID - 1, Math.max(0, Math.ceil(box[2]! * GRID / view.width))),
+    Math.min(GRID - 1, Math.max(0, Math.ceil(box[3]! * GRID / view.height))),
+  ]
 }
 
 /**
- * The cells pdf.js recorded for its drawing ops, 1 = covered. Its `BBoxReader` reads each op's bytes as
- * minX, minY, maxX, maxY in 256ths of the canvas, and a max `c` as `(c + 1) / 256` (build/pdf.mjs
- * 8097-8128): cells min to max, both included. The bytes 255, 255, 0, 0 are its `EMPTY_BBOX` (8096), an op
- * that recorded nothing.
+ * The cells pdf.js recorded for its drawing ops. Its `BBoxReader` reads each op's bytes as minX, minY,
+ * maxX, maxY in 256ths of the canvas, and a max `c` as `(c + 1) / 256` (build/pdf.mjs 8097-8128): cells
+ * min to max, both included. The bytes 255, 255, 0, 0 are its `EMPTY_BBOX` (8096), an op that recorded
+ * nothing.
  *
  * Two `constructPath`s draw nothing of their own: one that takes a pending clip, whose box pdf.js moves
  * into the clip box (`consumePath`, 12222-12245), and an `endPath` (`n`), whose box pdf.js records all
- * the same (12242). Neither is read. Nor is a `showText` whose scene row `recordsClipBox`: the k-th
- * `showText` of the render list is the k-th `Text` row of the scene's page tree, since the render
- * list's optimizer merges text runs but keeps every `showText` (W 5690-5746).
+ * the same (12242). Neither is read. A pending clip is dropped by a `restore` (10832) and by the path
+ * a form's bbox or an annotation's rect ends (11599, 11922), not by a group's bbox. The k-th `showText`
+ * of the render list is the k-th `Text` row of the scene's page tree, and the k-th `beginGroup` its
+ * k-th `Group` or `SoftMask` row, since the render list's optimizer merges runs of ops but keeps each of
+ * these (W 5429-5803).
+ *
+ * Left unread, and counted in `skipped`:
+ * - a `showText` whose row is an `unreadRun`;
+ * - any drawing op inside a form drawn in hidden optional content (`isContentVisible`, 12339-12346;
+ *   `ocVisible[k]` is the k-th `OC` props' visibility). pdf.js records a path's box there before it
+ *   checks visibility (10876, 10967), which outside a form is read as any other, but
+ *   `paintFormXObjectBegin` returns before the form's matrix and bbox (11582-11585), so inside one the
+ *   box is not where the path is;
+ * - any drawing op under a clip to a path with no points: its box of infinities, which
+ *   `axialAlignedBoundingBox` turns into the whole plane under the view's y flip (590-626), leaves the
+ *   tracker's clip box whole, so pdf.js records each op's own box, while its clip box culls the drawing
+ *   (`updateClipFromPath`, 9694-9697). The clip holds until a restore of its level: a `restore`, or the
+ *   end of a form, group or annotation, each of which saved one.
+ *
+ * pdf.js clips what it draws to a group's bbox and an annotation's rect but does not cut its recorded
+ * boxes by either (11622-11700, 11877-11933), so this does, as the scene's boxes are cut.
  */
-export function gridFromRecorded(boxes: RecordedBoxes, scene: PageScene): Uint8Array {
+export function gridFromRecorded(boxes: RecordedBoxes, scene: PageScene, ocVisible: Uint8Array, view: Readonly<Mat6>): Grid {
   const coords = new Uint8Array(boxes.buffer)
-  const { fnArray } = boxes
+  const { fnArray, argsArray } = boxes
   if (coords.length !== fnArray.length * 4) {
     throw new Error(`gridFromRecorded: ${coords.length / 4} boxes for ${fnArray.length} ops; the boxes need their own render list`)
   }
   const textRows: number[] = []
-  for (let row = 0; row < scene.treeEnd; row++) if (scene.obj.kind[row] === Kind.Text) textRows.push(row)
-  const grid = new Uint8Array(GRID * GRID)
+  const groupRows: number[] = []
+  for (let row = 0; row < scene.treeEnd; row++) {
+    const kind = scene.obj.kind[row]
+    if (kind === Kind.Text) textRows.push(row)
+    else if (kind === Kind.Group || kind === Kind.SoftMask) groupRows.push(row)
+  }
+  const cells = new Uint8Array(GRID * GRID)
+  let skipped = 0
   let clipPending = false
   let texts = 0
+  let groups = 0
+  let ocs = 0
+  // Per marked-content level, whether it hides its content; `hidden` counts the levels that do. Per open
+  // form, whether it began hidden; `hiddenForms` counts those that did.
+  const marked: boolean[] = []
+  let hidden = 0
+  const forms: boolean[] = []
+  let hiddenForms = 0
+  // The save level, and the level a clip to a path with no points was set at (Infinity for none).
+  let depth = 0
+  let emptyClipDepth = Infinity
+  // The cells drawing is clipped to by the open groups' bboxes and annotations' rects.
+  const cuts: Box4[] = [[0, 0, GRID - 1, GRID - 1]]
+  const cut = (box: Box4) => {
+    const outer = cuts.at(-1)!
+    cuts.push([Math.max(outer[0], box[0]), Math.max(outer[1], box[1]), Math.min(outer[2], box[2]), Math.min(outer[3], box[3])])
+  }
+  // A restore of a save level, which drops a clip to no points set at that level.
+  const restoreLevel = () => {
+    depth--
+    if (depth < emptyClipDepth) emptyClipDepth = Infinity
+  }
   for (let op = 0; op < fnArray.length; op++) {
     const fn = fnArray[op]!
-    if (fn === OPS.clip || fn === OPS.eoClip) {
-      clipPending = true
-      continue
+    const args = argsArray[op] as unknown[] | null
+    switch (fn) {
+      case OPS.clip:
+      case OPS.eoClip:
+        clipPending = true
+        continue
+      case OPS.save:
+        depth++
+        continue
+      case OPS.restore:
+        clipPending = false
+        restoreLevel()
+        continue
+      case OPS.paintFormXObjectBegin:
+        depth++
+        if (args![1]) clipPending = false
+        forms.push(hidden > 0)
+        if (hidden > 0) hiddenForms++
+        continue
+      case OPS.paintFormXObjectEnd:
+        restoreLevel()
+        if (forms.pop()) hiddenForms--
+        continue
+      case OPS.beginGroup: {
+        depth++
+        const row = groupRows[groups++]
+        if (row === undefined) throw new Error(`gridFromRecorded: more beginGroup ops than the scene's ${groupRows.length} groups`)
+        const { bbox, matrix } = args![0] as { bbox: ArrayLike<number> | null; matrix: ArrayLike<number> | null }
+        const at = scene.obj.xform[row]! * 6
+        const ctm = Array.from(scene.xforms.subarray(at, at + 6)) as Mat6
+        cut(bbox ? cellBox(boxThrough(matrix ? multiply(ctm, Array.from(matrix) as Mat6) : ctm, [Math.min(bbox[0]!, bbox[2]!),
+          Math.min(bbox[1]!, bbox[3]!), Math.max(bbox[0]!, bbox[2]!), Math.max(bbox[1]!, bbox[3]!)]), scene.view) : cuts.at(-1)!)
+        continue
+      }
+      case OPS.beginAnnotation: {
+        depth++
+        // The rect is in the base transform, which for an annotation is the view's.
+        const rect = args![1] as ArrayLike<number> | null
+        if (rect) clipPending = false
+        cut(rect ? cellBox(boxThrough(view, [rect[0]!, rect[1]!, rect[2]!, rect[3]!]), scene.view) : cuts.at(-1)!)
+        continue
+      }
+      case OPS.endGroup:
+      case OPS.endAnnotation:
+        restoreLevel()
+        if (cuts.length > 1) cuts.pop()
+        continue
+      case OPS.beginMarkedContent:
+        marked.push(false)
+        continue
+      case OPS.beginMarkedContentProps: {
+        const hides = args![0] === 'OC' && ocVisible[ocs++] === 0
+        marked.push(hides)
+        if (hides) hidden++
+        continue
+      }
+      case OPS.endMarkedContent:
+        if (marked.pop()) hidden--
+        continue
     }
     if (fn === OPS.constructPath) {
-      const paintsNothing = clipPending || (boxes.argsArray[op] as readonly unknown[] | null)?.[0] === OPS.endPath
+      const paintsNothing = clipPending || args?.[0] === OPS.endPath
+      if (clipPending) {
+        const buffer = (args![1] as (ArrayLike<number> | null)[] | null)?.[0]
+        if (buffer && buffer.length > 0 && Array.from(buffer).every((v) => v === DRAW_OPS.closePath)) {
+          emptyClipDepth = Math.min(emptyClipDepth, depth)
+        }
+      }
       clipPending = false
       if (paintsNothing) continue
     } else if (fn === OPS.showText) {
       const row = textRows[texts++]
       if (row === undefined) throw new Error(`gridFromRecorded: more showText ops than the scene's ${textRows.length} Text rows`)
-      if (recordsClipBox(scene, row)) continue
+      if (unreadRun(scene, row)) {
+        skipped++
+        continue
+      }
     } else if (!DRAWING_OPS.has(fn)) {
       continue
     }
@@ -102,11 +240,19 @@ export function gridFromRecorded(boxes: RecordedBoxes, scene: PageScene): Uint8A
     const maxX = coords[op * 4 + 2]!
     const maxY = coords[op * 4 + 3]!
     if (minX === 255 && minY === 255 && maxX === 0 && maxY === 0) continue
+    if (hiddenForms > 0 || emptyClipDepth !== Infinity) {
+      skipped++
+      continue
+    }
     // A box min above max, which pdf.js leaves when a box lies outside its clip box, covers no cell.
-    for (let y = minY; y <= maxY; y++) grid.fill(1, y * GRID + minX, y * GRID + maxX + 1)
+    const [x0, y0, x1, y1] = cuts.at(-1)!
+    for (let y = Math.max(minY, y0); y <= Math.min(maxY, y1); y++) {
+      cells.fill(1, y * GRID + Math.max(minX, x0), y * GRID + Math.min(maxX, x1) + 1)
+    }
   }
   if (texts !== textRows.length) throw new Error(`gridFromRecorded: ${texts} showText ops for ${textRows.length} Text rows`)
-  return grid
+  if (groups !== groupRows.length) throw new Error(`gridFromRecorded: ${groups} beginGroup ops for ${groupRows.length} groups`)
+  return { cells, skipped }
 }
 
 /**
@@ -115,54 +261,83 @@ export function gridFromRecorded(boxes: RecordedBoxes, scene: PageScene): Uint8A
  *
  * - an inactive row, or a row inside an inactive container, covers nothing; containers cover nothing of
  *   their own, and out-of-tree rows are covered where the rows that use them are;
- * - inside a hidden `OptionalContent` only a `Path` covers its box: `constructPath` records the box
- *   before the paint checks visibility (10876, 10967), while text, images and shadings return first;
- * - a `Text` row that `recordsClipBox` is read on neither side; any other invisible run covers nothing,
- *   since pdf.js draws none of its glyphs, and any other run covers its box;
+ * - in hidden optional content only a `Path` covers its box: `constructPath` records the box before the
+ *   paint checks visibility (10876, 10967), while text, images and shadings return first. A row under a
+ *   `Form` there is read on neither side and counted in `skipped` (`gridFromRecorded`);
+ * - a `Text` row that is an `unreadRun`, and a row under a clip to a path with no points, are read on
+ *   neither side and counted; any other invisible run covers nothing, since pdf.js draws none of its
+ *   glyphs, and any other run covers its box;
  * - pdf.js cuts its boxes by `W` clips, form bboxes and d1 boxes (12240, 11598, `setCharWidthAndBounds`)
- *   but not by a text clip, so a row under a text clip covers the box of the clip above the outermost
- *   text clip, the page when there is none. Nor does it cut them by a group's bbox or an annotation's
- *   rect; no page checked so far has content outside either, and the scene's box is cut by both;
+ *   but not by a text clip. A row under one covers the box of the clip above the outermost text clip,
+ *   the page when there is none;
+ * - pdf.js records a box as its own box clamped into its clip box, min to the clip's min and max to the
+ *   clip's max (`recordBBox`, 8248-8265), and a `W` clip's box as the largest min and the smallest max
+ *   of the clips on each axis, with no test for empty (`bboxToClipBoxDropOperation`, 8296-8304). When that
+ *   box lies off the page on an axis, inside out or not, the byte clamp can put what is left on the edge
+ *   cells, though the row's box, cut by the clip, is empty: such a row covers that clip box clamped onto
+ *   the page, cells that hold pdf.js's. A form's bbox and a d1 box are taken as `W` clips here, though
+ *   pdf.js clips by them with an intersection tested for empty (`recordClipBox`, 8232-8246): where it
+ *   is empty pdf.js records nothing, and this marks edge cells it lacks;
  * - paint does not matter: pdf.js records a transparent paint like any other, and a soft mask's content
  *   is recorded as it is drawn into the mask.
  *
  * `ocVisible[k]` is the visibility of `ocProps[k]`; an index it lacks is visible.
  */
-export function gridFromScene(scene: PageScene, ocVisible: Uint8Array): Uint8Array {
+export function gridFromScene(scene: PageScene, ocVisible: Uint8Array): Grid {
   const { kind, flags, end, bbox, clip, d0 } = scene.obj
-  const { clips } = scene
+  const { clips, pathData } = scene
   const { width, height } = scene.view
-  const grid = new Uint8Array(GRID * GRID)
-  // The end of the outermost inactive container and of the outermost hidden optional content the walk
-  // is in. Subtrees nest, so the outermost one's end covers every inner one.
+  const cells = new Uint8Array(GRID * GRID)
+  let skipped = 0
+  // The end of the outermost inactive container, of the outermost hidden optional content and of the
+  // outermost form inside it that the walk is in. Subtrees nest, so the outermost one's end covers every
+  // inner one.
   let inactiveEnd = 0
   let hiddenEnd = 0
+  let hiddenFormEnd = 0
   for (let row = 0; row < scene.treeEnd; row++) {
     const k = kind[row]!
     const f = flags[row]!
     if (isContainer(k)) {
       if (row >= inactiveEnd && !(f & Flag.Active)) inactiveEnd = end[row]!
       if (k === Kind.OptionalContent && row >= hiddenEnd && ocVisible[d0[row]!] === 0) hiddenEnd = end[row]!
+      if (k === Kind.Form && row < hiddenEnd && row >= hiddenFormEnd) hiddenFormEnd = end[row]!
       continue
     }
     if (row < inactiveEnd || !(f & Flag.Active)) continue
     if (row < hiddenEnd && k !== Kind.Path) continue
-    if (k === Kind.Text && (recordsClipBox(scene, row) || f & Flag.Invisible)) continue
+    // The clip node above the outermost text clip, -1 for none above it; null when none is in force.
+    let above: number | null = null
+    let emptyClip = false
+    for (let c = clip[row]!; c >= 0; c = clips.parent[c]!) {
+      if (clips.kind[c] === ClipKind.Text) above = clips.parent[c]!
+      else if (pathData.subarray(clips.d0[c]!, clips.d0[c]! + clips.d1[c]!).every((v) => v === DRAW_OPS.closePath)) emptyClip = true
+    }
+    if (row < hiddenFormEnd || k === Kind.Text && unreadRun(scene, row) || emptyClip) {
+      skipped++
+      continue
+    }
+    if (k === Kind.Text && f & Flag.Invisible) continue
 
-    // The clip node above the outermost text clip, -1 for none above it; null when no text clip is in force.
-    let aboveText: number | null = null
-    for (let c = clip[row]!; c >= 0; c = clips.parent[c]!) if (clips.kind[c] === ClipKind.Text) aboveText = clips.parent[c]!
-    const box: ArrayLike<number> = aboveText === null ? bbox.subarray(row * 4, row * 4 + 4)
-      : aboveText < 0 ? [0, 0, width, height] : clips.box.subarray(aboveText * 4, aboveText * 4 + 4)
-
-    // pdf.js's quantisation (8276-8279), and its clamp: the coordinates are stored in a Uint8ClampedArray.
-    const minX = Math.min(255, Math.max(0, Math.floor(box[0]! * GRID / width)))
-    const minY = Math.min(255, Math.max(0, Math.floor(box[1]! * GRID / height)))
-    const maxX = Math.min(255, Math.max(0, Math.ceil(box[2]! * GRID / width)))
-    const maxY = Math.min(255, Math.max(0, Math.ceil(box[3]! * GRID / height)))
-    for (let y = minY; y <= maxY; y++) grid.fill(1, y * GRID + minX, y * GRID + maxX + 1)
+    let box: ArrayLike<number> = above === null ? bbox.subarray(row * 4, row * 4 + 4)
+      : above < 0 ? [0, 0, width, height] : clips.box.subarray(above * 4, above * 4 + 4)
+    if (above === null && clip[row]! >= 0 && !(box[0]! <= box[2]! && box[1]! <= box[3]!)) {
+      // pdf.js's clip box, the clips' largest min and smallest max on each axis with no test for empty.
+      const c: Box4 = [-Infinity, -Infinity, Infinity, Infinity]
+      for (let n = clip[row]!; n >= 0; n = clips.parent[n]!) {
+        const at = scene.xforms.subarray(clips.xform[n]! * 6, clips.xform[n]! * 6 + 6)
+        const own = boxThrough(Array.from(at) as Mat6, pathBounds(pathData.subarray(clips.d0[n]!, clips.d0[n]! + clips.d1[n]!)))
+        c[0] = Math.max(c[0], own[0])
+        c[1] = Math.max(c[1], own[1])
+        c[2] = Math.min(c[2], own[2])
+        c[3] = Math.min(c[3], own[3])
+      }
+      if (c[2] <= 0 || c[0] >= width || c[3] <= 0 || c[1] >= height) box = c
+    }
+    const [minX, minY, maxX, maxY] = cellBox(box, scene.view)
+    for (let y = minY; y <= maxY; y++) cells.fill(1, y * GRID + minX, y * GRID + maxX + 1)
   }
-  return grid
+  return { cells, skipped }
 }
 
 /** Each covered cell also covers its 8 neighbours. */
@@ -188,15 +363,21 @@ export interface GridDiff {
   sceneOnly: number
   /** The canvas-only cells as page-space boxes: runs along a grid row, merged down while they line up; at most 16. */
   canvasOnlyBoxes: Box4[]
+  /** The drawing ops and the rows a rule left unread (`gridFromRecorded`, `gridFromScene`). */
+  canvasSkipped: number
+  sceneSkipped: number
 }
 
 const MAX_BOXES = 16
 
 /** The two grids, each side against the other widened by a cell, so a box a quantisation step off is no difference. */
-export function diffGrids(canvas: Uint8Array, scene: Uint8Array, view: { width: number; height: number }): GridDiff {
+export function diffGrids(canvasGrid: Grid, sceneGrid: Grid, view: { width: number; height: number }): GridDiff {
+  const canvas = canvasGrid.cells
+  const scene = sceneGrid.cells
   const canvasWide = dilate(canvas)
   const sceneWide = dilate(scene)
-  const diff: GridDiff = { canvasCells: 0, sceneCells: 0, canvasOnly: 0, sceneOnly: 0, canvasOnlyBoxes: [] }
+  const diff: GridDiff = { canvasCells: 0, sceneCells: 0, canvasOnly: 0, sceneOnly: 0, canvasOnlyBoxes: [],
+    canvasSkipped: canvasGrid.skipped, sceneSkipped: sceneGrid.skipped }
   // Cell-space boxes, inclusive, and those that reach the row above by their [x0, x1].
   const boxes: Box4[] = []
   let above = new Map<string, Box4>()
@@ -248,6 +429,10 @@ export interface TextDiff {
   originsOff: number
   /** In page units (pt). */
   maxOriginError: number
+  /** Characters left out for lying off the page: the scene's, and the content's an item starts with. */
+  offPage: { scene: number; content: number }
+  /** Items holding a right-to-left character, compared without their order. */
+  unordered: number
 }
 
 /** Page units (pt). */
@@ -255,22 +440,35 @@ export const ORIGIN_TOLERANCE = 1
 
 const CONTEXT = 20
 
+/** The characters pdf.js's `bidi` counts as right to left; a string with none it leaves as it is (W 32480-32514). */
+const RIGHT_TO_LEFT = /[\u0590-\u05f4\u0600-\u08ac\ufb50-\ufdff\ufe70-\ufeff]/u
+
 /**
  * The scene's text against the page's text content. The scene side is the glyphs of active `Text` rows
  * in the page tree, outside annotations (which `getTextContent` does not read), in row order, accents
  * skipped (they are their base glyph's mark, not a character); text in hidden optional content counts,
  * as it does in `getTextContent`. Each side is its characters with whitespace removed.
  *
+ * `getTextContent` drops a glyph whose text is format marks (`\p{Cf}`, W 36256-36258), and one whose
+ * origin lies outside the view box, unless its text is a zero-width mark (W 36094-36101, 36276), so the
+ * scene side drops them too. pdf.js keeps a glyph that starts left of the box by less than its advance in
+ * text space, which the scene cannot know: an item that starts outside the box starts with such a glyph,
+ * and its first character is left out. It reorders an item that holds a right-to-left character (`bidi`,
+ * W 36065-36081), which is compared as a set of characters and, when it is the scene's set, takes the
+ * scene's order. Both are counted in the diff.
+ *
  * Origins are compared for each item whose string starts with a character: its origin, through
  * `view`, against the origin of the glyph that carries that character, up to the first difference.
- * An item that starts with whitespace is not compared: whitespace has no place in the sequences. Nor is
- * an item of a vertical font: `getTextContent` gives its pen position, while pdf.js draws each vertical
- * glyph at its vertical origin, offset from the pen by the glyph's `vmetric` (build/pdf.mjs 11348-11353),
- * and the scene keeps the origin drawn. Text with rise compares as any other.
+ * An item that starts with whitespace or off the page is not compared. Nor is an item whose first glyph
+ * pdf.js draws away from the pen position `getTextContent` gives: a vertical font's, at its vertical
+ * origin, offset from the pen by the glyph's `vmetric` (build/pdf.mjs 11348-11353), and a Type 3 font's
+ * whose font matrix translates (showType3Text, 11463-11464). Text with rise compares as any other.
  */
 export function diffText(scene: PageScene, items: readonly TextItem[], view: Readonly<Mat6>): TextDiff {
   const { kind, flags, end, d0, d1 } = scene.obj
   const { glyphs, strings } = scene
+  const { width, height } = scene.view
+  const offPage = { scene: 0, content: 0 }
   const sceneText: string[] = []
   const glyphOf: number[] = []
   let inactiveEnd = 0
@@ -285,8 +483,17 @@ export function diffText(scene: PageScene, items: readonly TextItem[], view: Rea
     if (k !== Kind.Text || row < inactiveEnd || row < annotationEnd || !(flags[row]! & Flag.Active)) continue
     for (let g = d0[row]!; g < d0[row]! + d1[row]!; g++) {
       if (glyphs.flags[g]! & GlyphFlag.Accent || glyphs.unicode[g]! < 0) continue
-      for (const ch of strings[glyphs.unicode[g]!]!) {
+      const str = strings[glyphs.unicode[g]!]!
+      if (/^\p{Cf}+$/u.test(str)) continue
+      const x = glyphs.x[g]!
+      const y = glyphs.y[g]!
+      const off = !/^\p{Mn}+$/u.test(str) && (x < 0 || x > width || y < 0 || y > height)
+      for (const ch of str) {
         if (/\s/u.test(ch)) continue
+        if (off) {
+          offPage.scene++
+          continue
+        }
         sceneText.push(ch)
         glyphOf.push(g)
       }
@@ -295,10 +502,22 @@ export function diffText(scene: PageScene, items: readonly TextItem[], view: Rea
 
   const contentText: string[] = []
   const starts: { item: TextItem; at: number }[] = []
+  const rightToLeft: { at: number; length: number }[] = []
   for (const item of items) {
-    const chars = Array.from(item.str)
-    if (chars.length > 0 && !/\s/u.test(chars[0]!)) starts.push({ item, at: contentText.length })
-    for (const ch of chars) if (!/\s/u.test(ch)) contentText.push(ch)
+    const chars = Array.from(item.str).filter((ch) => !/\s/u.test(ch))
+    const [x, y] = apply(view, item.transform[4]!, item.transform[5]!)
+    if (x < 0 || x > width || y < 0 || y > height) {
+      if (chars.length > 0) offPage.content++
+      chars.shift()
+    } else if (item.str.length > 0 && !/\s/u.test(item.str[0]!)) {
+      starts.push({ item, at: contentText.length })
+    }
+    if (RIGHT_TO_LEFT.test(item.str)) rightToLeft.push({ at: contentText.length, length: chars.length })
+    contentText.push(...chars)
+  }
+  for (const { at, length } of rightToLeft) {
+    const ordered = sceneText.slice(at, at + length)
+    if ([...ordered].sort().join('') === contentText.slice(at, at + length).sort().join('')) contentText.splice(at, length, ...ordered)
   }
 
   let firstMismatch = 0
@@ -315,11 +534,14 @@ export function diffText(scene: PageScene, items: readonly TextItem[], view: Rea
     originsCompared: 0,
     originsOff: 0,
     maxOriginError: 0,
+    offPage,
+    unordered: rightToLeft.length,
   }
   for (const { item, at } of starts) {
     if (firstMismatch >= 0 && at >= firstMismatch) break
     const g = glyphOf[at]!
-    if (scene.fonts[glyphs.font[g]!]?.vertical) continue
+    const font = scene.fonts[glyphs.font[g]!]
+    if (font?.vertical || font?.kind === 'type3' && (font.fontMatrix[4] !== 0 || font.fontMatrix[5] !== 0)) continue
     const [x, y] = apply(view, item.transform[4]!, item.transform[5]!)
     const error = Math.hypot(x - glyphs.x[g]!, y - glyphs.y[g]!)
     diff.originsCompared++
@@ -415,12 +637,15 @@ export function reportLines(report: SceneReport): string[] {
       .map(([feature, n]) => `${feature} ${n} (${FEATURE_STAGE[feature as Feature]})`))}`,
     `not drawn: ${list(Object.entries(report.notDrawn).map(([reason, n]) => `${reason} ${n}`))}`,
   ]
-  lines.push(`grid: canvas ${grid.canvasCells} cells, scene ${grid.sceneCells}, canvas-only ${grid.canvasOnly}, scene-only ${grid.sceneOnly}`)
+  lines.push(`grid: canvas ${grid.canvasCells} cells, scene ${grid.sceneCells}, canvas-only ${grid.canvasOnly}, scene-only ${grid.sceneOnly}`
+    + `; not read: ${grid.canvasSkipped} ops, ${grid.sceneSkipped} rows`)
   if (grid.canvasOnlyBoxes.length > 0) {
     const boxes = grid.canvasOnlyBoxes.map((b) => b.map((v) => v.toFixed(1)).join(' '))
     lines.push(`  canvas-only boxes (pt): ${boxes.join('; ')}`)
   }
   const origins = `origins ${text.originsCompared} compared, ${text.originsOff} off (max ${text.maxOriginError.toFixed(2)} pt)`
+    + (text.offPage.scene + text.offPage.content > 0 ? `; off the page: scene ${text.offPage.scene}, content ${text.offPage.content}` : '')
+    + (text.unordered > 0 ? `; right-to-left items unordered: ${text.unordered}` : '')
   if (text.context === null) {
     lines.push(`text: ${text.sceneChars} chars, equal; ${origins}`)
   } else {

@@ -340,9 +340,11 @@ class Walk implements Stepper {
         this.#showText(i, a[0] as readonly unknown[])
         break
       case OPS.setCharWidthAndBounds: {
-        // The glyph is cut to its d1 bounds (build/pdf.mjs 11480-11486).
+        // The glyph is cut to its d1 bounds, and the path ended, which drops a pending clip (build/pdf.mjs
+        // 11480-11486).
         const [, , llx, lly, urx, ury] = a as number[]
         this.#rectClip(s, [llx!, lly!, urx!, ury!], null)
+        s.pendingClip = 0
         break
       }
 
@@ -441,7 +443,11 @@ class Walk implements Stepper {
         }
         this.#base = inner.ctm
         this.#openRow(Kind.Form, i, { flags: 0, clip: inner.clip, xform: this.#ctmId(inner) })
-        if (bbox) this.#rectClip(inner, bbox, null)
+        // The bbox clip ends the path, which drops a pending clip (build/pdf.mjs 11592-11600).
+        if (bbox) {
+          this.#rectClip(inner, bbox, null)
+          inner.pendingClip = 0
+        }
         break
       }
       case OPS.paintFormXObjectEnd:
@@ -663,6 +669,8 @@ class Walk implements Stepper {
       inner.strokeAlpha = 1
       inner.transfer = -1
     }
+    // pdf.js clips to the bbox without ending the path, so a pending clip waits for the group's first path
+    // (build/pdf.mjs 11622-11632, 11684-11693).
     if (group.bbox) this.#rectClip(inner, group.bbox, group.matrix ? Array.from(group.matrix) as Mat6 : null)
   }
 
@@ -767,9 +775,13 @@ class Walk implements Stepper {
   }
 
   /**
-   * A Type 3 glyph's box in glyph space, from what its procedure paints in the using state `s`, cut to its
-   * d1 bounds. Text inside a glyph is not looked into, and the procedure's own miter limit is not
-   * followed: the larger of the PDF default and the using state's bounds a stroke's join.
+   * A Type 3 glyph's box in glyph space: where its procedure paints in the using state `s`, as pdf.js
+   * runs it (showType3Text, build/pdf.mjs 11458-11466). Each path, image and shading is cut to the clips
+   * in force: `W` paths, a form's bbox under its matrix (11582-11598), a group's bbox, and the d1 bounds,
+   * which pdf.js also records as the glyph's own box (`setCharWidthAndBounds`, 11480-11486). A shading
+   * fills its clip (`shadingFill`, 11549-11575), the whole plane when it has none. Text inside a glyph is
+   * not looked into, and the procedure's own miter limit is not followed: the larger of the PDF default
+   * and the using state's bounds a stroke's join.
    */
   #procBox(font: Font, id: string, s: GState): Box4 | null {
     const key = `${font.index}|${id}|${s.lineWidth}|${s.miter}`
@@ -778,60 +790,106 @@ class Walk implements Stepper {
     let box: Box4 | null = null
     if (proc !== undefined) {
       const content: Box4 = [...EMPTY_BOX]
-      let bounds: Box4 | null = null
-      let ctm: Mat6 = [...IDENTITY]
-      // The procedure takes the line width of the text that shows it until it sets its own.
-      let lineWidth = s.lineWidth
+      // The procedure takes the line width of the text that shows it until it sets its own. `clip` is
+      // the box of the clips in force, null for none.
+      let state: { ctm: Mat6; lineWidth: number; clip: Box4 | null } = { ctm: [...IDENTITY], lineWidth: s.lineWidth, clip: null }
+      const saved: (typeof state)[] = []
+      let pendingClip = false
       const miter = Math.max(10, s.miter)
-      const saved: [Mat6, number][] = []
+      const paint = (painted: Box4) => {
+        const cut = state.clip === null ? painted : intersect(painted, state.clip)
+        if (cut !== null) union(content, cut)
+      }
+      const clipTo = (rect: Box4) => {
+        state.clip = state.clip === null ? rect : intersect(state.clip, rect) ?? [...EMPTY_BOX]
+      }
+      const rect = (r: ArrayLike<number>): Box4 => [Math.min(r[0]!, r[2]!), Math.min(r[1]!, r[3]!), Math.max(r[0]!, r[2]!),
+        Math.max(r[1]!, r[3]!)]
       for (let i = 0; i < proc.fnArray.length; i++) {
         const a = (proc.argsArray[i] ?? []) as unknown[]
         switch (proc.fnArray[i]) {
           case OPS.save:
-            saved.push([ctm, lineWidth])
+            saved.push({ ...state })
             break
           case OPS.restore:
-            [ctm, lineWidth] = saved.pop() ?? [ctm, lineWidth]
+          case OPS.paintFormXObjectEnd:
+          case OPS.endGroup:
+            state = saved.pop() ?? state
+            pendingClip = false
             break
           case OPS.transform:
-            ctm = multiply(ctm, a as Mat6)
+            state.ctm = multiply(state.ctm, a as Mat6)
             break
           case OPS.setLineWidth:
-            lineWidth = a[0] as number
+            state.lineWidth = a[0] as number
+            break
+          case OPS.setGState:
+            for (const [name, value] of a[0] as [string, unknown][]) if (name === 'LW') state.lineWidth = value as number
+            break
+          case OPS.clip:
+          case OPS.eoClip:
+            pendingClip = true
             break
           case OPS.constructPath: {
             const buffer = (a[1] as (ArrayLike<number> | null)[] | null)?.[0] ?? null
             const minMax = a[2] as ArrayLike<number> | null
-            if (buffer === null || buffer.length === 0 || a[0] === OPS.endPath) break
-            const path = boxThrough(ctm, minMax && a[0] !== OPS.rawFillPath
+            if (buffer === null || buffer.length === 0) {
+              pendingClip = false
+              break
+            }
+            const path = boxThrough(state.ctm, minMax && a[0] !== OPS.rawFillPath
               ? [minMax[0]!, minMax[1]!, minMax[2]!, minMax[3]!]
               : pathBounds(buffer))
-            if ((PAINT_FLAGS[a[0] as number] ?? 0) & Flag.Stroke) {
-              const pad = lineWidth / 2 * miter * maxScale(ctm)
-              path[0] -= pad
-              path[1] -= pad
-              path[2] += pad
-              path[3] += pad
+            const flags = a[0] === OPS.rawFillPath ? Flag.Fill : PAINT_FLAGS[a[0] as number] ?? 0
+            if (flags & Flag.Stroke) {
+              const pad = state.lineWidth / 2 * miter * maxScale(state.ctm)
+              paint([path[0] - pad, path[1] - pad, path[2] + pad, path[3] + pad])
+            } else if (flags !== 0) {
+              paint(path)
             }
-            union(content, path)
+            // As in the walk: painted first, then clipped to (consumePath, 12222-12245).
+            if (pendingClip && a[0] !== OPS.rawFillPath) clipTo(path)
+            pendingClip = false
             break
           }
           case OPS.paintImageXObject:
+            // An image pdf.js could not decode paints nothing (paintImageXObject, 12041-12048).
+            if (this.#input.image(a[0] as string) !== null) paint(boxThrough(state.ctm, UNIT_SQUARE))
+            break
           case OPS.paintImageMaskXObject:
           case OPS.paintInlineImageXObject:
           case OPS.paintSolidColorImageMask:
-            union(content, boxThrough(ctm, UNIT_SQUARE))
+            paint(boxThrough(state.ctm, UNIT_SQUARE))
             break
+          case OPS.shadingFill:
+            paint(state.clip === null ? [-Infinity, -Infinity, Infinity, Infinity] : [...state.clip])
+            break
+          case OPS.paintFormXObjectBegin: {
+            const [matrix, bbox] = a as [ArrayLike<number> | null, ArrayLike<number> | null]
+            saved.push({ ...state })
+            if (matrix) state.ctm = multiply(state.ctm, Array.from(matrix) as Mat6)
+            if (bbox) {
+              clipTo(boxThrough(state.ctm, rect(bbox)))
+              pendingClip = false
+            }
+            break
+          }
+          case OPS.beginGroup: {
+            const { bbox, matrix } = a[0] as GroupInput
+            saved.push({ ...state })
+            if (bbox) clipTo(boxThrough(matrix ? multiply(state.ctm, Array.from(matrix) as Mat6) : state.ctm, rect(bbox)))
+            break
+          }
           case OPS.setCharWidthAndBounds: {
-            const [, , llx, lly, urx, ury] = a as number[]
-            const cut = boxThrough(ctm, [Math.min(llx!, urx!), Math.min(lly!, ury!), Math.max(llx!, urx!), Math.max(lly!, ury!)])
-            bounds = bounds === null ? cut : intersect(bounds, cut) ?? [...EMPTY_BOX]
+            const bounds = boxThrough(state.ctm, rect((a as number[]).slice(2)))
+            paint(bounds)
+            clipTo(bounds)
+            pendingClip = false
             break
           }
         }
       }
-      const cut = bounds === null ? content : intersect(content, bounds)
-      box = cut !== null && cut[0] <= cut[2] ? cut : null
+      box = content[0] <= content[2] && content[1] <= content[3] ? content : null
     }
     this.#procBoxes.set(key, box)
     return box
@@ -846,8 +904,6 @@ class Walk implements Stepper {
     const [d0, d1] = this.#b.path(buffer)
     const box = boxThrough(multiply(s.ctm, m), [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)])
     s.clip = this.#b.clips.intern(s.clip, ClipKind.Path, false, d0, d1, this.#ctmId(s), pathKey(buffer, 0, buffer.length), box)
-    // Each of these ends in pdf.js's endPath, which drops a pending clip.
-    s.pendingClip = 0
   }
 
   #openRow(kind: Kind, i: number, init: RowInit): number {
@@ -911,7 +967,7 @@ class Walk implements Stepper {
 }
 
 /** The hull of a DrawOPS buffer's points, control points included. */
-function pathBounds(data: ArrayLike<number>): Box4 {
+export function pathBounds(data: ArrayLike<number>): Box4 {
   const box: Box4 = [...EMPTY_BOX]
   for (let i = 0; i < data.length;) {
     const verb = data[i++]
