@@ -232,32 +232,41 @@ describe('the licence check', () => {
     expect(PDFJS_ASSET_DIRS).not.toContain('iccs')
   })
 
-  it('names a permissive source, its licence, the revision and the changes in each ported file of the page scene', () => {
-    const sceneDir = join(appDir, 'app/lib/pdf/scene')
+  it('names a permissive source, its licence, the revision and the changes in each ported file of the page scene, the rasteriser and the GPU side', () => {
     const notices = readFileSync(join(repoDir, 'THIRD_PARTY_NOTICES'), 'utf8')
     const ported: string[] = []
-    for (const name of readdirSync(sceneDir).filter((file) => file.endsWith('.ts'))) {
-      const source = readFileSync(join(sceneDir, name), 'utf8')
-      expect(source, name).not.toMatch(/poppler|mupdf/i)
-      // The file's header is its first comment.
-      const header = source.slice(0, source.indexOf('*/'))
-      const from = /Ported from (\S+)/.exec(header)?.[1]
-      if (from === undefined) {
-        continue
+    // A folder that does not exist fails here, so the expected list below cannot pass half built.
+    for (const dir of ['scene', 'raster', 'gpu']) {
+      const folder = join(appDir, 'app/lib/pdf', dir)
+      for (const file of readdirSync(folder).filter((entry) => entry.endsWith('.ts'))) {
+        const name = `${dir}/${file}`
+        const source = readFileSync(join(folder, file), 'utf8')
+        expect(source, name).not.toMatch(/poppler|mupdf/i)
+        // The file's header is its first comment.
+        const header = source.slice(0, source.indexOf('*/'))
+        const from = /Ported from (\S+)/.exec(header)?.[1]
+        if (from === undefined) {
+          continue
+        }
+        ported.push(name)
+        expect(Object.keys(PORT_SOURCES), name).toContain(from)
+        const { licence, notice } = PORT_SOURCES[from]!
+        expect(header, name).toMatch(licence)
+        // Apache-2.0 § 4(b) and the doc's rule: the revision it was ported from, a release or a git
+        // revision for a source whose ported code is unreleased, and what was changed.
+        expect(header, name).toMatch(/Ported from \S+ (\d+\.\d+(\.\d+)?|git [0-9a-f]{7,})\b/)
+        expect(header, name).toContain('Changed:')
+        // The header points to the source's section of the notices, which must exist.
+        const section = new RegExp(`^(\\d+)\\. ${notice}\\b`, 'm').exec(notices)?.[1]
+        expect(section, `${name}: no section for ${from} in THIRD_PARTY_NOTICES`).toBeDefined()
+        expect(header, name).toContain(`THIRD_PARTY_NOTICES § ${section}`)
       }
-      ported.push(name)
-      expect(Object.keys(PORT_SOURCES), name).toContain(from)
-      const { licence, notice } = PORT_SOURCES[from]!
-      expect(header, name).toMatch(licence)
-      // Apache-2.0 § 4(b) and the doc's rule: the revision it was ported from, and what was changed.
-      expect(header, name).toMatch(/Ported from \S+ \d+\.\d+(\.\d+)?\b/)
-      expect(header, name).toContain('Changed:')
-      // The header points to the source's section of the notices, which must exist.
-      const section = new RegExp(`^(\\d+)\\. ${notice}\\b`, 'm').exec(notices)?.[1]
-      expect(section, `${name}: no section for ${from} in THIRD_PARTY_NOTICES`).toBeDefined()
-      expect(header, name).toContain(`THIRD_PARTY_NOTICES § ${section}`)
     }
-    expect(ported.sort()).toEqual(['adapter.ts', 'matrix.ts', 'ops.ts', 'state.ts', 'text.ts'])
+    expect(ported.sort()).toEqual(['gpu/shaders.ts', 'raster/clip.ts', 'raster/encode.ts', 'raster/flatten.ts', 'raster/offset.ts',
+      'raster/region.ts', 'raster/sampling.ts', 'raster/stroke.ts', 'raster/strips.ts', 'raster/tiles.ts',
+      'scene/adapter.ts', 'scene/matrix.ts', 'scene/ops.ts', 'scene/state.ts', 'scene/text.ts'])
     expect(notices).toContain('apps/web/app/lib/pdf/scene/')
+    expect(notices).toContain('apps/web/app/lib/pdf/raster/')
+    expect(notices).toContain('apps/web/app/lib/pdf/gpu/')
   })
 })

@@ -165,7 +165,7 @@ export const Feature = {
 export type Feature = (typeof Feature)[keyof typeof Feature]
 
 /** The stage the WebGPU renderer is at: a feature drawn from a later stage is pending in the report. */
-export const RENDERER_STAGE = 3
+export const RENDERER_STAGE = 4
 
 /** The stage that first draws each feature. */
 export const FEATURE_STAGE: Readonly<Record<Feature, 4 | 5 | 6>> = {
