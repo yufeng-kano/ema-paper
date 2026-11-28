@@ -91,6 +91,9 @@ async def upload_attachment(
     if await _pending(db, user_id, max_age) >= settings.chat_attachments_pending_max:
         raise ApiError(429, "rate_limit", PENDING_FULL)
     cap = settings.chat_attachment_max_bytes
+    # No pooled connection waits on the client while the body arrives (docs/api.md
+    # § Database connections).
+    await db.commit()
     # Bounded before the parser spools a byte: a chunked request without a length would
     # otherwise fill the disk before anything answered 413 (jobs/intake.capped_stream).
     form = await capped_form(request, cap, CAP_NAME)

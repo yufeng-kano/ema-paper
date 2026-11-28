@@ -216,6 +216,9 @@ async def protected_resource_metadata(settings: AppSettings) -> JSONResponse:
 @router.post("/oauth/register", status_code=201)
 async def register(request: Request, db: DbSession, settings: AppSettings):
     """Open DCR (RFC 7591). Public clients only: no secret is issued, PKCE is mandatory."""
+    # The settings read's transaction ends before the body (docs/api.md § Database
+    # connections).
+    await db.commit()
     try:
         body = await request.json()
     except ValueError:

@@ -449,6 +449,9 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
     are committed (docs/billing.md § Kano Pay)."""
     if not settings.kano_pay_configured:
         raise ApiError(503, "pay_unavailable", "Billing is not configured")
+    # The settings read's transaction ends before the body (docs/api.md § Database
+    # connections).
+    await db.commit()
     raw = await request.body()
     if len(raw) > settings.kano_pay_event_max_bytes:
         raise ApiError(413, "invalid_request", "Event too large")
