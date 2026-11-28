@@ -179,6 +179,21 @@ function refused(packages: Installed[], allowed: ReadonlySet<string>): string[] 
     .sort()
 }
 
+/**
+ * The sources a file of the page scene may be ported from (docs/pdf-viewer.md § What is taken from
+ * where), each with the licence its header must name and the title of its section in the notices.
+ * Poppler (GPL) and MuPDF (AGPL) are not among them.
+ */
+const PORT_SOURCES: Record<string, { licence: RegExp; notice: string }> = {
+  'pdf.js': { licence: /Apache-2\.0/, notice: 'PDF.js' },
+  Vello: { licence: /Apache-2\.0|MIT/, notice: 'Vello' },
+  kurbo: { licence: /Apache-2\.0|MIT/, notice: 'kurbo' },
+  hayro: { licence: /Apache-2\.0|MIT/, notice: 'hayro' },
+  glifo: { licence: /Apache-2\.0|MIT/, notice: 'glifo' },
+  Skia: { licence: /BSD-3-Clause/, notice: 'Skia' },
+  PDFium: { licence: /BSD-3-Clause|Apache-2\.0/, notice: 'PDFium' },
+}
+
 describe('the licence check', () => {
   const manifest = JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')) as { dependencies: Record<string, string> }
 
@@ -215,5 +230,34 @@ describe('the licence check', () => {
     }
     // The ICC profile's folder is not served at all.
     expect(PDFJS_ASSET_DIRS).not.toContain('iccs')
+  })
+
+  it('names a permissive source, its licence, the revision and the changes in each ported file of the page scene', () => {
+    const sceneDir = join(appDir, 'app/lib/pdf/scene')
+    const notices = readFileSync(join(repoDir, 'THIRD_PARTY_NOTICES'), 'utf8')
+    const ported: string[] = []
+    for (const name of readdirSync(sceneDir).filter((file) => file.endsWith('.ts'))) {
+      const source = readFileSync(join(sceneDir, name), 'utf8')
+      expect(source, name).not.toMatch(/poppler|mupdf/i)
+      // The file's header is its first comment.
+      const header = source.slice(0, source.indexOf('*/'))
+      const from = /Ported from (\S+)/.exec(header)?.[1]
+      if (from === undefined) {
+        continue
+      }
+      ported.push(name)
+      expect(Object.keys(PORT_SOURCES), name).toContain(from)
+      const { licence, notice } = PORT_SOURCES[from]!
+      expect(header, name).toMatch(licence)
+      // Apache-2.0 § 4(b) and the doc's rule: the revision it was ported from, and what was changed.
+      expect(header, name).toMatch(/Ported from \S+ \d+\.\d+(\.\d+)?\b/)
+      expect(header, name).toContain('Changed:')
+      // The header points to the source's section of the notices, which must exist.
+      const section = new RegExp(`^(\\d+)\\. ${notice}\\b`, 'm').exec(notices)?.[1]
+      expect(section, `${name}: no section for ${from} in THIRD_PARTY_NOTICES`).toBeDefined()
+      expect(header, name).toContain(`THIRD_PARTY_NOTICES § ${section}`)
+    }
+    expect(ported.sort()).toEqual(['adapter.ts', 'matrix.ts', 'ops.ts', 'state.ts', 'text.ts'])
+    expect(notices).toContain('apps/web/app/lib/pdf/scene/')
   })
 })

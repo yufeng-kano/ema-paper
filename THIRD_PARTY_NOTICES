@@ -29,9 +29,12 @@ Copyright 2024 Mozilla Foundation
 
 What ships: the pdf.js library bundled into the web app's JavaScript, and
 its worker (build/pdf.worker.min.mjs or legacy/build/pdf.worker.min.mjs),
-emitted unchanged as a /_nuxt/ asset. The text-layer CSS and the selection
-handling the web app ports from pdf.js (apps/web/app/lib/pdf/,
-apps/web/app/assets/css/pdf-layers.css) are covered by the same licence.
+emitted unchanged as a /_nuxt/ asset. The text-layer CSS, the selection
+handling, and the operator codes, the operator-list walk with its graphics
+and text state, glyph placement and affine helpers the web app ports from
+pdf.js (apps/web/app/lib/pdf/, apps/web/app/lib/pdf/scene/,
+apps/web/app/assets/css/pdf-layers.css) are covered by the same licence; each
+ported file names pdf.js and says what was changed.
 
 Licence: Apache License 2.0, the full text below, from
 apps/web/node_modules/pdfjs-dist/LICENSE.
